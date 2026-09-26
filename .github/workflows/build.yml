@@ -1,0 +1,129 @@
+name: Build
+
+# The single definition of how Cthulhu Git is compiled and packaged. ci.yml
+# calls it for every pull request and release.yml for every v* tag, so a
+# release ships exactly what the pull request already built.
+on:
+  workflow_call:
+    inputs:
+      label:
+        description: Goes into every file name, e.g. v0.0.1 or pr-12
+        required: true
+        type: string
+      retention-days:
+        description: How long the packages stay downloadable from the run
+        required: false
+        type: number
+        default: 7
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # rust-toolchain.toml pins the compiler; this installs exactly that one.
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+      # No compiler cache: published binaries never build from outputs
+      # restored from an Actions cache.
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          name="cthulhu-git-${{ inputs.label }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/cthulhu-git.exe" "dist/$name/"
+          else
+            cp "target/${{ matrix.target }}/release/cthulhu-git" "dist/$name/"
+          fi
+          cp README.md LICENSE "dist/$name/"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "$name.zip" "$name"
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          retention-days: ${{ inputs.retention-days }}
+          if-no-files-found: error
+
+  macos:
+    name: macOS universal app
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: App bundle
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          app="dist/Cthulhu Git.app"
+          mkdir -p "$app/Contents/MacOS"
+          lipo -create \
+            target/aarch64-apple-darwin/release/cthulhu-git \
+            target/x86_64-apple-darwin/release/cthulhu-git \
+            -output "$app/Contents/MacOS/cthulhu-git"
+          lipo -info "$app/Contents/MacOS/cthulhu-git"
+          sed "s/__VERSION__/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          plutil -lint "$app/Contents/Info.plist"
+          # Apple Silicon refuses to run unsigned code; an ad-hoc signature is
+          # enough to start. Gatekeeper still asks on first open because the
+          # app is not notarized.
+          codesign --force --sign - "$app"
+          codesign --verify --verbose "$app"
+
+      - name: Disk image
+        run: |
+          staging="$RUNNER_TEMP/dmg"
+          mkdir -p "$staging"
+          cp -R "dist/Cthulhu Git.app" "$staging/"
+          ln -s /Applications "$staging/Applications"
+          cp README.md LICENSE "$staging/"
+          hdiutil create -volname "Cthulhu Git" -srcfolder "$staging" -ov -format UDZO \
+            "dist/cthulhu-git-${{ inputs.label }}-macos-universal.dmg"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-universal
+          path: dist/*.dmg
+          retention-days: ${{ inputs.retention-days }}
+          if-no-files-found: error
