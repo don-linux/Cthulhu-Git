@@ -107,8 +107,8 @@ is behind `cfg` and compiles for all three targets.
 | Platform | Status |
 | -------- | ------ |
 | Linux x86_64 | Built, tested and run; screenshots and video captured |
-| Windows x86_64 | `cargo check` and `cargo clippy` pass for `x86_64-pc-windows-gnu`; not run on a real machine yet |
-| macOS x86_64 | `cargo check` and `cargo clippy` pass for `x86_64-apple-darwin`; not run on a real machine yet |
+| Windows x86_64 | Built and packaged by CI (`x86_64-pc-windows-msvc`); not run on a real machine yet |
+| macOS Apple Silicon and Intel | Built by CI as one universal app (`aarch64` + `x86_64`, macOS 11+); not run on a real machine yet |
 
 The Windows search logic (`git.exe` plus Git for Windows fallbacks) is also
 covered by a simulated test that runs on Linux.
@@ -129,13 +129,26 @@ The crate forbids `unsafe` code. Tests never modify the process environment
 parallel without locks. The test that proves an inherited `GIT_DIR` is ignored
 re-runs the test binary as a child process with that variable set.
 
+## Releases
+
+Downloads for macOS (universal), Windows x86-64 and Linux x86-64 are on the
+[releases page](https://github.com/don-linux/Cthulhu-Git/releases).
+
+Only a `v*` tag publishes a release: every pull request to `main` is checked
+and built for the three platforms by `.github/workflows/ci.yml`, and pushing a
+tag such as `v0.0.1` runs `.github/workflows/release.yml`, which builds the
+same packages and publishes them with the notes in `docs/release-notes/`. How
+to write those notes and cut a release is in
+[docs/HOW-TO-CHANGELOG.md](docs/HOW-TO-CHANGELOG.md).
+
 ## Limits of this version
 
 - Read-only: no commit, push, stage, diff, history or file list.
 - No native folder picker; the path is typed or pasted.
 - No timeout for a Git process that hangs (for example on a stalled network
   filesystem); the window stays responsive but keeps showing "Loading…".
-- No packaging or installers.
+- No installers: a portable zip on Windows and an archive on Linux. The Mac
+  app is not signed or notarized by Apple.
 
 ## License
 
