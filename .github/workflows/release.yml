@@ -1,0 +1,96 @@
+name: Release
+
+# The only workflow that publishes. Pushing a tag such as v0.0.1 runs it;
+# nothing else does. See docs/HOW-TO-CHANGELOG.md.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Tag format
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag $TAG is not vMAJOR.MINOR.PATCH, e.g. v0.0.1"
+            exit 1
+          fi
+
+      - name: Tag matches Cargo.toml
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::Tag $TAG does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - name: Release notes exist
+        run: |
+          notes="docs/release-notes/$TAG.md"
+          if [ ! -s "$notes" ]; then
+            echo "::error::Missing $notes; see docs/HOW-TO-CHANGELOG.md"
+            exit 1
+          fi
+
+      - name: Tagged commit is on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$(git rev-parse "$TAG^{commit}")" origin/main; then
+            echo "::error::$TAG points to a commit that is not on main"
+            exit 1
+          fi
+
+      - run: rustup toolchain install
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    needs: verify
+    uses: ./.github/workflows/build.yml
+    with:
+      label: ${{ github.ref_name }}
+
+  publish:
+    name: GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > checksums.txt
+          cat checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          name: Cthulhu Git ${{ github.ref_name }}
+          # Handwritten notes committed with the tag, not a generated summary.
+          body_path: docs/release-notes/${{ github.ref_name }}.md
+          generate_release_notes: false
