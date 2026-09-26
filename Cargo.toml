@@ -1,6 +1,6 @@
 [package]
 name = "cthulhu-git"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.98"
 description = "Desktop Git client spike: finds the system git and shows the repository name and current branch."
