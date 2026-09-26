@@ -1,0 +1,21 @@
+[package]
+name = "cthulhu-git"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Desktop Git client spike: finds the system git and shows the repository name and current branch."
+license = "MIT"
+publish = false
+
+[dependencies]
+dunce = "1.0.5"
+eframe = "0.36.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
