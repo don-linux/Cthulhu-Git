@@ -23,6 +23,7 @@ pub struct CthulhuApp {
 
 impl CthulhuApp {
     pub fn new(ctx: &egui::Context, initial: &Path) -> Self {
+        crate::ui::theme::apply(ctx, crate::ui::theme::resolve(None));
         let mut app = Self {
             path_input: initial.display().to_string(),
             pending: None,
@@ -125,7 +126,10 @@ impl CthulhuApp {
 
                 ui.label(RichText::new("Branch").weak());
                 ui.label(match repo {
-                    Some(repo) => branch_text(&repo.head, ui.visuals().warn_fg_color),
+                    Some(repo) => branch_text(
+                        &repo.head,
+                        crate::ui::theme::current(ui.ctx()).palette.warning,
+                    ),
                     None => placeholder(),
                 });
                 ui.end_row();
