@@ -3,6 +3,10 @@ name: Build
 # The single definition of how Cthulhu Git is compiled and packaged. ci.yml
 # calls it for every pull request and release.yml for every v* tag, so a
 # release ships exactly what the pull request already built.
+#
+# The icon comes from assets/icon.svg. build.rs renders it with resvg for the
+# window icon and the Windows .exe; the jobs below render the Linux and macOS
+# sizes with the resvg CLI of the same version, so every PNG is identical.
 on:
   workflow_call:
     inputs:
@@ -21,62 +25,182 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RESVG_VERSION: "0.48.1"
 
 jobs:
-  build:
-    name: build (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+  linux:
+    name: Linux x86-64 (tar.gz, AppImage, deb, rpm)
+    # The glibc of this image is the oldest one the packages run on (2.39:
+    # Ubuntu 24.04, Debian 13, Fedora 40 and newer).
+    runs-on: ubuntu-24.04
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+      APPIMAGETOOL_VERSION: "1.9.1"
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       # rust-toolchain.toml pins the compiler; this installs exactly that one.
       - name: Rust toolchain
-        shell: bash
         run: |
           rustup toolchain install
-          rustup target add ${{ matrix.target }}
+          rustup target add "$TARGET"
       # No compiler cache: published binaries never build from outputs
       # restored from an Actions cache.
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target "$TARGET"
 
-      - name: Package
-        shell: bash
+      - name: Packaging tools
         run: |
-          name="cthulhu-git-${{ inputs.label }}-${{ matrix.target }}"
-          mkdir -p "dist/$name"
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp "target/${{ matrix.target }}/release/cthulhu-git.exe" "dist/$name/"
-          else
-            cp "target/${{ matrix.target }}/release/cthulhu-git" "dist/$name/"
-          fi
-          cp README.md LICENSE "dist/$name/"
-          cd dist
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a "$name.zip" "$name"
-          else
-            tar czf "$name.tar.gz" "$name"
-          fi
+          sudo apt-get update
+          sudo apt-get install -y rpm desktop-file-utils
+          mkdir -p "$RUNNER_TEMP/tools"
+          cd "$RUNNER_TEMP/tools"
+          curl -fsSL -o resvg.tar.gz \
+            "https://github.com/linebender/resvg/releases/download/v$RESVG_VERSION/resvg-linux-x86_64.tar.gz"
+          echo "fa8c26495a187e592c501db15bf9e8a9fdc051d4b2b336b39703d5b59f912b9d  resvg.tar.gz" | sha256sum -c
+          tar xzf resvg.tar.gz
+          curl -fsSL -o appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool" | sha256sum -c
+          chmod +x appimagetool
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb@3.8.0,cargo-generate-rpm@0.21.0
+
+      # PNG only: KDE draws SVG icons with Qt SVG, which lacks feTurbulence and
+      # feDropShadow, so installing icon.svg itself would render it broken.
+      - name: Icons
+        run: |
+          for size in 16 22 24 32 48 64 128 256 512; do
+            dir="target/icons/hicolor/${size}x${size}/apps"
+            mkdir -p "$dir"
+            resvg -w "$size" -h "$size" assets/icon.svg "$dir/cthulhu-git.png"
+          done
+          desktop-file-validate packaging/linux/cthulhu-git.desktop
+
+      - name: Archive
+        run: |
+          name="cthulhu-git-${{ inputs.label }}-$TARGET"
+          mkdir -p "dist/$name/share/applications" "dist/$name/share/icons"
+          cp "target/$TARGET/release/cthulhu-git" README.md LICENSE "dist/$name/"
+          cp packaging/linux/cthulhu-git.desktop "dist/$name/share/applications/"
+          cp -R target/icons/hicolor "dist/$name/share/icons/"
+          tar czf "dist/$name.tar.gz" -C dist "$name"
+          rm -rf "dist/$name"
+
+      - name: Debian package
+        run: |
+          cargo deb --no-build --target "$TARGET" \
+            --output "dist/cthulhu-git-${{ inputs.label }}-x86_64.deb"
+
+      - name: RPM package
+        run: |
+          cargo generate-rpm --target "$TARGET" \
+            --output "dist/cthulhu-git-${{ inputs.label }}-x86_64.rpm"
+
+      # No system libraries inside: the app loads the windowing and graphics
+      # libraries of the machine it runs on, as the AppImage excludelist advises.
+      - name: AppImage
+        run: |
+          appdir="$RUNNER_TEMP/AppDir"
+          mkdir -p "$appdir/usr/bin" "$appdir/usr/share/applications" "$appdir/usr/share/icons"
+          cp "target/$TARGET/release/cthulhu-git" "$appdir/usr/bin/"
+          cp packaging/linux/cthulhu-git.desktop "$appdir/"
+          cp packaging/linux/cthulhu-git.desktop "$appdir/usr/share/applications/"
+          cp -R target/icons/hicolor "$appdir/usr/share/icons/"
+          cp target/icons/hicolor/256x256/apps/cthulhu-git.png "$appdir/cthulhu-git.png"
+          ln -s cthulhu-git.png "$appdir/.DirIcon"
+          ln -s usr/bin/cthulhu-git "$appdir/AppRun"
+          # The runner has no FUSE; extract-and-run avoids needing it.
+          APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 appimagetool --no-appstream \
+            "$appdir" "dist/cthulhu-git-${{ inputs.label }}-x86_64.AppImage"
+
+      - name: Check the packages
+        run: |
+          deb="dist/cthulhu-git-${{ inputs.label }}-x86_64.deb"
+          rpm="dist/cthulhu-git-${{ inputs.label }}-x86_64.rpm"
+          appimage="dist/cthulhu-git-${{ inputs.label }}-x86_64.AppImage"
+
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          # Proves every declared dependency resolves on the oldest supported Ubuntu.
+          sudo apt-get install -y "./$deb"
+          test -x /usr/bin/cthulhu-git
+          test -f /usr/share/icons/hicolor/256x256/apps/cthulhu-git.png
+
+          rpm -qpi "$rpm"
+          rpm -qpR "$rpm"
+          rpm -qpl "$rpm" | grep -qx /usr/share/applications/cthulhu-git.desktop
+
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/$appimage" --appimage-extract > /dev/null
+          test -x squashfs-root/AppRun
+          test -f squashfs-root/cthulhu-git.desktop
+          test -f squashfs-root/.DirIcon
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.target }}
+          name: ${{ env.TARGET }}
           path: |
             dist/*.tar.gz
-            dist/*.zip
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
+          retention-days: ${{ inputs.retention-days }}
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86-64 (zip)
+    runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+      # build.rs embeds the icon and VERSIONINFO into the executable.
+      - run: cargo build --release --locked --target $env:TARGET
+
+      # build.rs only warns when no resource compiler is found; a release
+      # executable without its icon must fail here instead.
+      - name: Check icon and version info
+        run: |
+          $exe = "target\$env:TARGET\release\cthulhu-git.exe"
+          $info = (Get-Item $exe).VersionInfo
+          $info | Format-List ProductName, FileDescription, ProductVersion, FileVersion
+          if ($info.ProductName -ne "Cthulhu Git") { throw "VERSIONINFO is missing from $exe" }
+          Add-Type -Namespace Win32 -Name Shell -MemberDefinition @'
+          [System.Runtime.InteropServices.DllImport("shell32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+          public static extern uint ExtractIconEx(string file, int index, System.IntPtr[] large, System.IntPtr[] small, uint count);
+          '@
+          $icons = [Win32.Shell]::ExtractIconEx((Resolve-Path $exe).Path, -1, $null, $null, 0)
+          if ($icons -lt 1) { throw "No icon embedded in $exe" }
+          "Icons embedded: $icons"
+
+      - name: Archive
+        shell: bash
+        run: |
+          name="cthulhu-git-${{ inputs.label }}-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/cthulhu-git.exe" README.md LICENSE "dist/$name/"
+          cd dist
+          7z a "$name.zip" "$name"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.TARGET }}
+          path: dist/*.zip
           retention-days: ${{ inputs.retention-days }}
           if-no-files-found: error
 
   macos:
-    name: macOS universal app
+    name: macOS universal app (dmg)
     runs-on: macos-latest
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
@@ -93,16 +217,40 @@ jobs:
           cargo build --release --locked --target aarch64-apple-darwin
           cargo build --release --locked --target x86_64-apple-darwin
 
+      # macos-latest runs on Apple Silicon.
+      - name: resvg
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools"
+          cd "$RUNNER_TEMP/tools"
+          curl -fsSL -o resvg.zip \
+            "https://github.com/linebender/resvg/releases/download/v$RESVG_VERSION/resvg-macos-aarch64.zip"
+          echo "06440eb5aa14a28cbfc7e40ae39e1ffa71adc051b89fbaa913b4f1d9b905d09f  resvg.zip" | shasum -a 256 -c
+          unzip -q resvg.zip
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+
+      # icon-macos.svg places icon.svg on Apple's grid (824 of 1024).
+      - name: App icon
+        run: |
+          iconset="$RUNNER_TEMP/AppIcon.iconset"
+          mkdir -p "$iconset"
+          for size in 16 32 128 256 512; do
+            resvg -w "$size" -h "$size" assets/icon-macos.svg "$iconset/icon_${size}x${size}.png"
+            double=$((size * 2))
+            resvg -w "$double" -h "$double" assets/icon-macos.svg "$iconset/icon_${size}x${size}@2x.png"
+          done
+          iconutil -c icns -o "$RUNNER_TEMP/AppIcon.icns" "$iconset"
+
       - name: App bundle
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
           app="dist/Cthulhu Git.app"
-          mkdir -p "$app/Contents/MacOS"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
           lipo -create \
             target/aarch64-apple-darwin/release/cthulhu-git \
             target/x86_64-apple-darwin/release/cthulhu-git \
             -output "$app/Contents/MacOS/cthulhu-git"
           lipo -info "$app/Contents/MacOS/cthulhu-git"
+          cp "$RUNNER_TEMP/AppIcon.icns" "$app/Contents/Resources/"
           sed "s/__VERSION__/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
           plutil -lint "$app/Contents/Info.plist"
           # Apple Silicon refuses to run unsigned code; an ad-hoc signature is
