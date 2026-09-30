@@ -106,7 +106,7 @@ is behind `cfg` and compiles for all three targets.
 
 | Platform | Status |
 | -------- | ------ |
-| Linux x86_64 | Built, tested and run; screenshots and video captured |
+| Linux x86_64 | Built, tested and run; packaged by CI on Ubuntu 24.04 as AppImage, `.deb`, `.rpm` and `.tar.gz` (glibc 2.39+: Ubuntu 24.04, Debian 13, Fedora 40 or later) |
 | Windows x86_64 | Built and packaged by CI (`x86_64-pc-windows-msvc`); not run on a real machine yet |
 | macOS Apple Silicon and Intel | Built by CI as one universal app (`aarch64` + `x86_64`, macOS 11+); not run on a real machine yet |
 
@@ -129,9 +129,33 @@ The crate forbids `unsafe` code. Tests never modify the process environment
 parallel without locks. The test that proves an inherited `GIT_DIR` is ignored
 re-runs the test binary as a child process with that variable set.
 
+## Icon
+
+Every icon comes from one file, [`assets/icon.svg`](assets/icon.svg), rendered
+with [resvg](https://github.com/linebender/resvg) at each size a platform
+asks for, so nothing is scaled from a bitmap:
+
+- **Window icon** (title bar and taskbar on Linux and Windows): `build.rs`
+  renders a 256 px PNG that is embedded in the binary.
+- **Windows `.exe`** (Explorer, Start menu, taskbar): `build.rs` builds an
+  `.ico` with 16, 20, 24, 32, 40, 48, 64 and 256 px images and embeds it,
+  together with the version information shown in the file's properties, with
+  [`embed-resource`](https://crates.io/crates/embed-resource).
+- **macOS** (Dock, Finder): CI renders
+  [`assets/icon-macos.svg`](assets/icon-macos.svg), which places the same
+  drawing on Apple's icon grid, into `AppIcon.icns` inside the app bundle.
+- **Linux** (application menus): CI renders PNGs from 16 to 512 px into the
+  `hicolor` theme, used by the `.deb`, `.rpm`, AppImage and archive together
+  with [`packaging/linux/cthulhu-git.desktop`](packaging/linux/cthulhu-git.desktop).
+  PNGs are used instead of the SVG because some desktops draw SVG icons
+  without the filters the drawing relies on.
+
+To change the icon, edit `assets/icon.svg` and rebuild.
+
 ## Releases
 
-Downloads for macOS (universal), Windows x86-64 and Linux x86-64 are on the
+Downloads for macOS (universal), Windows x86-64 and Linux x86-64 (AppImage,
+`.deb`, `.rpm` and `.tar.gz`) are on the
 [releases page](https://github.com/don-linux/Cthulhu-Git/releases).
 
 Only a `v*` tag publishes a release: every pull request to `main` is checked
@@ -147,8 +171,10 @@ to write those notes and cut a release is in
 - No native folder picker; the path is typed or pasted.
 - No timeout for a Git process that hangs (for example on a stalled network
   filesystem); the window stays responsive but keeps showing "Loading…".
-- No installers: a portable zip on Windows and an archive on Linux. The Mac
-  app is not signed or notarized by Apple.
+- No Windows installer: a portable zip. The Mac app is not signed or
+  notarized by Apple.
+- Linux packages are x86-64 only and need glibc 2.39 or newer. No Flatpak
+  yet.
 
 ## License
 

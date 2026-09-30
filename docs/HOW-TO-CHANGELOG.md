@@ -75,7 +75,13 @@ Copy this into `docs/release-notes/vX.Y.Z.md` and replace every `X.Y.Z` and
 ````markdown
 Cthulhu Git X.Y.Z <one or two sentences: what this release is about>.
 
-**Download Cthulhu Git:** [Mac (Apple Silicon and Intel)](https://github.com/don-linux/Cthulhu-Git/releases/download/vX.Y.Z/cthulhu-git-vX.Y.Z-macos-universal.dmg) · [Windows](https://github.com/don-linux/Cthulhu-Git/releases/download/vX.Y.Z/cthulhu-git-vX.Y.Z-x86_64-pc-windows-msvc.zip) · [Linux](https://github.com/don-linux/Cthulhu-Git/releases/download/vX.Y.Z/cthulhu-git-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz)
+**Download Cthulhu Git:** [Mac (Apple Silicon and Intel)](https://github.com/don-linux/Cthulhu-Git/releases/download/vX.Y.Z/cthulhu-git-vX.Y.Z-macos-universal.dmg) · [Windows](https://github.com/don-linux/Cthulhu-Git/releases/download/vX.Y.Z/cthulhu-git-vX.Y.Z-x86_64-pc-windows-msvc.zip) · Linux: [AppImage](https://github.com/don-linux/Cthulhu-Git/releases/download/vX.Y.Z/cthulhu-git-vX.Y.Z-x86_64.AppImage), [.deb](https://github.com/don-linux/Cthulhu-Git/releases/download/vX.Y.Z/cthulhu-git-vX.Y.Z-x86_64.deb), [.rpm](https://github.com/don-linux/Cthulhu-Git/releases/download/vX.Y.Z/cthulhu-git-vX.Y.Z-x86_64.rpm), [.tar.gz](https://github.com/don-linux/Cthulhu-Git/releases/download/vX.Y.Z/cthulhu-git-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz)
+
+The Linux packages need glibc 2.39 or newer: Ubuntu 24.04, Debian 13, Fedora 40 or later.
+
+- **AppImage**, to try it without installing: `chmod +x cthulhu-git-vX.Y.Z-x86_64.AppImage`, then run it.
+- **Debian and Ubuntu:** `sudo apt install ./cthulhu-git-vX.Y.Z-x86_64.deb`
+- **Fedora:** `sudo dnf install ./cthulhu-git-vX.Y.Z-x86_64.rpm` (openSUSE Tumbleweed: `sudo zypper install` with the same file)
 
 The Mac app is not signed by Apple yet. The first time, open it from Finder, then go to **System Settings → Privacy & Security** and click **Open Anyway**. From a terminal, `xattr -dr com.apple.quarantine "/Applications/Cthulhu Git.app"` does the same.
 
@@ -154,5 +160,18 @@ patch version.
 | --- | --- |
 | `cthulhu-git-vX.Y.Z-macos-universal.dmg` | macOS 11+, Apple Silicon and Intel in one app |
 | `cthulhu-git-vX.Y.Z-x86_64-pc-windows-msvc.zip` | Windows x86-64, portable `.exe` |
-| `cthulhu-git-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | Linux x86-64, built on GitHub's `ubuntu-latest`: needs a glibc at least as new as that runner's |
+| `cthulhu-git-vX.Y.Z-x86_64.AppImage` | Linux x86-64, runs without installing |
+| `cthulhu-git-vX.Y.Z-x86_64.deb` | Debian, Ubuntu and derivatives; pulls in Git and the window libraries |
+| `cthulhu-git-vX.Y.Z-x86_64.rpm` | Fedora, openSUSE Tumbleweed; pulls in Git and the window libraries |
+| `cthulhu-git-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | Linux x86-64, binary plus `.desktop` file and icons |
 | `checksums.txt` | SHA-256 of every file above |
+
+Every Linux file is built on Ubuntu 24.04 and needs glibc 2.39 or newer
+(Ubuntu 24.04, Debian 13, Fedora 40 or later). When 24.04 stops being
+supported, move the runner in
+[`build.yml`](../.github/workflows/build.yml) to the next LTS and update the
+glibc line in the notes.
+
+The icon in every package is rendered from
+[`assets/icon.svg`](../assets/icon.svg) during the build; see the README's
+"Icon" section.
