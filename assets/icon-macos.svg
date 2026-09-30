@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    Apple's macOS icon grid: the icon body is 824x824, centred on a 1024x1024
+    canvas. icon.svg draws its body from 8 to 504 of 512, so it is scaled by
+    824/496 and offset to put that body at 100..924. Icons that ignore the grid
+    are shown inside a grey tile on macOS 26.
+  -->
+  <image href="icon.svg" x="86.7097" y="86.7097" width="850.5806" height="850.5806"/>
+</svg>

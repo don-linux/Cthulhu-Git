@@ -1,0 +1,394 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title description">
+  <title id="title">Cthulhu-Git submarino fusionado</title>
+  <desc id="description">Cthulhu-Git integrado en una escena abisal, contenido en un unico SVG</desc>
+
+  <defs>
+    <!-- Fondo submarino -->
+    <linearGradient id="abyss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#28706c"/>
+      <stop offset=".28" stop-color="#164e4c"/>
+      <stop offset=".68" stop-color="#0a302f"/>
+      <stop offset="1" stop-color="#041b1d"/>
+    </linearGradient>
+    <radialGradient id="deep-halo" cx=".5" cy=".38" r=".6">
+      <stop offset="0" stop-color="#73b69a" stop-opacity=".28"/>
+      <stop offset=".46" stop-color="#1f7468" stop-opacity=".12"/>
+      <stop offset="1" stop-color="#031416" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="vignette" cx=".5" cy=".44" r=".72">
+      <stop offset=".48" stop-color="#061b1b" stop-opacity="0"/>
+      <stop offset=".8" stop-color="#031314" stop-opacity=".42"/>
+      <stop offset="1" stop-color="#010a0c" stop-opacity=".76"/>
+    </radialGradient>
+    <linearGradient id="light-ray" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#c8eee0" stop-opacity=".34"/>
+      <stop offset=".72" stop-color="#78b9a7" stop-opacity=".05"/>
+      <stop offset="1" stop-color="#78b9a7" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="seabed" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b2826"/>
+      <stop offset="1" stop-color="#021012"/>
+    </linearGradient>
+    <linearGradient id="foreground-haze" x1="0" y1="0" x2="0" y2="1">
+      <stop offset=".45" stop-color="#5ca392" stop-opacity="0"/>
+      <stop offset="1" stop-color="#174d48" stop-opacity=".24"/>
+    </linearGradient>
+    <clipPath id="icon-frame">
+      <rect x="8" y="8" width="496" height="496" rx="94"/>
+    </clipPath>
+    <filter id="water-softness" x="-30%" y="-20%" width="160%" height="140%">
+      <feGaussianBlur stdDeviation="10"/>
+    </filter>
+    <filter id="water-texture" x="-10%" y="-10%" width="120%" height="120%">
+      <feTurbulence type="fractalNoise" baseFrequency=".018 .065" numOctaves="2" seed="23" result="noise"/>
+      <feColorMatrix
+        in="noise"
+        type="matrix"
+        values="0 0 0 0 0.35
+                0 0 0 0 0.67
+                0 0 0 0 0.61
+                0 0 0 .18 0"
+      />
+    </filter>
+    <filter id="logo-depth" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="14" stdDeviation="12" flood-color="#010a0c" flood-opacity=".62"/>
+    </filter>
+
+    <!-- Definiciones originales de Cthulhu-Git -->
+    <linearGradient id="skull-green" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#789767"/>
+      <stop offset=".48" stop-color="#4f714d"/>
+      <stop offset="1" stop-color="#2d4c3b"/>
+    </linearGradient>
+    <linearGradient id="brow-green" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9aae78"/>
+      <stop offset="1" stop-color="#4b6a49"/>
+    </linearGradient>
+    <linearGradient id="branch-green" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#66865b"/>
+      <stop offset="1" stop-color="#3c6147"/>
+    </linearGradient>
+    <radialGradient id="git-eye">
+      <stop offset="0" stop-color="#ffd072"/>
+      <stop offset=".35" stop-color="#f58242"/>
+      <stop offset="1" stop-color="#f05032"/>
+    </radialGradient>
+    <filter id="eye-glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feFlood flood-color="#f05032" flood-opacity=".75"/>
+      <feComposite in2="blur" operator="in"/>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="soft-shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="5" stdDeviation="5" flood-color="#102a25" flood-opacity=".35"/>
+    </filter>
+
+    <!-- Topologia de las ramas Git -->
+    <path id="trunk" d="M256 252C241 272 242 289 256 304C272 321 272 341 255 357C239 372 239 396 254 412C269 428 271 452 256 472"/>
+    <path id="inner-left" d="M231 252C223 278 224 302 199 332C178 357 176 381 188 401C198 419 207 428 211 443C214 455 205 466 193 462"/>
+    <path id="inner-right" d="M281 252C289 278 288 302 313 332C334 357 336 381 324 401C314 419 305 428 301 443C298 455 307 466 319 462"/>
+    <path id="outer-left" d="M209 250C205 278 187 300 159 315C143 324 129 335 120 348C110 362 109 376 113 390C118 409 130 422 146 426"/>
+    <path id="outer-right" d="M303 250C307 278 325 300 353 315C369 324 383 335 392 348C402 362 403 376 399 390C394 409 382 422 366 426"/>
+    <path id="frond-left" d="M193 250C178 256 164 269 145 274C124 280 103 272 94 257C85 242 90 226 105 220"/>
+    <path id="frond-right" d="M319 250C334 256 348 269 367 274C388 280 409 272 418 257C427 242 422 226 407 220"/>
+    <path id="fork-left-up" d="M159 315C140 301 119 290 94 293"/>
+    <path id="fork-left-low" d="M120 348C96 345 79 357 75 376C74 381 74 386 75 390"/>
+    <path id="fork-right-up" d="M353 315C372 301 393 290 418 293"/>
+    <path id="fork-right-low" d="M392 348C416 345 433 357 437 376C438 381 438 386 437 390"/>
+    <path id="fork-left-tail" d="M146 426C136 444 121 456 103 459"/>
+    <path id="fork-right-tail" d="M366 426C376 444 391 456 409 459"/>
+    <path id="fork-inner-left" d="M188 401C170 411 164 428 175 445"/>
+    <path id="fork-trunk" d="M254 412C269 418 278 429 278 445"/>
+    <path id="fork-inner-right" d="M324 401C342 411 348 428 337 445"/>
+  </defs>
+
+  <g clip-path="url(#icon-frame)">
+    <!-- Escena submarina trasera -->
+    <g id="underwater-background">
+      <rect width="512" height="512" fill="url(#abyss)"/>
+      <rect width="512" height="512" fill="url(#deep-halo)"/>
+      <path
+        fill="none"
+        stroke="#9ed0bd"
+        stroke-width="8"
+        stroke-linecap="round"
+        opacity=".18"
+        d="M-18 45C52 27 104 58 169 39C233 20 288 50 347 35C410 19 465 33 530 17"
+      />
+      <path
+        fill="none"
+        stroke="#c3e3d5"
+        stroke-width="3"
+        stroke-linecap="round"
+        opacity=".2"
+        d="M-12 66C43 52 94 76 149 58C206 40 264 69 320 51C383 31 443 54 524 36"
+      />
+      <g filter="url(#water-softness)">
+        <path fill="url(#light-ray)" opacity=".72" d="M53-24L155-24L235 430L105 430Z"/>
+        <path fill="url(#light-ray)" opacity=".5" d="M190-20L262-20L301 389L232 389Z"/>
+        <path fill="url(#light-ray)" opacity=".58" d="M343-24L423-24L360 408L286 408Z"/>
+      </g>
+      <ellipse cx="256" cy="238" rx="205" ry="226" fill="#3b8c78" opacity=".08" filter="url(#water-softness)"/>
+      <rect width="512" height="512" filter="url(#water-texture)" opacity=".46"/>
+
+      <g fill="#b6dcca">
+        <circle cx="61" cy="118" r="2.2" opacity=".48"/>
+        <circle cx="97" cy="174" r="1.4" opacity=".32"/>
+        <circle cx="139" cy="101" r="1.8" opacity=".38"/>
+        <circle cx="178" cy="152" r="1.2" opacity=".42"/>
+        <circle cx="212" cy="83" r="2" opacity=".32"/>
+        <circle cx="287" cy="112" r="1.3" opacity=".36"/>
+        <circle cx="337" cy="76" r="1.8" opacity=".44"/>
+        <circle cx="391" cy="139" r="1.3" opacity=".36"/>
+        <circle cx="449" cy="92" r="2.1" opacity=".42"/>
+        <circle cx="474" cy="189" r="1.4" opacity=".3"/>
+        <circle cx="47" cy="264" r="1.5" opacity=".34"/>
+        <circle cx="89" cy="323" r="2.1" opacity=".26"/>
+        <circle cx="433" cy="294" r="1.7" opacity=".3"/>
+        <circle cx="467" cy="349" r="2.3" opacity=".24"/>
+      </g>
+      <g fill="none" stroke="#b6dcca" opacity=".28">
+        <circle cx="74" cy="206" r="4"/>
+        <circle cx="424" cy="207" r="3"/>
+        <circle cx="454" cy="242" r="5"/>
+        <circle cx="117" cy="388" r="3"/>
+      </g>
+
+      <path
+        fill="url(#seabed)"
+        d="M0 450
+           C52 434 96 448 141 438
+           C186 428 224 450 269 440
+           C320 429 365 443 408 434
+           C449 425 482 433 512 424
+           L512 512L0 512Z"
+      />
+      <g fill="#173b35" opacity=".72">
+        <path d="M24 462L42 412L49 460Z"/>
+        <path d="M55 456L70 430L77 458Z"/>
+        <path d="M443 449L458 401L466 452Z"/>
+        <path d="M471 451L488 419L493 454Z"/>
+      </g>
+      <rect width="512" height="512" fill="url(#vignette)"/>
+    </g>
+
+    <!-- Cthulhu-Git, integrado directamente en este archivo -->
+    <g id="cthulhu-git-mark" filter="url(#logo-depth)">
+      <g id="skull" stroke="#18372f" stroke-linejoin="round">
+        <path
+          fill="url(#skull-green)"
+          stroke-width="9"
+          d="M256 35
+             C215 34 185 50 168 77
+             C142 76 120 94 116 121
+             C93 134 87 163 101 185
+             C91 214 108 247 139 255
+             C151 282 190 294 217 279
+             C230 294 245 301 256 301
+             C267 301 282 294 295 279
+             C322 294 361 282 373 255
+             C404 247 421 214 411 185
+             C425 163 419 134 396 121
+             C392 94 370 76 344 77
+             C327 50 297 34 256 35Z"
+        />
+        <g fill="none" stroke="#294b3d" stroke-linecap="round">
+          <path stroke-width="7" d="M256 49C246 79 247 112 256 143"/>
+          <path stroke-width="5" d="M221 57C211 92 219 119 239 146"/>
+          <path stroke-width="5" d="M291 57C301 92 293 119 273 146"/>
+          <path stroke-width="5" d="M180 88C177 113 189 133 215 153"/>
+          <path stroke-width="5" d="M332 88C335 113 323 133 297 153"/>
+        </g>
+        <path
+          fill="url(#brow-green)"
+          stroke-width="7"
+          d="M127 168
+             C158 141 197 137 235 161
+             L256 179L277 161
+             C315 137 354 141 385 168
+             C355 164 326 173 300 197
+             L275 214L256 204L237 214L212 197
+             C186 173 157 164 127 168Z"
+        />
+        <path fill="#19352d" stroke-width="6" d="M142 177C166 164 205 169 224 190C208 221 166 225 142 196C137 189 137 183 142 177Z"/>
+        <path fill="#19352d" stroke-width="6" d="M370 177C346 164 307 169 288 190C304 221 346 225 370 196C375 189 375 183 370 177Z"/>
+        <g id="eyes" fill="url(#git-eye)" stroke="#9f2f1d" stroke-width="3" filter="url(#eye-glow)">
+          <path d="M159 185C177 177 199 181 211 192C194 205 173 207 157 195C153 192 154 188 159 185Z"/>
+          <path d="M353 185C335 177 313 181 301 192C318 205 339 207 355 195C359 192 358 188 353 185Z"/>
+        </g>
+        <g fill="#ffe4a1">
+          <circle cx="184" cy="188" r="3.5"/>
+          <circle cx="328" cy="188" r="3.5"/>
+        </g>
+        <path
+          fill="#345544"
+          stroke-width="6"
+          d="M236 197C242 205 247 212 256 216C265 212 270 205 276 197L281 238C274 250 265 256 256 258C247 256 238 250 231 238Z"
+        />
+        <path fill="none" stroke-width="5" stroke-linecap="round" d="M247 223L245 240M265 223L267 240"/>
+        <path fill="#496c4e" stroke-width="7" d="M143 211C145 239 165 261 197 268L189 301C148 297 119 269 118 233Z"/>
+        <path fill="#496c4e" stroke-width="7" d="M369 211C367 239 347 261 315 268L323 301C364 297 393 269 394 233Z"/>
+      </g>
+
+      <g id="git-branches" fill="none" stroke-linecap="round" stroke-linejoin="round" filter="url(#soft-shadow)">
+        <g stroke="#18372f">
+          <g stroke-width="24">
+            <use href="#trunk"/>
+            <use href="#inner-left"/>
+            <use href="#inner-right"/>
+            <use href="#outer-left"/>
+            <use href="#outer-right"/>
+            <use href="#frond-left"/>
+            <use href="#frond-right"/>
+          </g>
+          <g stroke-width="18">
+            <use href="#fork-left-up"/>
+            <use href="#fork-left-low"/>
+            <use href="#fork-right-up"/>
+            <use href="#fork-right-low"/>
+            <use href="#fork-left-tail"/>
+            <use href="#fork-right-tail"/>
+            <use href="#fork-inner-left"/>
+            <use href="#fork-trunk"/>
+            <use href="#fork-inner-right"/>
+          </g>
+        </g>
+        <g stroke="url(#branch-green)">
+          <g stroke-width="13">
+            <use href="#trunk"/>
+            <use href="#inner-left"/>
+            <use href="#inner-right"/>
+            <use href="#outer-left"/>
+            <use href="#outer-right"/>
+            <use href="#frond-left"/>
+            <use href="#frond-right"/>
+          </g>
+          <g stroke-width="9">
+            <use href="#fork-left-up"/>
+            <use href="#fork-left-low"/>
+            <use href="#fork-right-up"/>
+            <use href="#fork-right-low"/>
+            <use href="#fork-left-tail"/>
+            <use href="#fork-right-tail"/>
+            <use href="#fork-inner-left"/>
+            <use href="#fork-trunk"/>
+            <use href="#fork-inner-right"/>
+          </g>
+        </g>
+      </g>
+
+      <g id="beard-roots" stroke="#18372f" stroke-linejoin="round">
+        <path
+          fill="url(#skull-green)"
+          stroke-width="7"
+          d="M183 245
+             C198 237 214 239 228 250
+             C236 239 247 237 256 250
+             C265 237 276 239 284 250
+             C298 239 314 237 329 245
+             C325 264 315 278 303 288
+             C295 278 287 270 279 266
+             C277 286 269 299 256 307
+             C243 299 235 286 233 266
+             C225 270 217 278 209 288
+             C197 278 187 264 183 245Z"
+        />
+        <g fill="none" stroke="#294b3d" stroke-linecap="round">
+          <path stroke-width="5" d="M202 249C211 260 213 273 209 285"/>
+          <path stroke-width="5" d="M229 250C237 261 239 276 236 289"/>
+          <path stroke-width="5" d="M256 253C251 268 252 285 256 299"/>
+          <path stroke-width="5" d="M283 250C275 261 273 276 276 289"/>
+          <path stroke-width="5" d="M310 249C301 260 299 273 303 285"/>
+        </g>
+        <g fill="none" stroke="#9bb286" stroke-linecap="round" opacity=".32">
+          <path stroke-width="3" d="M193 249C201 253 205 260 207 269"/>
+          <path stroke-width="3" d="M246 251C243 261 243 271 245 279"/>
+          <path stroke-width="3" d="M266 251C269 261 269 271 267 279"/>
+          <path stroke-width="3" d="M319 249C311 253 307 260 305 269"/>
+        </g>
+      </g>
+
+      <g id="commits" fill="#f05032" stroke="#18372f" stroke-width="5">
+        <circle cx="256" cy="304" r="9"/>
+        <circle cx="255" cy="357" r="9"/>
+        <circle cx="254" cy="412" r="10"/>
+        <circle cx="256" cy="472" r="11"/>
+        <circle cx="199" cy="332" r="8"/>
+        <circle cx="313" cy="332" r="8"/>
+        <circle cx="188" cy="401" r="8"/>
+        <circle cx="324" cy="401" r="8"/>
+        <circle cx="193" cy="462" r="9"/>
+        <circle cx="319" cy="462" r="9"/>
+        <circle cx="175" cy="445" r="9"/>
+        <circle cx="278" cy="445" r="9"/>
+        <circle cx="337" cy="445" r="9"/>
+        <circle cx="159" cy="315" r="8"/>
+        <circle cx="120" cy="348" r="8"/>
+        <circle cx="353" cy="315" r="8"/>
+        <circle cx="392" cy="348" r="8"/>
+        <circle cx="94" cy="293" r="9"/>
+        <circle cx="75" cy="390" r="9"/>
+        <circle cx="146" cy="426" r="9"/>
+        <circle cx="418" cy="293" r="9"/>
+        <circle cx="437" cy="390" r="9"/>
+        <circle cx="366" cy="426" r="9"/>
+        <circle cx="105" cy="220" r="9"/>
+        <circle cx="407" cy="220" r="9"/>
+        <circle cx="103" cy="459" r="9"/>
+        <circle cx="409" cy="459" r="9"/>
+      </g>
+
+      <g fill="none" stroke="#9bb286" stroke-linecap="round" opacity=".38">
+        <path stroke-width="4" d="M150 111C132 127 127 144 130 158"/>
+        <path stroke-width="4" d="M362 111C380 127 385 144 382 158"/>
+        <path stroke-width="4" d="M203 75C193 95 196 116 207 131"/>
+        <path stroke-width="4" d="M309 75C319 95 316 116 305 131"/>
+      </g>
+    </g>
+
+    <!-- Agua delante del personaje para integrarlo en la escena -->
+    <g id="foreground-water">
+      <path
+        fill="url(#foreground-haze)"
+        d="M0 210C84 188 150 231 230 211C308 192 386 211 512 180V512H0Z"
+      />
+      <g fill="#d1eee1">
+        <circle cx="134" cy="201" r="1.7" opacity=".42"/>
+        <circle cx="161" cy="286" r="1.2" opacity=".34"/>
+        <circle cx="224" cy="231" r="1.5" opacity=".3"/>
+        <circle cx="292" cy="266" r="1.2" opacity=".38"/>
+        <circle cx="367" cy="224" r="1.8" opacity=".36"/>
+        <circle cx="393" cy="339" r="1.4" opacity=".3"/>
+        <circle cx="242" cy="430" r="1.5" opacity=".28"/>
+      </g>
+      <g fill="none" stroke="#d1eee1" opacity=".3">
+        <circle cx="149" cy="244" r="3.5"/>
+        <circle cx="376" cy="278" r="4"/>
+        <circle cx="346" cy="373" r="2.5"/>
+      </g>
+      <path
+        fill="none"
+        stroke="#b6dfcd"
+        stroke-width="5"
+        stroke-linecap="round"
+        opacity=".1"
+        d="M92 126C177 97 248 122 317 101C369 85 409 87 454 73"
+      />
+    </g>
+  </g>
+
+  <rect
+    x="8"
+    y="8"
+    width="496"
+    height="496"
+    rx="94"
+    fill="none"
+    stroke="#8fc0aa"
+    stroke-opacity=".22"
+    stroke-width="3"
+  />
+</svg>

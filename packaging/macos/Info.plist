@@ -8,6 +8,8 @@
 	<string>Cthulhu Git</string>
 	<key>CFBundleExecutable</key>
 	<string>cthulhu-git</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>io.github.don-linux.cthulhu-git</string>
 	<key>CFBundleInfoDictionaryVersion</key>
