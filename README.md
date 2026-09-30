@@ -1,9 +1,9 @@
 # Cthulhu Git
 
 A small desktop Git client written in Rust with [egui/eframe](https://github.com/emilk/egui).
-This first slice finds the Git installed on the machine, then shows the
-repository name, its root folder and the current branch for any folder you
-point it at.
+It uses the Git installed on the machine. Open a repository with the system
+folder dialog or from the recent list to see its current branch, latest
+commit and commit history.
 
 It is read-only: no commit, push, stage or diff yet.
 
@@ -19,17 +19,17 @@ It is read-only: no commit, push, stage or diff yet.
   sudo apt install libxkbcommon-x11-0 libgl1 libegl1 libxcursor1 libxrandr2 libxi6 libx11-xcb1 libgl1-mesa-dri
   ```
 
+- Linux only, for the folder dialog: an XDG Desktop Portal backend
+  (`xdg-desktop-portal-gtk`, `-gnome` or `-kde`, installed by every mainstream
+  desktop) or, as a fallback, `zenity`.
+
 ## Build and run
 
 ```bash
-cargo run -- /path/to/a/repository   # open a specific folder
-cargo run                            # use the current directory
+cargo run                            # last repository, or the home screen
+cargo run -- /path/to/a/repository   # open this folder instead
 cargo build --release                # binary in target/release/cthulhu-git
 ```
-
-In the window, edit the path and press **Enter** or **Refresh**, or click
-**Use current directory**. Any folder inside a repository works; the root is
-resolved automatically.
 
 To use a specific Git executable instead of searching for one:
 
@@ -39,15 +39,58 @@ CTHULHU_GIT=/opt/git/bin/git cargo run -- ~/src/project
 
 ## What the window shows
 
-| Field      | Example                                            |
-| ---------- | -------------------------------------------------- |
-| Repository | `cthulhu-demo` (name of the root folder)           |
-| Branch     | `main`, `main (no commits yet)` or `Detached HEAD at 21de8d4` |
-| Root       | `/tmp/cthulhu-demo`                                |
-| Git        | `/usr/bin/git (2.43.0)`                            |
+**Home screen.** An **Open repository…** button that opens the system folder
+dialog (File Explorer on Windows, Finder on macOS, the desktop's own dialog
+through the XDG Desktop Portal on Linux), and the ten most recent
+repositories. Any folder inside a repository works; its root is what gets
+remembered.
+
+**Repository view.** A **Home** button to go back and pick another repository,
+then:
+
+| Field | Example |
+| ----- | ------- |
+| Repository | `cthulhu-demo` (name of the root folder) |
+| Branch | `main`, `main (no commits yet)` or `Detached HEAD at 21de8d4a3b7c` |
+| Latest commit | `21de8d4a3b7c - Rise from the sea` |
+| Commit history | Collapsed until clicked; one `hash - summary` line per commit, newest first |
+
+Hashes show 12 hex digits, the Linux kernel convention: short, yet unique
+in practice even in very large histories. The history lists the latest 1000
+commits and says so when there are more.
+
+**Which screen opens on launch:**
+
+1. A folder passed on the command line (the Linux desktop entry passes one
+   with `%f`).
+2. Otherwise, the last repository opened. Going Home does not forget it.
+3. Otherwise (first launch, or the last repository was moved or deleted),
+   the home screen. A failed reopen is shown as an error and forgotten.
 
 Errors (Git not found, too old, not a folder, not a repository, repository
-owned by another user) appear in a red panel and the previous data is cleared.
+owned by another user, unreadable settings) appear in a red panel.
+
+## Settings
+
+Stored as JSON in the per-user config folder of each OS, resolved with the
+[`directories`](https://crates.io/crates/directories) crate:
+
+| OS | File |
+| -- | ---- |
+| Linux | `$XDG_CONFIG_HOME/cthulhu-git/settings.json` (default `~/.config/cthulhu-git/settings.json`) |
+| macOS | `~/Library/Application Support/io.github.don-linux.cthulhu-git/settings.json` |
+| Windows | `%APPDATA%\don-linux\cthulhu-git\config\settings.json` |
+
+It holds the theme, the last repository and the recent repositories, and is
+rewritten atomically on every change. How to add a setting:
+[docs/SETTINGS.md](docs/SETTINGS.md).
+
+## Themes
+
+Colors come from a theme: a palette of named roles (`text`, `text_muted`,
+`accent`, `hash`…) that is turned into egui's visuals in one place. Views
+never use literal colors. One dark theme ships; there is no theme picker yet.
+How to add a theme: [docs/THEMES.md](docs/THEMES.md).
 
 ## How the Git layer works
 
@@ -95,8 +138,13 @@ and converts `C:/...` paths), and one
 `git status --porcelain=v2 --branch -z --untracked-files=no` call gives the
 branch, detached HEAD or unborn branch.
 
-In the UI, each refresh runs on a worker thread and reports back over a
-channel, so the window never freezes while Git runs.
+**Reading the history** (`log.rs`). One
+`git log --max-count=1001 -z --format=%H%x1f%s HEAD --` call gives the full
+hash and summary of the latest commits; asking for one more than the limit
+tells whether there are more. An unborn branch skips the call.
+
+In the UI, opening a repository and the folder dialog both run on worker
+threads and report back over a channel, so the window never freezes.
 
 ## Platform support
 
@@ -167,10 +215,14 @@ to write those notes and cut a release is in
 
 ## Limits of this version
 
-- Read-only: no commit, push, stage, diff, history or file list.
-- No native folder picker; the path is typed or pasted.
+- Read-only: no commit, push, stage, diff or file list.
+- The history shows commit summaries only (no author, date or graph) and
+  stops at the latest 1000 commits.
+- One theme and no settings screen yet.
 - No timeout for a Git process that hangs (for example on a stalled network
-  filesystem); the window stays responsive but keeps showing "Loading…".
+  filesystem); the window stays responsive but keeps showing "Opening…".
+- A repository whose path is not valid Unicode opens, but is not remembered
+  (JSON strings must be UTF-8).
 - No Windows installer: a portable zip. The Mac app is not signed or
   notarized by Apple.
 - Linux packages are x86-64 only and need glibc 2.39 or newer. No Flatpak

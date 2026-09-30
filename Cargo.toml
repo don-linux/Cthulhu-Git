@@ -3,7 +3,7 @@ name = "cthulhu-git"
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.98"
-description = "Desktop Git client spike: finds the system git and shows the repository name and current branch."
+description = "Desktop Git client: opens a repository and shows its branch, latest commit and commit history."
 license = "MIT"
 repository = "https://github.com/don-linux/Cthulhu-Git"
 publish = false
@@ -35,12 +35,15 @@ resvg = { version = "0.48.1", default-features = false }
 maintainer = "Fernando Diaz <194445529+don-linux@users.noreply.github.com>"
 copyright = "2026 Fernando Diaz / don-linux"
 extended-description = """\
-A small desktop Git client. It finds the Git installed on the machine and \
-shows the repository name, root folder and current branch of any folder."""
+A small desktop Git client that uses the Git installed on the machine. Open \
+a repository with the system folder dialog or from the recent list to see \
+its current branch, latest commit and commit history."""
 section = "vcs"
 priority = "optional"
 depends = "$auto, git (>= 1:2.15), libxkbcommon0, libxkbcommon-x11-0, libx11-6, libx11-xcb1, libxcursor1, libxi6, libegl1, libwayland-client0, libwayland-egl1"
-recommends = "libvulkan1"
+# The folder dialog goes through the XDG Desktop Portal over D-Bus (libdbus is
+# loaded at run time) and falls back to zenity when no portal answers.
+recommends = "libvulkan1, libdbus-1-3, xdg-desktop-portal-gtk | xdg-desktop-portal-gnome | xdg-desktop-portal-kde, zenity"
 assets = [
     ["target/release/cthulhu-git", "usr/bin/", "755"],
     ["packaging/linux/cthulhu-git.desktop", "usr/share/applications/", "644"],
@@ -57,7 +60,7 @@ assets = [
 ]
 
 [package.metadata.generate-rpm]
-summary = "Desktop Git client that shows the repository and branch of any folder"
+summary = "Desktop Git client that shows a repository's branch, latest commit and history"
 assets = [
     { source = "target/release/cthulhu-git", dest = "/usr/bin/cthulhu-git", mode = "755" },
     { source = "packaging/linux/cthulhu-git.desktop", dest = "/usr/share/applications/cthulhu-git.desktop", mode = "644" },
@@ -88,6 +91,9 @@ git-core = ">= 2.15"
 
 [package.metadata.generate-rpm.recommends]
 "libvulkan.so.1()(64bit)" = "*"
+"libdbus-1.so.3()(64bit)" = "*"
+xdg-desktop-portal = "*"
+zenity = "*"
 
 [lints.rust]
 unsafe_code = "forbid"

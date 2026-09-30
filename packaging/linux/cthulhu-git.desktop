@@ -2,7 +2,7 @@
 Type=Application
 Name=Cthulhu Git
 GenericName=Git Client
-Comment=Show the repository and branch of any folder
+Comment=Browse a Git repository's branch and commit history
 Exec=cthulhu-git %f
 Icon=cthulhu-git
 Terminal=false
