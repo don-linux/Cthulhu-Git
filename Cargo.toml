@@ -21,6 +21,69 @@ embed-resource = "3.0.11"
 ico = "0.5.0"
 resvg = { version = "0.48.1", default-features = false }
 
+# Linux packages, built by .github/workflows/build.yml. The icons under
+# target/icons/ are rendered from assets/icon.svg by that workflow first.
+#
+# eframe opens the windowing and graphics libraries at run time instead of
+# linking them, so dpkg and rpm cannot detect them: they are listed by hand.
+[package.metadata.deb]
+maintainer = "Fernando Diaz <194445529+don-linux@users.noreply.github.com>"
+copyright = "2026 Fernando Diaz / don-linux"
+extended-description = """\
+A small desktop Git client. It finds the Git installed on the machine and \
+shows the repository name, root folder and current branch of any folder."""
+section = "vcs"
+priority = "optional"
+depends = "$auto, git (>= 1:2.15), libxkbcommon0, libxkbcommon-x11-0, libx11-6, libx11-xcb1, libxcursor1, libxi6, libegl1, libwayland-client0, libwayland-egl1"
+recommends = "libvulkan1"
+assets = [
+    ["target/release/cthulhu-git", "usr/bin/", "755"],
+    ["packaging/linux/cthulhu-git.desktop", "usr/share/applications/", "644"],
+    ["README.md", "usr/share/doc/cthulhu-git/", "644"],
+    ["target/icons/hicolor/16x16/apps/cthulhu-git.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+    ["target/icons/hicolor/22x22/apps/cthulhu-git.png", "usr/share/icons/hicolor/22x22/apps/", "644"],
+    ["target/icons/hicolor/24x24/apps/cthulhu-git.png", "usr/share/icons/hicolor/24x24/apps/", "644"],
+    ["target/icons/hicolor/32x32/apps/cthulhu-git.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+    ["target/icons/hicolor/48x48/apps/cthulhu-git.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["target/icons/hicolor/64x64/apps/cthulhu-git.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["target/icons/hicolor/128x128/apps/cthulhu-git.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["target/icons/hicolor/256x256/apps/cthulhu-git.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["target/icons/hicolor/512x512/apps/cthulhu-git.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "Desktop Git client that shows the repository and branch of any folder"
+assets = [
+    { source = "target/release/cthulhu-git", dest = "/usr/bin/cthulhu-git", mode = "755" },
+    { source = "packaging/linux/cthulhu-git.desktop", dest = "/usr/share/applications/cthulhu-git.desktop", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/cthulhu-git/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/cthulhu-git/LICENSE", mode = "644" },
+    { source = "target/icons/hicolor/16x16/apps/cthulhu-git.png", dest = "/usr/share/icons/hicolor/16x16/apps/cthulhu-git.png", mode = "644" },
+    { source = "target/icons/hicolor/22x22/apps/cthulhu-git.png", dest = "/usr/share/icons/hicolor/22x22/apps/cthulhu-git.png", mode = "644" },
+    { source = "target/icons/hicolor/24x24/apps/cthulhu-git.png", dest = "/usr/share/icons/hicolor/24x24/apps/cthulhu-git.png", mode = "644" },
+    { source = "target/icons/hicolor/32x32/apps/cthulhu-git.png", dest = "/usr/share/icons/hicolor/32x32/apps/cthulhu-git.png", mode = "644" },
+    { source = "target/icons/hicolor/48x48/apps/cthulhu-git.png", dest = "/usr/share/icons/hicolor/48x48/apps/cthulhu-git.png", mode = "644" },
+    { source = "target/icons/hicolor/64x64/apps/cthulhu-git.png", dest = "/usr/share/icons/hicolor/64x64/apps/cthulhu-git.png", mode = "644" },
+    { source = "target/icons/hicolor/128x128/apps/cthulhu-git.png", dest = "/usr/share/icons/hicolor/128x128/apps/cthulhu-git.png", mode = "644" },
+    { source = "target/icons/hicolor/256x256/apps/cthulhu-git.png", dest = "/usr/share/icons/hicolor/256x256/apps/cthulhu-git.png", mode = "644" },
+    { source = "target/icons/hicolor/512x512/apps/cthulhu-git.png", dest = "/usr/share/icons/hicolor/512x512/apps/cthulhu-git.png", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+git-core = ">= 2.15"
+"libxkbcommon.so.0()(64bit)" = "*"
+"libxkbcommon-x11.so.0()(64bit)" = "*"
+"libX11.so.6()(64bit)" = "*"
+"libX11-xcb.so.1()(64bit)" = "*"
+"libXcursor.so.1()(64bit)" = "*"
+"libXi.so.6()(64bit)" = "*"
+"libEGL.so.1()(64bit)" = "*"
+"libwayland-client.so.0()(64bit)" = "*"
+"libwayland-egl.so.1()(64bit)" = "*"
+
+[package.metadata.generate-rpm.recommends]
+"libvulkan.so.1()(64bit)" = "*"
+
 [lints.rust]
 unsafe_code = "forbid"
 
