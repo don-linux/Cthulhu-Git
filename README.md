@@ -45,15 +45,16 @@ through the XDG Desktop Portal on Linux), and the ten most recent
 repositories. Any folder inside a repository works; its root is what gets
 remembered.
 
-**Repository view.** A **Home** button to go back and pick another repository,
-then:
+**Repository view.**
 
-| Field | Example |
-| ----- | ------- |
-| Repository | `cthulhu-demo` (name of the root folder) |
-| Branch | `main`, `main (no commits yet)` or `Detached HEAD at 21de8d4a3b7c` |
-| Latest commit | `21de8d4a3b7c - Rise from the sea` |
-| Commit history | Collapsed until clicked; one `hash - summary` line per commit, newest first |
+| Where | What | Example |
+| ----- | ---- | ------- |
+| Top bar, left | Panel button that hides or shows the commit history; the choice is remembered | |
+| Top bar, centered | Repository name (name of the root folder; hover for the full path) | `cthulhu-demo` |
+| Left sidebar | Commit history, one `hash - summary` line per commit, newest first; drag its edge to resize it | `21de8d4a3b7c - Rise from the sea` |
+| Middle | Latest commit | `21de8d4a3b7c - Rise from the sea` |
+| Bottom bar, left | House button to go back and pick another repository | |
+| Bottom bar | Current branch, next to a branch icon | `main`, `main (no commits yet)` or `Detached HEAD at 21de8d4a3b7c` |
 
 Hashes show 12 hex digits, the Linux kernel convention: short, yet unique
 in practice even in very large histories. The history lists the latest 1000
@@ -81,7 +82,8 @@ Stored as JSON in the per-user config folder of each OS, resolved with the
 | macOS | `~/Library/Application Support/io.github.don-linux.cthulhu-git/settings.json` |
 | Windows | `%APPDATA%\don-linux\cthulhu-git\config\settings.json` |
 
-It holds the theme, the last repository and the recent repositories, and is
+It holds the theme, the last repository, the recent repositories and whether
+the commit history sidebar is hidden, and is
 rewritten atomically on every change. How to add a setting:
 [docs/SETTINGS.md](docs/SETTINGS.md).
 
@@ -199,6 +201,13 @@ asks for, so nothing is scaled from a bitmap:
   without the filters the drawing relies on.
 
 To change the icon, edit `assets/icon.svg` and rebuild.
+
+The interface icons (`panel-left`, `house`, `git-branch`) are unmodified
+[Lucide](https://lucide.dev) SVGs in [`assets/icons/`](assets/icons), under
+the license in [`assets/icons/LICENSE`](assets/icons/LICENSE). `build.rs`
+renders them white at 64 px and the app tints them with the theme's colors.
+To add one, put the SVG there, then list it in `UI_ICONS` in `build.rs` and in
+`Icon` in `src/ui/icons.rs`.
 
 ## Releases
 

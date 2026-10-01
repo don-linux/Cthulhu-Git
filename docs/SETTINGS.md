@@ -28,6 +28,7 @@ atomic: a temp file next to `settings.json` is renamed over it
 | `src/settings.rs` | `SettingsError` | Read / parse / write errors shown to the user |
 | `src/ui/mod.rs` | `CthulhuApp::new` | Loads settings, applies the theme, picks the startup screen |
 | `src/ui/mod.rs` | `CthulhuApp::poll_opening` | Remembers a repository on success; forgets `last_repository` when it fails to open |
+| `src/ui/mod.rs` | `CthulhuApp::ui`, `Action::ToggleHistorySidebar` | Flips `history_sidebar_hidden` when the repository view asks |
 | `src/ui/mod.rs` | `CthulhuApp::save_settings` | The only caller of `save_to` |
 
 ## File location
@@ -44,7 +45,8 @@ For manual tests on Linux, point `XDG_CONFIG_HOME` at a temp folder.
 {
   "theme": null,
   "last_repository": "/home/me/src/rlyeh",
-  "recent_repositories": ["/home/me/src/rlyeh", "/home/me/src/necronomicon"]
+  "recent_repositories": ["/home/me/src/rlyeh", "/home/me/src/necronomicon"],
+  "history_sidebar_hidden": false
 }
 ```
 
@@ -55,6 +57,7 @@ For manual tests on Linux, point `XDG_CONFIG_HOME` at a temp folder.
 | `theme` | Theme id (`docs/THEMES.md`); `null` or unknown means the default theme | `null` |
 | `last_repository` | Repository root reopened on launch | `null` |
 | `recent_repositories` | Repository roots, newest first, no duplicates, at most 10 | `[]` |
+| `history_sidebar_hidden` | The commit history sidebar of the repository view is hidden (toggled with the panel button in the top bar). Negated so a missing field shows the sidebar | `false` |
 
 Only repository roots are stored, never subfolders. Paths that are not valid
 Unicode are not stored (JSON strings are UTF-8).
