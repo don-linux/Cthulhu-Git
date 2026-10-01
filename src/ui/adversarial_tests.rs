@@ -83,21 +83,28 @@ fn child_name(name: &str) -> String {
 }
 
 /// The settings file the child is allowed to touch. Refuses the real user config.
+///
+/// Linux honors `XDG_CONFIG_HOME`. macOS ignores it and uses
+/// `$HOME/Library/Application Support`, so a path under the temporary home is
+/// the sandbox there.
 fn settings_path() -> PathBuf {
     let config = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").expect("XDG_CONFIG_HOME"));
     let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
     let path = Settings::default_path().expect("settings path");
+    let under_config = path.starts_with(&config);
+    let under_home = path.starts_with(&home);
     assert!(
-        path.is_absolute() && path.starts_with(&config),
-        "settings path {} is outside the temp config {}",
+        path.is_absolute() && (under_config || under_home),
+        "settings path {} is outside the temp config {} and home {}",
         path.display(),
-        config.display()
+        config.display(),
+        home.display()
     );
-    assert!(
-        !path.starts_with(home.join(".config")),
-        "refusing to touch {}",
-        path.display()
-    );
+    // `$HOME/.config` is the Linux fallback used when XDG_CONFIG_HOME is unset.
+    // A path there is only acceptable when that directory is the temp config.
+    if path.starts_with(home.join(".config")) {
+        assert!(under_config, "refusing to touch {}", path.display());
+    }
     assert_eq!(
         path.file_name().and_then(|name| name.to_str()),
         Some(cthulhu_git::settings::FILE_NAME)
@@ -308,6 +315,9 @@ fn commit(summary: &str) -> Commit {
     }
 }
 
+// Windows resolves the config directory with SHGetKnownFolderPath, which
+// ignores HOME and XDG_CONFIG_HOME, so these tests cannot be sandboxed there.
+#[cfg(unix)]
 #[test]
 fn adversarial_not_a_repo_shows_home_error() {
     let output = reexec(&child_name("child_not_a_repo"));
@@ -333,6 +343,7 @@ fn child_not_a_repo() {
     println!("CHILD_OK not_a_repo");
 }
 
+#[cfg(unix)]
 #[test]
 fn adversarial_missing_cli_path_shows_directory_error() {
     let output = reexec(&child_name("child_missing_cli_path"));
@@ -354,6 +365,7 @@ fn child_missing_cli_path() {
     println!("CHILD_OK missing_cli_path");
 }
 
+#[cfg(unix)]
 #[test]
 fn adversarial_file_cli_path_shows_directory_error() {
     let output = reexec(&child_name("child_file_cli_path"));
@@ -376,6 +388,7 @@ fn child_file_cli_path() {
     println!("CHILD_OK file_cli_path");
 }
 
+#[cfg(unix)]
 #[test]
 fn adversarial_home_keeps_last_repository() {
     let output = reexec(&child_name("child_home_keeps_last_repository"));
@@ -421,6 +434,7 @@ fn child_home_keeps_last_repository() {
     println!("CHILD_OK home_keeps_last_repository");
 }
 
+#[cfg(unix)]
 #[test]
 fn adversarial_missing_recent_shows_error_when_opened() {
     let output = reexec(&child_name("child_missing_recent"));
@@ -469,6 +483,7 @@ fn child_missing_recent() {
     println!("CHILD_OK missing_recent");
 }
 
+#[cfg(unix)]
 #[test]
 fn adversarial_corrupt_settings_are_not_overwritten() {
     let output = reexec(&child_name("child_corrupt_settings"));
@@ -500,6 +515,7 @@ fn child_corrupt_settings() {
     println!("CHILD_OK corrupt_settings");
 }
 
+#[cfg(unix)]
 #[test]
 fn adversarial_history_sidebar_toggle_is_saved() {
     let output = reexec(&child_name("child_history_sidebar_toggle"));

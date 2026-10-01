@@ -233,14 +233,29 @@ mod tests {
 
     #[test]
     fn relative_and_empty_path_entries_are_not_searched() {
+        // `/usr/bin` is not absolute on Windows, so the one absolute entry has
+        // to be a path this platform actually treats as absolute.
+        let absolute = if cfg!(windows) {
+            PathBuf::from(r"C:\Program Files\Git\cmd")
+        } else {
+            PathBuf::from("/usr/bin")
+        };
         let inputs = DiscoverInputs {
             override_path: None,
-            path_var: Some(env::join_paths([".", "", "bin", "/usr/bin"]).expect("PATH")),
+            path_var: Some(
+                env::join_paths([
+                    Path::new("."),
+                    Path::new(""),
+                    Path::new("bin"),
+                    absolute.as_path(),
+                ])
+                .expect("PATH"),
+            ),
             exe_name: "git",
             fallbacks: Vec::new(),
         };
         let searched = find_git_in(&inputs).searched;
-        assert_eq!(searched, vec![PathBuf::from("/usr/bin/git")]);
+        assert_eq!(searched, vec![absolute.join("git")]);
     }
 
     #[test]

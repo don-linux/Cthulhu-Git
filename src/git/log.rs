@@ -50,7 +50,12 @@ pub fn history(git: &Git, root: &Path, head: &Head, limit: usize) -> Result<Hist
         return Ok(History::default());
     }
 
-    let max_count = format!("--max-count={}", limit.saturating_add(1));
+    // Git parses --max-count as a signed integer. usize::MAX does not fit and
+    // the command fails instead of listing the commits.
+    let max_count = format!(
+        "--max-count={}",
+        limit.saturating_add(1).min(i64::MAX as usize)
+    );
     let args = [
         "log",
         &max_count,
