@@ -1,7 +1,7 @@
 // Release builds on Windows must not open a console window next to the GUI.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
+mod ui;
 
 use std::env;
 use std::path::PathBuf;
@@ -9,27 +9,27 @@ use std::path::PathBuf;
 use eframe::egui;
 
 fn main() -> eframe::Result {
-    let initial = env::args_os()
+    // A folder given on the command line (or by the Linux desktop entry's
+    // `%f`) opens instead of the last repository.
+    let command_line = env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .or_else(|| env::current_dir().ok())
-        .unwrap_or_default();
-    let initial = std::path::absolute(&initial).unwrap_or(initial);
+        .map(|path| std::path::absolute(&path).unwrap_or(path));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Cthulhu Git")
             .with_app_id("cthulhu-git")
             .with_icon(window_icon())
-            .with_inner_size([780.0, 400.0])
-            .with_min_inner_size([460.0, 320.0]),
+            .with_inner_size([860.0, 620.0])
+            .with_min_inner_size([520.0, 400.0]),
         ..Default::default()
     };
 
     eframe::run_native(
         "Cthulhu Git",
         options,
-        Box::new(move |cc| Ok(Box::new(app::CthulhuApp::new(&cc.egui_ctx, &initial)))),
+        Box::new(move |cc| Ok(Box::new(ui::CthulhuApp::new(&cc.egui_ctx, command_line)))),
     )
 }
 

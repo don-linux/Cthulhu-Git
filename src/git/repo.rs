@@ -2,6 +2,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::exec::{Git, GitError};
+use super::log::short_oid;
 
 const STATUS_ARGS: &[&str] = &[
     "status",
@@ -120,7 +121,7 @@ pub(crate) fn parse_head(stdout: &[u8]) -> Option<Head> {
     Some(match (head.as_str(), oid.as_str()) {
         ("(detached)", "(initial)") => return None,
         ("(detached)", oid) => Head::Detached {
-            short_oid: oid.chars().take(7).collect(),
+            short_oid: short_oid(oid).to_owned(),
         },
         (_, "(initial)") => Head::Unborn(head),
         _ => Head::Branch(head),
@@ -163,7 +164,7 @@ mod tests {
         assert_eq!(
             parse_head(&stdout),
             Some(Head::Detached {
-                short_oid: "4b825dc".to_owned()
+                short_oid: "4b825dc642cb".to_owned()
             })
         );
     }
@@ -190,10 +191,10 @@ mod tests {
         );
         assert_eq!(
             Head::Detached {
-                short_oid: "abc1234".to_owned()
+                short_oid: "abc1234def56".to_owned()
             }
             .to_string(),
-            "Detached HEAD at abc1234"
+            "Detached HEAD at abc1234def56"
         );
     }
 }

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cthulhu_git::git::{Git, GitError, Head, RepoInfo, inspect};
+use cthulhu_git::git::{Git, GitError, Head, History, RepoInfo, SHORT_OID_LEN, history, inspect};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -81,6 +81,15 @@ impl Fixture {
     fn inspect(&self) -> RepoInfo {
         self.inspect_at(&self.root).expect("inspect")
     }
+
+    fn commit(&self, message: &str) {
+        self.git(&["commit", "--allow-empty", "-m", message]);
+    }
+
+    fn history(&self, limit: usize) -> History {
+        let info = self.inspect();
+        history(&self.git, &info.root, &info.head, limit).expect("history")
+    }
 }
 
 #[test]
@@ -117,7 +126,7 @@ fn detached_head_reports_short_oid() {
     assert_eq!(
         fixture.inspect().head,
         Head::Detached {
-            short_oid: oid[..7].to_owned()
+            short_oid: oid[..SHORT_OID_LEN].to_owned()
         }
     );
 }
@@ -165,6 +174,64 @@ fn missing_path_is_not_a_directory() {
     let missing = fixture.root.join("does-not-exist");
     let error = fixture.inspect_at(&missing).expect_err("missing");
     assert!(matches!(error, GitError::NotADirectory(_)), "{error:?}");
+}
+
+#[test]
+fn history_lists_newest_first_with_full_oid() {
+    let fixture = Fixture::with_commit();
+    fixture.commit("Dream in R'lyeh");
+    fixture.commit("Rise from the sea\n\nThe body is not part of the summary.");
+    let head = fixture.git(&["rev-parse", "HEAD"]);
+
+    let history = fixture.history(100);
+    let summaries: Vec<_> = history
+        .commits
+        .iter()
+        .map(|commit| commit.summary.as_str())
+        .collect();
+    assert_eq!(
+        summaries,
+        ["Rise from the sea", "Dream in R'lyeh", "Awaken"]
+    );
+    assert!(!history.truncated);
+
+    let latest = history.latest().expect("latest commit");
+    assert_eq!(latest.oid, head);
+    assert_eq!(latest.short_oid(), &head[..SHORT_OID_LEN]);
+}
+
+#[test]
+fn history_is_truncated_at_the_limit() {
+    let fixture = Fixture::with_commit();
+    fixture.commit("Second");
+    fixture.commit("Third");
+
+    let history = fixture.history(2);
+    assert_eq!(history.commits.len(), 2);
+    assert!(history.truncated);
+    assert_eq!(history.commits[0].summary, "Third");
+
+    assert!(!fixture.history(3).truncated);
+}
+
+#[test]
+fn history_follows_a_detached_head() {
+    let fixture = Fixture::with_commit();
+    fixture.commit("Second");
+    fixture.git(&["checkout", "--detach", "HEAD~1"]);
+    let summaries: Vec<_> = fixture
+        .history(10)
+        .commits
+        .into_iter()
+        .map(|commit| commit.summary)
+        .collect();
+    assert_eq!(summaries, ["Awaken"]);
+}
+
+#[test]
+fn empty_repository_has_empty_history() {
+    let fixture = Fixture::init();
+    assert_eq!(fixture.history(10), History::default());
 }
 
 const CHILD_TARGET_VAR: &str = "CTHULHU_TEST_INSPECT_TARGET";
