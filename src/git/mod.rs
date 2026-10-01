@@ -8,6 +8,9 @@ mod exec;
 mod log;
 mod repo;
 
+#[cfg(test)]
+mod proptest_tests;
+
 pub use discover::{DiscoverInputs, OVERRIDE_VAR, discover_with};
 pub use exec::{Git, GitError, GitOutput, GitVersion, MIN_GIT_VERSION};
 pub use log::{Commit, History, SHORT_OID_LEN, history};
