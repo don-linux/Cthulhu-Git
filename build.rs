@@ -1,6 +1,9 @@
-//! Renders `assets/icon.svg`, the single source of the application icon.
+//! Renders the SVGs under `assets/`.
 //!
-//! - Every target: `OUT_DIR/icon-256.png`, embedded by `main.rs` as the window icon.
+//! - Every target: `OUT_DIR/icon-256.png` from `assets/icon.svg`, the single
+//!   source of the application icon, embedded by `main.rs` as the window icon.
+//! - Every target: `OUT_DIR/icons/<name>.rgba` for each Lucide interface icon
+//!   in `assets/icons/`, embedded by `src/ui/icons.rs`.
 //! - Windows targets: a multi-size `.ico` plus `VERSIONINFO`, compiled into the
 //!   executable so Explorer, the taskbar and Task Manager show the icon and name.
 
@@ -16,26 +19,66 @@ const ICON_SVG: &str = "assets/icon.svg";
 /// high-DPI scaling.
 const WINDOWS_ICON_SIZES: [u32; 8] = [16, 20, 24, 32, 40, 48, 64, 256];
 
+const UI_ICONS_DIR: &str = "assets/icons";
+
+/// Interface icons, by file name without `.svg`. Must match `src/ui/icons.rs`.
+const UI_ICONS: [&str; 3] = ["panel-left", "house", "git-branch"];
+
+/// Side of the rendered interface icons. Drawn at about 18 points, this stays
+/// sharp up to 3x display scaling.
+const UI_ICON_SIZE: u32 = 64;
+
 fn main() {
     println!("cargo::rerun-if-changed={ICON_SVG}");
+    println!("cargo::rerun-if-changed={UI_ICONS_DIR}");
     println!("cargo::rerun-if-changed=build.rs");
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-    let tree = load_icon();
+    let tree = load_svg(ICON_SVG, fs::read(ICON_SVG).expect("read assets/icon.svg"));
 
     let png = render(&tree, 256)
         .encode_png()
         .expect("encode the window icon as PNG");
     fs::write(out_dir.join("icon-256.png"), png).expect("write icon-256.png");
 
+    render_ui_icons(&out_dir);
+
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         embed_windows_resources(&tree, &out_dir);
     }
 }
 
-fn load_icon() -> usvg::Tree {
-    let data = fs::read(ICON_SVG).expect("read assets/icon.svg");
-    usvg::Tree::from_data(&data, &usvg::Options::default()).expect("parse assets/icon.svg")
+fn load_svg(path: &str, data: Vec<u8>) -> usvg::Tree {
+    usvg::Tree::from_data(&data, &usvg::Options::default())
+        .unwrap_or_else(|error| panic!("parse {path}: {error}"))
+}
+
+/// Lucide strokes with `currentColor`, which resvg draws black. Rendered
+/// white instead, the app tints each icon with a palette color.
+fn render_ui_icons(out_dir: &Path) {
+    let icons_dir = out_dir.join("icons");
+    fs::create_dir_all(&icons_dir).expect("create OUT_DIR/icons");
+    for name in UI_ICONS {
+        let path = format!("{UI_ICONS_DIR}/{name}.svg");
+        let svg = fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
+        let tree = load_svg(&path, svg.replace("currentColor", "#ffffff").into_bytes());
+        let rgba = straight_rgba(&render(&tree, UI_ICON_SIZE));
+        fs::write(icons_dir.join(format!("{name}.rgba")), rgba)
+            .unwrap_or_else(|error| panic!("write the {name} icon: {error}"));
+    }
+}
+
+/// tiny-skia keeps premultiplied alpha; ICO files and egui textures want
+/// straight RGBA.
+fn straight_rgba(pixmap: &tiny_skia::Pixmap) -> Vec<u8> {
+    pixmap
+        .pixels()
+        .iter()
+        .flat_map(|pixel| {
+            let color = pixel.demultiply();
+            [color.red(), color.green(), color.blue(), color.alpha()]
+        })
+        .collect()
 }
 
 fn render(tree: &usvg::Tree, size: u32) -> tiny_skia::Pixmap {
@@ -52,15 +95,7 @@ fn render(tree: &usvg::Tree, size: u32) -> tiny_skia::Pixmap {
 fn embed_windows_resources(tree: &usvg::Tree, out_dir: &Path) {
     let mut icon_dir = ico::IconDir::new(ico::ResourceType::Icon);
     for size in WINDOWS_ICON_SIZES {
-        // tiny-skia keeps premultiplied alpha; ICO wants straight RGBA.
-        let rgba = render(tree, size)
-            .pixels()
-            .iter()
-            .flat_map(|pixel| {
-                let color = pixel.demultiply();
-                [color.red(), color.green(), color.blue(), color.alpha()]
-            })
-            .collect();
+        let rgba = straight_rgba(&render(tree, size));
         let image = ico::IconImage::from_rgba_data(size, size, rgba);
         // 32-bit BMP for the small sizes (read by every Windows component),
         // PNG for 256 px as Microsoft recommends.

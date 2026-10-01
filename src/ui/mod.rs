@@ -6,6 +6,7 @@
 
 mod folder_picker;
 mod home;
+mod icons;
 mod repo_view;
 pub mod theme;
 mod widgets;
@@ -26,7 +27,7 @@ const HISTORY_LIMIT: usize = 1000;
 pub struct OpenedRepo {
     pub info: RepoInfo,
     pub history: History,
-    /// New on every open, so the history starts collapsed each time.
+    /// New on every open, so the history starts scrolled to the top each time.
     pub view_id: egui::Id,
 }
 
@@ -35,6 +36,7 @@ pub enum Action {
     Browse,
     Open(PathBuf),
     Home,
+    ToggleHistorySidebar,
 }
 
 enum Screen {
@@ -191,7 +193,12 @@ impl eframe::App for CthulhuApp {
                     error: self.error.as_deref(),
                 },
             ),
-            Screen::Repo(repo) => repo_view::show(ui, repo, self.error.as_deref()),
+            Screen::Repo(repo) => repo_view::show(
+                ui,
+                repo,
+                self.error.as_deref(),
+                !self.settings.history_sidebar_hidden,
+            ),
         };
 
         match action {
@@ -206,6 +213,10 @@ impl eframe::App for CthulhuApp {
             Some(Action::Home) => {
                 self.error = None;
                 self.screen = Screen::Home;
+            }
+            Some(Action::ToggleHistorySidebar) => {
+                self.settings.history_sidebar_hidden = !self.settings.history_sidebar_hidden;
+                self.save_settings();
             }
             None => {}
         }

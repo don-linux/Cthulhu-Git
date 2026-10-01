@@ -22,6 +22,9 @@ pub struct Settings {
     pub last_repository: Option<PathBuf>,
     /// Repository roots, newest first, without duplicates.
     pub recent_repositories: Vec<PathBuf>,
+    /// Whether the commit history sidebar of the repository view is hidden.
+    /// Stored negated so the sidebar shows when the field is missing.
+    pub history_sidebar_hidden: bool,
 }
 
 #[derive(Debug)]
@@ -206,6 +209,30 @@ mod tests {
                 theme: Some("abyss".to_owned()),
                 ..Settings::default()
             }
+        );
+    }
+
+    #[test]
+    fn history_sidebar_shows_unless_saved_hidden() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        fs::write(&path, r#"{ "recent_repositories": [] }"#).expect("write");
+        assert!(
+            !Settings::load_from(&path)
+                .expect("load")
+                .history_sidebar_hidden
+        );
+
+        let settings = Settings {
+            history_sidebar_hidden: true,
+            ..Settings::default()
+        };
+        settings.save_to(&path).expect("save");
+        assert!(
+            Settings::load_from(&path)
+                .expect("load")
+                .history_sidebar_hidden
         );
     }
 
