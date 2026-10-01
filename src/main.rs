@@ -10,11 +10,9 @@ use eframe::egui;
 
 fn main() -> eframe::Result {
     // A folder given on the command line (or by the Linux desktop entry's
-    // `%f`) opens instead of the last repository.
-    let command_line = env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .map(|path| std::path::absolute(&path).unwrap_or(path));
+    // `%f`) opens instead of the last repository. macOS Finder also passes
+    // `-psn_…`, which is not a folder.
+    let command_line = startup_folder(env::args_os().nth(1));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -33,12 +31,33 @@ fn main() -> eframe::Result {
     )
 }
 
+fn startup_folder(arg: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let arg = arg?;
+    if arg.to_string_lossy().starts_with('-') {
+        return None;
+    }
+    let path = PathBuf::from(arg);
+    Some(std::path::absolute(&path).unwrap_or(path))
+}
+
 /// Without an explicit icon, eframe shows the egui logo in the title bar,
 /// taskbar and Dock.
 #[cfg(not(target_os = "macos"))]
 fn window_icon() -> egui::IconData {
     eframe::icon_data::from_png_bytes(include_bytes!(concat!(env!("OUT_DIR"), "/icon-256.png")))
         .expect("icon-256.png rendered by build.rs")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finder_process_serial_number_is_not_a_repository_path() {
+        assert!(startup_folder(None).is_none());
+        assert!(startup_folder(Some("-psn_0_12345".into())).is_none());
+        assert!(startup_folder(Some("--help".into())).is_none());
+    }
 }
 
 /// On macOS an empty icon keeps eframe away from the Dock, so it shows
