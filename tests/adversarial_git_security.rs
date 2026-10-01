@@ -90,6 +90,10 @@ case "$mode" in
       exit 0
     fi
     for arg in "$@"; do
+      if [ "$arg" = "--is-bare-repository" ]; then
+        echo false
+        exit 0
+      fi
       if [ "$arg" = "--show-toplevel" ]; then
         # 32 MiB of ASCII. Do not raise this; the bound under test is ~32 MiB.
         dd if=/dev/zero bs=1048576 count=32 2>/dev/null | tr '\0' 'A'
