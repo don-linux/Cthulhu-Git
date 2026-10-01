@@ -26,6 +26,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RESVG_VERSION: "0.48.1"
+  # File names only. Kept out of the script text so a label cannot break the shell.
+  LABEL: ${{ inputs.label }}
 
 jobs:
   linux:
@@ -37,7 +39,7 @@ jobs:
       TARGET: x86_64-unknown-linux-gnu
       APPIMAGETOOL_VERSION: "1.9.1"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # rust-toolchain.toml pins the compiler; this installs exactly that one.
@@ -64,7 +66,7 @@ jobs:
           echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool" | sha256sum -c
           chmod +x appimagetool
           echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-deb@3.8.0,cargo-generate-rpm@0.21.0
 
@@ -81,7 +83,7 @@ jobs:
 
       - name: Archive
         run: |
-          name="cthulhu-git-${{ inputs.label }}-$TARGET"
+          name="cthulhu-git-${LABEL}-$TARGET"
           mkdir -p "dist/$name/share/applications" "dist/$name/share/icons"
           cp "target/$TARGET/release/cthulhu-git" README.md LICENSE "dist/$name/"
           cp packaging/linux/cthulhu-git.desktop "dist/$name/share/applications/"
@@ -92,12 +94,12 @@ jobs:
       - name: Debian package
         run: |
           cargo deb --no-build --target "$TARGET" \
-            --output "dist/cthulhu-git-${{ inputs.label }}-x86_64.deb"
+            --output "dist/cthulhu-git-${LABEL}-x86_64.deb"
 
       - name: RPM package
         run: |
           cargo generate-rpm --target "$TARGET" \
-            --output "dist/cthulhu-git-${{ inputs.label }}-x86_64.rpm"
+            --output "dist/cthulhu-git-${LABEL}-x86_64.rpm"
 
       # No system libraries inside: the app loads the windowing and graphics
       # libraries of the machine it runs on, as the AppImage excludelist advises.
@@ -114,13 +116,13 @@ jobs:
           ln -s usr/bin/cthulhu-git "$appdir/AppRun"
           # The runner has no FUSE; extract-and-run avoids needing it.
           APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 appimagetool --no-appstream \
-            "$appdir" "dist/cthulhu-git-${{ inputs.label }}-x86_64.AppImage"
+            "$appdir" "dist/cthulhu-git-${LABEL}-x86_64.AppImage"
 
       - name: Check the packages
         run: |
-          deb="dist/cthulhu-git-${{ inputs.label }}-x86_64.deb"
-          rpm="dist/cthulhu-git-${{ inputs.label }}-x86_64.rpm"
-          appimage="dist/cthulhu-git-${{ inputs.label }}-x86_64.AppImage"
+          deb="dist/cthulhu-git-${LABEL}-x86_64.deb"
+          rpm="dist/cthulhu-git-${LABEL}-x86_64.rpm"
+          appimage="dist/cthulhu-git-${LABEL}-x86_64.AppImage"
 
           dpkg-deb --info "$deb"
           dpkg-deb --contents "$deb"
@@ -139,7 +141,7 @@ jobs:
           test -f squashfs-root/cthulhu-git.desktop
           test -f squashfs-root/.DirIcon
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ env.TARGET }}
           path: |
@@ -156,7 +158,7 @@ jobs:
     env:
       TARGET: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Rust toolchain
@@ -186,13 +188,13 @@ jobs:
       - name: Archive
         shell: bash
         run: |
-          name="cthulhu-git-${{ inputs.label }}-$TARGET"
+          name="cthulhu-git-${LABEL}-$TARGET"
           mkdir -p "dist/$name"
           cp "target/$TARGET/release/cthulhu-git.exe" README.md LICENSE "dist/$name/"
           cd dist
           7z a "$name.zip" "$name"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ env.TARGET }}
           path: dist/*.zip
@@ -205,7 +207,7 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Rust toolchain
@@ -267,9 +269,9 @@ jobs:
           ln -s /Applications "$staging/Applications"
           cp README.md LICENSE "$staging/"
           hdiutil create -volname "Cthulhu Git" -srcfolder "$staging" -ov -format UDZO \
-            "dist/cthulhu-git-${{ inputs.label }}-macos-universal.dmg"
+            "dist/cthulhu-git-${LABEL}-macos-universal.dmg"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-universal
           path: dist/*.dmg
