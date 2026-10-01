@@ -63,7 +63,8 @@ commits and says so when there are more.
 **Which screen opens on launch:**
 
 1. A folder passed on the command line (the Linux desktop entry passes one
-   with `%f`).
+   with `%f`). An argument that starts with `-`, such as Finder's `-psn_…`,
+   is ignored.
 2. Otherwise, the last repository opened. Going Home does not forget it.
 3. Otherwise (first launch, or the last repository was moved or deleted),
    the home screen. A failed reopen is shown as an error and forgotten.
@@ -104,11 +105,16 @@ executable and answers `git --version` with 2.15+ wins. A candidate that fails
 does not stop the search.
 
 1. `CTHULHU_GIT`, if set. If it does not point to an executable file, that is
-   reported as an error instead of silently falling back.
+   reported as an error instead of silently falling back. A bare name such as
+   `git` is run from the working directory (`./git`), not looked up on `PATH`.
+   `--version` must answer within a quarter of a second or that candidate is
+   skipped. A pre-release such as `2.15.0-rc0` does not meet the 2.15.0 floor;
+   vendor suffixes (`.windows.1`, `.vfs`, Apple Git) do.
 2. Every absolute directory in `PATH`, looking for `git` (`git.exe` on
    Windows; `git.cmd`/`git.bat` are never used because they need a shell).
    Relative and empty `PATH` entries are skipped so a repository cannot plant
-   its own `git.exe` in the current directory.
+   its own `git.exe` in the current directory. One pair of surrounding quotes
+   is removed first, so a quoted absolute directory is still searched.
 3. Known install locations, for GUI apps that start with a minimal `PATH`:
    - Linux: `/usr/bin/git`, `/usr/local/bin/git`
    - macOS: `/opt/homebrew/bin/git`, `/usr/local/bin/git`, `/usr/bin/git`
@@ -121,24 +127,34 @@ does not stop the search.
 **Running Git** (`exec.rs`). Every invocation goes through one helper:
 
 - arguments are passed as argv, never through a shell;
-- `--no-optional-locks`, `--no-pager`, `core.fsmonitor=false`, and
-  `GIT_TERMINAL_PROMPT=0` so Git never touches the index or waits for input;
+- `--no-optional-locks`, `--no-pager`, `--no-replace-objects`,
+  `core.fsmonitor=false`, and `GIT_TERMINAL_PROMPT=0` so Git never touches the
+  index, waits for input, or follows replace refs;
 - `LC_ALL=C` so the messages the app matches on stay in English;
-- `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and similar variables are
+- `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_REPLACE_REF_BASE`,
+  `GIT_SHALLOW_FILE`, `GIT_GRAFT_FILE`, `GIT_TRACE` and similar variables are
   removed, so launching the app from a hook or a shell that exported them
-  cannot redirect it to another repository;
+  cannot redirect it to another repository or rewrite the history it shows;
+- stdout and stderr are capped at 8 MiB. `git --version` is killed after
+  250 ms; any other invocation after 60 s;
 - on Windows the process is created with `CREATE_NO_WINDOW` so no console
   flashes.
 
 Git's `safe.directory` protection is respected: a repository owned by another
-user produces an error that includes the exact
+user produces an error that includes a shell-quoted
 `git config --global --add safe.directory <root>` command to trust it.
+"not a git repository" is matched only when it is the primary fatal, so a
+path that merely contains those words is not mistyped. Git 2.15's capital
+"Not a git repository" counts too.
 
 **Reading the repository** (`repo.rs`). `git rev-parse --show-toplevel` gives
 the root (normalized with `dunce`, which also removes Windows `\\?\` prefixes
-and converts `C:/...` paths), and one
-`git status --porcelain=v2 --branch -z --untracked-files=no` call gives the
-branch, detached HEAD or unborn branch.
+and converts `C:/...` paths). Only the newline Git itself added is stripped,
+so a directory whose name ends in CR or LF keeps that byte. A bare repository
+uses `--absolute-git-dir` instead. The branch, detached HEAD or unborn branch
+comes from `git symbolic-ref` and `git rev-parse`, not from `git status`:
+status refreshes the index and would run clean and process filters planted in
+the repository.
 
 **Reading the history** (`log.rs`). One
 `git log --max-count=1001 -z --format=%H%x1f%s HEAD --` call gives the full
@@ -157,8 +173,8 @@ is behind `cfg` and compiles for all three targets.
 | Platform | Status |
 | -------- | ------ |
 | Linux x86_64 | Built, tested and run; packaged by CI on Ubuntu 24.04 as AppImage, `.deb`, `.rpm` and `.tar.gz` (glibc 2.39+: Ubuntu 24.04, Debian 13, Fedora 40 or later) |
-| Windows x86_64 | Built and packaged by CI (`x86_64-pc-windows-msvc`); not run on a real machine yet |
-| macOS Apple Silicon and Intel | Built by CI as one universal app (`aarch64` + `x86_64`, macOS 11+); not run on a real machine yet |
+| Windows x86_64 | Tests run in CI; packaged by CI (`x86_64-pc-windows-msvc`). The window has not been run on a real machine yet |
+| macOS Apple Silicon and Intel | Tests run in CI. Packaged as one universal app (`aarch64` + `x86_64`, macOS 11+). The window has not been run on a real machine yet |
 
 The Windows search logic (`git.exe` plus Git for Windows fallbacks) is also
 covered by a simulated test that runs on Linux.
@@ -178,6 +194,12 @@ The crate forbids `unsafe` code. Tests never modify the process environment
 (discovery takes its inputs as a `DiscoverInputs` value), so they run in
 parallel without locks. The test that proves an inherited `GIT_DIR` is ignored
 re-runs the test binary as a child process with that variable set.
+
+Before a release that moves the Git layer, settings, startup or CI, run an
+adversarial pass. The checklist and the file each pass owns are in
+[docs/ADVERSARIAL-TESTING.md](docs/ADVERSARIAL-TESTING.md). The 0.0.2 pass is
+written up in
+[docs/adversarial-reports/v0.0.2.md](docs/adversarial-reports/v0.0.2.md).
 
 ## Icon
 
@@ -228,8 +250,13 @@ to write those notes and cut a release is in
 - The history shows commit summaries only (no author, date or graph) and
   stops at the latest 1000 commits.
 - One theme and no settings screen yet.
-- No timeout for a Git process that hangs (for example on a stalled network
-  filesystem); the window stays responsive but keeps showing "Opening…".
+- A Git command that does not exit is killed after 60 seconds (`git --version`
+  after 250 ms). The window stays responsive, but that open still fails.
+- A deleted repository stays in the recent list until it is opened. The open
+  then fails and the entry is not removed.
+- Shortening a string at 12 bytes keeps the whole string when that cut would
+  split a character. Git object ids are ASCII hex, so real commits are not
+  affected.
 - A repository whose path is not valid Unicode opens, but is not remembered
   (JSON strings must be UTF-8).
 - No Windows installer: a portable zip. The Mac app is not signed or
