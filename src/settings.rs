@@ -2,11 +2,12 @@
 //! each OS. The map for changing this module is `docs/SETTINGS.md`.
 
 use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub const FILE_NAME: &str = "settings.json";
 pub const MAX_RECENT_REPOSITORIES: usize = 10;
@@ -21,6 +22,8 @@ pub struct Settings {
     /// Root of the repository reopened on launch.
     pub last_repository: Option<PathBuf>,
     /// Repository roots, newest first, without duplicates.
+    /// JSON `null` is the empty list, so one null field does not reject the file.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub recent_repositories: Vec<PathBuf>,
     /// Whether the commit history sidebar of the repository view is hidden.
     /// Stored negated so the sidebar shows when the field is missing.
@@ -53,7 +56,13 @@ impl Settings {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(error) => return Err(SettingsError::Read(path.to_path_buf(), error)),
         };
-        let mut settings: Self = serde_json::from_slice(&bytes)
+        // Notepad on Windows writes a UTF-8 BOM in front of otherwise valid JSON.
+        let json = if bytes.starts_with(b"\xEF\xBB\xBF") {
+            &bytes[3..]
+        } else {
+            bytes.as_slice()
+        };
+        let mut settings: Self = serde_json::from_slice(json)
             .map_err(|error| SettingsError::Parse(path.to_path_buf(), error))?;
         settings.normalize_recent();
         Ok(settings)
@@ -63,6 +72,11 @@ impl Settings {
     /// a crash never leaves a half-written file. `std::fs::rename` replaces
     /// the destination on Linux, macOS and Windows alike.
     pub fn save_to(&self, path: &Path) -> Result<(), SettingsError> {
+        // One temp name per process. Serializing saves keeps two threads from
+        // truncating that same file and publishing a mix of both documents.
+        let _guard = save_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let fail = |error: io::Error| SettingsError::Write(path.to_path_buf(), error);
 
         if let Some(parent) = path.parent() {
@@ -73,10 +87,19 @@ impl Settings {
 
         // The process id keeps two running instances from sharing a temp file.
         let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        let written = fs::File::create(&tmp).and_then(|mut file| {
-            file.write_all(&json)?;
-            file.sync_all()
-        });
+        // `create_new` fails on a symlink instead of following it. Unlink first
+        // so a planted temp symlink cannot truncate a file outside this directory.
+        if fs::symlink_metadata(&tmp).is_ok() {
+            fs::remove_file(&tmp).map_err(fail)?;
+        }
+        let written = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .and_then(|mut file| {
+                file.write_all(&json)?;
+                file.sync_all()
+            });
         if let Err(error) = written.and_then(|()| fs::rename(&tmp, path)) {
             let _ = fs::remove_file(&tmp);
             return Err(fail(error));
@@ -115,6 +138,19 @@ impl Settings {
         });
         self.recent_repositories.truncate(MAX_RECENT_REPOSITORIES);
     }
+}
+
+fn save_lock() -> &'static Mutex<()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    &LOCK
+}
+
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl fmt::Display for SettingsError {
