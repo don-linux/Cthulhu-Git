@@ -53,15 +53,9 @@ fn pid_temp_path(path: &Path) -> PathBuf {
     path.with_extension(format!("json.{}.tmp", std::process::id()))
 }
 
-/// Quote `text` as a JSON string. Test paths are plain ASCII.
+/// Quote `text` as a JSON string. Windows temp paths contain backslashes.
 fn json_string(text: &str) -> String {
-    assert!(
-        !text
-            .chars()
-            .any(|c| c == '"' || c == '\\' || c.is_control()),
-        "{text:?}"
-    );
-    format!("\"{text}\"")
+    serde_json::to_string(text).expect("json string")
 }
 
 #[track_caller]
