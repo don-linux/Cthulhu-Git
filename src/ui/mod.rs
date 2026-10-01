@@ -4,6 +4,8 @@
 //! repository from the settings, otherwise the home screen shows. Settings
 //! are described in `docs/SETTINGS.md`, themes in `docs/THEMES.md`.
 
+#[cfg(test)]
+mod adversarial_tests;
 mod folder_picker;
 mod home;
 mod icons;
