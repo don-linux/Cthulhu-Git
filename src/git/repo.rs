@@ -4,15 +4,6 @@ use std::path::{Path, PathBuf};
 use super::exec::{Git, GitError};
 use super::log::short_oid;
 
-const STATUS_ARGS: &[&str] = &[
-    "status",
-    "--porcelain=v2",
-    "--branch",
-    "-z",
-    "--untracked-files=no",
-    "--ignore-submodules",
-];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Head {
     Branch(String),
@@ -41,21 +32,18 @@ impl fmt::Display for Head {
 }
 
 /// Resolves the repository containing `path` and reads its name and current branch.
+///
+/// HEAD is read with `symbolic-ref` and `rev-parse`, not `git status`. Status
+/// refreshes the index and runs clean/process filters from the repository, so
+/// opening a hostile repo would execute commands planted in its config.
 pub fn inspect(git: &Git, path: &Path) -> Result<RepoInfo, GitError> {
     let dir = require_directory(path)?;
-    let root = show_toplevel(git, &dir)?;
+    let root = repository_root(git, &dir)?;
     let name = root
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| root.display().to_string());
-
-    let status = git.require_ok(&root, STATUS_ARGS)?;
-    let head = parse_head(&status.stdout).ok_or_else(|| GitError::Failed {
-        command: format!("git {}", STATUS_ARGS.join(" ")),
-        status: status.status.to_string(),
-        stderr: "output has no branch header".to_owned(),
-    })?;
-
+    let head = read_head(git, &root)?;
     Ok(RepoInfo { root, name, head })
 }
 
@@ -66,19 +54,45 @@ fn require_directory(path: &Path) -> Result<PathBuf, GitError> {
     dunce::canonicalize(path).map_err(|_| GitError::NotADirectory(path.to_path_buf()))
 }
 
+fn repository_root(git: &Git, dir: &Path) -> Result<PathBuf, GitError> {
+    let bare = git.run(dir, &["rev-parse", "--is-bare-repository"])?;
+    if !bare.status.success() {
+        return Err(super::exec::classify_failure(
+            dir,
+            &["rev-parse", "--is-bare-repository"],
+            bare.status.to_string(),
+            &bare.stderr,
+        ));
+    }
+
+    if stdout_text(&bare.stdout) == "true" {
+        let git_dir = git.require_ok(dir, &["rev-parse", "--absolute-git-dir"])?;
+        return git_path(git_dir.stdout);
+    }
+
+    show_toplevel(git, dir)
+}
+
 fn show_toplevel(git: &Git, dir: &Path) -> Result<PathBuf, GitError> {
     let output = git.require_ok(dir, &["rev-parse", "--show-toplevel"])?;
-    let mut stdout = output.stdout;
-    while stdout
-        .last()
-        .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
-    {
+    git_path(output.stdout)
+}
+
+fn git_path(stdout: Vec<u8>) -> Result<PathBuf, GitError> {
+    let mut stdout = stdout;
+    // Git adds one trailing newline (`\n` on Unix, `\r\n` on Windows). A
+    // directory whose name itself ends in CR or LF must keep that byte.
+    if stdout.last() == Some(&b'\n') {
+        stdout.pop();
+    }
+    #[cfg(windows)]
+    if stdout.last() == Some(&b'\r') {
         stdout.pop();
     }
     if stdout.is_empty() {
         return Err(GitError::Failed {
-            command: "git rev-parse --show-toplevel".to_owned(),
-            status: output.status.to_string(),
+            command: "git rev-parse".to_owned(),
+            status: "exit status: 0".to_owned(),
             stderr: "empty output".to_owned(),
         });
     }
@@ -86,6 +100,63 @@ fn show_toplevel(git: &Git, dir: &Path) -> Result<PathBuf, GitError> {
     // Git for Windows prints `C:/...`; canonicalizing gives native separators.
     let root = path_from_bytes(stdout);
     Ok(dunce::canonicalize(&root).unwrap_or(root))
+}
+
+fn read_head(git: &Git, root: &Path) -> Result<Head, GitError> {
+    let symbolic = git.run(root, &["symbolic-ref", "--quiet", "HEAD"])?;
+    if symbolic.status.success() {
+        let name = branch_name(&symbolic.stdout);
+        let verified = git.run(root, &["rev-parse", "--verify", "--quiet", "HEAD"])?;
+        return Ok(if verified.status.success() {
+            Head::Branch(name)
+        } else {
+            Head::Unborn(name)
+        });
+    }
+
+    // Detached HEAD: `symbolic-ref --quiet` exits 1 and prints nothing.
+    if symbolic.status.code() == Some(1) && symbolic.stderr.is_empty() {
+        return detached_head(git, root);
+    }
+
+    Err(super::exec::classify_failure(
+        root,
+        &["symbolic-ref", "--quiet", "HEAD"],
+        symbolic.status.to_string(),
+        &symbolic.stderr,
+    ))
+}
+
+fn branch_name(stdout: &[u8]) -> String {
+    let full = stdout_text(stdout);
+    full.strip_prefix("refs/heads/").unwrap_or(&full).to_owned()
+}
+
+fn detached_head(git: &Git, root: &Path) -> Result<Head, GitError> {
+    let output = git.require_ok(root, &["rev-parse", "--verify", "HEAD"])?;
+    let oid = stdout_text(&output.stdout);
+    if oid.is_empty() {
+        return Err(GitError::Failed {
+            command: "git rev-parse --verify HEAD".to_owned(),
+            status: output.status.to_string(),
+            stderr: "empty output".to_owned(),
+        });
+    }
+    Ok(Head::Detached {
+        short_oid: short_oid(&oid).to_owned(),
+    })
+}
+
+fn stdout_text(stdout: &[u8]) -> String {
+    let mut bytes = stdout.to_vec();
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    #[cfg(windows)]
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 #[cfg(unix)]
@@ -100,6 +171,10 @@ fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
 }
 
 /// Reads `# branch.oid` / `# branch.head` from `git status --porcelain=v2 --branch -z`.
+///
+/// Production code reads HEAD with `symbolic-ref` instead, so this parser is
+/// exercised by the unit and property tests only.
+#[cfg(test)]
 pub(crate) fn parse_head(stdout: &[u8]) -> Option<Head> {
     let mut oid = None;
     let mut head = None;
