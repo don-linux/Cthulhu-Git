@@ -49,11 +49,16 @@ impl Git {
 /// candidate that fails `--version` does not stop the search.
 pub fn discover_with(inputs: &DiscoverInputs) -> Result<Git, GitError> {
     if let Some(raw) = &inputs.override_path {
-        let path = PathBuf::from(raw);
-        if !is_executable(&path) {
-            return Err(GitError::BadOverride(path));
+        let requested = PathBuf::from(raw);
+        if !is_executable(&requested) {
+            return Err(GitError::BadOverride(requested));
         }
-        return supported(Git::probe(&path)?);
+        // A bare name such as `git` passes the cwd metadata check, but
+        // `Command` would search PATH and might run a different executable.
+        // Spawn `./git` and still report the path the user set.
+        let mut git = Git::probe(&override_spawn_path(&requested))?;
+        git.path = requested;
+        return supported(git);
     }
 
     let candidates = find_git_in(inputs);
@@ -77,6 +82,29 @@ pub fn discover_with(inputs: &DiscoverInputs) -> Result<Git, GitError> {
     })
 }
 
+/// `git` with no slash is one relative component. `./git` already has a slash.
+fn override_spawn_path(path: &Path) -> PathBuf {
+    let bare = path.is_relative() && path.components().count() == 1;
+    if bare {
+        Path::new(".").join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Some Windows launchers leave the quotes around a PATH element that contains
+/// spaces. A quoted absolute directory would otherwise look relative and be skipped.
+fn unquote_path_entry(dir: PathBuf) -> PathBuf {
+    let Some(text) = dir.to_str() else {
+        return dir;
+    };
+    if text.len() >= 2 && text.starts_with('"') && text.ends_with('"') {
+        PathBuf::from(&text[1..text.len() - 1])
+    } else {
+        dir
+    }
+}
+
 fn supported(git: Git) -> Result<Git, GitError> {
     if git.version.is_supported() {
         Ok(git)
@@ -94,6 +122,7 @@ pub(crate) fn find_git_in(inputs: &DiscoverInputs) -> Candidates {
         .path_var
         .iter()
         .flat_map(env::split_paths)
+        .map(unquote_path_entry)
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(inputs.exe_name));
 
