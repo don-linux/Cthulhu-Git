@@ -259,8 +259,29 @@ fn arb_stderr() -> impl Strategy<Value = String> {
     ]
 }
 
-/// Path inside the first `'...'` after `repository at '`, which is what
-/// `classify_failure` keeps today (see report G2).
+fn version_meets_floor(version: &GitVersion) -> bool {
+    if version.numbers() < (2, 15, 0) {
+        return false;
+    }
+    let rest = version
+        .raw
+        .trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.');
+    let rest = rest.to_ascii_lowercase();
+    !["-rc", "-alpha", "-beta", "-pre"]
+        .iter()
+        .any(|marker| rest.starts_with(marker))
+}
+
+fn line_is_not_a_repository(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        line.trim_start()
+            .to_ascii_lowercase()
+            .starts_with("fatal: not a git repository")
+    })
+}
+
+/// Path inside the first `'...'` after `repository at '`. A longer kept path
+/// (an apostrophe in the name) still starts with this slice.
 fn dubious_quoted_path(stderr: &str) -> Option<&str> {
     let (_, rest) = stderr.split_once("repository at '")?;
     let (path, _) = rest.split_once('\'')?;
@@ -351,7 +372,7 @@ proptest! {
                 assert!(!parsed.raw.is_empty());
                 assert_eq!(parsed.raw.trim(), parsed.raw);
                 assert_eq!(parsed.to_string(), parsed.raw);
-                assert_eq!(parsed.is_supported(), parsed.numbers() >= (2, 15, 0));
+                assert_eq!(parsed.is_supported(), version_meets_floor(&parsed));
             }
             (Some(parsed), None) => panic!("parse accepted {input:?} as {parsed:?}"),
             (None, Some(expected)) => panic!("parse rejected {input:?}, reference {expected:?}"),
@@ -443,7 +464,7 @@ proptest! {
         let rendered = error.to_string();
         assert!(!rendered.is_empty());
 
-        if stderr.contains("not a git repository") {
+        if line_is_not_a_repository(&stderr) {
             match &error {
                 GitError::NotARepository(path) => {
                     assert_eq!(path, cwd_path);
@@ -788,9 +809,10 @@ fn classify_failure_empty_and_interior_nul() {
     let _ = dubious.to_string();
 }
 
-/// Candidate bug G3. The phrase is not anchored, and it wins over dubious ownership.
+/// The phrase is not enough. It has to be the primary fatal, and it must not
+/// hide a dubious-ownership error whose path happens to contain the words.
 #[test]
-fn not_a_repository_substring_misclassifies_dubious_ownership() {
+fn not_a_repository_substring_does_not_hide_dubious_ownership() {
     let stderr = "\
 fatal: detected dubious ownership in repository at '/home/not a git repository'
 To add an exception for this directory, call:
@@ -803,15 +825,12 @@ To add an exception for this directory, call:
         stderr,
     );
     assert!(
-        matches!(error, GitError::NotARepository(ref path) if path == Path::new("/cwd")),
+        matches!(error, GitError::UnsafeRepository(ref path) if path == Path::new("/home/not a git repository")),
         "got {error:?}"
     );
     let rendered = error.to_string();
-    assert!(rendered.contains("is not inside a Git repository"));
-    assert!(
-        !rendered.contains("safe.directory"),
-        "actionable ownership hint was dropped: {rendered}"
-    );
+    assert!(rendered.contains("safe.directory"));
+    assert!(!rendered.contains("is not inside a Git repository"));
 
     let mentioned = classify_failure(
         Path::new("/cwd"),
@@ -819,12 +838,15 @@ To add an exception for this directory, call:
         "exit status: 1".to_owned(),
         "note: the handbook says this is not a git repository wording; real fault is permissions",
     );
-    assert!(matches!(mentioned, GitError::NotARepository(_)));
+    assert!(
+        matches!(mentioned, GitError::Failed { .. }),
+        "got {mentioned:?}"
+    );
 }
 
-/// Candidate bug G2. Git inserts the path unescaped inside single quotes.
+/// An apostrophe in the path is escaped in git's suggested command as `'\''`.
 #[test]
-fn dubious_ownership_apostrophe_truncates_the_path() {
+fn dubious_ownership_apostrophe_keeps_the_path() {
     let stderr = "\
 fatal: detected dubious ownership in repository at '/srv/o'brien/repo'
 To add an exception for this directory, call:
@@ -839,15 +861,15 @@ To add an exception for this directory, call:
     let GitError::UnsafeRepository(path) = &error else {
         panic!("expected UnsafeRepository, got {error:?}");
     };
-    assert_eq!(path, Path::new("/srv/o"));
+    assert_eq!(path, Path::new("/srv/o'brien/repo"));
     let rendered = error.to_string();
-    assert!(rendered.contains("safe.directory /srv/o"));
-    assert!(!rendered.contains("brien"));
+    assert!(rendered.contains("brien"), "{rendered}");
+    assert!(rendered.contains("safe.directory"), "{rendered}");
 }
 
-/// Candidate bug G4. `Some("")` skips the cwd fallback.
+/// Empty quotes are not a path. The directory git was pointed at is the fallback.
 #[test]
-fn dubious_ownership_empty_quotes_keep_an_empty_path() {
+fn dubious_ownership_empty_quotes_fall_back_to_cwd() {
     let error = classify_failure(
         Path::new("/actual/cwd"),
         &["status"],
@@ -857,8 +879,6 @@ fn dubious_ownership_empty_quotes_keep_an_empty_path() {
     let GitError::UnsafeRepository(path) = &error else {
         panic!("expected UnsafeRepository, got {error:?}");
     };
-    assert!(path.as_os_str().is_empty(), "{}", path.display());
-    let rendered = error.to_string();
-    assert!(rendered.contains("safe.directory"));
-    assert!(!rendered.contains("/actual/cwd"));
+    assert_eq!(path, Path::new("/actual/cwd"));
+    assert!(error.to_string().contains("/actual/cwd"));
 }
