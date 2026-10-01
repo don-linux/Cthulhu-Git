@@ -233,7 +233,8 @@ fn assert_bare_open(result: Result<RepoInfo, GitError>, canonical: &Path, head: 
 
 #[test]
 fn nul_byte_in_commit_subject_stays_in_history() {
-    let repo = Repo::init_named("nul");
+    // "nul" is a reserved device name on Windows, so the directory cannot be called that.
+    let repo = Repo::init_named("nul-subject");
     repo.commit("normal parent");
     let parent = repo.git(&["rev-parse", "HEAD"]);
     let tree = repo.git(&["write-tree"]);
@@ -425,10 +426,13 @@ fn broken_gitfile_is_a_typed_error() {
     fs::write(broken.join(".git"), "gitdir: /does/not/exist\n").expect("gitfile");
 
     let error = inspect(&repo.git, &broken).expect_err("missing gitdir");
+    // inspect canonicalizes first. macOS rewrites /var to /private/var, and
+    // Windows may rewrite the temp path, so either form is the same directory.
+    let canonical = dunce::canonicalize(&broken).unwrap_or_else(|_| broken.clone());
     assert!(
         matches!(
             &error,
-            GitError::NotARepository(path) if path == &broken
+            GitError::NotARepository(path) if path == &broken || path == &canonical
         ) || matches!(error, GitError::Failed { .. }),
         "typed error, got {error:?}"
     );
@@ -610,7 +614,8 @@ fn directory_with_quote_and_space_keeps_name_and_root() {
     assert_eq!(info.head, Head::Branch("main".to_owned()));
 }
 
-#[cfg(unix)]
+// APFS rejects a directory name that is not valid UTF-8. Linux accepts the byte.
+#[cfg(target_os = "linux")]
 #[test]
 fn non_utf8_directory_name_inspects() {
     use std::os::unix::ffi::OsStrExt;
