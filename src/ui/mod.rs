@@ -7,6 +7,7 @@
 #[cfg(test)]
 mod adversarial_tests;
 mod folder_picker;
+mod fonts;
 mod home;
 mod icons;
 mod repo_view;
@@ -57,6 +58,8 @@ pub enum Action {
     ToggleBranchesSidebar,
     ToggleDetailSidebar,
     ToggleTerminal,
+    SetTerminalFont(Option<String>),
+    EnsureFontCatalog,
 }
 
 enum Screen {
@@ -89,6 +92,7 @@ pub struct CthulhuApp {
     opened_count: u64,
     /// Covers the current screen. A repository underneath stays open.
     settings_open: bool,
+    fonts: fonts::FontService,
 }
 
 impl CthulhuApp {
@@ -118,6 +122,7 @@ impl CthulhuApp {
             error,
             opened_count: 0,
             settings_open: false,
+            fonts: fonts::FontService::default(),
         };
         if let Some(path) = startup {
             app.open(ctx, path);
@@ -222,6 +227,8 @@ impl eframe::App for CthulhuApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.poll_opening();
         self.poll_picker(ui.ctx());
+        self.fonts
+            .sync(ui.ctx(), self.settings.terminal_font.as_deref());
 
         let actions = if self.settings_open {
             // The repository stays underneath. Keep the shell alive and take
@@ -230,7 +237,7 @@ impl eframe::App for CthulhuApp {
                 terminal::service(ui.ctx(), &mut repo.terminal);
                 terminal::surrender_focus(ui.ctx(), repo.view_id);
             }
-            settings::show(ui)
+            settings::show(ui, self.settings.terminal_font.as_deref(), &self.fonts)
         } else {
             match &mut self.screen {
                 Screen::Home => home::show(
@@ -290,6 +297,13 @@ impl eframe::App for CthulhuApp {
                         self.settings.detail_sidebar_hidden = false;
                     }
                     self.save_settings();
+                }
+                Action::SetTerminalFont(name) => {
+                    self.settings.set_terminal_font(name);
+                    self.save_settings();
+                }
+                Action::EnsureFontCatalog => {
+                    self.fonts.ensure(ui.ctx(), true);
                 }
             }
         }

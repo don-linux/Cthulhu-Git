@@ -13,6 +13,7 @@ alacritty_terminal = "0.26.0"
 directories = "6.0.0"
 dunce = "1.0.5"
 eframe = "0.36.2"
+fontdb = "0.23.0"
 pollster = "1.0.1"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }

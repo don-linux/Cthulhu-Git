@@ -39,6 +39,9 @@ pub struct Settings {
     /// so this field names its own default.
     #[serde(default = "default_terminal_hidden")]
     pub terminal_hidden: bool,
+    /// Font family drawn in the terminal. `None`, blank, or an unknown name
+    /// keeps the built-in monospace. A family name, not a file path.
+    pub terminal_font: Option<String>,
 }
 
 /// Older settings files omit the field. The terminal stays hidden until the
@@ -56,6 +59,7 @@ impl Default for Settings {
             history_sidebar_hidden: false,
             detail_sidebar_hidden: false,
             terminal_hidden: default_terminal_hidden(),
+            terminal_font: None,
         }
     }
 }
@@ -95,6 +99,7 @@ impl Settings {
         let mut settings: Self = serde_json::from_slice(json)
             .map_err(|error| SettingsError::Parse(path.to_path_buf(), error))?;
         settings.normalize_recent();
+        settings.normalize_terminal_font();
         Ok(settings)
     }
 
@@ -112,7 +117,11 @@ impl Settings {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(fail)?;
         }
-        let mut json = serde_json::to_vec_pretty(self).map_err(|error| fail(error.into()))?;
+        // A blank family is not a font. Writing the normalized copy keeps a
+        // direct field assignment consistent with `load_from`.
+        let mut stored = self.clone();
+        stored.normalize_terminal_font();
+        let mut json = serde_json::to_vec_pretty(&stored).map_err(|error| fail(error.into()))?;
         json.push(b'\n');
 
         // The process id keeps two running instances from sharing a temp file.
@@ -156,6 +165,12 @@ impl Settings {
         self.last_repository = None;
     }
 
+    /// Stores the terminal font family. Blank and whitespace-only names clear it.
+    pub fn set_terminal_font(&mut self, name: Option<String>) {
+        self.terminal_font = name;
+        self.normalize_terminal_font();
+    }
+
     /// A hand-edited file may repeat or pile up entries.
     fn normalize_recent(&mut self) {
         let mut seen = Vec::with_capacity(self.recent_repositories.len());
@@ -167,6 +182,20 @@ impl Settings {
             new
         });
         self.recent_repositories.truncate(MAX_RECENT_REPOSITORIES);
+    }
+
+    /// Drops a blank family and trims the rest, so `"  Fira Code  "` is stored
+    /// as `"Fira Code"`.
+    fn normalize_terminal_font(&mut self) {
+        let Some(name) = self.terminal_font.as_deref() else {
+            return;
+        };
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            self.terminal_font = None;
+        } else if trimmed.len() != name.len() {
+            self.terminal_font = Some(trimmed.to_owned());
+        }
     }
 }
 
@@ -324,6 +353,70 @@ mod tests {
                 .expect("load")
                 .detail_sidebar_hidden
         );
+    }
+
+    #[test]
+    fn terminal_font_trims_and_old_files_keep_the_default() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        fs::write(&path, r#"{ "theme": "abyss" }"#).expect("write");
+        assert_eq!(
+            Settings::load_from(&path).expect("old file").terminal_font,
+            None
+        );
+
+        let settings = Settings {
+            terminal_font: Some("JetBrains Mono".to_owned()),
+            ..Settings::default()
+        };
+        settings.save_to(&path).expect("save");
+        assert_eq!(Settings::load_from(&path).expect("load"), settings);
+
+        for (json, expected) in [
+            (r#"{ "terminal_font": "  Fira Code  " }"#, Some("Fira Code")),
+            (r#"{ "terminal_font": "   " }"#, None),
+            (r#"{ "terminal_font": "" }"#, None),
+            (r#"{ "terminal_font": null }"#, None),
+        ] {
+            fs::write(&path, json).expect("write");
+            assert_eq!(
+                Settings::load_from(&path)
+                    .expect("load")
+                    .terminal_font
+                    .as_deref(),
+                expected,
+                "{json}"
+            );
+        }
+
+        let padded = Settings {
+            terminal_font: Some("  Fira Code  ".to_owned()),
+            ..Settings::default()
+        };
+        padded.save_to(&path).expect("save");
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
+        assert_eq!(value["terminal_font"], "Fira Code");
+
+        let blank = Settings {
+            terminal_font: Some("   ".to_owned()),
+            ..Settings::default()
+        };
+        blank.save_to(&path).expect("save blank");
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
+        assert!(value["terminal_font"].is_null());
+        assert_eq!(
+            Settings::load_from(&path).expect("load").terminal_font,
+            None
+        );
+
+        let mut settings = Settings::default();
+        settings.set_terminal_font(Some("  ".to_owned()));
+        assert_eq!(settings.terminal_font, None);
+        settings.set_terminal_font(Some("  IBM Plex Mono  ".to_owned()));
+        assert_eq!(settings.terminal_font.as_deref(), Some("IBM Plex Mono"));
     }
 
     #[test]

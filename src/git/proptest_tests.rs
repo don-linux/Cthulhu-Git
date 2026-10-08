@@ -531,6 +531,7 @@ proptest! {
             history_sidebar_hidden: hidden,
             detail_sidebar_hidden: detail_hidden,
             terminal_hidden,
+            terminal_font: None,
         };
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("nested").join(FILE_NAME);
@@ -631,6 +632,7 @@ proptest! {
             detail_hidden.unwrap_or(false)
         );
         assert_eq!(loaded.terminal_hidden, terminal_hidden.unwrap_or(true));
+        assert_eq!(loaded.terminal_font, None);
         let expected = recents.unwrap_or_default();
         let expected: Vec<PathBuf> = expected.iter().map(PathBuf::from).collect();
         assert_eq!(loaded.recent_repositories, normalized_recents(&expected));

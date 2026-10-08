@@ -9,6 +9,8 @@ startup   Settings::default_path() -> Settings::load_from(path)
           missing file -> defaults; unreadable/invalid -> defaults + error banner
 decide    command-line folder > settings.last_repository > home screen
 change    mutate CthulhuApp.settings -> CthulhuApp::save_settings() -> Settings::save_to(path)
+font      a saved terminal_font starts a background scan of installed families
+          until the face is registered, the terminal keeps the built-in monospace
 ```
 
 Saved right away on every change (no timer, no save-on-exit). The write is
@@ -24,6 +26,10 @@ atomic: a temp file next to `settings.json` is renamed over it
 | `src/settings.rs` | `Settings::load_from` | Read + parse; dedupes and caps recents |
 | `src/settings.rs` | `Settings::save_to` | Atomic write |
 | `src/settings.rs` | `remember_repository`, `forget_last_repository` | Last and recent repositories |
+| `src/settings.rs` | `set_terminal_font` | Trims the terminal family; a blank name clears it |
+| `src/ui/settings.rs` | `show` | Settings sidebar and the Terminal page |
+| `src/ui/fonts.rs` | `FontService` | Lists installed families on a background thread and registers the terminal face |
+| `src/ui/mod.rs` | `Action::SetTerminalFont` | Stores the family and saves |
 | `src/settings.rs` | `MAX_RECENT_REPOSITORIES` | Recent list size (10) |
 | `src/settings.rs` | `SettingsError` | Read / parse / write errors shown to the user |
 | `src/ui/mod.rs` | `CthulhuApp::new` | Loads settings, applies the theme, picks the startup screen |
@@ -49,7 +55,8 @@ For manual tests on Linux, point `XDG_CONFIG_HOME` at a temp folder.
   "recent_repositories": ["/home/me/src/rlyeh", "/home/me/src/necronomicon"],
   "history_sidebar_hidden": false,
   "detail_sidebar_hidden": false,
-  "terminal_hidden": true
+  "terminal_hidden": true,
+  "terminal_font": null
 }
 ```
 
@@ -63,6 +70,7 @@ For manual tests on Linux, point `XDG_CONFIG_HOME` at a temp folder.
 | `history_sidebar_hidden` | The branches sidebar is hidden (toggled with the left panel button in the top bar). The JSON name is historical: this flag used to hide the commit list, which is now the center of the window. Negated so a missing field shows the sidebar | `false` |
 | `detail_sidebar_hidden` | The latest-commit sidebar on the right is hidden (toggled with the right panel button). Negated so a missing field shows the sidebar | `false` |
 | `terminal_hidden` | The terminal strip at the bottom of the right sidebar is hidden (toggled with the terminal button in the bottom bar). A missing field keeps it hidden. Showing it also opens the right sidebar. Its height is not saved | `true` |
+| `terminal_font` | Font family drawn in the terminal. `null`, blank, or an unknown name keeps the built-in monospace. A family name, not a file path. A missing field keeps the default | `null` |
 
 Only repository roots are stored, never subfolders. Paths that are not valid
 Unicode are not stored (JSON strings are UTF-8).

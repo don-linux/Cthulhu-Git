@@ -24,7 +24,7 @@ use alacritty_terminal::tty::{self, Pty};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, Event, FontId, Id, Key, Modifiers, Painter, PointerButton,
-    Pos2, Rect, RichText, Sense, Stroke, TextStyle, Ui, Vec2,
+    Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2,
 };
 
 use super::theme::Palette;
@@ -413,7 +413,7 @@ fn exited_prompt(ui: &mut Ui, rect: Rect, message: &str, palette: &Palette) -> b
 }
 
 fn metrics(ui: &Ui, rect: Rect) -> Metrics {
-    let font = TextStyle::Monospace.resolve(ui.style());
+    let font = super::fonts::terminal_font_id(ui);
     let (cell_w, cell_h) = ui.ctx().fonts_mut(|fonts| {
         (
             fonts.glyph_width(&font, 'M').max(1.0),
