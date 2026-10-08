@@ -1,7 +1,8 @@
 //! Repository screen. A top bar with the branch and detail toggles and the
 //! repository name, a sidebar of local branches, the commit history in the
 //! middle, the latest commit on the right with the terminal beneath it, and a
-//! bottom bar with the terminal toggle, the Home button and the current branch.
+//! bottom bar with the Home button, the current branch, and the terminal
+//! toggle at the right end.
 
 use cthulhu_git::git::{Branch, Head, Upstream};
 use eframe::egui::{
@@ -51,18 +52,6 @@ pub fn show(
         .frame(bar_frame(&palette))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                let (terminal_tint, terminal_hover) = if terminal_open {
-                    (palette.accent, "Hide terminal")
-                } else {
-                    (palette.text_muted, "Show terminal")
-                };
-                if icons::icon_button(ui, Icon::Terminal, terminal_tint, terminal_hover).clicked() {
-                    terminal_open = !terminal_open;
-                    // The strip lives in the right sidebar, so showing it opens that too.
-                    if terminal_open {
-                        detail_open = true;
-                    }
-                }
                 if icons::icon_button(ui, Icon::House, palette.text, "Open another repository")
                     .clicked()
                 {
@@ -71,7 +60,30 @@ pub fn show(
                 ui.separator();
                 let (branch, color) = branch_text(&repo.info.head, &palette);
                 icons::icon(ui, Icon::GitBranch, color).on_hover_text("Current branch");
-                ui.add(Label::new(branch).truncate());
+                let (terminal_tint, terminal_hover) = if terminal_open {
+                    (palette.accent, "Hide terminal")
+                } else {
+                    (palette.text_muted, "Show terminal")
+                };
+                // The remaining width stays with the branch name. The toggle
+                // sits on the opposite end of this bar.
+                let terminal_toggle = ui
+                    .with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let toggle =
+                            icons::icon_button(ui, Icon::Terminal, terminal_tint, terminal_hover);
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(Label::new(branch).truncate());
+                        });
+                        toggle
+                    })
+                    .inner;
+                if terminal_toggle.clicked() {
+                    terminal_open = !terminal_open;
+                    // The strip lives in the right sidebar, so showing it opens that too.
+                    if terminal_open {
+                        detail_open = true;
+                    }
+                }
             });
         });
 

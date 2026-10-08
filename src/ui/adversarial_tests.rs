@@ -9,6 +9,7 @@
 //! [`Harness::run`](egui_kittest::Harness::run) is not used; settle with
 //! [`Harness::step`](egui_kittest::Harness::step) instead.
 
+use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -271,28 +272,24 @@ fn assert_repo(harness: &Harness<'_, CthulhuApp>, name: &str) {
     );
 }
 
-/// Home is the rightmost button on the bottom bar. The terminal toggle is the
-/// first button on that row, so "lowest, then first" would press it instead.
-fn click_lowest_rightmost_button<State>(harness: &Harness<'_, State>) {
-    let buttons: Vec<_> = harness.query_all_by_role(Role::Button).collect();
+fn click_extreme_button<State>(harness: &Harness<'_, State>, top: bool) {
+    let any_button = harness.query_all_by_role(Role::Button).next().is_some();
     assert!(
-        !buttons.is_empty(),
+        any_button,
         "no buttons in the layout:\n{}",
         visible_text(harness)
     );
-    let bottom_y = buttons
-        .iter()
-        .map(|button| button.rect().center().y)
-        .fold(f32::MIN, f32::max);
+    let buttons: Vec<_> = harness.query_all_by_role(Role::Button).collect();
     let mut chosen = 0;
-    let mut best_x = f32::MIN;
-    for (index, button) in buttons.iter().enumerate() {
-        let center = button.rect().center();
-        if (center.y - bottom_y).abs() > 1.0 {
-            continue;
-        }
-        if center.x > best_x {
-            best_x = center.x;
+    for index in 1..buttons.len() {
+        let y = buttons[index].rect().center().y;
+        let best_y = buttons[chosen].rect().center().y;
+        let pick = match y.total_cmp(&best_y) {
+            Ordering::Less => top,
+            Ordering::Greater => !top,
+            Ordering::Equal => false,
+        };
+        if pick {
             chosen = index;
         }
     }
@@ -464,9 +461,10 @@ fn child_home_keeps_last_repository() {
     );
     let before_home = settings_bytes();
 
-    // Home is applied after the repository view draws, so the release frame
-    // still shows the repo. One more step paints the home screen.
-    click_lowest_rightmost_button(&harness);
+    // Home is the first button on the bottom row; the terminal toggle is the
+    // last. The click is applied after the repository view draws, so the
+    // release frame still shows the repo. One more step paints Home.
+    click_extreme_button(&harness, false);
     harness.step();
     harness.step();
 
