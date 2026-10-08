@@ -9,7 +9,6 @@
 //! [`Harness::run`](egui_kittest::Harness::run) is not used; settle with
 //! [`Harness::step`](egui_kittest::Harness::step) instead.
 
-use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -272,24 +271,28 @@ fn assert_repo(harness: &Harness<'_, CthulhuApp>, name: &str) {
     );
 }
 
-fn click_extreme_button<State>(harness: &Harness<'_, State>, top: bool) {
-    let any_button = harness.query_all_by_role(Role::Button).next().is_some();
+/// Home is the rightmost button on the bottom bar. The terminal toggle is the
+/// first button on that row, so "lowest, then first" would press it instead.
+fn click_lowest_rightmost_button<State>(harness: &Harness<'_, State>) {
+    let buttons: Vec<_> = harness.query_all_by_role(Role::Button).collect();
     assert!(
-        any_button,
+        !buttons.is_empty(),
         "no buttons in the layout:\n{}",
         visible_text(harness)
     );
-    let buttons: Vec<_> = harness.query_all_by_role(Role::Button).collect();
+    let bottom_y = buttons
+        .iter()
+        .map(|button| button.rect().center().y)
+        .fold(f32::MIN, f32::max);
     let mut chosen = 0;
-    for index in 1..buttons.len() {
-        let y = buttons[index].rect().center().y;
-        let best_y = buttons[chosen].rect().center().y;
-        let pick = match y.total_cmp(&best_y) {
-            Ordering::Less => top,
-            Ordering::Greater => !top,
-            Ordering::Equal => false,
-        };
-        if pick {
+    let mut best_x = f32::MIN;
+    for (index, button) in buttons.iter().enumerate() {
+        let center = button.rect().center();
+        if (center.y - bottom_y).abs() > 1.0 {
+            continue;
+        }
+        if center.x > best_x {
+            best_x = center.x;
             chosen = index;
         }
     }
@@ -349,6 +352,7 @@ fn opened(name: &str, commits: Vec<Commit>, truncated: bool) -> OpenedRepo {
         }],
         latest,
         view_id: egui::Id::new(("adversarial-repo", name.len(), truncated)),
+        terminal: None,
     }
 }
 
@@ -462,7 +466,7 @@ fn child_home_keeps_last_repository() {
 
     // Home is applied after the repository view draws, so the release frame
     // still shows the repo. One more step paints the home screen.
-    click_extreme_button(&harness, false);
+    click_lowest_rightmost_button(&harness);
     harness.step();
     harness.step();
 
@@ -629,7 +633,7 @@ fn adversarial_min_window_long_name_and_bidi_summary() {
     let summary = "port \u{202E}starboard\u{202C} side";
     let mut repo = opened(&name, vec![commit(summary)], false);
     let harness = ui_harness(|ui| {
-        let _ = repo_view::show(ui, &mut repo, None, true, true);
+        let _ = repo_view::show(ui, &mut repo, None, true, true, false);
     });
     assert_text(&harness, &name);
     assert_text(&harness, "\u{202E}");
@@ -648,7 +652,7 @@ fn adversarial_thousand_commits_are_virtualized() {
         .collect();
     let mut repo = opened("bulk-history", commits, true);
     let harness = ui_harness(|ui| {
-        let _ = repo_view::show(ui, &mut repo, None, true, false);
+        let _ = repo_view::show(ui, &mut repo, None, true, false, false);
     });
     assert_text(&harness, "Showing the latest 1000 commits.");
     assert_text(&harness, "Commit history (1000+)");

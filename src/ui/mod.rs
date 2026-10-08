@@ -10,6 +10,7 @@ mod folder_picker;
 mod home;
 mod icons;
 mod repo_view;
+mod terminal;
 pub mod theme;
 mod widgets;
 
@@ -33,6 +34,8 @@ pub struct OpenedRepo {
     pub latest: Option<CommitDetail>,
     /// New on every open, so the history starts scrolled to the top each time.
     pub view_id: egui::Id,
+    /// Shell for this repository. `None` until the terminal strip is shown.
+    pub terminal: Option<terminal::Terminal>,
 }
 
 /// A local branch and whether its checkbox is on.
@@ -50,6 +53,7 @@ pub enum Action {
     Home,
     ToggleBranchesSidebar,
     ToggleDetailSidebar,
+    ToggleTerminal,
 }
 
 enum Screen {
@@ -161,6 +165,7 @@ impl CthulhuApp {
                         .collect(),
                     latest: loaded.latest,
                     view_id: egui::Id::new(("repo-view", self.opened_count)),
+                    terminal: None,
                 }));
             }
             Err(message) => {
@@ -230,6 +235,7 @@ impl eframe::App for CthulhuApp {
                 self.error.as_deref(),
                 !self.settings.history_sidebar_hidden,
                 !self.settings.detail_sidebar_hidden,
+                !self.settings.terminal_hidden,
             ),
         };
 
@@ -253,6 +259,13 @@ impl eframe::App for CthulhuApp {
                 }
                 Action::ToggleDetailSidebar => {
                     self.settings.detail_sidebar_hidden = !self.settings.detail_sidebar_hidden;
+                    self.save_settings();
+                }
+                Action::ToggleTerminal => {
+                    self.settings.terminal_hidden = !self.settings.terminal_hidden;
+                    if !self.settings.terminal_hidden {
+                        self.settings.detail_sidebar_hidden = false;
+                    }
                     self.save_settings();
                 }
             }

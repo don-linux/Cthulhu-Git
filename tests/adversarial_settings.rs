@@ -175,6 +175,7 @@ fn null_option_fields_load_as_none() {
     assert!(loaded.recent_repositories.is_empty());
     assert!(!loaded.history_sidebar_hidden);
     assert!(!loaded.detail_sidebar_hidden);
+    assert!(loaded.terminal_hidden);
 }
 
 #[test]
@@ -559,6 +560,28 @@ fn detail_sidebar_hidden_round_trips() {
         let settings = Settings {
             theme: Some("abyss".to_owned()),
             detail_sidebar_hidden: hidden,
+            ..Settings::default()
+        };
+        settings.save_to(&path).expect("save");
+        assert_eq!(Settings::load_from(&path).expect("load"), settings);
+    }
+}
+
+#[test]
+fn terminal_hidden_round_trips_and_old_files_stay_hidden() {
+    let dir = temp_dir();
+    let path = settings_path(&dir);
+    write_bytes(&path, br#"{ "theme": "abyss" }"#);
+    assert!(
+        Settings::load_from(&path)
+            .expect("old file")
+            .terminal_hidden
+    );
+
+    for hidden in [false, true, false] {
+        let settings = Settings {
+            theme: Some("abyss".to_owned()),
+            terminal_hidden: hidden,
             ..Settings::default()
         };
         settings.save_to(&path).expect("save");

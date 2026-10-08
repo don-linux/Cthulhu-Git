@@ -29,6 +29,7 @@ atomic: a temp file next to `settings.json` is renamed over it
 | `src/ui/mod.rs` | `CthulhuApp::new` | Loads settings, applies the theme, picks the startup screen |
 | `src/ui/mod.rs` | `CthulhuApp::poll_opening` | Remembers a repository on success; forgets `last_repository` when it fails to open |
 | `src/ui/mod.rs` | `CthulhuApp::ui`, `Action::ToggleBranchesSidebar`, `Action::ToggleDetailSidebar` | Flips `history_sidebar_hidden` or `detail_sidebar_hidden` when the repository view asks |
+| `src/ui/mod.rs` | `CthulhuApp::ui`, `Action::ToggleTerminal` | Flips `terminal_hidden` when the repository view asks. Showing the terminal also opens the right sidebar |
 | `src/ui/mod.rs` | `CthulhuApp::save_settings` | The only caller of `save_to` |
 
 ## File location
@@ -47,7 +48,8 @@ For manual tests on Linux, point `XDG_CONFIG_HOME` at a temp folder.
   "last_repository": "/home/me/src/rlyeh",
   "recent_repositories": ["/home/me/src/rlyeh", "/home/me/src/necronomicon"],
   "history_sidebar_hidden": false,
-  "detail_sidebar_hidden": false
+  "detail_sidebar_hidden": false,
+  "terminal_hidden": true
 }
 ```
 
@@ -60,6 +62,7 @@ For manual tests on Linux, point `XDG_CONFIG_HOME` at a temp folder.
 | `recent_repositories` | Repository roots, newest first, no duplicates, at most 10 | `[]` |
 | `history_sidebar_hidden` | The branches sidebar is hidden (toggled with the left panel button in the top bar). The JSON name is historical: this flag used to hide the commit list, which is now the center of the window. Negated so a missing field shows the sidebar | `false` |
 | `detail_sidebar_hidden` | The latest-commit sidebar on the right is hidden (toggled with the right panel button). Negated so a missing field shows the sidebar | `false` |
+| `terminal_hidden` | The terminal strip at the bottom of the right sidebar is hidden (toggled with the terminal button in the bottom bar). A missing field keeps it hidden. Showing it also opens the right sidebar. Its height is not saved | `true` |
 
 Only repository roots are stored, never subfolders. Paths that are not valid
 Unicode are not stored (JSON strings are UTF-8).

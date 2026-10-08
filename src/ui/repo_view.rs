@@ -1,7 +1,7 @@
 //! Repository screen. A top bar with the branch and detail toggles and the
 //! repository name, a sidebar of local branches, the commit history in the
-//! middle, the latest commit on the right, and a bottom bar with the Home
-//! button and the current branch.
+//! middle, the latest commit on the right with the terminal beneath it, and a
+//! bottom bar with the terminal toggle, the Home button and the current branch.
 
 use cthulhu_git::git::{Branch, Head, Upstream};
 use eframe::egui::{
@@ -10,6 +10,7 @@ use eframe::egui::{
 };
 
 use super::icons::{self, Icon};
+use super::terminal;
 use super::theme::{self, Palette};
 use super::widgets;
 use super::{Action, ListedBranch, OpenedRepo};
@@ -24,6 +25,7 @@ pub fn show(
     error: Option<&str>,
     branches_open: bool,
     detail_open: bool,
+    terminal_open: bool,
 ) -> Vec<Action> {
     let palette = theme::current(ui.ctx()).palette;
     let mut actions = Vec::new();
@@ -31,8 +33,12 @@ pub fn show(
     // both flip these; the app saves the change.
     let branches_were_open = branches_open;
     let detail_was_open = detail_open;
+    let terminal_was_open = terminal_open;
     let mut branches_open = branches_open;
     let mut detail_open = detail_open;
+    let mut terminal_open = terminal_open;
+    // Replies from the shell have to land even while the strip is hidden.
+    terminal::service(ui.ctx(), &mut repo.terminal);
 
     // Top and bottom bars come first so they span the whole window width.
     egui::Panel::top("repo-top-bar")
@@ -45,6 +51,18 @@ pub fn show(
         .frame(bar_frame(&palette))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                let (terminal_tint, terminal_hover) = if terminal_open {
+                    (palette.accent, "Hide terminal")
+                } else {
+                    (palette.text_muted, "Show terminal")
+                };
+                if icons::icon_button(ui, Icon::Terminal, terminal_tint, terminal_hover).clicked() {
+                    terminal_open = !terminal_open;
+                    // The strip lives in the right sidebar, so showing it opens that too.
+                    if terminal_open {
+                        detail_open = true;
+                    }
+                }
                 if icons::icon_button(ui, Icon::House, palette.text, "Open another repository")
                     .clicked()
                 {
@@ -73,7 +91,7 @@ pub fn show(
         .size_range(SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH)
         .frame(side)
         .show_collapsible(ui, &mut detail_open, |ui| {
-            detail_panel(ui, repo, &palette);
+            detail_column(ui, repo, &palette, terminal_open);
         });
 
     egui::CentralPanel::default()
@@ -89,10 +107,50 @@ pub fn show(
     if branches_open != branches_were_open {
         actions.push(Action::ToggleBranchesSidebar);
     }
-    if detail_open != detail_was_open {
+    if detail_open != detail_was_open && !(terminal_open && !terminal_was_open) {
         actions.push(Action::ToggleDetailSidebar);
     }
+    if terminal_open != terminal_was_open {
+        actions.push(Action::ToggleTerminal);
+    }
+    if !terminal_open || !detail_open {
+        terminal::surrender_focus(ui.ctx(), repo.view_id);
+    }
     actions
+}
+
+fn detail_column(ui: &mut Ui, repo: &mut OpenedRepo, palette: &Palette, terminal_open: bool) {
+    if !terminal_open {
+        detail_panel(ui, repo, palette);
+        return;
+    }
+
+    let available = ui.available_height();
+    let (detail_h, splitter_h, terminal_h) = terminal::split_height(ui, repo.view_id, available);
+    ui.allocate_ui(Vec2::new(ui.available_width(), detail_h), |ui| {
+        ui.set_min_height(detail_h);
+        detail_panel(ui, repo, palette);
+    });
+    let splitter = ui.allocate_response(Vec2::new(ui.available_width(), splitter_h), Sense::drag());
+    if splitter.hovered() || splitter.dragged() {
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
+    }
+    let y = splitter.rect.center().y;
+    ui.painter()
+        .hline(splitter.rect.x_range(), y, Stroke::new(1.0, palette.border));
+    if splitter.dragged() {
+        terminal::drag_split(ui, repo.view_id, available, splitter.drag_delta().y);
+    }
+    ui.allocate_ui(Vec2::new(ui.available_width(), terminal_h), |ui| {
+        ui.set_min_height(terminal_h);
+        terminal::show(
+            ui,
+            &mut repo.terminal,
+            &repo.info.root,
+            repo.view_id,
+            palette,
+        );
+    });
 }
 
 fn bar_frame(palette: &Palette) -> Frame {

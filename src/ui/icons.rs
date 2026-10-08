@@ -19,6 +19,7 @@ pub enum Icon {
     PanelRight,
     House,
     GitBranch,
+    Terminal,
 }
 
 impl Icon {
@@ -29,6 +30,7 @@ impl Icon {
             Self::PanelRight => "panel-right",
             Self::House => "house",
             Self::GitBranch => "git-branch",
+            Self::Terminal => "terminal",
         }
     }
 
@@ -38,6 +40,7 @@ impl Icon {
             Self::PanelRight => include_bytes!(concat!(env!("OUT_DIR"), "/icons/panel-right.rgba")),
             Self::House => include_bytes!(concat!(env!("OUT_DIR"), "/icons/house.rgba")),
             Self::GitBranch => include_bytes!(concat!(env!("OUT_DIR"), "/icons/git-branch.rgba")),
+            Self::Terminal => include_bytes!(concat!(env!("OUT_DIR"), "/icons/terminal.rgba")),
         }
     }
 
@@ -86,6 +89,7 @@ mod tests {
             Icon::PanelRight,
             Icon::House,
             Icon::GitBranch,
+            Icon::Terminal,
         ] {
             assert_eq!(
                 icon.rgba().len(),

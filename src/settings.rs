@@ -14,7 +14,7 @@ pub const MAX_RECENT_REPOSITORIES: usize = 10;
 
 /// Every field has a default, so files written by older or newer versions
 /// still load: missing fields take the default and unknown ones are ignored.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Id of the active theme. `None` or an unknown id means the default theme.
@@ -33,6 +33,31 @@ pub struct Settings {
     /// Whether the latest-commit sidebar on the right is hidden.
     /// Stored negated so the sidebar shows when the field is missing.
     pub detail_sidebar_hidden: bool,
+    /// Whether the terminal strip in the right sidebar is hidden.
+    /// A missing field keeps the terminal hidden, unlike the sidebars.
+    /// `#[serde(default)]` on the struct fills a missing bool with `false`,
+    /// so this field names its own default.
+    #[serde(default = "default_terminal_hidden")]
+    pub terminal_hidden: bool,
+}
+
+/// Older settings files omit the field. The terminal stays hidden until the
+/// user shows it.
+fn default_terminal_hidden() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: None,
+            last_repository: None,
+            recent_repositories: Vec::new(),
+            history_sidebar_hidden: false,
+            detail_sidebar_hidden: false,
+            terminal_hidden: default_terminal_hidden(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -299,6 +324,27 @@ mod tests {
                 .expect("load")
                 .detail_sidebar_hidden
         );
+    }
+
+    #[test]
+    fn terminal_stays_hidden_unless_saved_open() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        fs::write(&path, r#"{ "recent_repositories": [] }"#).expect("write");
+        assert!(Settings::load_from(&path).expect("load").terminal_hidden);
+
+        for hidden in [false, true, false] {
+            let settings = Settings {
+                terminal_hidden: hidden,
+                ..Settings::default()
+            };
+            settings.save_to(&path).expect("save");
+            assert_eq!(
+                Settings::load_from(&path).expect("load").terminal_hidden,
+                hidden
+            );
+        }
     }
 
     #[test]
