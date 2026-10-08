@@ -20,6 +20,8 @@ pub enum Icon {
     House,
     GitBranch,
     Terminal,
+    Settings,
+    ArrowLeft,
 }
 
 impl Icon {
@@ -31,6 +33,8 @@ impl Icon {
             Self::House => "house",
             Self::GitBranch => "git-branch",
             Self::Terminal => "terminal",
+            Self::Settings => "settings",
+            Self::ArrowLeft => "arrow-left",
         }
     }
 
@@ -41,6 +45,8 @@ impl Icon {
             Self::House => include_bytes!(concat!(env!("OUT_DIR"), "/icons/house.rgba")),
             Self::GitBranch => include_bytes!(concat!(env!("OUT_DIR"), "/icons/git-branch.rgba")),
             Self::Terminal => include_bytes!(concat!(env!("OUT_DIR"), "/icons/terminal.rgba")),
+            Self::Settings => include_bytes!(concat!(env!("OUT_DIR"), "/icons/settings.rgba")),
+            Self::ArrowLeft => include_bytes!(concat!(env!("OUT_DIR"), "/icons/arrow-left.rgba")),
         }
     }
 
@@ -90,6 +96,8 @@ mod tests {
             Icon::House,
             Icon::GitBranch,
             Icon::Terminal,
+            Icon::Settings,
+            Icon::ArrowLeft,
         ] {
             assert_eq!(
                 icon.rgba().len(),

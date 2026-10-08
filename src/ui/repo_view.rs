@@ -1,8 +1,8 @@
 //! Repository screen. A top bar with the branch and detail toggles and the
 //! repository name, a sidebar of local branches, the commit history in the
 //! middle, the latest commit on the right with the terminal beneath it, and a
-//! bottom bar with the Home button, the current branch, and the terminal
-//! toggle at the right end.
+//! bottom bar with the Home and Settings buttons, the current branch, and the
+//! terminal toggle at the right end.
 
 use cthulhu_git::git::{Branch, Head, Upstream};
 use eframe::egui::{
@@ -56,6 +56,9 @@ pub fn show(
                     .clicked()
                 {
                     actions.push(Action::Home);
+                }
+                if icons::icon_button(ui, Icon::Settings, palette.text, "Settings").clicked() {
+                    actions.push(Action::OpenSettings);
                 }
                 ui.separator();
                 let (branch, color) = branch_text(&repo.info.head, &palette);

@@ -1,4 +1,4 @@
-//! The window: a home screen and a repository view.
+//! The window: a home screen, a repository view, and a settings screen.
 //!
 //! On launch, a folder passed on the command line opens first, then the last
 //! repository from the settings, otherwise the home screen shows. Settings
@@ -10,6 +10,7 @@ mod folder_picker;
 mod home;
 mod icons;
 mod repo_view;
+mod settings;
 mod terminal;
 pub mod theme;
 mod widgets;
@@ -51,6 +52,8 @@ pub enum Action {
     Browse,
     Open(PathBuf),
     Home,
+    OpenSettings,
+    CloseSettings,
     ToggleBranchesSidebar,
     ToggleDetailSidebar,
     ToggleTerminal,
@@ -84,6 +87,8 @@ pub struct CthulhuApp {
     picker: Option<FolderPicker>,
     error: Option<String>,
     opened_count: u64,
+    /// Covers the current screen. A repository underneath stays open.
+    settings_open: bool,
 }
 
 impl CthulhuApp {
@@ -112,6 +117,7 @@ impl CthulhuApp {
             picker: None,
             error,
             opened_count: 0,
+            settings_open: false,
         };
         if let Some(path) = startup {
             app.open(ctx, path);
@@ -217,26 +223,36 @@ impl eframe::App for CthulhuApp {
         self.poll_opening();
         self.poll_picker(ui.ctx());
 
-        let actions = match &mut self.screen {
-            Screen::Home => home::show(
-                ui,
-                &home::HomeState {
-                    recent: &self.settings.recent_repositories,
-                    busy: self.opening.is_some() || self.picker.is_some(),
-                    opening: self.opening.as_ref().map(|opening| opening.path.as_path()),
-                    error: self.error.as_deref(),
-                },
-            )
-            .into_iter()
-            .collect(),
-            Screen::Repo(repo) => repo_view::show(
-                ui,
-                repo,
-                self.error.as_deref(),
-                !self.settings.history_sidebar_hidden,
-                !self.settings.detail_sidebar_hidden,
-                !self.settings.terminal_hidden,
-            ),
+        let actions = if self.settings_open {
+            // The repository stays underneath. Keep the shell alive and take
+            // keystrokes away from the hidden terminal.
+            if let Screen::Repo(repo) = &mut self.screen {
+                terminal::service(ui.ctx(), &mut repo.terminal);
+                terminal::surrender_focus(ui.ctx(), repo.view_id);
+            }
+            settings::show(ui)
+        } else {
+            match &mut self.screen {
+                Screen::Home => home::show(
+                    ui,
+                    &home::HomeState {
+                        recent: &self.settings.recent_repositories,
+                        busy: self.opening.is_some() || self.picker.is_some(),
+                        opening: self.opening.as_ref().map(|opening| opening.path.as_path()),
+                        error: self.error.as_deref(),
+                    },
+                )
+                .into_iter()
+                .collect(),
+                Screen::Repo(repo) => repo_view::show(
+                    ui,
+                    repo,
+                    self.error.as_deref(),
+                    !self.settings.history_sidebar_hidden,
+                    !self.settings.detail_sidebar_hidden,
+                    !self.settings.terminal_hidden,
+                ),
+            }
         };
 
         for action in actions {
@@ -251,7 +267,14 @@ impl eframe::App for CthulhuApp {
                 }
                 Action::Home => {
                     self.error = None;
+                    self.settings_open = false;
                     self.screen = Screen::Home;
+                }
+                Action::OpenSettings => {
+                    self.settings_open = true;
+                }
+                Action::CloseSettings => {
+                    self.settings_open = false;
                 }
                 Action::ToggleBranchesSidebar => {
                     self.settings.history_sidebar_hidden = !self.settings.history_sidebar_hidden;
