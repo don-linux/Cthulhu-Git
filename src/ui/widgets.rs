@@ -60,21 +60,6 @@ pub fn error_banner(ui: &mut Ui, message: &str) {
         });
 }
 
-/// A card: the surface color with a border, used to group related fields.
-pub fn card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
-    let palette = theme::current(ui.ctx()).palette;
-    Frame::new()
-        .fill(palette.surface)
-        .stroke(Stroke::new(1.0, palette.border))
-        .corner_radius(CORNER_RADIUS)
-        .inner_margin(Margin::same(16))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add_contents(ui)
-        })
-        .inner
-}
-
 /// A full-width clickable row with a title and a muted second line.
 pub fn list_row(ui: &mut Ui, title: &str, detail: &str, enabled: bool) -> Response {
     let palette = theme::current(ui.ctx()).palette;
@@ -146,23 +131,4 @@ pub fn commit_line(commit: &Commit, palette: &Palette, style: &Style) -> LayoutJ
 pub fn commit_line_height(ui: &Ui) -> f32 {
     ui.text_style_height(&TextStyle::Monospace)
         .max(ui.text_style_height(&TextStyle::Body))
-}
-
-const FIELD_LABEL_WIDTH: f32 = 110.0;
-
-/// A muted label in a fixed-width column, then the value in the remaining
-/// width (values should truncate rather than widen the row).
-pub fn field_row(ui: &mut Ui, label: &str, add_value: impl FnOnce(&mut Ui)) {
-    let palette = theme::current(ui.ctx()).palette;
-    ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(
-            Vec2::new(FIELD_LABEL_WIDTH, ui.spacing().interact_size.y),
-            egui::Layout::left_to_right(Align::Center),
-            |ui| {
-                ui.set_min_width(FIELD_LABEL_WIDTH);
-                ui.label(RichText::new(label).color(palette.text_muted));
-            },
-        );
-        add_value(ui);
-    });
 }

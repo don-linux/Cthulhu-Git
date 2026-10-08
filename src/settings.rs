@@ -25,9 +25,14 @@ pub struct Settings {
     /// JSON `null` is the empty list, so one null field does not reject the file.
     #[serde(default, deserialize_with = "null_as_default")]
     pub recent_repositories: Vec<PathBuf>,
-    /// Whether the commit history sidebar of the repository view is hidden.
-    /// Stored negated so the sidebar shows when the field is missing.
+    /// Whether the branches sidebar of the repository view is hidden.
+    /// The JSON name is historical: this flag used to hide the commit list,
+    /// which is now the center of the window. Stored negated so the sidebar
+    /// shows when the field is missing.
     pub history_sidebar_hidden: bool,
+    /// Whether the latest-commit sidebar on the right is hidden.
+    /// Stored negated so the sidebar shows when the field is missing.
+    pub detail_sidebar_hidden: bool,
 }
 
 #[derive(Debug)]
@@ -269,6 +274,30 @@ mod tests {
             Settings::load_from(&path)
                 .expect("load")
                 .history_sidebar_hidden
+        );
+    }
+
+    #[test]
+    fn detail_sidebar_shows_unless_saved_hidden() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        fs::write(&path, r#"{ "recent_repositories": [] }"#).expect("write");
+        assert!(
+            !Settings::load_from(&path)
+                .expect("load")
+                .detail_sidebar_hidden
+        );
+
+        let settings = Settings {
+            detail_sidebar_hidden: true,
+            ..Settings::default()
+        };
+        settings.save_to(&path).expect("save");
+        assert!(
+            Settings::load_from(&path)
+                .expect("load")
+                .detail_sidebar_hidden
         );
     }
 

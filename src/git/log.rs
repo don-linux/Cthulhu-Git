@@ -37,6 +37,83 @@ impl History {
     }
 }
 
+/// The newest commit, with the fields the detail sidebar shows.
+///
+/// `message` is the raw commit message (`%B`): subject, a blank line, and the
+/// body. Git's trailing record newline is not part of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitDetail {
+    pub oid: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub authored_at: String,
+    pub message: String,
+}
+
+/// Reads `HEAD`'s newest commit. An unborn branch has none, so git is not asked.
+///
+/// The record is not NUL-terminated. A NUL inside the message stays in
+/// `message` instead of cutting the record short.
+pub fn latest_commit(
+    git: &Git,
+    root: &Path,
+    head: &Head,
+) -> Result<Option<CommitDetail>, GitError> {
+    if matches!(head, Head::Unborn(_)) {
+        return Ok(None);
+    }
+
+    let args = [
+        "log",
+        "-1",
+        "--date=format-local:%Y-%m-%d %H:%M",
+        "--format=%H%x1f%an%x1f%ae%x1f%ad%x1f%B",
+        "HEAD",
+        "--",
+    ];
+    let output = git.require_ok(root, &args)?;
+    parse_commit_detail(&output.stdout)
+        .ok_or_else(|| GitError::Failed {
+            command: format!("git {}", args.join(" ")),
+            status: output.status.to_string(),
+            stderr: "unrecognized log output".to_owned(),
+        })
+        .map(Some)
+}
+
+/// Parses one `git log -1 --format=%H%x1f%an%x1f%ae%x1f%ad%x1f%B` record.
+/// The first four separators split the fixed fields; the rest is the message,
+/// so a unit separator inside the message is kept.
+pub(crate) fn parse_commit_detail(stdout: &[u8]) -> Option<CommitDetail> {
+    if stdout.is_empty() {
+        return None;
+    }
+    let mut record = stdout.to_vec();
+    if record.last() == Some(&b'\n') {
+        record.pop();
+        if record.last() == Some(&b'\r') {
+            record.pop();
+        }
+    }
+
+    let mut parts = record.splitn(5, |byte| *byte == FIELD_SEPARATOR);
+    let oid = parts.next()?;
+    let author_name = parts.next()?;
+    let author_email = parts.next()?;
+    let authored_at = parts.next()?;
+    let message = parts.next()?;
+    if oid.is_empty() || !oid.iter().all(u8::is_ascii_hexdigit) || authored_at.is_empty() {
+        return None;
+    }
+    Some(CommitDetail {
+        oid: String::from_utf8_lossy(oid).into_owned(),
+        author_name: String::from_utf8_lossy(author_name).into_owned(),
+        author_email: String::from_utf8_lossy(author_email).into_owned(),
+        authored_at: String::from_utf8_lossy(authored_at).into_owned(),
+        message: String::from_utf8_lossy(message).into_owned(),
+    })
+}
+
 pub(crate) fn short_oid(oid: &str) -> &str {
     oid.get(..SHORT_OID_LEN).unwrap_or(oid)
 }
@@ -166,6 +243,79 @@ mod tests {
         assert_eq!(parse_log(b"no separator\0"), None);
         assert_eq!(parse_log(b"\x1fsubject without oid\0"), None);
         assert_eq!(parse_log(b"not-hex\x1fsubject\0"), None);
+    }
+
+    fn detail_record(oid: &str, name: &str, email: &str, date: &str, message: &[u8]) -> Vec<u8> {
+        let mut out = oid.as_bytes().to_vec();
+        for field in [name.as_bytes(), email.as_bytes(), date.as_bytes()] {
+            out.push(FIELD_SEPARATOR);
+            out.extend_from_slice(field);
+        }
+        out.push(FIELD_SEPARATOR);
+        out.extend_from_slice(message);
+        out.push(b'\n');
+        out
+    }
+
+    #[test]
+    fn parses_commit_detail_and_keeps_a_separator_in_the_message() {
+        let stdout = detail_record(
+            OID_A,
+            "cthulhu",
+            "cthulhu@example.invalid",
+            "2026-10-07 18:43",
+            b"Second\n\nThe body\x1f stays.",
+        );
+        assert_eq!(
+            parse_commit_detail(&stdout),
+            Some(CommitDetail {
+                oid: OID_A.to_owned(),
+                author_name: "cthulhu".to_owned(),
+                author_email: "cthulhu@example.invalid".to_owned(),
+                authored_at: "2026-10-07 18:43".to_owned(),
+                message: "Second\n\nThe body\u{1f} stays.".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn commit_detail_keeps_a_nul_inside_the_message() {
+        let stdout = detail_record(
+            OID_A,
+            "cthulhu",
+            "cthulhu@example.invalid",
+            "2026-10-07 18:43",
+            b"subject with NUL\x00 and more",
+        );
+        let detail = parse_commit_detail(&stdout).expect("parsable");
+        assert!(detail.message.contains('\u{0}'));
+        assert!(detail.message.contains("and more"));
+    }
+
+    #[test]
+    fn malformed_commit_detail_is_rejected() {
+        assert_eq!(parse_commit_detail(b""), None);
+        assert_eq!(parse_commit_detail(b"no separators\n"), None);
+        assert_eq!(
+            parse_commit_detail(&detail_record(
+                "not-hex",
+                "cthulhu",
+                "cthulhu@example.invalid",
+                "2026-10-07 18:43",
+                b"msg"
+            )),
+            None
+        );
+        assert_eq!(
+            parse_commit_detail(&detail_record(
+                OID_A,
+                "cthulhu",
+                "cthulhu@example.invalid",
+                "",
+                b"msg"
+            )),
+            None
+        );
     }
 
     #[test]

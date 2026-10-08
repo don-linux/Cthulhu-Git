@@ -174,6 +174,7 @@ fn null_option_fields_load_as_none() {
     assert_eq!(loaded.last_repository, None);
     assert!(loaded.recent_repositories.is_empty());
     assert!(!loaded.history_sidebar_hidden);
+    assert!(!loaded.detail_sidebar_hidden);
 }
 
 #[test]
@@ -543,6 +544,21 @@ fn history_sidebar_hidden_round_trips() {
         let settings = Settings {
             theme: Some("abyss".to_owned()),
             history_sidebar_hidden: hidden,
+            ..Settings::default()
+        };
+        settings.save_to(&path).expect("save");
+        assert_eq!(Settings::load_from(&path).expect("load"), settings);
+    }
+}
+
+#[test]
+fn detail_sidebar_hidden_round_trips() {
+    let dir = temp_dir();
+    let path = settings_path(&dir);
+    for hidden in [false, true, false] {
+        let settings = Settings {
+            theme: Some("abyss".to_owned()),
+            detail_sidebar_hidden: hidden,
             ..Settings::default()
         };
         settings.save_to(&path).expect("save");

@@ -1,16 +1,18 @@
-//! Repository screen. A top bar with the history toggle and the repository
-//! name, a sidebar with the commit history, the latest commit in the middle,
-//! and a bottom bar with the Home button and the current branch.
+//! Repository screen. A top bar with the branch and detail toggles and the
+//! repository name, a sidebar of local branches, the commit history in the
+//! middle, the latest commit on the right, and a bottom bar with the Home
+//! button and the current branch.
 
-use cthulhu_git::git::Head;
+use cthulhu_git::git::{Branch, Head, Upstream};
 use eframe::egui::{
-    self, Color32, Frame, Label, Margin, Pos2, Rect, RichText, ScrollArea, Stroke, Ui, Vec2,
+    self, Align, Color32, CursorIcon, Frame, Label, Layout, Margin, Pos2, Rect, RichText,
+    ScrollArea, Sense, Stroke, Ui, Vec2,
 };
 
 use super::icons::{self, Icon};
 use super::theme::{self, Palette};
 use super::widgets;
-use super::{Action, OpenedRepo};
+use super::{Action, ListedBranch, OpenedRepo};
 
 const SIDEBAR_DEFAULT_WIDTH: f32 = 320.0;
 const SIDEBAR_MIN_WIDTH: f32 = 220.0;
@@ -18,20 +20,26 @@ const SIDEBAR_MAX_WIDTH: f32 = 560.0;
 
 pub fn show(
     ui: &mut Ui,
-    repo: &OpenedRepo,
+    repo: &mut OpenedRepo,
     error: Option<&str>,
-    sidebar_open: bool,
-) -> Option<Action> {
+    branches_open: bool,
+    detail_open: bool,
+) -> Vec<Action> {
     let palette = theme::current(ui.ctx()).palette;
-    let mut action = None;
-    // The toggle button and dragging the sidebar edge past its minimum width
-    // both flip this; the app saves the change.
-    let mut open = sidebar_open;
+    let mut actions = Vec::new();
+    // The toggle buttons and dragging a sidebar edge past its minimum width
+    // both flip these; the app saves the change.
+    let branches_were_open = branches_open;
+    let detail_was_open = detail_open;
+    let mut branches_open = branches_open;
+    let mut detail_open = detail_open;
 
     // Top and bottom bars come first so they span the whole window width.
     egui::Panel::top("repo-top-bar")
         .frame(bar_frame(&palette))
-        .show(ui, |ui| top_bar(ui, repo, &palette, &mut open));
+        .show(ui, |ui| {
+            top_bar(ui, repo, &palette, &mut branches_open, &mut detail_open);
+        });
 
     egui::Panel::bottom("repo-bottom-bar")
         .frame(bar_frame(&palette))
@@ -40,7 +48,7 @@ pub fn show(
                 if icons::icon_button(ui, Icon::House, palette.text, "Open another repository")
                     .clicked()
                 {
-                    action = Some(Action::Home);
+                    actions.push(Action::Home);
                 }
                 ui.separator();
                 let (branch, color) = branch_text(&repo.info.head, &palette);
@@ -49,41 +57,42 @@ pub fn show(
             });
         });
 
-    egui::Panel::left("repo-history-sidebar")
+    let side = side_frame(&palette);
+    egui::Panel::left("repo-branches-sidebar")
         .resizable(true)
         .default_size(SIDEBAR_DEFAULT_WIDTH)
         .size_range(SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH)
-        .frame(
-            Frame::new()
-                .fill(palette.background)
-                .inner_margin(Margin::same(12)),
-        )
-        .show_collapsible(ui, &mut open, |ui| history(ui, repo, &palette));
-
-    egui::CentralPanel::default().show(ui, |ui| {
-        if let Some(error) = error {
-            widgets::error_banner(ui, error);
-            ui.add_space(12.0);
-        }
-
-        widgets::card(ui, |ui| {
-            widgets::field_row(ui, "Latest commit", |ui| match repo.history.latest() {
-                Some(commit) => {
-                    ui.add(
-                        Label::new(widgets::commit_line(commit, &palette, ui.style())).truncate(),
-                    );
-                }
-                None => {
-                    ui.label(RichText::new("No commits yet").color(palette.text_muted));
-                }
-            });
+        .frame(side)
+        .show_collapsible(ui, &mut branches_open, |ui| {
+            branches_panel(ui, repo, &palette);
         });
-    });
 
-    if open != sidebar_open {
-        action = Some(Action::ToggleHistorySidebar);
+    egui::Panel::right("repo-detail-sidebar")
+        .resizable(true)
+        .default_size(SIDEBAR_DEFAULT_WIDTH)
+        .size_range(SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH)
+        .frame(side)
+        .show_collapsible(ui, &mut detail_open, |ui| {
+            detail_panel(ui, repo, &palette);
+        });
+
+    egui::CentralPanel::default()
+        .frame(side_frame(&palette))
+        .show(ui, |ui| {
+            if let Some(error) = error {
+                widgets::error_banner(ui, error);
+                ui.add_space(12.0);
+            }
+            history(ui, repo, &palette);
+        });
+
+    if branches_open != branches_were_open {
+        actions.push(Action::ToggleBranchesSidebar);
     }
-    action
+    if detail_open != detail_was_open {
+        actions.push(Action::ToggleDetailSidebar);
+    }
+    actions
 }
 
 fn bar_frame(palette: &Palette) -> Frame {
@@ -93,27 +102,58 @@ fn bar_frame(palette: &Palette) -> Frame {
         .inner_margin(Margin::symmetric(12, 6))
 }
 
-/// The toggle on the left, the name centered on the window (not on the space
-/// left by the toggle) and truncated before it would reach the toggle.
-fn top_bar(ui: &mut Ui, repo: &OpenedRepo, palette: &Palette, open: &mut bool) {
+fn side_frame(palette: &Palette) -> Frame {
+    Frame::new()
+        .fill(palette.background)
+        .inner_margin(Margin::same(12))
+}
+
+/// The branch toggle on the left, the detail toggle on the right, and the name
+/// centered on the window. The name is truncated before it would reach either
+/// toggle.
+fn top_bar(
+    ui: &mut Ui,
+    repo: &OpenedRepo,
+    palette: &Palette,
+    branches_open: &mut bool,
+    detail_open: &mut bool,
+) {
     ui.horizontal(|ui| {
-        let (tint, hover) = if *open {
-            (palette.accent, "Hide commit history")
+        let (branches_tint, branches_hover) = if *branches_open {
+            (palette.accent, "Hide branches")
         } else {
-            (palette.text_muted, "Show commit history")
+            (palette.text_muted, "Show branches")
         };
-        let toggle = icons::icon_button(ui, Icon::PanelLeft, tint, hover);
-        if toggle.clicked() {
-            *open = !*open;
+        let branches_toggle =
+            icons::icon_button(ui, Icon::PanelLeft, branches_tint, branches_hover);
+        if branches_toggle.clicked() {
+            *branches_open = !*branches_open;
+        }
+
+        let (detail_tint, detail_hover) = if *detail_open {
+            (palette.accent, "Hide commit details")
+        } else {
+            (palette.text_muted, "Show commit details")
+        };
+        let detail_toggle = ui
+            .with_layout(Layout::right_to_left(Align::Center), |ui| {
+                icons::icon_button(ui, Icon::PanelRight, detail_tint, detail_hover)
+            })
+            .inner;
+        if detail_toggle.clicked() {
+            *detail_open = !*detail_open;
         }
 
         let row = ui.max_rect();
-        let reserved = toggle.rect.right() - row.left() + ui.spacing().item_spacing.x;
+        let spacing = ui.spacing().item_spacing.x;
+        let left_reserved = branches_toggle.rect.right() - row.left() + spacing;
+        let right_reserved = row.right() - detail_toggle.rect.left() + spacing;
+        let reserved = left_reserved.max(right_reserved);
         let name_rect = Rect::from_center_size(
-            Pos2::new(row.center().x, toggle.rect.center().y),
+            Pos2::new(row.center().x, branches_toggle.rect.center().y),
             Vec2::new(
                 (row.width() - 2.0 * reserved).max(0.0),
-                toggle.rect.height(),
+                branches_toggle.rect.height(),
             ),
         );
         ui.put(
@@ -128,6 +168,149 @@ fn top_bar(ui: &mut Ui, repo: &OpenedRepo, palette: &Palette, open: &mut bool) {
         )
         .on_hover_text(repo.info.root.display().to_string());
     });
+}
+
+fn branches_panel(ui: &mut Ui, repo: &mut OpenedRepo, palette: &Palette) {
+    ui.add(
+        Label::new(
+            RichText::new(format!("Branches ({})", repo.branches.len()))
+                .strong()
+                .color(palette.text),
+        )
+        .truncate(),
+    );
+    ui.add_space(6.0);
+
+    if repo.branches.is_empty() {
+        ui.label(RichText::new("No branches.").color(palette.text_muted));
+        return;
+    }
+
+    ScrollArea::vertical()
+        .id_salt(repo.view_id.with("branches"))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for listed in &mut repo.branches {
+                branch_row(ui, listed, palette);
+            }
+        });
+}
+
+fn branch_row(ui: &mut Ui, listed: &mut ListedBranch, palette: &Palette) {
+    let width = ui.available_width();
+    ui.push_id(&listed.branch.name, |ui| {
+        ui.set_max_width(width);
+        ui.horizontal(|ui| {
+            ui.add(egui::Checkbox::without_text(&mut listed.checked));
+            let mut name = RichText::new(&listed.branch.name).color(palette.text);
+            if listed.branch.current {
+                name = name.strong();
+            }
+            let response = ui
+                .add(
+                    Label::new(name)
+                        .truncate()
+                        .selectable(false)
+                        .sense(Sense::click()),
+                )
+                .on_hover_cursor(CursorIcon::PointingHand);
+            if response.clicked() {
+                listed.checked = !listed.checked;
+            }
+        });
+
+        let indent = ui.spacing().icon_width + ui.spacing().item_spacing.x;
+        ui.horizontal(|ui| {
+            ui.add_space(indent);
+            ui.add(
+                Label::new(
+                    RichText::new(branch_metrics(&listed.branch))
+                        .small()
+                        .color(palette.text_muted),
+                )
+                .truncate(),
+            );
+        });
+    });
+    ui.add_space(8.0);
+}
+
+fn branch_metrics(branch: &Branch) -> String {
+    let commits = match branch.commit_count {
+        1 => "1 commit".to_owned(),
+        count => format!("{count} commits"),
+    };
+    match &branch.upstream {
+        Upstream::None => format!("{commits} · no upstream"),
+        Upstream::Gone { name } if name.is_empty() => format!("{commits} · upstream gone"),
+        Upstream::Gone { name } => format!("{commits} · {name} · upstream gone"),
+        Upstream::Tracking {
+            name,
+            ahead,
+            behind,
+        } => {
+            let relation = match (*ahead, *behind) {
+                (0, 0) => "in sync".to_owned(),
+                (ahead, 0) => format!("{ahead} ahead"),
+                (0, behind) => format!("{behind} behind"),
+                (ahead, behind) => format!("{ahead} ahead, {behind} behind"),
+            };
+            if name.is_empty() {
+                format!("{commits} · {relation}")
+            } else {
+                format!("{commits} · {name} · {relation}")
+            }
+        }
+    }
+}
+
+fn detail_panel(ui: &mut Ui, repo: &OpenedRepo, palette: &Palette) {
+    ui.add(Label::new(RichText::new("Latest commit").strong().color(palette.text)).truncate());
+    ui.add_space(6.0);
+
+    let Some(commit) = &repo.latest else {
+        ui.label(RichText::new("No commits yet.").color(palette.text_muted));
+        return;
+    };
+
+    ScrollArea::vertical()
+        .id_salt(repo.view_id.with("detail"))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            detail_field(
+                ui,
+                palette,
+                "Hash",
+                RichText::new(&commit.oid).monospace().color(palette.hash),
+            );
+            let author = format!("{} <{}>", commit.author_name, commit.author_email);
+            detail_field(
+                ui,
+                palette,
+                "Author",
+                RichText::new(author).color(palette.text),
+            );
+            detail_field(
+                ui,
+                palette,
+                "Date",
+                RichText::new(&commit.authored_at).color(palette.text),
+            );
+            ui.label(RichText::new("Message").small().color(palette.text_muted));
+            ui.add_space(2.0);
+            if commit.message.is_empty() {
+                ui.label(RichText::new("No message.").color(palette.text_muted));
+            } else {
+                ui.label(RichText::new(&commit.message).color(palette.text));
+            }
+        });
+}
+
+fn detail_field(ui: &mut Ui, palette: &Palette, label: &str, value: RichText) {
+    ui.label(RichText::new(label).small().color(palette.text_muted));
+    ui.add_space(2.0);
+    ui.add(Label::new(value));
+    ui.add_space(10.0);
 }
 
 fn history(ui: &mut Ui, repo: &OpenedRepo, palette: &Palette) {
@@ -177,5 +360,82 @@ fn branch_text(head: &Head, palette: &Palette) -> (RichText, Color32) {
         Head::Branch(_) => (text.strong().color(palette.text), palette.text),
         Head::Unborn(_) => (text.italics().color(palette.text_muted), palette.text_muted),
         Head::Detached { .. } => (text.color(palette.warning), palette.warning),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn branch(count: u64, upstream: Upstream) -> Branch {
+        Branch {
+            name: "main".to_owned(),
+            commit_count: count,
+            upstream,
+            current: true,
+        }
+    }
+
+    #[test]
+    fn metrics_describe_count_and_upstream() {
+        assert_eq!(
+            branch_metrics(&branch(0, Upstream::None)),
+            "0 commits · no upstream"
+        );
+        assert_eq!(
+            branch_metrics(&branch(1, Upstream::None)),
+            "1 commit · no upstream"
+        );
+        assert_eq!(
+            branch_metrics(&branch(
+                12,
+                Upstream::Tracking {
+                    name: "origin/main".to_owned(),
+                    ahead: 2,
+                    behind: 1,
+                },
+            )),
+            "12 commits · origin/main · 2 ahead, 1 behind"
+        );
+        assert_eq!(
+            branch_metrics(&branch(
+                4,
+                Upstream::Tracking {
+                    name: "origin/main".to_owned(),
+                    ahead: 0,
+                    behind: 0,
+                },
+            )),
+            "4 commits · origin/main · in sync"
+        );
+        assert_eq!(
+            branch_metrics(&branch(
+                3,
+                Upstream::Tracking {
+                    name: "origin/main".to_owned(),
+                    ahead: 2,
+                    behind: 0,
+                },
+            )),
+            "3 commits · origin/main · 2 ahead"
+        );
+        assert_eq!(
+            branch_metrics(&branch(
+                3,
+                Upstream::Gone {
+                    name: "origin/main".to_owned(),
+                },
+            )),
+            "3 commits · origin/main · upstream gone"
+        );
+        assert_eq!(
+            branch_metrics(&branch(
+                3,
+                Upstream::Gone {
+                    name: String::new(),
+                },
+            )),
+            "3 commits · upstream gone"
+        );
     }
 }

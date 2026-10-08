@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
-use cthulhu_git::git::{self, Git, History, RepoInfo};
+use cthulhu_git::git::{self, Branch, CommitDetail, Git, History, RepoInfo};
 use cthulhu_git::settings::Settings;
 use eframe::egui;
 
@@ -29,8 +29,18 @@ const HISTORY_LIMIT: usize = 1000;
 pub struct OpenedRepo {
     pub info: RepoInfo,
     pub history: History,
+    pub branches: Vec<ListedBranch>,
+    pub latest: Option<CommitDetail>,
     /// New on every open, so the history starts scrolled to the top each time.
     pub view_id: egui::Id,
+}
+
+/// A local branch and whether its checkbox is on.
+///
+/// `checked` is kept for a later history filter. The commit list does not read it.
+pub struct ListedBranch {
+    pub branch: Branch,
+    pub checked: bool,
 }
 
 /// What a screen asks the app to do after drawing itself.
@@ -38,7 +48,8 @@ pub enum Action {
     Browse,
     Open(PathBuf),
     Home,
-    ToggleHistorySidebar,
+    ToggleBranchesSidebar,
+    ToggleDetailSidebar,
 }
 
 enum Screen {
@@ -46,7 +57,14 @@ enum Screen {
     Repo(Box<OpenedRepo>),
 }
 
-type OpenResult = Result<(RepoInfo, History), String>;
+struct LoadedRepo {
+    info: RepoInfo,
+    history: History,
+    branches: Vec<Branch>,
+    latest: Option<CommitDetail>,
+}
+
+type OpenResult = Result<LoadedRepo, String>;
 
 struct Opening {
     path: PathBuf,
@@ -125,14 +143,23 @@ impl CthulhuApp {
         };
 
         match result {
-            Ok((info, history)) => {
+            Ok(loaded) => {
                 self.error = None;
-                self.settings.remember_repository(&info.root);
+                self.settings.remember_repository(&loaded.info.root);
                 self.save_settings();
                 self.opened_count += 1;
                 self.screen = Screen::Repo(Box::new(OpenedRepo {
-                    info,
-                    history,
+                    info: loaded.info,
+                    history: loaded.history,
+                    branches: loaded
+                        .branches
+                        .into_iter()
+                        .map(|branch| ListedBranch {
+                            branch,
+                            checked: true,
+                        })
+                        .collect(),
+                    latest: loaded.latest,
                     view_id: egui::Id::new(("repo-view", self.opened_count)),
                 }));
             }
@@ -185,7 +212,7 @@ impl eframe::App for CthulhuApp {
         self.poll_opening();
         self.poll_picker(ui.ctx());
 
-        let action = match &self.screen {
+        let actions = match &mut self.screen {
             Screen::Home => home::show(
                 ui,
                 &home::HomeState {
@@ -194,33 +221,41 @@ impl eframe::App for CthulhuApp {
                     opening: self.opening.as_ref().map(|opening| opening.path.as_path()),
                     error: self.error.as_deref(),
                 },
-            ),
+            )
+            .into_iter()
+            .collect(),
             Screen::Repo(repo) => repo_view::show(
                 ui,
                 repo,
                 self.error.as_deref(),
                 !self.settings.history_sidebar_hidden,
+                !self.settings.detail_sidebar_hidden,
             ),
         };
 
-        match action {
-            Some(Action::Browse) => {
-                self.error = None;
-                self.picker = Some(FolderPicker::open(ui.ctx(), frame, self.browse_start()));
+        for action in actions {
+            match action {
+                Action::Browse => {
+                    self.error = None;
+                    self.picker = Some(FolderPicker::open(ui.ctx(), frame, self.browse_start()));
+                }
+                Action::Open(path) => {
+                    self.error = None;
+                    self.open(ui.ctx(), path);
+                }
+                Action::Home => {
+                    self.error = None;
+                    self.screen = Screen::Home;
+                }
+                Action::ToggleBranchesSidebar => {
+                    self.settings.history_sidebar_hidden = !self.settings.history_sidebar_hidden;
+                    self.save_settings();
+                }
+                Action::ToggleDetailSidebar => {
+                    self.settings.detail_sidebar_hidden = !self.settings.detail_sidebar_hidden;
+                    self.save_settings();
+                }
             }
-            Some(Action::Open(path)) => {
-                self.error = None;
-                self.open(ui.ctx(), path);
-            }
-            Some(Action::Home) => {
-                self.error = None;
-                self.screen = Screen::Home;
-            }
-            Some(Action::ToggleHistorySidebar) => {
-                self.settings.history_sidebar_hidden = !self.settings.history_sidebar_hidden;
-                self.save_settings();
-            }
-            None => {}
         }
     }
 }
@@ -230,5 +265,14 @@ fn load(path: &Path) -> OpenResult {
     let info = git::inspect(&git, path).map_err(|error| error.to_string())?;
     let history = git::history(&git, &info.root, &info.head, HISTORY_LIMIT)
         .map_err(|error| error.to_string())?;
-    Ok((info, history))
+    let branches =
+        git::branches(&git, &info.root, &info.head).map_err(|error| error.to_string())?;
+    let latest =
+        git::latest_commit(&git, &info.root, &info.head).map_err(|error| error.to_string())?;
+    Ok(LoadedRepo {
+        info,
+        history,
+        branches,
+        latest,
+    })
 }

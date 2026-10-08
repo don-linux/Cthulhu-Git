@@ -16,6 +16,7 @@ const ICON_SIZE: f32 = 18.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
     PanelLeft,
+    PanelRight,
     House,
     GitBranch,
 }
@@ -25,6 +26,7 @@ impl Icon {
     fn name(self) -> &'static str {
         match self {
             Self::PanelLeft => "panel-left",
+            Self::PanelRight => "panel-right",
             Self::House => "house",
             Self::GitBranch => "git-branch",
         }
@@ -33,6 +35,7 @@ impl Icon {
     fn rgba(self) -> &'static [u8] {
         match self {
             Self::PanelLeft => include_bytes!(concat!(env!("OUT_DIR"), "/icons/panel-left.rgba")),
+            Self::PanelRight => include_bytes!(concat!(env!("OUT_DIR"), "/icons/panel-right.rgba")),
             Self::House => include_bytes!(concat!(env!("OUT_DIR"), "/icons/house.rgba")),
             Self::GitBranch => include_bytes!(concat!(env!("OUT_DIR"), "/icons/git-branch.rgba")),
         }
@@ -78,7 +81,12 @@ mod tests {
 
     #[test]
     fn rendered_icons_have_the_texture_size() {
-        for icon in [Icon::PanelLeft, Icon::House, Icon::GitBranch] {
+        for icon in [
+            Icon::PanelLeft,
+            Icon::PanelRight,
+            Icon::House,
+            Icon::GitBranch,
+        ] {
             assert_eq!(
                 icon.rgba().len(),
                 TEXTURE_SIZE * TEXTURE_SIZE * 4,

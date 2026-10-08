@@ -521,12 +521,14 @@ proptest! {
         last in prop::option::of(arb_path_string()),
         recents in arb_recents(),
         hidden in any::<bool>(),
+        detail_hidden in any::<bool>(),
     ) {
         let settings = Settings {
             theme,
             last_repository: last.map(PathBuf::from),
             recent_repositories: recents,
             history_sidebar_hidden: hidden,
+            detail_sidebar_hidden: detail_hidden,
         };
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("nested").join(FILE_NAME);
@@ -537,6 +539,7 @@ proptest! {
         assert_eq!(loaded.theme, settings.theme);
         assert_eq!(loaded.last_repository, settings.last_repository);
         assert_eq!(loaded.history_sidebar_hidden, settings.history_sidebar_hidden);
+        assert_eq!(loaded.detail_sidebar_hidden, settings.detail_sidebar_hidden);
         assert_eq!(loaded.recent_repositories, expected_recents);
         assert_recents_normalized(&loaded.recent_repositories);
 
@@ -558,6 +561,7 @@ proptest! {
         last in prop::option::of(arb_path_string()),
         recents in prop::option::of(prop::collection::vec(arb_path_string(), 0..14)),
         hidden in prop::option::of(any::<bool>()),
+        detail_hidden in prop::option::of(any::<bool>()),
         unknown_key in "[a-z][a-z0-9]{0,11}",
         unknown_value in any::<i64>(),
     ) {
@@ -589,6 +593,12 @@ proptest! {
                 serde_json::Value::Bool(hidden),
             );
         }
+        if let Some(detail_hidden) = detail_hidden {
+            object.insert(
+                "detail_sidebar_hidden".to_owned(),
+                serde_json::Value::Bool(detail_hidden),
+            );
+        }
         object.insert(
             format!("future_{unknown_key}"),
             serde_json::Value::Number(unknown_value.into()),
@@ -606,6 +616,10 @@ proptest! {
             last.as_ref().map(PathBuf::from)
         );
         assert_eq!(loaded.history_sidebar_hidden, hidden.unwrap_or(false));
+        assert_eq!(
+            loaded.detail_sidebar_hidden,
+            detail_hidden.unwrap_or(false)
+        );
         let expected = recents.unwrap_or_default();
         let expected: Vec<PathBuf> = expected.iter().map(PathBuf::from).collect();
         assert_eq!(loaded.recent_repositories, normalized_recents(&expected));

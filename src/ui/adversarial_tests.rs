@@ -16,7 +16,7 @@ use std::process::{Command, Output};
 use std::thread;
 use std::time::Duration;
 
-use cthulhu_git::git::{Commit, Head, History, RepoInfo};
+use cthulhu_git::git::{Branch, Commit, CommitDetail, Head, History, RepoInfo, Upstream};
 use cthulhu_git::settings::Settings;
 use eframe::egui::{self, accesskit::Role};
 use egui_kittest::Harness;
@@ -25,7 +25,7 @@ use tempfile::TempDir;
 
 use super::home::{self, HomeState};
 use super::repo_view;
-use super::{CthulhuApp, OpenedRepo, Screen};
+use super::{CthulhuApp, ListedBranch, OpenedRepo, Screen};
 
 const CHILD_ENV: &str = "CTHULHU_ADVERSARIAL_UI_CHILD";
 const WINDOW_SIZE: egui::Vec2 = egui::Vec2::new(520.0, 400.0);
@@ -296,7 +296,41 @@ fn click_extreme_button<State>(harness: &Harness<'_, State>, top: bool) {
     buttons[chosen].click();
 }
 
+fn click_leftmost_top_button<State>(harness: &Harness<'_, State>) {
+    let buttons: Vec<_> = harness.query_all_by_role(Role::Button).collect();
+    assert!(
+        !buttons.is_empty(),
+        "no buttons in the layout:\n{}",
+        visible_text(harness)
+    );
+    let top_y = buttons
+        .iter()
+        .map(|button| button.rect().center().y)
+        .fold(f32::MAX, f32::min);
+    let mut chosen = 0;
+    let mut best_x = f32::MAX;
+    for (index, button) in buttons.iter().enumerate() {
+        let center = button.rect().center();
+        if (center.y - top_y).abs() > 1.0 {
+            continue;
+        }
+        if center.x < best_x {
+            best_x = center.x;
+            chosen = index;
+        }
+    }
+    buttons[chosen].click();
+}
+
 fn opened(name: &str, commits: Vec<Commit>, truncated: bool) -> OpenedRepo {
+    let commit_count = commits.len() as u64;
+    let latest = commits.first().map(|commit| CommitDetail {
+        oid: commit.oid.clone(),
+        author_name: "cthulhu".to_owned(),
+        author_email: "cthulhu@example.invalid".to_owned(),
+        authored_at: "2026-01-01 00:00".to_owned(),
+        message: commit.summary.clone(),
+    });
     OpenedRepo {
         info: RepoInfo {
             root: PathBuf::from("/repos").join(name),
@@ -304,6 +338,16 @@ fn opened(name: &str, commits: Vec<Commit>, truncated: bool) -> OpenedRepo {
             head: Head::Branch("main".to_owned()),
         },
         history: History { commits, truncated },
+        branches: vec![ListedBranch {
+            branch: Branch {
+                name: "main".to_owned(),
+                commit_count,
+                upstream: Upstream::None,
+                current: true,
+            },
+            checked: true,
+        }],
+        latest,
         view_id: egui::Id::new(("adversarial-repo", name.len(), truncated)),
     }
 }
@@ -533,6 +577,7 @@ fn child_history_sidebar_toggle() {
     let mut harness = app_harness(Some(repo.root.clone()));
     settle_open(&mut harness);
     assert_repo(&harness, "sidebar-repo");
+    assert_text(&harness, "Branches");
     assert_text(&harness, "Commit history");
     assert_eq!(
         settings_json()["history_sidebar_hidden"].as_bool(),
@@ -540,13 +585,13 @@ fn child_history_sidebar_toggle() {
     );
     let last_before = settings_json()["last_repository"].clone();
 
-    click_extreme_button(&harness, true);
+    click_leftmost_top_button(&harness);
     harness.step();
 
     assert_eq!(
         settings_json()["history_sidebar_hidden"].as_bool(),
         Some(true),
-        "history sidebar toggle was not saved"
+        "branches sidebar toggle was not saved"
     );
     assert_eq!(
         settings_json()["last_repository"],
@@ -554,7 +599,8 @@ fn child_history_sidebar_toggle() {
         "toggling the sidebar changed last_repository"
     );
     assert!(harness.state().settings.history_sidebar_hidden);
-    assert_eq!(count_text(&harness, "Commit history"), 0);
+    assert_eq!(count_text(&harness, "Branches"), 0);
+    assert_text(&harness, "Commit history");
     println!("CHILD_OK history_sidebar_toggle");
 }
 
@@ -581,9 +627,9 @@ fn adversarial_long_recent_name_stays_in_layout() {
 fn adversarial_min_window_long_name_and_bidi_summary() {
     let name = "N".repeat(400);
     let summary = "port \u{202E}starboard\u{202C} side";
-    let repo = opened(&name, vec![commit(summary)], false);
+    let mut repo = opened(&name, vec![commit(summary)], false);
     let harness = ui_harness(|ui| {
-        let _ = repo_view::show(ui, &repo, None, true);
+        let _ = repo_view::show(ui, &mut repo, None, true, true);
     });
     assert_text(&harness, &name);
     assert_text(&harness, "\u{202E}");
@@ -600,9 +646,9 @@ fn adversarial_thousand_commits_are_virtualized() {
             summary: format!("commit-{index:04}"),
         })
         .collect();
-    let repo = opened("bulk-history", commits, true);
+    let mut repo = opened("bulk-history", commits, true);
     let harness = ui_harness(|ui| {
-        let _ = repo_view::show(ui, &repo, None, true);
+        let _ = repo_view::show(ui, &mut repo, None, true, false);
     });
     assert_text(&harness, "Showing the latest 1000 commits.");
     assert_text(&harness, "Commit history (1000+)");

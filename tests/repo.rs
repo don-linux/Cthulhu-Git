@@ -4,7 +4,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cthulhu_git::git::{Git, GitError, Head, History, RepoInfo, SHORT_OID_LEN, history, inspect};
+use cthulhu_git::git::{
+    Git, GitError, Head, History, RepoInfo, SHORT_OID_LEN, Upstream, branches, history, inspect,
+    latest_commit,
+};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -232,6 +235,75 @@ fn history_follows_a_detached_head() {
 fn empty_repository_has_empty_history() {
     let fixture = Fixture::init();
     assert_eq!(fixture.history(10), History::default());
+}
+
+#[test]
+fn unborn_repository_lists_its_branch_and_has_no_commit_detail() {
+    let fixture = Fixture::init();
+    let info = fixture.inspect();
+    let listed = branches(&fixture.git, &info.root, &info.head).expect("branches");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "main");
+    assert!(listed[0].current);
+    assert_eq!(listed[0].commit_count, 0);
+    assert_eq!(listed[0].upstream, Upstream::None);
+    assert_eq!(
+        latest_commit(&fixture.git, &info.root, &info.head).expect("detail"),
+        None
+    );
+}
+
+#[test]
+fn branches_report_commit_counts_and_ahead_behind() {
+    let fixture = Fixture::with_commit();
+    fixture.git(&["branch", "feature"]);
+    fixture.git(&["switch", "feature"]);
+    fixture.commit("Second\n\nThe body is not part of the summary.");
+    fixture.git(&["branch", "--set-upstream-to=main"]);
+
+    let info = fixture.inspect();
+    let listed = branches(&fixture.git, &info.root, &info.head).expect("branches");
+    assert_eq!(listed.len(), 2);
+
+    let feature = &listed[0];
+    assert_eq!(feature.name, "feature");
+    assert!(feature.current);
+    assert_eq!(feature.commit_count, 2);
+    assert_eq!(
+        feature.upstream,
+        Upstream::Tracking {
+            name: "main".to_owned(),
+            ahead: 1,
+            behind: 0,
+        }
+    );
+
+    let main = &listed[1];
+    assert_eq!(main.name, "main");
+    assert!(!main.current);
+    assert_eq!(main.commit_count, 1);
+    assert_eq!(main.upstream, Upstream::None);
+
+    let detail = latest_commit(&fixture.git, &info.root, &info.head)
+        .expect("detail")
+        .expect("commit");
+    assert_eq!(detail.oid, fixture.git(&["rev-parse", "HEAD"]));
+    assert_eq!(detail.author_name, "cthulhu");
+    assert_eq!(detail.author_email, "cthulhu@example.invalid");
+    assert!(
+        detail
+            .message
+            .starts_with("Second\n\nThe body is not part of the summary."),
+        "{:?}",
+        detail.message
+    );
+    let expected_date = fixture.git(&[
+        "log",
+        "-1",
+        "--date=format-local:%Y-%m-%d %H:%M",
+        "--format=%ad",
+    ]);
+    assert_eq!(detail.authored_at, expected_date);
 }
 
 const CHILD_TARGET_VAR: &str = "CTHULHU_TEST_INSPECT_TARGET";
