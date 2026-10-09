@@ -5,15 +5,21 @@
 //!
 //! The font browser is a modal drawn after the panels, so its veil covers the
 //! bar, the navigation, and the page.
+//!
+//! The Terminal page draws one prompt line in the chosen font. That shell
+//! ignores pointer and keyboard, and it is not the repository terminal.
+
+use std::path::Path;
 
 use eframe::egui::{
     self, Align, Button, Color32, CursorIcon, Frame, Id, Key, Layout, Margin, RichText, ScrollArea,
-    Sense, Stroke, TextEdit, Ui, UiBuilder,
+    Sense, Stroke, TextEdit, Ui, UiBuilder, Vec2,
 };
 
 use super::Action;
 use super::fonts::{self, CatalogPhase, FacePhase, FontService};
 use super::icons::{self, Icon};
+use super::terminal::{self, Terminal};
 use super::theme::{self, Palette};
 use super::widgets;
 
@@ -22,7 +28,8 @@ const FORM_WIDTH: f32 = 560.0;
 const MODAL_WIDTH: f32 = 440.0;
 const MODAL_FADE_SECS: f32 = 0.15;
 const MODAL_BACKDROP_ALPHA: u8 = 160;
-const SAMPLE: &str = "The quick brown fox jumps over 0123456789";
+/// Space above and below the prompt, inside the preview border.
+const PREVIEW_PAD: f32 = 8.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -35,7 +42,13 @@ struct FontPicker {
     query: String,
 }
 
-pub fn show(ui: &mut Ui, terminal_font: Option<&str>, fonts: &FontService) -> Vec<Action> {
+pub fn show(
+    ui: &mut Ui,
+    terminal_font: Option<&str>,
+    fonts: &FontService,
+    preview: &mut Option<Terminal>,
+    cwd: Option<&Path>,
+) -> Vec<Action> {
     let palette = theme::current(ui.ctx()).palette;
     let mut actions = Vec::new();
     let mut page = ui
@@ -103,15 +116,21 @@ pub fn show(ui: &mut Ui, terminal_font: Option<&str>, fonts: &FontService) -> Ve
                 ui.set_min_width(width);
                 ui.set_max_width(width);
                 match page {
-                    Page::Terminal => terminal_page(
-                        ui,
-                        &palette,
-                        terminal_font,
-                        &view,
-                        &mut picker,
-                        modal_visible,
-                        &mut actions,
-                    ),
+                    Page::Terminal => {
+                        terminal_page(
+                            ui,
+                            &palette,
+                            terminal_font,
+                            &view,
+                            &mut picker,
+                            modal_visible,
+                            &mut actions,
+                        );
+                        if let Some(cwd) = cwd {
+                            ui.add_space(8.0);
+                            shell_preview(ui, &palette, preview, cwd);
+                        }
+                    }
                 }
             });
     });
@@ -165,11 +184,46 @@ fn terminal_page(
     }
     ui.add_space(8.0);
     font_hint(ui, palette, view);
-    if let FacePhase::Ready { .. } = view.face {
-        ui.add_space(8.0);
-        let font = fonts::terminal_font_id(ui);
-        ui.label(RichText::new(SAMPLE).font(font).color(palette.text));
-    }
+}
+
+/// One prompt line, clipped out of a normal-sized shell. A one-row PTY scrolls
+/// the prompt away. The shell measures the terminal font each frame, so a new
+/// family shows up here without touching the repository session. Pointer and
+/// keyboard are ignored.
+fn shell_preview(ui: &mut Ui, palette: &Palette, preview: &mut Option<Terminal>, cwd: &Path) {
+    let row = terminal_row_height(ui);
+    let size = Vec2::new(ui.available_width(), row + PREVIEW_PAD * 2.0);
+    let drawn = ui.allocate_ui(size, |ui| {
+        ui.set_min_size(size);
+        let outer = ui.max_rect();
+        ui.painter().rect_filled(outer, 0.0, palette.background);
+        let content = outer.shrink2(Vec2::new(0.0, PREVIEW_PAD));
+        ui.scope_builder(UiBuilder::new().max_rect(content), |ui| {
+            ui.shrink_clip_rect(content);
+            terminal::show(ui, preview, cwd, preview_view_id(), palette, false);
+        });
+        // Clicks land here, including the padding, and do nothing.
+        let _ = ui.interact(outer, preview_hit_id(), Sense::CLICK | Sense::DRAG);
+    });
+    ui.painter().rect_stroke(
+        drawn.response.rect,
+        0.0,
+        Stroke::new(1.0, palette.border),
+        egui::StrokeKind::Inside,
+    );
+}
+
+fn terminal_row_height(ui: &Ui) -> f32 {
+    let font = fonts::terminal_font_id(ui);
+    ui.ctx().fonts_mut(|fonts| fonts.row_height(&font).max(1.0))
+}
+
+fn preview_hit_id() -> Id {
+    preview_view_id().with("hit")
+}
+
+fn preview_view_id() -> Id {
+    Id::new("settings-font-preview")
 }
 
 /// Commits when the field loses focus, including Enter. Escape reverts.

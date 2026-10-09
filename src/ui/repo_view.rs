@@ -164,6 +164,7 @@ fn detail_column(ui: &mut Ui, repo: &mut OpenedRepo, palette: &Palette, terminal
             &repo.info.root,
             repo.view_id,
             palette,
+            true,
         );
     });
 }

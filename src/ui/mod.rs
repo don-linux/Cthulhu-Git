@@ -93,6 +93,10 @@ pub struct CthulhuApp {
     /// Covers the current screen. A repository underneath stays open.
     settings_open: bool,
     fonts: fonts::FontService,
+    /// Shell drawn on the Terminal settings page. Separate from the repository
+    /// terminal so the preview size does not resize that session. Dropped when
+    /// settings closes; not saved.
+    font_preview: Option<terminal::Terminal>,
 }
 
 impl CthulhuApp {
@@ -123,6 +127,7 @@ impl CthulhuApp {
             opened_count: 0,
             settings_open: false,
             fonts: fonts::FontService::default(),
+            font_preview: None,
         };
         if let Some(path) = startup {
             app.open(ctx, path);
@@ -237,7 +242,18 @@ impl eframe::App for CthulhuApp {
                 terminal::service(ui.ctx(), &mut repo.terminal);
                 terminal::surrender_focus(ui.ctx(), repo.view_id);
             }
-            settings::show(ui, self.settings.terminal_font.as_deref(), &self.fonts)
+            let cwd = match &self.screen {
+                Screen::Repo(repo) => Some(repo.info.root.clone()),
+                Screen::Home => None,
+            };
+            terminal::service(ui.ctx(), &mut self.font_preview);
+            settings::show(
+                ui,
+                self.settings.terminal_font.as_deref(),
+                &self.fonts,
+                &mut self.font_preview,
+                cwd.as_deref(),
+            )
         } else {
             match &mut self.screen {
                 Screen::Home => home::show(
@@ -275,6 +291,7 @@ impl eframe::App for CthulhuApp {
                 Action::Home => {
                     self.error = None;
                     self.settings_open = false;
+                    self.font_preview = None;
                     self.screen = Screen::Home;
                 }
                 Action::OpenSettings => {
@@ -282,6 +299,7 @@ impl eframe::App for CthulhuApp {
                 }
                 Action::CloseSettings => {
                     self.settings_open = false;
+                    self.font_preview = None;
                 }
                 Action::ToggleBranchesSidebar => {
                     self.settings.history_sidebar_hidden = !self.settings.history_sidebar_hidden;

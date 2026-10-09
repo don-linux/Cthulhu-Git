@@ -2,9 +2,10 @@
 //!
 //! The scan runs once, on a background thread, the first time a family is
 //! needed. The chosen face is registered under egui's named family
-//! `"terminal"`, so the rest of the interface keeps its monospace. Until that
-//! face is ready — or when the name is blank or unknown — the terminal uses
-//! the built-in monospace.
+//! `"terminal"`, so the rest of the interface keeps its monospace. egui loads
+//! `set_fonts` on the following pass, so the named family stays unused until
+//! then. Until that face is ready — or when the name is blank or unknown —
+//! the terminal uses the built-in monospace.
 //!
 //! `fontdb` reads fontconfig's file list through its Rust parser. It does not
 //! link `libfontconfig`.
@@ -105,6 +106,8 @@ pub struct FontService {
     applied: Applied,
     /// A custom face is in egui's font map. Clearing it restores the defaults.
     installed: bool,
+    /// `set_fonts` was queued this pass. The named family is bound on the next one.
+    activate_next_pass: bool,
 }
 
 impl Default for FontService {
@@ -113,6 +116,7 @@ impl Default for FontService {
             slot: Slot::Idle,
             applied: Applied::Builtin,
             installed: false,
+            activate_next_pass: false,
         }
     }
 }
@@ -133,6 +137,11 @@ impl FontService {
     /// Picks up a finished scan and registers `wanted` when the catalog can answer.
     pub fn sync(&mut self, ctx: &egui::Context, wanted: Option<&str>) {
         self.poll();
+        // Fonts queued last pass are loaded before this call.
+        if self.activate_next_pass {
+            set_active(ctx, true);
+            self.activate_next_pass = false;
+        }
         let Some(name) = wanted else {
             self.use_builtin(ctx);
             return;
@@ -249,6 +258,11 @@ impl FontService {
                     name: name.to_owned(),
                     monospace,
                 };
+                // A replacement is already bound this pass. The first install
+                // is not, so the named family stays off until the next one.
+                if !family_active(ctx) {
+                    self.activate_next_pass = true;
+                }
             }
             Err(error) => {
                 self.clear_installed(ctx);
@@ -261,6 +275,7 @@ impl FontService {
     }
 
     fn clear_installed(&mut self, ctx: &egui::Context) {
+        self.activate_next_pass = false;
         if self.installed {
             ctx.set_fonts(FontDefinitions::default());
             self.installed = false;
@@ -276,8 +291,8 @@ struct ChosenFace {
     monospace: bool,
 }
 
-/// The font the terminal grid measures. The named family is used only after
-/// [`register`] has installed a face.
+/// The font the terminal grid measures. The named family is used only on a
+/// pass where egui has already loaded it.
 pub fn terminal_font_id(ui: &egui::Ui) -> FontId {
     let mut font = TextStyle::Monospace.resolve(ui.style());
     if family_active(ui.ctx()) {
@@ -401,7 +416,8 @@ fn catalog_from_faces(faces: Vec<FaceChoice>) -> Catalog {
 }
 
 /// Puts `bytes` in the terminal family. Monospace stays the fallback for glyphs
-/// this file does not have, and is not itself replaced.
+/// this file does not have, and is not itself replaced. The named family is
+/// bound on the next pass, not this one.
 fn register(ctx: &egui::Context, bytes: Vec<u8>, index: u32) {
     let mut fonts = FontDefinitions::default();
     let mut data = FontData::from_owned(bytes);
@@ -417,7 +433,6 @@ fn register(ctx: &egui::Context, bytes: Vec<u8>, index: u32) {
         .families
         .insert(FontFamily::Name(TERMINAL_FAMILY.into()), chain);
     ctx.set_fonts(fonts);
-    set_active(ctx, true);
     ctx.request_repaint();
 }
 
@@ -515,5 +530,78 @@ mod tests {
         ]);
         assert_eq!(catalog.names, vec!["apple".to_owned(), "Zebra".to_owned()]);
         assert_eq!(catalog.faces.len(), 3);
+    }
+
+    /// egui binds `set_fonts` at the start of the next pass. Measuring the
+    /// named family on the install pass is the panic this guards.
+    #[test]
+    fn terminal_family_is_measured_on_the_pass_after_it_is_queued() {
+        let bytes = FontDefinitions::default()
+            .font_data
+            .get("Hack")
+            .expect("egui monospace")
+            .font
+            .clone()
+            .into_owned();
+        let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&scratch).expect("target dir");
+        let dir = tempfile::tempdir_in(&scratch).expect("temp dir");
+        let path = dir.path().join("Hack.ttf");
+        std::fs::write(&path, bytes).expect("write font");
+
+        let ctx = egui::Context::default();
+        let mut service = FontService {
+            slot: Slot::Ready(catalog_from_faces(vec![stored_face("Test Mono", &path)])),
+            ..FontService::default()
+        };
+
+        ctx.begin_pass(egui::RawInput::default());
+        service.sync(&ctx, Some("Test Mono"));
+        assert!(!family_active(&ctx));
+        assert!(service.activate_next_pass);
+        finish_pass(&ctx);
+
+        ctx.begin_pass(egui::RawInput::default());
+        service.sync(&ctx, Some("Test Mono"));
+        assert!(family_active(&ctx));
+        assert!(!service.activate_next_pass);
+        let named = FontId::new(14.0, FontFamily::Name(TERMINAL_FAMILY.into()));
+        ctx.fonts_mut(|fonts| {
+            assert!(fonts.glyph_width(&named, 'M') > 0.0);
+        });
+        finish_pass(&ctx);
+
+        service.slot = Slot::Ready(catalog_from_faces(vec![stored_face("Other Mono", &path)]));
+        ctx.begin_pass(egui::RawInput::default());
+        service.sync(&ctx, Some("Other Mono"));
+        assert!(family_active(&ctx));
+        assert!(!service.activate_next_pass);
+        ctx.fonts_mut(|fonts| {
+            assert!(fonts.glyph_width(&named, 'M') > 0.0);
+        });
+        finish_pass(&ctx);
+
+        ctx.begin_pass(egui::RawInput::default());
+        service.sync(&ctx, None);
+        assert!(!family_active(&ctx));
+        assert!(!service.activate_next_pass);
+        finish_pass(&ctx);
+    }
+
+    fn finish_pass(ctx: &egui::Context) {
+        // Dropping an unapplied texture delta panics. This test has no renderer.
+        let mut output = ctx.end_pass();
+        output.textures_delta.clear();
+    }
+
+    fn stored_face(family: &str, path: &std::path::Path) -> FaceChoice {
+        FaceChoice {
+            family: family.to_owned(),
+            path: path.to_owned(),
+            index: 0,
+            weight: 400,
+            italic: false,
+            monospace: true,
+        }
     }
 }

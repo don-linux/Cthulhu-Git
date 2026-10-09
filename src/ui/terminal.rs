@@ -348,40 +348,66 @@ pub fn service(ctx: &egui::Context, terminal: &mut Option<Terminal>) {
     }
 }
 
+/// Screen the settings preview keeps. The widget draws one line; a one-row
+/// PTY scrolls the prompt off that line and leaves the cursor.
+const PREVIEW_SCREEN_HEIGHT: f32 = 240.0;
+
 /// Paint the strip and, the first time, start the shell.
+///
+/// When `interactive` is false the shell still runs, so the prompt uses the
+/// current face, but pointer and keyboard are ignored. The widget is clipped
+/// to one line. The PTY stays [`PREVIEW_SCREEN_HEIGHT`] tall.
 pub fn show(
     ui: &mut Ui,
     terminal: &mut Option<Terminal>,
     cwd: &Path,
     view_id: Id,
     palette: &Palette,
+    interactive: bool,
 ) {
-    let rect = ui.available_rect_before_wrap();
-    let metrics = metrics(ui, rect);
-    ui.painter().rect_filled(rect, 0.0, palette.background);
+    let visible = ui.available_rect_before_wrap();
+    let grid = if interactive {
+        visible
+    } else {
+        Rect::from_min_size(
+            visible.min,
+            Vec2::new(visible.width().max(1.0), PREVIEW_SCREEN_HEIGHT),
+        )
+    };
+    let metrics = metrics(ui, grid);
+    let painter = ui.painter().with_clip_rect(visible);
+    painter.rect_filled(visible, 0.0, palette.background);
 
     if terminal.is_none() {
         *terminal = start_shell(ui.ctx(), cwd, &metrics);
     }
 
+    if !interactive {
+        surrender_focus(ui.ctx(), view_id);
+    }
+
     let mut restart = false;
     match terminal {
         Some(Terminal::Exited { message }) => {
-            restart = exited_prompt(ui, rect, message, palette);
+            restart = exited_prompt(ui, visible, message, palette, interactive);
         }
         Some(Terminal::Live(session)) => {
-            let response = ui.interact(rect, focus_id(view_id), Sense::click_and_drag());
-            let response = response.on_hover_cursor(CursorIcon::Text);
-            if response.hovered() && ui.input(|input| input.pointer.primary_pressed()) {
-                response.request_focus();
+            if interactive {
+                let response = ui.interact(visible, focus_id(view_id), Sense::click_and_drag());
+                let response = response.on_hover_cursor(CursorIcon::Text);
+                if response.hovered() && ui.input(|input| input.pointer.primary_pressed()) {
+                    response.request_focus();
+                }
+                session.resize(&metrics, ui.pixels_per_point());
+                let focused = response.has_focus();
+                handle_pointer(ui, session, &response, visible, &metrics);
+                if focused {
+                    handle_keys(ui, session);
+                }
+            } else {
+                session.resize(&metrics, ui.pixels_per_point());
             }
-            session.resize(&metrics, ui.pixels_per_point());
-            let focused = response.has_focus();
-            handle_pointer(ui, session, &response, rect, &metrics);
-            if focused {
-                handle_keys(ui, session);
-            }
-            paint(ui.painter(), session, rect, &metrics, palette);
+            paint(&painter, session, visible, &metrics, palette);
         }
         None => {}
     }
@@ -397,7 +423,24 @@ fn start_shell(ctx: &egui::Context, cwd: &Path, metrics: &Metrics) -> Option<Ter
     }
 }
 
-fn exited_prompt(ui: &mut Ui, rect: Rect, message: &str, palette: &Palette) -> bool {
+fn exited_prompt(
+    ui: &mut Ui,
+    rect: Rect,
+    message: &str,
+    palette: &Palette,
+    interactive: bool,
+) -> bool {
+    if !interactive {
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        ui.painter().text(
+            rect.left_top(),
+            Align2::LEFT_TOP,
+            message,
+            font,
+            palette.text_muted,
+        );
+        return false;
+    }
     let mut restart = false;
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
         ui.vertical_centered(|ui| {

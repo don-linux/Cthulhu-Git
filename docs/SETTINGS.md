@@ -11,6 +11,7 @@ decide    command-line folder > settings.last_repository > home screen
 change    mutate CthulhuApp.settings -> CthulhuApp::save_settings() -> Settings::save_to(path)
 font      a saved terminal_font starts a background scan of installed families
           until the face is registered, the terminal keeps the built-in monospace
+          the Terminal page shows one prompt line from a full-height preview shell and ignores input; the preview is not saved
 ```
 
 Saved right away on every change (no timer, no save-on-exit). The write is
@@ -28,6 +29,7 @@ atomic: a temp file next to `settings.json` is renamed over it
 | `src/settings.rs` | `remember_repository`, `forget_last_repository` | Last and recent repositories |
 | `src/settings.rs` | `set_terminal_font` | Trims the terminal family; a blank name clears it |
 | `src/ui/settings.rs` | `show` | Settings sidebar and the Terminal page |
+| `src/ui/mod.rs` | `CthulhuApp::font_preview` | Full-height shell on the Terminal page, clipped to one prompt line. Ignores pointer and keyboard. Dropped when settings closes. Not saved |
 | `src/ui/fonts.rs` | `FontService` | Lists installed families on a background thread and registers the terminal face |
 | `src/ui/mod.rs` | `Action::SetTerminalFont` | Stores the family and saves |
 | `src/settings.rs` | `MAX_RECENT_REPOSITORIES` | Recent list size (10) |
