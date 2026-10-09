@@ -19,9 +19,6 @@ use eframe::egui::{self, FontData, FontDefinitions, FontFamily, FontId, Id, Text
 /// egui family that holds only the terminal face.
 pub const TERMINAL_FAMILY: &str = "terminal";
 
-/// Names drawn at once in the font browser.
-pub const PAGE_SIZE: usize = 12;
-
 /// One installed face. Several faces can share a family (regular, bold, italic).
 #[derive(Clone)]
 struct FaceChoice {
