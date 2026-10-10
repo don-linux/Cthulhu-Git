@@ -1,8 +1,8 @@
 //! Repository screen. A top bar with the branch and detail toggles and the
 //! repository name, a sidebar of local branches, the commit graph in the
 //! middle, the latest commit on the right with the terminal beneath it, and a
-//! bottom bar with the Home and Settings buttons, the current branch, and the
-//! terminal toggle at the right end.
+//! bottom bar with the Home and Settings buttons, the current branch with
+//! fetch and pull, and the terminal toggle at the right end.
 
 use cthulhu_git::git::{Branch, Commit, GraphBranch, GraphRow, Head, Upstream};
 use eframe::egui::{
@@ -14,7 +14,7 @@ use super::icons::{self, Icon};
 use super::terminal;
 use super::theme::{self, Palette};
 use super::widgets;
-use super::{Action, ListedBranch, OpenedRepo};
+use super::{Action, ListedBranch, OpenedRepo, SyncKind};
 
 const LANE_WIDTH: f32 = 14.0;
 const SIDEBAR_DEFAULT_WIDTH: f32 = 320.0;
@@ -28,6 +28,7 @@ pub fn show(
     branches_open: bool,
     detail_open: bool,
     terminal_open: bool,
+    syncing: Option<SyncKind>,
 ) -> Vec<Action> {
     let palette = theme::current(ui.ctx()).palette;
     let mut actions = Vec::new();
@@ -64,19 +65,61 @@ pub fn show(
                 ui.separator();
                 let (branch, color) = branch_text(&repo.info.head, &palette);
                 icons::icon(ui, Icon::GitBranch, color).on_hover_text("Current branch");
+                let offer = sync_offer(&repo.info.head, &repo.branches);
+                let (fetch_on, pull_on, fetch_hover, pull_hover) = match syncing {
+                    Some(SyncKind::Fetch) => (false, false, "Fetching…", "Fetching…"),
+                    Some(SyncKind::Pull) => (false, false, "Pulling…", "Pulling…"),
+                    None => (
+                        offer.fetch_upstream.is_some(),
+                        offer.pull,
+                        offer.fetch_hover,
+                        offer.pull_hover,
+                    ),
+                };
                 let (terminal_tint, terminal_hover) = if terminal_open {
                     (palette.accent, "Hide terminal")
                 } else {
                     (palette.text_muted, "Show terminal")
                 };
-                // The remaining width stays with the branch name. The toggle
-                // sits on the opposite end of this bar.
+                // The name truncates before fetch and pull, so a long branch
+                // cannot push those buttons off the bar. The terminal stays
+                // at the right end, and the spare width sits between them.
                 let terminal_toggle = ui
                     .with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let toggle =
                             icons::icon_button(ui, Icon::Terminal, terminal_tint, terminal_hover);
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                            ui.add(Label::new(branch).truncate());
+                            let reserve = sync_control_width(ui, "Fetch")
+                                + sync_control_width(ui, "Pull")
+                                + ui.spacing().item_spacing.x;
+                            let max_name = (ui.available_width() - reserve).max(0.0);
+                            ui.scope(|ui| {
+                                ui.set_max_width(max_name);
+                                ui.add(Label::new(branch).truncate());
+                            });
+                            if sync_labeled(
+                                ui,
+                                Icon::CloudDownload,
+                                "Fetch",
+                                fetch_on,
+                                palette.text,
+                                palette.text_muted,
+                                fetch_hover,
+                            ) && let Some(upstream) = offer.fetch_upstream.clone()
+                            {
+                                actions.push(Action::Fetch(upstream));
+                            }
+                            if sync_labeled(
+                                ui,
+                                Icon::ArrowDownToLine,
+                                "Pull",
+                                pull_on,
+                                palette.text,
+                                palette.text_muted,
+                                pull_hover,
+                            ) {
+                                actions.push(Action::Pull);
+                            }
                         });
                         toggle
                     })
@@ -535,6 +578,97 @@ fn chip_text(name: &str) -> String {
     }
 }
 
+struct SyncOffer {
+    fetch_upstream: Option<String>,
+    pull: bool,
+    fetch_hover: &'static str,
+    pull_hover: &'static str,
+}
+
+fn unavailable(fetch_hover: &'static str, pull_hover: &'static str) -> SyncOffer {
+    SyncOffer {
+        fetch_upstream: None,
+        pull: false,
+        fetch_hover,
+        pull_hover,
+    }
+}
+
+/// Fetch when the current branch has an upstream name git can be given.
+/// Pull only while that upstream is still tracking.
+fn sync_offer(head: &Head, branches: &[ListedBranch]) -> SyncOffer {
+    let (Head::Branch(name) | Head::Unborn(name)) = head else {
+        return unavailable(
+            "Detached HEAD has no branch to fetch.",
+            "Pull needs a branch with an upstream.",
+        );
+    };
+    let Some(listed) = branches.iter().find(|listed| listed.branch.name == *name) else {
+        return unavailable(
+            "This branch has no upstream.",
+            "Pull needs a branch with an upstream.",
+        );
+    };
+    match &listed.branch.upstream {
+        Upstream::Tracking { name, .. } => {
+            let fetchable = cthulhu_git::git::fetch_request(name).is_some();
+            SyncOffer {
+                fetch_upstream: fetchable.then_some(name.clone()),
+                pull: true,
+                fetch_hover: if fetchable {
+                    "Fetch current branch"
+                } else {
+                    "This branch has no upstream."
+                },
+                pull_hover: "Pull current branch (fast-forward only)",
+            }
+        }
+        Upstream::Gone { name } => {
+            let fetchable = cthulhu_git::git::fetch_request(name).is_some();
+            SyncOffer {
+                fetch_upstream: fetchable.then_some(name.clone()),
+                pull: false,
+                fetch_hover: if fetchable {
+                    "Fetch current branch"
+                } else {
+                    "This branch has no upstream."
+                },
+                pull_hover: "The upstream branch is gone.",
+            }
+        }
+        Upstream::None => unavailable(
+            "This branch has no upstream.",
+            "Pull needs a branch with an upstream.",
+        ),
+    }
+}
+
+/// Width of an icon-and-word control, so the branch name stops before it.
+fn sync_control_width(ui: &Ui, text: &str) -> f32 {
+    let font = eframe::egui::TextStyle::Button.resolve(ui.style());
+    let text_width = ui.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER)
+            .rect
+            .width()
+    });
+    text_width + 18.0 + ui.spacing().icon_spacing + ui.spacing().button_padding.x * 2.0
+}
+
+/// Icon and word, one click. Dimmed, and not clickable, when the action cannot run.
+fn sync_labeled(
+    ui: &mut Ui,
+    icon: Icon,
+    word: &str,
+    enabled: bool,
+    tint: Color32,
+    muted: Color32,
+    hover: &str,
+) -> bool {
+    let color = if enabled { tint } else { muted };
+    icons::icon_text_button(ui, icon, word, color, hover, enabled).clicked()
+}
+
 /// The branch name, and the color its icon shares with it.
 fn branch_text(head: &Head, palette: &Palette) -> (RichText, Color32) {
     let text = RichText::new(head.to_string());
@@ -619,6 +753,62 @@ mod tests {
                 },
             )),
             "3 commits · upstream gone"
+        );
+    }
+
+    fn listed(upstream: Upstream) -> ListedBranch {
+        ListedBranch {
+            branch: branch(1, upstream),
+            checked: true,
+        }
+    }
+
+    #[test]
+    fn sync_offer_fetches_and_pulls_a_tracking_branch() {
+        let offer = sync_offer(
+            &Head::Branch("main".to_owned()),
+            &[listed(Upstream::Tracking {
+                name: "origin/main".to_owned(),
+                ahead: 0,
+                behind: 1,
+            })],
+        );
+        assert_eq!(offer.fetch_upstream.as_deref(), Some("origin/main"));
+        assert!(offer.pull);
+        assert_eq!(offer.fetch_hover, "Fetch current branch");
+        assert_eq!(offer.pull_hover, "Pull current branch (fast-forward only)");
+    }
+
+    #[test]
+    fn sync_offer_fetches_a_gone_upstream_without_pulling() {
+        let offer = sync_offer(
+            &Head::Branch("main".to_owned()),
+            &[listed(Upstream::Gone {
+                name: "origin/main".to_owned(),
+            })],
+        );
+        assert_eq!(offer.fetch_upstream.as_deref(), Some("origin/main"));
+        assert!(!offer.pull);
+        assert_eq!(offer.pull_hover, "The upstream branch is gone.");
+    }
+
+    #[test]
+    fn sync_offer_disables_both_without_an_upstream_or_a_branch() {
+        let none = sync_offer(&Head::Branch("main".to_owned()), &[listed(Upstream::None)]);
+        assert!(none.fetch_upstream.is_none());
+        assert!(!none.pull);
+
+        let detached = sync_offer(
+            &Head::Detached {
+                short_oid: "abc".to_owned(),
+            },
+            &[],
+        );
+        assert!(detached.fetch_upstream.is_none());
+        assert!(!detached.pull);
+        assert_eq!(
+            detached.fetch_hover,
+            "Detached HEAD has no branch to fetch."
         );
     }
 }

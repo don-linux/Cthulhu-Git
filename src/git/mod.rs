@@ -1,7 +1,9 @@
-//! Read-only access to repositories through the system `git` executable.
+//! Access to repositories through the system `git` executable.
 //!
-//! No libgit2 or gitoxide: the app uses whatever git the user already has,
-//! so behavior (config, credentials, hooks) matches their terminal.
+//! Reads do not write. Fetch updates the remote-tracking ref of the current
+//! branch, and pull fast-forwards that branch. No libgit2 or gitoxide: the app
+//! uses whatever git the user already has, so behavior (config, credentials,
+//! hooks) matches their terminal.
 
 mod branches;
 mod discover;
@@ -9,6 +11,7 @@ mod exec;
 mod graph;
 mod log;
 mod repo;
+mod sync;
 
 #[cfg(test)]
 mod proptest_tests;
@@ -22,3 +25,4 @@ pub use graph::{
 };
 pub use log::{Commit, CommitDetail, History, SHORT_OID_LEN, history, latest_commit};
 pub use repo::{Head, RepoInfo, inspect};
+pub use sync::{fetch, fetch_request, pull_ff_only};

@@ -65,6 +65,16 @@ pub enum Action {
     ToggleTerminal,
     SetTerminalFont(Option<String>),
     EnsureFontCatalog,
+    /// `upstream` is `%(upstream:short)`, for example `origin/main`.
+    Fetch(String),
+    Pull,
+}
+
+/// A fetch or pull running against the open repository.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SyncKind {
+    Fetch,
+    Pull,
 }
 
 enum Screen {
@@ -106,6 +116,7 @@ pub struct CthulhuApp {
     font_preview: Option<terminal::Terminal>,
     graph_load: Option<GraphLoad>,
     graph_generation: u64,
+    sync_job: Option<SyncJob>,
 }
 
 impl CthulhuApp {
@@ -139,6 +150,7 @@ impl CthulhuApp {
             font_preview: None,
             graph_load: None,
             graph_generation: 0,
+            sync_job: None,
         };
         if let Some(path) = startup {
             app.open(ctx, path);
@@ -248,10 +260,12 @@ impl eframe::App for CthulhuApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.poll_opening();
         self.poll_graph();
+        self.poll_sync();
         self.poll_picker(ui.ctx());
         self.fonts
             .sync(ui.ctx(), self.settings.terminal_font.as_deref());
 
+        let syncing = self.sync_for_open_repo();
         let actions = if self.settings_open {
             // The repository stays underneath. Keep the shell alive and take
             // keystrokes away from the hidden terminal.
@@ -291,6 +305,7 @@ impl eframe::App for CthulhuApp {
                     !self.settings.history_sidebar_hidden,
                     !self.settings.detail_sidebar_hidden,
                     !self.settings.terminal_hidden,
+                    syncing,
                 ),
             }
         };
@@ -340,26 +355,30 @@ impl eframe::App for CthulhuApp {
                 Action::EnsureFontCatalog => {
                     self.fonts.ensure(ui.ctx(), true);
                 }
+                Action::Fetch(upstream) => {
+                    self.start_sync(ui.ctx(), SyncCommand::Fetch(upstream));
+                }
+                Action::Pull => {
+                    self.start_sync(ui.ctx(), SyncCommand::Pull);
+                }
             }
         }
         self.sync_graph(ui.ctx());
     }
 }
 
+struct Refreshed {
+    info: RepoInfo,
+    branches: Vec<Branch>,
+    latest: Option<CommitDetail>,
+    detached_oid: Option<String>,
+}
+
 fn load(path: &Path) -> OpenResult {
     let git = Git::discover().map_err(|error| error.to_string())?;
-    let info = git::inspect(&git, path).map_err(|error| error.to_string())?;
-    let branches =
-        git::branches(&git, &info.root, &info.head).map_err(|error| error.to_string())?;
-    let latest =
-        git::latest_commit(&git, &info.root, &info.head).map_err(|error| error.to_string())?;
-    let detached_oid = match &info.head {
-        Head::Detached { .. } => {
-            Some(git::head_commit_oid(&git, &info.root).map_err(|error| error.to_string())?)
-        }
-        Head::Branch(_) | Head::Unborn(_) => None,
-    };
-    let listed: Vec<ListedBranch> = branches
+    let refreshed = reload_repo(&git, path)?;
+    let listed: Vec<ListedBranch> = refreshed
+        .branches
         .iter()
         .cloned()
         .map(|branch| ListedBranch {
@@ -367,17 +386,81 @@ fn load(path: &Path) -> OpenResult {
             checked: true,
         })
         .collect();
-    let tips = selected_tips(&listed, detached_oid.as_deref());
-    let graph = git::branch_graph(&git, &info.root, &tips, HISTORY_LIMIT)
+    let tips = selected_tips(&listed, refreshed.detached_oid.as_deref());
+    let graph = git::branch_graph(&git, &refreshed.info.root, &tips, HISTORY_LIMIT)
         .map_err(|error| error.to_string())?;
     Ok(LoadedRepo {
-        info,
+        info: refreshed.info,
         graph,
         tips,
-        detached_oid,
+        detached_oid: refreshed.detached_oid,
+        branches: refreshed.branches,
+        latest: refreshed.latest,
+    })
+}
+
+/// HEAD, branches and the latest commit, without rebuilding the graph.
+fn reload_repo(git: &Git, path: &Path) -> Result<Refreshed, String> {
+    let info = git::inspect(git, path).map_err(|error| error.to_string())?;
+    let branches = git::branches(git, &info.root, &info.head).map_err(|error| error.to_string())?;
+    let latest =
+        git::latest_commit(git, &info.root, &info.head).map_err(|error| error.to_string())?;
+    let detached_oid = match &info.head {
+        Head::Detached { .. } => {
+            Some(git::head_commit_oid(git, &info.root).map_err(|error| error.to_string())?)
+        }
+        Head::Branch(_) | Head::Unborn(_) => None,
+    };
+    Ok(Refreshed {
+        info,
         branches,
         latest,
+        detached_oid,
     })
+}
+
+enum SyncCommand {
+    Fetch(String),
+    Pull,
+}
+
+struct SyncJob {
+    view_id: egui::Id,
+    kind: SyncKind,
+    receiver: Receiver<Result<Refreshed, String>>,
+}
+
+fn run_sync(root: &Path, command: SyncCommand) -> Result<Refreshed, String> {
+    let git = Git::discover().map_err(|error| error.to_string())?;
+    match &command {
+        SyncCommand::Fetch(upstream) => {
+            git::fetch(&git, root, upstream).map_err(|error| error.to_string())?;
+        }
+        SyncCommand::Pull => {
+            git::pull_ff_only(&git, root).map_err(|error| error.to_string())?;
+        }
+    }
+    reload_repo(&git, root)
+}
+
+/// Keeps the sidebar checkboxes. New branches start checked, same as an open.
+fn apply_refresh(repo: &mut OpenedRepo, refreshed: Refreshed) {
+    let previous = std::mem::take(&mut repo.branches);
+    repo.info = refreshed.info;
+    repo.latest = refreshed.latest;
+    repo.detached_oid = refreshed.detached_oid;
+    repo.branches = refreshed
+        .branches
+        .into_iter()
+        .map(|branch| {
+            let checked = previous
+                .iter()
+                .find(|listed| listed.branch.name == branch.name)
+                .map(|listed| listed.checked)
+                .unwrap_or(true);
+            ListedBranch { branch, checked }
+        })
+        .collect();
 }
 
 /// Checked branches that have commits, in sidebar order, plus detached HEAD.
@@ -413,6 +496,78 @@ struct GraphLoad {
 }
 
 impl CthulhuApp {
+    fn sync_for_open_repo(&self) -> Option<SyncKind> {
+        let Screen::Repo(repo) = &self.screen else {
+            return None;
+        };
+        self.sync_job
+            .as_ref()
+            .and_then(|job| (job.view_id == repo.view_id).then_some(job.kind))
+    }
+
+    fn start_sync(&mut self, ctx: &egui::Context, command: SyncCommand) {
+        let Screen::Repo(repo) = &self.screen else {
+            return;
+        };
+        if self
+            .sync_job
+            .as_ref()
+            .is_some_and(|job| job.view_id == repo.view_id)
+        {
+            return;
+        }
+        let view_id = repo.view_id;
+        let root = repo.info.root.clone();
+        let kind = match &command {
+            SyncCommand::Fetch(_) => SyncKind::Fetch,
+            SyncCommand::Pull => SyncKind::Pull,
+        };
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let result = run_sync(&root, command);
+            let _ = sender.send(result);
+            ctx.request_repaint();
+        });
+        self.error = None;
+        self.sync_job = Some(SyncJob {
+            view_id,
+            kind,
+            receiver,
+        });
+    }
+
+    /// Applies a finished fetch or pull. A result for a repository that is no
+    /// longer on screen is dropped, including when the user went Home.
+    fn poll_sync(&mut self) {
+        let Some(job) = &self.sync_job else {
+            return;
+        };
+        let result = match job.receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                Err("The Git command stopped unexpectedly. Try again.".to_owned())
+            }
+        };
+        let Some(job) = self.sync_job.take() else {
+            return;
+        };
+        let Screen::Repo(repo) = &mut self.screen else {
+            return;
+        };
+        if repo.view_id != job.view_id {
+            return;
+        }
+        match result {
+            Ok(refreshed) => {
+                apply_refresh(repo, refreshed);
+                self.error = None;
+            }
+            Err(message) => self.error = Some(message),
+        }
+    }
+
     fn poll_graph(&mut self) {
         if !matches!(self.screen, Screen::Repo(_)) {
             if self.graph_load.is_some() {

@@ -5,7 +5,7 @@ It uses the Git installed on the machine. Open a repository with the system
 folder dialog or from the recent list to see its current branch, latest
 commit and commit history.
 
-It is read-only: no commit, push, stage or diff yet.
+Fetch and fast-forward pull are available. There is no commit, push, stage or diff yet.
 
 ## Requirements
 
@@ -128,15 +128,16 @@ does not stop the search.
 
 - arguments are passed as argv, never through a shell;
 - `--no-optional-locks`, `--no-pager`, `--no-replace-objects`,
-  `core.fsmonitor=false`, and `GIT_TERMINAL_PROMPT=0` so Git never touches the
-  index, waits for input, or follows replace refs;
+  `core.fsmonitor=false`, and `GIT_TERMINAL_PROMPT=0` so Git does not wait
+  for input or follow replace refs. Optional locks are skipped; a fast-forward
+  pull still updates the index and working tree;
 - `LC_ALL=C` so the messages the app matches on stay in English;
 - `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_REPLACE_REF_BASE`,
   `GIT_SHALLOW_FILE`, `GIT_GRAFT_FILE`, `GIT_TRACE` and similar variables are
   removed, so launching the app from a hook or a shell that exported them
   cannot redirect it to another repository or rewrite the history it shows;
 - stdout and stderr are capped at 8 MiB. `git --version` is killed after
-  250 ms; any other invocation after 60 s;
+  250 ms, reads after 60 s, and fetch or pull after 3 minutes;
 - on Windows the process is created with `CREATE_NO_WINDOW` so no console
   flashes.
 
@@ -246,12 +247,13 @@ to write those notes and cut a release is in
 
 ## Limits of this version
 
-- Read-only: no commit, push, stage, diff or file list.
+- No commit, push, stage, diff or file list. Fetch and fast-forward pull are the writes.
 - The history shows commit summaries only (no author, date or graph) and
   stops at the latest 1000 commits.
 - One theme and no settings screen yet.
-- A Git command that does not exit is killed after 60 seconds (`git --version`
-  after 250 ms). The window stays responsive, but that open still fails.
+- A Git read that does not exit is killed after 60 seconds (`git --version`
+  after 250 ms). Fetch and pull are killed after 3 minutes. The window stays
+  responsive, but that command still fails.
 - A deleted repository stays in the recent list until it is opened. The open
   then fails and the entry is not removed.
 - Shortening a string at 12 bytes keeps the whole string when that cut would

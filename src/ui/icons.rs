@@ -3,7 +3,7 @@
 //! the theme.
 
 use eframe::egui::{
-    Button, Color32, ColorImage, Context, CursorIcon, Id, Image, Response, TextureHandle,
+    Button, Color32, ColorImage, Context, CursorIcon, Id, Image, Response, RichText, TextureHandle,
     TextureOptions, Ui, Vec2,
 };
 
@@ -22,6 +22,8 @@ pub enum Icon {
     Terminal,
     Settings,
     ArrowLeft,
+    CloudDownload,
+    ArrowDownToLine,
 }
 
 impl Icon {
@@ -35,6 +37,8 @@ impl Icon {
             Self::Terminal => "terminal",
             Self::Settings => "settings",
             Self::ArrowLeft => "arrow-left",
+            Self::CloudDownload => "cloud-download",
+            Self::ArrowDownToLine => "arrow-down-to-line",
         }
     }
 
@@ -47,6 +51,12 @@ impl Icon {
             Self::Terminal => include_bytes!(concat!(env!("OUT_DIR"), "/icons/terminal.rgba")),
             Self::Settings => include_bytes!(concat!(env!("OUT_DIR"), "/icons/settings.rgba")),
             Self::ArrowLeft => include_bytes!(concat!(env!("OUT_DIR"), "/icons/arrow-left.rgba")),
+            Self::CloudDownload => {
+                include_bytes!(concat!(env!("OUT_DIR"), "/icons/cloud-download.rgba"))
+            }
+            Self::ArrowDownToLine => {
+                include_bytes!(concat!(env!("OUT_DIR"), "/icons/arrow-down-to-line.rgba"))
+            }
         }
     }
 
@@ -84,6 +94,30 @@ pub fn icon(ui: &mut Ui, icon: Icon, tint: Color32) -> Response {
     ui.add(icon.image(ui.ctx(), tint))
 }
 
+/// Icon with a word beside it. The whole control is one click, and the frame
+/// only shows while hovered or pressed. A disabled control keeps the word and
+/// does not take the click.
+pub fn icon_text_button(
+    ui: &mut Ui,
+    icon: Icon,
+    text: &str,
+    tint: Color32,
+    hover_text: &str,
+    enabled: bool,
+) -> Response {
+    let mut response = ui
+        .add_enabled(
+            enabled,
+            Button::image_and_text(icon.image(ui.ctx(), tint), RichText::new(text).color(tint))
+                .frame_when_inactive(false),
+        )
+        .on_hover_text(hover_text);
+    if enabled {
+        response = response.on_hover_cursor(CursorIcon::PointingHand);
+    }
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +132,8 @@ mod tests {
             Icon::Terminal,
             Icon::Settings,
             Icon::ArrowLeft,
+            Icon::CloudDownload,
+            Icon::ArrowDownToLine,
         ] {
             assert_eq!(
                 icon.rgba().len(),

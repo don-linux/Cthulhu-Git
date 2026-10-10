@@ -119,11 +119,23 @@ impl Git {
         })
     }
 
-    /// Runs `git <args>` in `cwd` without a shell and without touching the index.
+    /// Runs `git <args>` in `cwd` without a shell, bounded by [`COMMAND_TIMEOUT`].
     ///
-    /// The user's environment is inherited (credential helpers, ssh-agent) except
-    /// for variables that would redirect git to another repository.
+    /// `--no-optional-locks` skips locks a read does not need. A command that
+    /// must write, such as pull, still takes its required locks. The user's
+    /// environment is inherited (credential helpers, ssh-agent) except for
+    /// variables that would redirect git to another repository.
     pub fn run(&self, cwd: &Path, args: &[&str]) -> Result<GitOutput, GitError> {
+        self.run_for(cwd, args, COMMAND_TIMEOUT)
+    }
+
+    /// Like [`Git::run`], with a caller-chosen limit. Reads keep the default.
+    pub fn run_for(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<GitOutput, GitError> {
         let command_line = format!("git {}", args.join(" "));
         capture(
             command(&self.path)
@@ -134,14 +146,24 @@ impl Git {
                 .args(["-c", "core.fsmonitor=false"])
                 .args(["-c", "log.showSignature=false"])
                 .args(args),
-            COMMAND_TIMEOUT,
+            timeout,
             &command_line,
         )
     }
 
     /// Like [`Git::run`], but a non-zero exit becomes a typed [`GitError`].
     pub fn require_ok(&self, cwd: &Path, args: &[&str]) -> Result<GitOutput, GitError> {
-        let output = self.run(cwd, args)?;
+        self.require_ok_for(cwd, args, COMMAND_TIMEOUT)
+    }
+
+    /// Like [`Git::require_ok`], with a caller-chosen limit.
+    pub fn require_ok_for(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<GitOutput, GitError> {
+        let output = self.run_for(cwd, args, timeout)?;
 
         if output.status.success() {
             return Ok(output);

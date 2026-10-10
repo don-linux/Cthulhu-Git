@@ -298,6 +298,44 @@ fn click_extreme_button<State>(harness: &Harness<'_, State>, top: bool) {
     buttons[chosen].click();
 }
 
+fn bottom_bar_buttons<State>(harness: &Harness<'_, State>) -> Vec<egui::Rect> {
+    let buttons: Vec<_> = harness
+        .query_all_by_role(Role::Button)
+        .map(|button| button.rect())
+        .collect();
+    let bottom_y = buttons
+        .iter()
+        .map(|rect| rect.center().y)
+        .fold(f32::MIN, f32::max);
+    let mut row: Vec<_> = buttons
+        .into_iter()
+        .filter(|rect| (rect.center().y - bottom_y).abs() < 8.0)
+        .collect();
+    row.sort_by(|left, right| left.left().total_cmp(&right.left()));
+    row
+}
+
+fn bottom_bar_label<State>(harness: &Harness<'_, State>, buttons: &[egui::Rect]) -> egui::Rect {
+    let y = buttons[0].center().y;
+    let mut labels: Vec<_> = harness
+        .query_all_by_role(Role::Label)
+        .filter(|label| {
+            let value = label.value();
+            value.as_deref() != Some("Fetch")
+                && value.as_deref() != Some("Pull")
+                && (label.rect().center().y - y).abs() < 8.0
+        })
+        .map(|label| label.rect())
+        .collect();
+    labels.sort_by(|left, right| left.left().total_cmp(&right.left()));
+    assert_eq!(
+        labels.len(),
+        1,
+        "expected the branch name as the only bottom-bar label besides Fetch and Pull"
+    );
+    labels[0]
+}
+
 fn click_leftmost_top_button<State>(harness: &Harness<'_, State>) {
     let buttons: Vec<_> = harness.query_all_by_role(Role::Button).collect();
     assert!(
@@ -669,13 +707,66 @@ fn adversarial_min_window_long_name_and_bidi_summary() {
     let summary = "port \u{202E}starboard\u{202C} side";
     let mut repo = opened(&name, vec![commit(summary)], false);
     let harness = ui_harness(|ui| {
-        let _ = repo_view::show(ui, &mut repo, None, true, true, false);
+        let _ = repo_view::show(ui, &mut repo, None, true, true, false, None);
     });
     assert_text(&harness, &name);
     assert_text(&harness, "\u{202E}");
     assert_text(&harness, "starboard");
     assert_text(&harness, "Latest commit");
     assert_text(&harness, "main");
+}
+
+#[test]
+fn fetch_and_pull_sit_beside_the_branch_name() {
+    let mut repo = opened("beside", vec![commit("one")], false);
+    repo.branches[0].branch.upstream = Upstream::Tracking {
+        name: "origin/main".to_owned(),
+        ahead: 1,
+        behind: 0,
+    };
+    let harness = ui_harness(|ui| {
+        let _ = repo_view::show(ui, &mut repo, None, true, true, false, None);
+    });
+    assert_text(&harness, "Fetch");
+    assert_text(&harness, "Pull");
+    let row = bottom_bar_buttons(&harness);
+    assert_eq!(
+        row.len(),
+        5,
+        "expected home, settings, fetch, pull and terminal on the bottom bar"
+    );
+    let branch = bottom_bar_label(&harness, &row);
+    let name_to_fetch = row[2].left() - branch.right();
+    let pull_to_terminal = row[4].left() - row[3].right();
+    assert!(
+        row[2].left() + 1.0 >= branch.right(),
+        "fetch overlaps the branch name"
+    );
+    assert!(row[3].left() + 1.0 >= row[2].right());
+    assert!(
+        pull_to_terminal + 1.0 >= name_to_fetch,
+        "spare width should sit before the terminal, not between the name and fetch \
+         (name gap {name_to_fetch}, pull-to-terminal {pull_to_terminal})"
+    );
+
+    let long = "b".repeat(240);
+    let mut repo = opened("beside-long", vec![commit("one")], false);
+    repo.info.head = Head::Branch(long.clone());
+    repo.branches[0].branch.name = long;
+    repo.branches[0].branch.upstream = Upstream::Tracking {
+        name: "origin/main".to_owned(),
+        ahead: 0,
+        behind: 0,
+    };
+    let harness = ui_harness(|ui| {
+        let _ = repo_view::show(ui, &mut repo, None, true, true, false, None);
+    });
+    let row = bottom_bar_buttons(&harness);
+    assert_eq!(row.len(), 5);
+    assert!(
+        row[3].right() <= row[4].left() + 1.0,
+        "pull is pushed past the terminal"
+    );
 }
 
 #[test]
@@ -688,7 +779,7 @@ fn adversarial_thousand_commits_are_virtualized() {
         .collect();
     let mut repo = opened("bulk-history", commits, true);
     let harness = ui_harness(|ui| {
-        let _ = repo_view::show(ui, &mut repo, None, true, false, false);
+        let _ = repo_view::show(ui, &mut repo, None, true, false, false, None);
     });
     assert_text(&harness, "Showing the latest 1000 commits.");
     assert_text(&harness, "Commit history (1000+)");
