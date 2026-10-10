@@ -20,18 +20,25 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
-use cthulhu_git::git::{self, Branch, CommitDetail, Git, History, RepoInfo};
+use cthulhu_git::git::{self, Branch, CommitDetail, Git, GraphTip, Head, HistoryGraph, RepoInfo};
 use cthulhu_git::settings::Settings;
 use eframe::egui;
 
 use folder_picker::FolderPicker;
 
-/// Newest commits read when a repository opens; the view says when there are more.
+/// Newest commits read for the branch graph; the view says when there are more.
 const HISTORY_LIMIT: usize = 1000;
 
 pub struct OpenedRepo {
     pub info: RepoInfo,
-    pub history: History,
+    pub graph: HistoryGraph,
+    /// Tips the displayed graph was built from.
+    pub graph_selection: Vec<GraphTip>,
+    /// Last selection asked of git. After a failure it stays, so the next
+    /// frame does not ask again until the checkboxes change.
+    pub graph_requested: Vec<GraphTip>,
+    /// Full hash when HEAD is detached. That commit stays in the graph.
+    pub detached_oid: Option<String>,
     pub branches: Vec<ListedBranch>,
     pub latest: Option<CommitDetail>,
     /// New on every open, so the history starts scrolled to the top each time.
@@ -40,9 +47,7 @@ pub struct OpenedRepo {
     pub terminal: Option<terminal::Terminal>,
 }
 
-/// A local branch and whether its checkbox is on.
-///
-/// `checked` is kept for a later history filter. The commit list does not read it.
+/// A local branch and whether it is drawn in the history graph.
 pub struct ListedBranch {
     pub branch: Branch,
     pub checked: bool,
@@ -69,7 +74,9 @@ enum Screen {
 
 struct LoadedRepo {
     info: RepoInfo,
-    history: History,
+    graph: HistoryGraph,
+    tips: Vec<GraphTip>,
+    detached_oid: Option<String>,
     branches: Vec<Branch>,
     latest: Option<CommitDetail>,
 }
@@ -97,6 +104,8 @@ pub struct CthulhuApp {
     /// terminal so the preview size does not resize that session. Dropped when
     /// settings closes; not saved.
     font_preview: Option<terminal::Terminal>,
+    graph_load: Option<GraphLoad>,
+    graph_generation: u64,
 }
 
 impl CthulhuApp {
@@ -128,6 +137,8 @@ impl CthulhuApp {
             settings_open: false,
             fonts: fonts::FontService::default(),
             font_preview: None,
+            graph_load: None,
+            graph_generation: 0,
         };
         if let Some(path) = startup {
             app.open(ctx, path);
@@ -137,6 +148,8 @@ impl CthulhuApp {
 
     /// Git runs on a worker thread: blocking the UI thread would freeze the window.
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
+        self.graph_generation = self.graph_generation.wrapping_add(1);
+        self.graph_load = None;
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
         let worker_path = path.clone();
@@ -170,7 +183,10 @@ impl CthulhuApp {
                 self.opened_count += 1;
                 self.screen = Screen::Repo(Box::new(OpenedRepo {
                     info: loaded.info,
-                    history: loaded.history,
+                    graph: loaded.graph,
+                    graph_selection: loaded.tips.clone(),
+                    graph_requested: loaded.tips,
+                    detached_oid: loaded.detached_oid,
                     branches: loaded
                         .branches
                         .into_iter()
@@ -231,6 +247,7 @@ impl CthulhuApp {
 impl eframe::App for CthulhuApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.poll_opening();
+        self.poll_graph();
         self.poll_picker(ui.ctx());
         self.fonts
             .sync(ui.ctx(), self.settings.terminal_font.as_deref());
@@ -325,22 +342,213 @@ impl eframe::App for CthulhuApp {
                 }
             }
         }
+        self.sync_graph(ui.ctx());
     }
 }
 
 fn load(path: &Path) -> OpenResult {
     let git = Git::discover().map_err(|error| error.to_string())?;
     let info = git::inspect(&git, path).map_err(|error| error.to_string())?;
-    let history = git::history(&git, &info.root, &info.head, HISTORY_LIMIT)
-        .map_err(|error| error.to_string())?;
     let branches =
         git::branches(&git, &info.root, &info.head).map_err(|error| error.to_string())?;
     let latest =
         git::latest_commit(&git, &info.root, &info.head).map_err(|error| error.to_string())?;
+    let detached_oid = match &info.head {
+        Head::Detached { .. } => {
+            Some(git::head_commit_oid(&git, &info.root).map_err(|error| error.to_string())?)
+        }
+        Head::Branch(_) | Head::Unborn(_) => None,
+    };
+    let listed: Vec<ListedBranch> = branches
+        .iter()
+        .cloned()
+        .map(|branch| ListedBranch {
+            branch,
+            checked: true,
+        })
+        .collect();
+    let tips = selected_tips(&listed, detached_oid.as_deref());
+    let graph = git::branch_graph(&git, &info.root, &tips, HISTORY_LIMIT)
+        .map_err(|error| error.to_string())?;
     Ok(LoadedRepo {
         info,
-        history,
+        graph,
+        tips,
+        detached_oid,
         branches,
         latest,
     })
+}
+
+/// Checked branches that have commits, in sidebar order, plus detached HEAD.
+fn selected_tips(branches: &[ListedBranch], detached_oid: Option<&str>) -> Vec<GraphTip> {
+    let mut tips = Vec::new();
+    for (index, listed) in branches.iter().enumerate() {
+        if !listed.checked {
+            continue;
+        }
+        if let Some(oid) = &listed.branch.oid {
+            tips.push(GraphTip {
+                name: listed.branch.name.clone(),
+                oid: oid.clone(),
+                color: index,
+            });
+        }
+    }
+    if let Some(oid) = detached_oid {
+        tips.push(GraphTip {
+            name: "HEAD".to_owned(),
+            oid: oid.to_owned(),
+            color: branches.len(),
+        });
+    }
+    tips
+}
+
+struct GraphLoad {
+    generation: u64,
+    view_id: egui::Id,
+    selection: Vec<GraphTip>,
+    receiver: Receiver<Result<HistoryGraph, String>>,
+}
+
+impl CthulhuApp {
+    fn poll_graph(&mut self) {
+        if !matches!(self.screen, Screen::Repo(_)) {
+            if self.graph_load.is_some() {
+                self.graph_generation = self.graph_generation.wrapping_add(1);
+                self.graph_load = None;
+            }
+            return;
+        }
+
+        let result = {
+            let Some(load) = &self.graph_load else {
+                return;
+            };
+            match load.receiver.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    Err("The history graph stopped unexpectedly. Try again.".to_owned())
+                }
+            }
+        };
+        let Some(load) = self.graph_load.take() else {
+            return;
+        };
+        if load.generation != self.graph_generation {
+            return;
+        }
+
+        let mut clear_error = false;
+        let mut failure = None;
+        if let Screen::Repo(repo) = &mut self.screen
+            && repo.view_id == load.view_id
+            && selected_tips(&repo.branches, repo.detached_oid.as_deref()) == load.selection
+        {
+            match result {
+                Ok(graph) => {
+                    repo.graph = graph;
+                    repo.graph_selection = load.selection.clone();
+                    repo.graph_requested = load.selection;
+                    clear_error = true;
+                }
+                Err(message) => {
+                    repo.graph_requested = load.selection;
+                    failure = Some(message);
+                }
+            }
+        }
+        if clear_error {
+            self.error = None;
+        }
+        if let Some(message) = failure {
+            self.error = Some(message);
+        }
+    }
+
+    fn sync_graph(&mut self, ctx: &egui::Context) {
+        enum Next {
+            Ignore,
+            Drop,
+            Clear,
+            Start(Vec<GraphTip>),
+        }
+
+        let next = match &self.screen {
+            Screen::Repo(repo) => {
+                let desired = selected_tips(&repo.branches, repo.detached_oid.as_deref());
+                if desired == repo.graph_selection {
+                    Next::Ignore
+                } else if desired.is_empty() {
+                    Next::Clear
+                } else if self
+                    .graph_load
+                    .as_ref()
+                    .is_some_and(|load| load.selection == desired)
+                    || (desired == repo.graph_requested && self.graph_load.is_none())
+                {
+                    Next::Ignore
+                } else {
+                    Next::Start(desired)
+                }
+            }
+            Screen::Home => {
+                if self.graph_load.is_some() {
+                    Next::Drop
+                } else {
+                    Next::Ignore
+                }
+            }
+        };
+
+        match next {
+            Next::Ignore => {}
+            Next::Drop => {
+                self.graph_generation = self.graph_generation.wrapping_add(1);
+                self.graph_load = None;
+            }
+            Next::Clear => {
+                self.graph_generation = self.graph_generation.wrapping_add(1);
+                self.graph_load = None;
+                if let Screen::Repo(repo) = &mut self.screen {
+                    repo.graph = HistoryGraph::default();
+                    repo.graph_selection.clear();
+                    repo.graph_requested.clear();
+                }
+            }
+            Next::Start(tips) => self.start_graph_load(ctx, tips),
+        }
+    }
+
+    fn start_graph_load(&mut self, ctx: &egui::Context, tips: Vec<GraphTip>) {
+        let (root, view_id) = {
+            let Screen::Repo(repo) = &self.screen else {
+                return;
+            };
+            (repo.info.root.clone(), repo.view_id)
+        };
+        self.graph_generation = self.graph_generation.wrapping_add(1);
+        let generation = self.graph_generation;
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        let requested = tips.clone();
+        thread::spawn(move || {
+            let result = reload_graph(&root, &requested);
+            let _ = sender.send(result);
+            ctx.request_repaint();
+        });
+        self.graph_load = Some(GraphLoad {
+            generation,
+            view_id,
+            selection: tips,
+            receiver,
+        });
+    }
+}
+
+fn reload_graph(root: &Path, tips: &[GraphTip]) -> Result<HistoryGraph, String> {
+    let git = Git::discover().map_err(|error| error.to_string())?;
+    git::branch_graph(&git, root, tips, HISTORY_LIMIT).map_err(|error| error.to_string())
 }

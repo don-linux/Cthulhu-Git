@@ -6,6 +6,9 @@ mod dark;
 
 use eframe::egui::{self, Color32, Context, Id, Stroke, Visuals};
 
+/// How many distinct lane colors a theme provides. Extra lanes cycle through them.
+pub const GRAPH_LANE_COUNT: usize = 8;
+
 /// Semantic colors. Views ask for a role (`text_muted`, `hash`), never for a
 /// literal color, so a new theme only has to fill in this struct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +36,8 @@ pub struct Palette {
     pub selection: Color32,
     /// Commit hashes.
     pub hash: Color32,
+    /// Commit-graph lanes. [`Palette::graph_color`] cycles them.
+    pub graph: [Color32; GRAPH_LANE_COUNT],
     /// Detached HEAD and other cautions.
     pub warning: Color32,
     pub error: Color32,
@@ -140,6 +145,19 @@ fn visuals(theme: &Theme) -> Visuals {
     visuals.window_stroke = Stroke::new(1.0, palette.border);
 
     visuals
+}
+
+impl Palette {
+    /// Lane color `index`, cycling when a graph has more lanes than colors.
+    pub fn graph_color(self, index: usize) -> Color32 {
+        self.graph[index % GRAPH_LANE_COUNT]
+    }
+
+    /// Faded lane color drawn behind a branch name on its tip commit.
+    pub fn graph_chip(self, index: usize) -> Color32 {
+        let color = self.graph_color(index);
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 48)
+    }
 }
 
 #[cfg(test)]

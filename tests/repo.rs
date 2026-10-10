@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cthulhu_git::git::{
-    Git, GitError, Head, History, RepoInfo, SHORT_OID_LEN, Upstream, branches, history, inspect,
-    latest_commit,
+    Git, GitError, GraphTip, Head, History, RepoInfo, SHORT_OID_LEN, Upstream, branch_graph,
+    branches, head_commit_oid, history, inspect, latest_commit,
 };
 use tempfile::TempDir;
 
@@ -87,6 +87,34 @@ impl Fixture {
 
     fn commit(&self, message: &str) {
         self.git(&["commit", "--allow-empty", "-m", message]);
+    }
+
+    fn commit_at(&self, message: &str, date: &str) {
+        let output = Command::new(&self.git.path)
+            .current_dir(&self.root)
+            .env("GIT_AUTHOR_NAME", "cthulhu")
+            .env("GIT_AUTHOR_EMAIL", "cthulhu@example.invalid")
+            .env("GIT_COMMITTER_NAME", "cthulhu")
+            .env("GIT_COMMITTER_EMAIL", "cthulhu@example.invalid")
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .args([
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                message,
+            ])
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "commit {message:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn history(&self, limit: usize) -> History {
@@ -246,6 +274,7 @@ fn unborn_repository_lists_its_branch_and_has_no_commit_detail() {
     assert_eq!(listed[0].name, "main");
     assert!(listed[0].current);
     assert_eq!(listed[0].commit_count, 0);
+    assert_eq!(listed[0].oid, None);
     assert_eq!(listed[0].upstream, Upstream::None);
     assert_eq!(
         latest_commit(&fixture.git, &info.root, &info.head).expect("detail"),
@@ -283,6 +312,8 @@ fn branches_report_commit_counts_and_ahead_behind() {
     assert!(!main.current);
     assert_eq!(main.commit_count, 1);
     assert_eq!(main.upstream, Upstream::None);
+    assert!(feature.oid.is_some());
+    assert_ne!(feature.oid, main.oid);
 
     let detail = latest_commit(&fixture.git, &info.root, &info.head)
         .expect("detail")
@@ -304,6 +335,107 @@ fn branches_report_commit_counts_and_ahead_behind() {
         "--format=%ad",
     ]);
     assert_eq!(detail.authored_at, expected_date);
+}
+
+fn tips_of(listed: &[cthulhu_git::git::Branch]) -> Vec<GraphTip> {
+    listed
+        .iter()
+        .enumerate()
+        .filter_map(|(index, branch)| {
+            branch.oid.as_ref().map(|oid| GraphTip {
+                name: branch.name.clone(),
+                oid: oid.clone(),
+                color: index,
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn graph_shows_where_a_branch_leaves_main() {
+    let fixture = Fixture::init();
+    fixture.commit_at("Awaken", "2020-01-01T00:00:00");
+    fixture.git(&["switch", "-c", "feature"]);
+    fixture.commit_at("Feature", "2020-01-02T00:00:00");
+    fixture.git(&["switch", "main"]);
+    fixture.commit_at("On main", "2020-01-03T00:00:00");
+
+    let info = fixture.inspect();
+    let listed = branches(&fixture.git, &info.root, &info.head).expect("branches");
+    let tips = tips_of(&listed);
+    let graph = branch_graph(&fixture.git, &info.root, &tips, 100).expect("graph");
+
+    let main = graph
+        .rows
+        .iter()
+        .find(|row| row.branches.iter().any(|branch| branch.name == "main"))
+        .expect("main tip");
+    let feature = graph
+        .rows
+        .iter()
+        .find(|row| row.branches.iter().any(|branch| branch.name == "feature"))
+        .expect("feature tip");
+    assert_eq!(main.oid, fixture.git(&["rev-parse", "main"]));
+    assert_eq!(main.commit_lane, 0);
+    assert_eq!(main.commit_color, 0);
+    assert_eq!(feature.oid, fixture.git(&["rev-parse", "feature"]));
+    assert_eq!(feature.commit_lane, 1);
+    assert_eq!(feature.commit_color, 1);
+    assert!(
+        feature
+            .traces
+            .iter()
+            .any(|trace| trace.from_lane.is_none() && trace.to_lane == Some(0))
+    );
+
+    let feature_at = graph
+        .rows
+        .iter()
+        .position(|row| row.summary == "Feature")
+        .expect("feature row");
+    assert_eq!(graph.rows[feature_at + 1].summary, "Awaken");
+    assert_eq!(graph.rows[feature_at + 1].commit_lane, 0);
+    assert!(graph.rows[feature_at + 1].branches.is_empty());
+
+    let limited = branch_graph(&fixture.git, &info.root, &tips, 1).expect("limited graph");
+    assert!(limited.truncated);
+    assert_eq!(limited.rows.len(), 1);
+    assert_eq!(limited.rows[0].summary, "On main");
+
+    let empty = branch_graph(&fixture.git, &info.root, &[], 10).expect("no tips");
+    assert!(empty.rows.is_empty());
+}
+
+#[test]
+fn detached_head_stays_on_the_graph() {
+    let fixture = Fixture::with_commit();
+    fixture.commit("Second");
+    fixture.git(&["checkout", "--detach", "HEAD~1"]);
+
+    let info = fixture.inspect();
+    let listed = branches(&fixture.git, &info.root, &info.head).expect("branches");
+    assert!(listed.iter().all(|branch| !branch.current));
+    let mut tips = tips_of(&listed);
+    let head = head_commit_oid(&fixture.git, &info.root).expect("head oid");
+    assert_eq!(head, fixture.git(&["rev-parse", "HEAD"]));
+    tips.push(GraphTip {
+        name: "HEAD".to_owned(),
+        oid: head,
+        color: listed.len(),
+    });
+    let graph = branch_graph(&fixture.git, &info.root, &tips, 10).expect("graph");
+    assert!(
+        graph
+            .rows
+            .iter()
+            .any(|row| row.branches.iter().any(|branch| branch.name == "main"))
+    );
+    assert!(
+        graph
+            .rows
+            .iter()
+            .any(|row| row.branches.iter().any(|branch| branch.name == "HEAD"))
+    );
 }
 
 const CHILD_TARGET_VAR: &str = "CTHULHU_TEST_INSPECT_TARGET";

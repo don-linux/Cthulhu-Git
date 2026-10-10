@@ -15,6 +15,9 @@ const FIELD_SEPARATOR: u8 = 0x1f;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Branch {
     pub name: String,
+    /// Full hash of the commit this branch points at. `None` when the branch
+    /// has no commits yet.
+    pub oid: Option<String>,
     /// Commits reachable from the branch tip, including ancestors.
     pub commit_count: u64,
     pub upstream: Upstream,
@@ -38,6 +41,7 @@ pub enum Upstream {
 
 struct ParsedRef {
     name: String,
+    oid: Option<String>,
     upstream: Upstream,
 }
 
@@ -49,7 +53,7 @@ struct ParsedRef {
 pub fn branches(git: &Git, root: &Path, head: &Head) -> Result<Vec<Branch>, GitError> {
     let separator = FIELD_SEPARATOR as char;
     let format = format!(
-        "--format=%(refname:short){separator}%(upstream:short){separator}%(upstream:track)"
+        "--format=%(refname:short){separator}%(objectname){separator}%(upstream:short){separator}%(upstream:track)"
     );
     let args = ["for-each-ref", format.as_str(), "refs/heads"];
     let output = git.require_ok(root, &args)?;
@@ -64,6 +68,7 @@ pub fn branches(git: &Git, root: &Path, head: &Head) -> Result<Vec<Branch>, GitE
         let commit_count = commit_count(git, root, &parsed.name)?;
         rows.push(Branch {
             name: parsed.name,
+            oid: parsed.oid,
             commit_count,
             upstream: parsed.upstream,
             current: false,
@@ -100,7 +105,7 @@ fn parse_count(stdout: &[u8]) -> Option<u64> {
     std::str::from_utf8(&bytes).ok()?.parse().ok()
 }
 
-/// `name SEP upstream SEP track`, one branch per line.
+/// `name SEP oid SEP upstream SEP track`, one branch per line.
 fn parse_refs(stdout: &[u8]) -> Option<Vec<ParsedRef>> {
     let mut refs = Vec::new();
     for mut line in stdout.split(|byte| *byte == b'\n') {
@@ -116,18 +121,27 @@ fn parse_refs(stdout: &[u8]) -> Option<Vec<ParsedRef>> {
 }
 
 fn parse_ref_line(line: &[u8]) -> Option<ParsedRef> {
-    let mut parts = line.splitn(3, |byte| *byte == FIELD_SEPARATOR);
+    let mut parts = line.splitn(4, |byte| *byte == FIELD_SEPARATOR);
     let name = parts.next()?;
+    let oid = parts.next()?;
     let upstream = parts.next()?;
     let track = parts.next()?;
     if name.is_empty() {
         return None;
     }
+    let oid = if oid.is_empty() {
+        None
+    } else if oid.iter().all(u8::is_ascii_hexdigit) {
+        Some(String::from_utf8_lossy(oid).into_owned())
+    } else {
+        return None;
+    };
     let name = String::from_utf8_lossy(name).into_owned();
     let upstream = String::from_utf8_lossy(upstream).into_owned();
     let track = String::from_utf8_lossy(track).into_owned();
     Some(ParsedRef {
         name,
+        oid,
         upstream: classify_upstream(&upstream, &track)?,
     })
 }
@@ -184,6 +198,7 @@ fn finish(mut branches: Vec<Branch>, head: &Head) -> Vec<Branch> {
             Some(branch) => branch.current = true,
             None => branches.push(Branch {
                 name: name.to_owned(),
+                oid: None,
                 commit_count: 0,
                 upstream: Upstream::None,
                 current: true,
@@ -203,12 +218,18 @@ fn finish(mut branches: Vec<Branch>, head: &Head) -> Vec<Branch> {
 mod tests {
     use super::*;
 
+    const OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
     fn line(name: &str, upstream: &str, track: &str) -> Vec<u8> {
+        line_with_oid(name, OID, upstream, track)
+    }
+
+    fn line_with_oid(name: &str, oid: &str, upstream: &str, track: &str) -> Vec<u8> {
         let mut out = name.as_bytes().to_vec();
-        out.push(FIELD_SEPARATOR);
-        out.extend_from_slice(upstream.as_bytes());
-        out.push(FIELD_SEPARATOR);
-        out.extend_from_slice(track.as_bytes());
+        for field in [oid, upstream, track] {
+            out.push(FIELD_SEPARATOR);
+            out.extend_from_slice(field.as_bytes());
+        }
         out.push(b'\n');
         out
     }
@@ -228,6 +249,7 @@ mod tests {
 
         let refs = parsed(&stdout);
         assert_eq!(refs.len(), 6);
+        assert_eq!(refs[0].oid.as_deref(), Some(OID));
         assert_eq!(
             refs[0].upstream,
             Upstream::Tracking {
@@ -299,6 +321,15 @@ mod tests {
         assert!(parse_refs(&line("feature", "main", "[ahead]")).is_none());
         assert!(parse_refs(&line("feature", "main", "ahead 1")).is_none());
         assert!(parse_refs(&line("feature", "main", "[behind 1, ahead 2]")).is_none());
+        assert!(parse_refs(&line_with_oid("feature", "not-hex", "main", "")).is_none());
+        // The previous three-field record is no longer a complete branch.
+        assert!(parse_refs(b"feature\x1fmain\x1f\n").is_none());
+    }
+
+    #[test]
+    fn empty_oid_is_a_branch_with_no_commit() {
+        let refs = parsed(&line_with_oid("main", "", "", ""));
+        assert_eq!(refs[0].oid, None);
     }
 
     #[test]
@@ -312,6 +343,7 @@ mod tests {
     fn sample(name: &str, count: u64) -> Branch {
         Branch {
             name: name.to_owned(),
+            oid: None,
             commit_count: count,
             upstream: Upstream::None,
             current: false,
@@ -332,6 +364,7 @@ mod tests {
             unborn,
             vec![Branch {
                 name: "main".to_owned(),
+                oid: None,
                 commit_count: 0,
                 upstream: Upstream::None,
                 current: true,

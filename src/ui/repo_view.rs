@@ -1,10 +1,10 @@
 //! Repository screen. A top bar with the branch and detail toggles and the
-//! repository name, a sidebar of local branches, the commit history in the
+//! repository name, a sidebar of local branches, the commit graph in the
 //! middle, the latest commit on the right with the terminal beneath it, and a
 //! bottom bar with the Home and Settings buttons, the current branch, and the
 //! terminal toggle at the right end.
 
-use cthulhu_git::git::{Branch, Head, Upstream};
+use cthulhu_git::git::{Branch, Commit, GraphBranch, GraphRow, Head, Upstream};
 use eframe::egui::{
     self, Align, Color32, CursorIcon, Frame, Label, Layout, Margin, Pos2, Rect, RichText,
     ScrollArea, Sense, Stroke, Ui, Vec2,
@@ -16,6 +16,7 @@ use super::theme::{self, Palette};
 use super::widgets;
 use super::{Action, ListedBranch, OpenedRepo};
 
+const LANE_WIDTH: f32 = 14.0;
 const SIDEBAR_DEFAULT_WIDTH: f32 = 320.0;
 const SIDEBAR_MIN_WIDTH: f32 = 220.0;
 const SIDEBAR_MAX_WIDTH: f32 = 560.0;
@@ -388,11 +389,11 @@ fn detail_field(ui: &mut Ui, palette: &Palette, label: &str, value: RichText) {
 }
 
 fn history(ui: &mut Ui, repo: &OpenedRepo, palette: &Palette) {
-    let commits = &repo.history.commits;
-    let count = if repo.history.truncated {
-        format!("{}+", commits.len())
+    let rows = &repo.graph.rows;
+    let count = if repo.graph.truncated {
+        format!("{}+", rows.len())
     } else {
-        commits.len().to_string()
+        rows.len().to_string()
     };
 
     ui.add(
@@ -405,26 +406,133 @@ fn history(ui: &mut Ui, repo: &OpenedRepo, palette: &Palette) {
     );
     ui.add_space(6.0);
 
-    if commits.is_empty() {
-        ui.label(RichText::new("No commits yet.").color(palette.text_muted));
+    if rows.is_empty() {
+        ui.label(RichText::new(empty_history(repo)).color(palette.text_muted));
         return;
     }
-    if repo.history.truncated {
+    if repo.graph.truncated {
         ui.label(
-            RichText::new(format!("Showing the latest {} commits.", commits.len()))
+            RichText::new(format!("Showing the latest {} commits.", rows.len()))
                 .color(palette.text_muted),
         );
         ui.add_space(4.0);
     }
-    let row_height = widgets::commit_line_height(ui);
-    ScrollArea::vertical()
-        .id_salt(repo.view_id.with("history"))
-        .auto_shrink([false, false])
-        .show_rows(ui, row_height, commits.len(), |ui, rows| {
-            for commit in &commits[rows] {
-                ui.add(Label::new(widgets::commit_line(commit, palette, ui.style())).truncate());
+    // Rows touch, so a lane drawn to the bottom of one meets the top of the next.
+    let columns = repo.graph.columns;
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let row_height = (widgets::commit_line_height(ui) + 6.0).max(LANE_WIDTH + 4.0);
+        ScrollArea::vertical()
+            .id_salt(repo.view_id.with("history"))
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, rows.len(), |ui, range| {
+                for row in &rows[range] {
+                    graph_row(ui, row, columns, row_height, palette);
+                }
+            });
+    });
+}
+
+fn empty_history(repo: &OpenedRepo) -> &'static str {
+    let selectable = repo
+        .branches
+        .iter()
+        .any(|listed| listed.branch.oid.is_some());
+    let selected = repo
+        .branches
+        .iter()
+        .any(|listed| listed.checked && listed.branch.oid.is_some())
+        || repo.detached_oid.is_some();
+    if selectable && !selected {
+        "No branches selected."
+    } else {
+        "No commits yet."
+    }
+}
+
+fn graph_row(ui: &mut Ui, row: &GraphRow, columns: usize, row_height: f32, palette: &Palette) {
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, row_height),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            let graph_width = columns.max(1) as f32 * LANE_WIDTH;
+            let (graph_rect, _) =
+                ui.allocate_exact_size(Vec2::new(graph_width, row_height), Sense::hover());
+            paint_lanes(ui.painter(), graph_rect, row, palette);
+            for branch in &row.branches {
+                branch_chip(ui, branch, row_height, palette);
             }
-        });
+            let commit = Commit {
+                oid: row.oid.clone(),
+                summary: row.summary.clone(),
+            };
+            ui.add(Label::new(widgets::commit_line(&commit, palette, ui.style())).truncate());
+        },
+    );
+}
+
+fn paint_lanes(painter: &egui::Painter, rect: Rect, row: &GraphRow, palette: &Palette) {
+    let dot = Pos2::new(lane_center(rect, row.commit_lane), rect.center().y);
+    for trace in &row.traces {
+        let start = match trace.from_lane {
+            Some(lane) => Pos2::new(lane_center(rect, lane), rect.top()),
+            None => dot,
+        };
+        let end = match trace.to_lane {
+            Some(lane) => Pos2::new(lane_center(rect, lane), rect.bottom()),
+            None => dot,
+        };
+        if start.distance(end) < 0.5 {
+            continue;
+        }
+        painter.line_segment(
+            [start, end],
+            Stroke::new(2.0, palette.graph_color(trace.color)),
+        );
+    }
+    painter.circle_filled(dot, 5.0, palette.background);
+    painter.circle_filled(dot, 3.5, palette.graph_color(row.commit_color));
+}
+
+fn lane_center(rect: Rect, lane: usize) -> f32 {
+    rect.left() + lane as f32 * LANE_WIDTH + LANE_WIDTH / 2.0
+}
+
+fn branch_chip(ui: &mut Ui, branch: &GraphBranch, row_height: f32, palette: &Palette) {
+    let color = palette.graph_color(branch.color);
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(chip_text(&branch.name), font, color);
+    let width = galley.size().x + 8.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, row_height), Sense::hover());
+    response.on_hover_text(&branch.name);
+    let chip = Rect::from_center_size(
+        rect.center(),
+        Vec2::new(width, (galley.size().y + 4.0).min(row_height)),
+    );
+    ui.painter()
+        .rect_filled(chip, 4, palette.graph_chip(branch.color));
+    ui.painter().galley(
+        Pos2::new(chip.left() + 4.0, chip.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+}
+
+/// Long branch names stay on the row; the full name is on the chip's tooltip.
+fn chip_text(name: &str) -> String {
+    const MAX: usize = 32;
+    let mut chars = name.chars();
+    let short: String = chars.by_ref().take(MAX).collect();
+    if chars.next().is_some() {
+        let mut trimmed: String = short.chars().take(MAX - 1).collect();
+        trimmed.push('…');
+        trimmed
+    } else {
+        short
+    }
 }
 
 /// The branch name, and the color its icon shares with it.
@@ -444,6 +552,7 @@ mod tests {
     fn branch(count: u64, upstream: Upstream) -> Branch {
         Branch {
             name: "main".to_owned(),
+            oid: None,
             commit_count: count,
             upstream,
             current: true,

@@ -16,7 +16,9 @@ use std::process::{Command, Output};
 use std::thread;
 use std::time::Duration;
 
-use cthulhu_git::git::{Branch, Commit, CommitDetail, Head, History, RepoInfo, Upstream};
+use cthulhu_git::git::{
+    Branch, Commit, CommitDetail, GraphCommit, GraphTip, Head, RepoInfo, Upstream, layout_graph,
+};
 use cthulhu_git::settings::Settings;
 use eframe::egui::{self, accesskit::Role};
 use egui_kittest::Harness;
@@ -331,16 +333,23 @@ fn opened(name: &str, commits: Vec<Commit>, truncated: bool) -> OpenedRepo {
         authored_at: "2026-01-01 00:00".to_owned(),
         message: commit.summary.clone(),
     });
+    let mut graph = linear_graph(&commits);
+    graph.truncated = truncated;
+    let tips = graph_tips(&commits);
     OpenedRepo {
         info: RepoInfo {
             root: PathBuf::from("/repos").join(name),
             name: name.to_owned(),
             head: Head::Branch("main".to_owned()),
         },
-        history: History { commits, truncated },
+        graph,
+        graph_selection: tips.clone(),
+        graph_requested: tips,
+        detached_oid: None,
         branches: vec![ListedBranch {
             branch: Branch {
                 name: "main".to_owned(),
+                oid: commits.first().map(|commit| commit.oid.clone()),
                 commit_count,
                 upstream: Upstream::None,
                 current: true,
@@ -351,6 +360,35 @@ fn opened(name: &str, commits: Vec<Commit>, truncated: bool) -> OpenedRepo {
         view_id: egui::Id::new(("adversarial-repo", name.len(), truncated)),
         terminal: None,
     }
+}
+
+/// One lane, each commit the parent of the one above it, `main` on the newest.
+fn linear_graph(commits: &[Commit]) -> cthulhu_git::git::HistoryGraph {
+    let inputs: Vec<GraphCommit> = commits
+        .iter()
+        .enumerate()
+        .map(|(index, commit)| GraphCommit {
+            oid: commit.oid.clone(),
+            summary: commit.summary.clone(),
+            parents: commits
+                .get(index + 1)
+                .map(|parent| vec![parent.oid.clone()])
+                .unwrap_or_default(),
+        })
+        .collect();
+    layout_graph(&inputs, &graph_tips(commits))
+}
+
+fn graph_tips(commits: &[Commit]) -> Vec<GraphTip> {
+    commits
+        .first()
+        .map(|commit| GraphTip {
+            name: "main".to_owned(),
+            oid: commit.oid.clone(),
+            color: 0,
+        })
+        .into_iter()
+        .collect()
 }
 
 fn commit(summary: &str) -> Commit {
