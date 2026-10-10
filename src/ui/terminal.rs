@@ -1,13 +1,16 @@
 //! Interactive shell for the open repository.
 //!
-//! The PTY is `alacritty_terminal`, not `Git::run`: the user's environment is
-//! left alone, and the process is not killed after 60 seconds. It starts the
-//! first time the strip is shown and dies with the [`OpenedRepo`](super::OpenedRepo).
+//! The PTY is `alacritty_terminal`, not `Git::run`: the parent environment is
+//! left alone, and the process is not killed after 60 seconds. The child is
+//! given `TERM` and `COLORTERM` so `clear` and Ctrl+L erase the screen. It
+//! starts the first time the strip is shown and dies with the
+//! [`OpenedRepo`](super::OpenedRepo).
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::JoinHandle;
@@ -61,6 +64,68 @@ fn this_host() -> HostOs {
     } else {
         HostOs::Unix
     }
+}
+
+/// Environment applied only to the PTY child.
+///
+/// `clear` and the shell binding for Ctrl+L (`clear-screen`) write the
+/// terminfo `clear` capability. A parent `TERM` of `dumb`, or an empty one,
+/// writes nothing, so the screen stays as it was. Alacritty's `setup_env`
+/// chooses the same name and also sets `COLORTERM`, but it stores both on the
+/// whole process. `tty::Options.env` overrides them for the child only.
+fn shell_env() -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    env.insert(
+        "TERM".to_owned(),
+        term_name(alacritty_terminfo_installed()).to_owned(),
+    );
+    env.insert("COLORTERM".to_owned(), "truecolor".to_owned());
+    env
+}
+
+/// `alacritty` when that terminfo entry is installed, otherwise `xterm-256color`.
+fn term_name(alacritty_installed: bool) -> &'static str {
+    if alacritty_installed {
+        "alacritty"
+    } else {
+        "xterm-256color"
+    }
+}
+
+fn alacritty_terminfo_installed() -> bool {
+    terminfo_installed("alacritty")
+}
+
+/// Same lookup as `alacritty_terminal::tty::setup_env`: `TERMINFO`, otherwise
+/// `~/.terminfo`, then `TERMINFO_DIRS`, `PREFIX`, and the system databases.
+fn terminfo_installed(name: &str) -> bool {
+    let Some(first) = name.chars().next() else {
+        return false;
+    };
+    let letter = first.to_string();
+    let hex = format!("{:x}", u32::from(first));
+    let mut dirs = Vec::new();
+    if let Some(dir) = std::env::var_os("TERMINFO") {
+        dirs.push(PathBuf::from(dir));
+    } else if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+    {
+        dirs.push(PathBuf::from(home).join(".terminfo"));
+    }
+    if let Ok(list) = std::env::var("TERMINFO_DIRS") {
+        dirs.extend(list.split(':').map(PathBuf::from));
+    }
+    if let Ok(prefix) = std::env::var("PREFIX") {
+        let prefix = PathBuf::from(prefix);
+        dirs.push(prefix.join("etc/terminfo"));
+        dirs.push(prefix.join("lib/terminfo"));
+        dirs.push(prefix.join("share/terminfo"));
+    }
+    dirs.push(PathBuf::from("/etc/terminfo"));
+    dirs.push(PathBuf::from("/lib/terminfo"));
+    dirs.push(PathBuf::from("/usr/share/terminfo"));
+    dirs.push(PathBuf::from("/boot/system/data/terminfo"));
+    dirs.iter()
+        .any(|dir| dir.join(&letter).join(name).exists() || dir.join(&hex).join(name).exists())
 }
 
 /// One shell for the open repository, or the message left after it exits.
@@ -180,6 +245,7 @@ impl ShellSession {
         let options = tty::Options {
             shell: Some(tty::Shell::new(program, Vec::new())),
             working_directory: Some(cwd.to_path_buf()),
+            env: shell_env(),
             ..tty::Options::default()
         };
         let size = window_size(metrics, ctx.pixels_per_point());
@@ -1139,6 +1205,26 @@ mod tests {
         assert_eq!(
             shell_program(HostOs::Windows, None),
             OsString::from("powershell.exe")
+        );
+    }
+
+    #[test]
+    fn term_name_prefers_alacritty_when_that_terminfo_exists() {
+        assert_eq!(term_name(true), "alacritty");
+        assert_eq!(term_name(false), "xterm-256color");
+    }
+
+    #[test]
+    fn ctrl_l_is_form_feed() {
+        assert_eq!(
+            letter_key(
+                Key::L,
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::NONE
+                }
+            ),
+            Some(vec![0x0c])
         );
     }
 
