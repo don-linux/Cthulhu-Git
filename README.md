@@ -169,9 +169,10 @@ does not stop the search.
    is removed first, so a quoted absolute directory is still searched.
 3. Known install locations, for GUI apps that start with a minimal `PATH`:
    - Linux: `/usr/bin/git`, `/usr/local/bin/git`
-   - macOS: `/opt/homebrew/bin/git`, `/usr/local/bin/git`, `/usr/bin/git`
-     (the Xcode shim; without the Command Line Tools it fails `--version`
-     and is skipped)
+   - macOS: `/opt/homebrew/bin/git`, `/usr/local/bin/git`, then the Command
+     Line Tools or Xcode `git` when that file exists. `/usr/bin/git` is the
+     Xcode stub that opens the installer, so it is tried only after one of
+     those developer copies is present.
    - Windows: `%ProgramFiles%\Git\cmd\git.exe`, `%ProgramFiles%\Git\bin\git.exe`,
      `%ProgramFiles(x86)%\Git\cmd\git.exe`,
      `%LOCALAPPDATA%\Programs\Git\cmd\git.exe`, `%USERPROFILE%\scoop\shims\git.exe`

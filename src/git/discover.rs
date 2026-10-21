@@ -151,27 +151,52 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-/// Apps started from Finder get a minimal `PATH` without Homebrew.
-/// `/usr/bin/git` is the Xcode shim: without the Command Line Tools it fails
-/// `--version` and the search moves on.
-#[cfg(target_os = "macos")]
-fn platform_fallbacks() -> Vec<PathBuf> {
-    [
-        "/opt/homebrew/bin/git",
-        "/usr/local/bin/git",
-        "/usr/bin/git",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .collect()
+const MACOS_HOMEBREW_GIT: &str = "/opt/homebrew/bin/git";
+const MACOS_USR_LOCAL_GIT: &str = "/usr/local/bin/git";
+const MACOS_CLT_GIT: &str = "/Library/Developer/CommandLineTools/usr/bin/git";
+const MACOS_XCODE_GIT: &str = "/Applications/Xcode.app/Contents/Developer/usr/bin/git";
+const MACOS_SHIM_GIT: &str = "/usr/bin/git";
+
+/// Finder starts the app with a `PATH` that has no Homebrew. `/usr/bin/git`
+/// on macOS is a stub that opens the Command Line Tools installer and often
+/// never exits, so it is searched only when a real developer git is already
+/// installed. `exists` is injected so Linux tests can lock the table.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn macos_fallback_paths(exists: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+    let clt = Path::new(MACOS_CLT_GIT);
+    let xcode = Path::new(MACOS_XCODE_GIT);
+    let mut paths = vec![
+        PathBuf::from(MACOS_HOMEBREW_GIT),
+        PathBuf::from(MACOS_USR_LOCAL_GIT),
+    ];
+    if exists(clt) {
+        paths.push(clt.to_path_buf());
+    }
+    if exists(xcode) {
+        paths.push(xcode.to_path_buf());
+    }
+    if exists(clt) || exists(xcode) {
+        paths.push(PathBuf::from(MACOS_SHIM_GIT));
+    }
+    paths
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-fn platform_fallbacks() -> Vec<PathBuf> {
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+fn linux_fallback_paths() -> Vec<PathBuf> {
     ["/usr/bin/git", "/usr/local/bin/git"]
         .into_iter()
         .map(PathBuf::from)
         .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn platform_fallbacks() -> Vec<PathBuf> {
+    macos_fallback_paths(|path| path.is_file())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_fallbacks() -> Vec<PathBuf> {
+    linux_fallback_paths()
 }
 
 /// Git for Windows (machine and per-user installs) and Scoop, which are often
@@ -300,5 +325,59 @@ mod tests {
         let found = find_git_in(&inputs(&[&plain, &executable], Vec::new()));
         assert_eq!(found.existing, vec![executable.join("git")]);
         assert_eq!(found.searched.len(), 2);
+    }
+
+    #[test]
+    fn linux_fallbacks_are_usr_then_usr_local() {
+        assert_eq!(
+            linux_fallback_paths(),
+            vec![
+                PathBuf::from("/usr/bin/git"),
+                PathBuf::from("/usr/local/bin/git")
+            ]
+        );
+    }
+
+    #[test]
+    fn macos_fallbacks_skip_the_xcode_stub_without_a_developer_git() {
+        let paths = macos_fallback_paths(|_| false);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from(MACOS_HOMEBREW_GIT),
+                PathBuf::from(MACOS_USR_LOCAL_GIT),
+            ]
+        );
+        assert!(!paths.iter().any(|path| path == Path::new(MACOS_SHIM_GIT)));
+    }
+
+    #[test]
+    fn macos_fallbacks_keep_homebrew_ahead_of_the_stub_when_clt_exists() {
+        let clt = Path::new(MACOS_CLT_GIT);
+        let paths = macos_fallback_paths(|path| path == clt);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from(MACOS_HOMEBREW_GIT),
+                PathBuf::from(MACOS_USR_LOCAL_GIT),
+                PathBuf::from(MACOS_CLT_GIT),
+                PathBuf::from(MACOS_SHIM_GIT),
+            ]
+        );
+    }
+
+    #[test]
+    fn macos_fallbacks_include_xcode_git_only_when_that_file_exists() {
+        let xcode = Path::new(MACOS_XCODE_GIT);
+        let paths = macos_fallback_paths(|path| path == xcode);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from(MACOS_HOMEBREW_GIT),
+                PathBuf::from(MACOS_USR_LOCAL_GIT),
+                PathBuf::from(MACOS_XCODE_GIT),
+                PathBuf::from(MACOS_SHIM_GIT),
+            ]
+        );
     }
 }
