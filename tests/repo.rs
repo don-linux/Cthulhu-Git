@@ -7,7 +7,7 @@ use std::process::Command;
 use cthulhu_git::git::{
     CommitStats, Git, GitError, GraphCandidate, GraphTip, Head, History, Person, Remote, RepoInfo,
     SHORT_OID_LEN, Upstream, branch_graph, branches, commit_hover, graph_tips, head_commit_oid,
-    history, inspect, latest_commit, remotes,
+    history, inspect, latest_commit, pull_ff_only, remotes,
 };
 use tempfile::TempDir;
 
@@ -122,6 +122,63 @@ impl Fixture {
         let info = self.inspect();
         history(&self.git, &info.root, &info.head, limit).expect("history")
     }
+}
+
+#[test]
+fn divergent_pull_with_rebase_config_does_not_rewrite_head() {
+    let origin = Fixture::init();
+    origin.write("README.md", "base\n");
+    origin.git(&["add", "README.md"]);
+    origin.git(&["commit", "-m", "base"]);
+
+    let local_tmp = TempDir::with_prefix("cthulhu-pull-").expect("temp dir");
+    let local_root = local_tmp.path().join("local");
+    let cloned = Command::new(&origin.git.path)
+        .args([
+            "clone",
+            "--",
+            origin.root.to_str().expect("utf8 origin"),
+            local_root.to_str().expect("utf8 local"),
+        ])
+        .env("GIT_AUTHOR_NAME", "cthulhu")
+        .env("GIT_AUTHOR_EMAIL", "cthulhu@example.invalid")
+        .env("GIT_COMMITTER_NAME", "cthulhu")
+        .env("GIT_COMMITTER_EMAIL", "cthulhu@example.invalid")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .expect("clone");
+    assert!(
+        cloned.status.success(),
+        "clone failed: {}",
+        String::from_utf8_lossy(&cloned.stderr)
+    );
+
+    let local = Fixture {
+        _tmp: local_tmp,
+        root: local_root,
+        git: origin.git.clone(),
+    };
+    origin.write("README.md", "origin moved\n");
+    origin.git(&["add", "README.md"]);
+    origin.git(&["commit", "-m", "origin"]);
+    local.write("README.md", "local moved\n");
+    local.git(&["add", "README.md"]);
+    local.git(&["commit", "-m", "local"]);
+    local.git(&["config", "pull.rebase", "true"]);
+    local.git(&["config", "branch.main.rebase", "true"]);
+
+    let head = local.git(&["rev-parse", "HEAD"]);
+    let error = pull_ff_only(&local.git, &local.root).expect_err("divergent pull");
+    assert!(
+        matches!(error, GitError::Failed { .. }),
+        "pull must fail without rewriting, got {error:?}"
+    );
+    assert_eq!(local.git(&["rev-parse", "HEAD"]), head);
+    let git_dir = local.root.join(".git");
+    assert!(!git_dir.join("rebase-merge").exists());
+    assert!(!git_dir.join("rebase-apply").exists());
+    assert!(!git_dir.join("MERGE_HEAD").exists());
 }
 
 #[test]
