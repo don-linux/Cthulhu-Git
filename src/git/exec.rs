@@ -25,7 +25,7 @@ const KEPT_GIT_VARS: &[&str] = &[
 
 /// `true` when `name` is an inherited `GIT_*` variable that redirects git,
 /// rewrites history, or points at another exec path.
-pub(crate) fn inherited_git_var_is_cleared(name: &str) -> bool {
+pub fn inherited_git_var_is_cleared(name: &str) -> bool {
     name.starts_with("GIT_") && !KEPT_GIT_VARS.contains(&name)
 }
 
