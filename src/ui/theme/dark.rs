@@ -32,5 +32,7 @@ pub const THEME: Theme = Theme {
         ],
         warning: Color32::from_rgb(0xe3, 0xb3, 0x41),
         error: Color32::from_rgb(0xf4, 0x70, 0x67),
+        diff_added: Color32::from_rgb(0x3f, 0xb9, 0x50),
+        diff_removed: Color32::from_rgb(0xf8, 0x51, 0x49),
     },
 };

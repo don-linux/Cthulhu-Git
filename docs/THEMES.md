@@ -12,7 +12,9 @@ settings.json "theme": "dark"
 ```
 
 A theme is only data: a `Palette` of named color roles. `apply` is the only
-code that touches `egui::Visuals`. Views never write `Color32` literals.
+code that touches `egui::Visuals`. Views do not pick theme colors with
+`Color32` literals; `Color32::PLACEHOLDER`, `Color32::TRANSPARENT`, the white
+tint of an avatar texture and the terminal's ANSI colors are the exceptions.
 
 ## Where things are
 
@@ -28,7 +30,8 @@ code that touches `egui::Visuals`. Views never write `Color32` literals.
 | `src/ui/theme/mod.rs` | `current` | The active theme, for views |
 | `src/ui/theme/dark.rs` | `THEME` | The dark theme (the only one today) |
 | `src/ui/mod.rs` | `CthulhuApp::new` | Applies the saved theme at startup |
-| `src/ui/widgets.rs`, `home.rs`, `repo_view.rs` | `theme::current(..).palette` | Where views read colors |
+| `src/ui/widgets.rs`, `home.rs`, `repo_view.rs`, `settings.rs` | `theme::current(..).palette` | Where views read colors |
+| `src/ui/history.rs`, `hover.rs`, `avatars.rs`, `terminal.rs` | `&Palette` | Read the palette their callers pass |
 
 ## Palette roles
 
@@ -41,14 +44,16 @@ code that touches `egui::Visuals`. Views never write `Color32` literals.
 | `input_background` | Text fields, scroll wells |
 | `border` | Card and widget outlines, separators |
 | `text` | Main text |
-| `text_muted` | Field labels, paths, hints, " - " between hash and summary |
+| `text_muted` | Field labels, paths, hints, history column titles |
 | `accent` | Primary button, hover and focus outlines, links |
 | `on_accent` | Text on `accent` |
 | `selection` | Selected text background |
 | `hash` | Commit hashes |
-| `graph` | Commit-graph lanes. Index 0 is the principal branch (`#3794FF` in the dark theme); the rest cycle when there are more lanes than colors. The same hues, faded, fill the branch-name labels, and a translucent stroke of the same hue joins a label to its commit |
-| `warning` | Detached HEAD |
+| `graph` | Commit-graph lanes. Index 0 is the principal branch (`#3794FF` in the dark theme); the rest cycle when there are more lanes than colors. The same hues, faded, fill the branch-name labels, and a translucent stroke of the same hue joins a label to its commit. Author initials (when there is no avatar) use one of these hues, chosen from the address |
+| `warning` | Detached HEAD, a rejected GitHub token and the rate-limit pause on GitHub Auth |
 | `error` | Error banner |
+| `diff_added` | Insertions in the commit hover's short stat, and the "Connected as …" line on GitHub Auth |
+| `diff_removed` | Deletions in the commit hover's short stat |
 
 ## Add a theme
 
@@ -69,6 +74,7 @@ Some(theme.id.to_owned())` (see `docs/SETTINGS.md`).
 
 ## Rules
 
-- No `Color32` literals outside `src/ui/theme/`.
+- No theme colors as `Color32` literals outside `src/ui/theme/` (the
+  exceptions are listed above).
 - Only `apply` / `visuals` modify `egui::Visuals`.
 - A published theme `id` is never renamed: it is stored in users' settings.

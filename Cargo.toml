@@ -14,10 +14,18 @@ directories = "6.0.0"
 dunce = "1.0.5"
 eframe = "0.36.2"
 fontdb = "0.23.0"
+# Author avatars. Already in the tree through eframe; only these decoders.
+# No GIF: its decoder allocates up to 50 MB before image's limits apply.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+# The optional GitHub token, in Keychain, Credential Manager or Secret Service.
+keyring = "4.2.0"
 pollster = "1.0.1"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.11.1"
+# HTTPS for avatars and the GitHub API: rustls with ring, no OpenSSL.
+ureq = "3.4.2"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }

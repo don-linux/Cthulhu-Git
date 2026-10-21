@@ -18,7 +18,7 @@ use proptest::test_runner::FileFailurePersistence;
 use super::exec::{GitError, GitVersion, MIN_GIT_VERSION, classify_failure};
 use super::log::{SHORT_OID_LEN, parse_log, short_oid};
 use super::repo::{Head, parse_head};
-use crate::settings::{FILE_NAME, MAX_RECENT_REPOSITORIES, Settings};
+use crate::settings::{FILE_NAME, HistoryColumns, MAX_RECENT_REPOSITORIES, Settings};
 
 fn proptest_config() -> ProptestConfig {
     ProptestConfig {
@@ -532,6 +532,7 @@ proptest! {
             detail_sidebar_hidden: detail_hidden,
             terminal_hidden,
             terminal_font: None,
+            ..Settings::default()
         };
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("nested").join(FILE_NAME);
@@ -637,6 +638,82 @@ proptest! {
         let expected: Vec<PathBuf> = expected.iter().map(PathBuf::from).collect();
         assert_eq!(loaded.recent_repositories, normalized_recents(&expected));
         assert_recents_normalized(&loaded.recent_repositories);
+        assert_eq!(loaded.history_columns, HistoryColumns::default());
+        assert!(loaded.author_avatars);
+        assert!(!loaded.github_token_in_keyring);
+    }
+
+    #[test]
+    fn history_columns_round_trip_normalized(
+        branch in any::<u16>(),
+        graph in any::<u16>(),
+        hash in any::<u16>(),
+        message in any::<u16>(),
+        author in any::<u16>(),
+        avatars in any::<bool>(),
+        in_keyring in any::<bool>(),
+    ) {
+        let settings = Settings {
+            history_columns: HistoryColumns { branch, graph, hash, message, author },
+            author_avatars: avatars,
+            github_token_in_keyring: in_keyring,
+            ..Settings::default()
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(FILE_NAME);
+        settings.save_to(&path).expect("save");
+        let loaded = Settings::load_from(&path).expect("load");
+        let mut expected = settings;
+        expected.history_columns = expected.history_columns.normalized();
+        assert_eq!(&loaded, &expected);
+        loaded.save_to(&path).expect("save again");
+        assert_eq!(Settings::load_from(&path).expect("load again"), loaded);
+    }
+
+    #[test]
+    fn one_bad_column_keeps_its_siblings(
+        good in 20u16..=1000,
+        which in 0usize..5,
+        bad in prop_oneof![
+            Just(serde_json::json!(0)),
+            Just(serde_json::json!(1001)),
+            Just(serde_json::json!(null)),
+            Just(serde_json::json!("wide")),
+            Just(serde_json::json!(1.5)),
+            Just(serde_json::json!(-4)),
+        ],
+    ) {
+        let names = ["branch", "graph", "hash", "message", "author"];
+        let mut columns = serde_json::Map::new();
+        for (index, name) in names.iter().enumerate() {
+            let value = if index == which { bad.clone() } else { serde_json::json!(good) };
+            columns.insert((*name).to_owned(), value);
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(FILE_NAME);
+        let json = serde_json::json!({
+            "theme": "abyss",
+            "author_avatars": false,
+            "github_token_in_keyring": true,
+            "history_columns": columns,
+        });
+        fs::write(&path, json.to_string()).expect("write");
+        let loaded = Settings::load_from(&path).expect("load");
+        assert_eq!(loaded.theme.as_deref(), Some("abyss"));
+        assert!(!loaded.author_avatars && loaded.github_token_in_keyring);
+        let defaults = HistoryColumns::default();
+        let got = loaded.history_columns;
+        let got = [got.branch, got.graph, got.hash, got.message, got.author];
+        let fallback = [
+            defaults.branch,
+            defaults.graph,
+            defaults.hash,
+            defaults.message,
+            defaults.author,
+        ];
+        for (index, value) in got.iter().enumerate() {
+            assert_eq!(*value, if index == which { fallback[index] } else { good });
+        }
     }
 }
 

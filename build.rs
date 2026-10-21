@@ -22,7 +22,7 @@ const WINDOWS_ICON_SIZES: [u32; 8] = [16, 20, 24, 32, 40, 48, 64, 256];
 const UI_ICONS_DIR: &str = "assets/icons";
 
 /// Interface icons, by file name without `.svg`. Must match `src/ui/icons.rs`.
-const UI_ICONS: [&str; 9] = [
+const UI_ICONS: [&str; 11] = [
     "panel-left",
     "panel-right",
     "house",
@@ -32,6 +32,8 @@ const UI_ICONS: [&str; 9] = [
     "arrow-left",
     "cloud-download",
     "arrow-down-to-line",
+    "circle-user-round",
+    "key-round",
 ];
 
 /// Side of the rendered interface icons. Drawn at about 18 points, this stays

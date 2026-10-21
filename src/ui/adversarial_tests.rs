@@ -17,15 +17,18 @@ use std::thread;
 use std::time::Duration;
 
 use cthulhu_git::git::{
-    Branch, Commit, CommitDetail, GraphCommit, GraphTip, Head, RepoInfo, Upstream, layout_graph,
+    Branch, Commit, CommitDetail, GraphCommit, GraphTip, Head, Person, RepoInfo, Upstream,
+    layout_graph,
 };
-use cthulhu_git::settings::Settings;
+use cthulhu_git::settings::{HistoryColumns, Settings};
 use eframe::egui::{self, accesskit::Role};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use tempfile::TempDir;
 
+use super::avatars::AvatarService;
 use super::home::{self, HomeState};
+use super::hover::HoverCache;
 use super::repo_view;
 use super::theme;
 use super::{CthulhuApp, ListedBranch, OpenedRepo, Screen};
@@ -367,8 +370,8 @@ fn opened(name: &str, commits: Vec<Commit>, truncated: bool) -> OpenedRepo {
     let commit_count = commits.len() as u64;
     let latest = commits.first().map(|commit| CommitDetail {
         oid: commit.oid.clone(),
-        author_name: "cthulhu".to_owned(),
-        author_email: "cthulhu@example.invalid".to_owned(),
+        author: Person::new("cthulhu", "cthulhu@example.invalid"),
+        co_authors: Vec::new(),
         authored_at: "2026-01-01 00:00".to_owned(),
         message: commit.summary.clone(),
     });
@@ -399,7 +402,32 @@ fn opened(name: &str, commits: Vec<Commit>, truncated: bool) -> OpenedRepo {
         latest,
         view_id: egui::Id::new(("adversarial-repo", name.len(), truncated)),
         terminal: None,
+        github: None,
+        hover: HoverCache::default(),
     }
+}
+
+/// The repository screen with avatars off, so nothing reaches the network.
+fn show_repo(
+    ui: &mut egui::Ui,
+    repo: &mut OpenedRepo,
+    branches_open: bool,
+    detail_open: bool,
+    terminal_open: bool,
+) -> Vec<super::Action> {
+    repo_view::show(
+        ui,
+        repo,
+        &repo_view::ViewState {
+            error: None,
+            branches_open,
+            detail_open,
+            terminal_open,
+            syncing: None,
+            columns: HistoryColumns::default(),
+        },
+        &mut AvatarService::disabled(),
+    )
 }
 
 /// One lane, each commit the parent of the one above it, `main` on the newest.
@@ -414,6 +442,8 @@ fn linear_graph(commits: &[Commit]) -> cthulhu_git::git::HistoryGraph {
                 .get(index + 1)
                 .map(|parent| vec![parent.oid.clone()])
                 .unwrap_or_default(),
+            author: Person::new("cthulhu", "cthulhu@example.invalid"),
+            co_authors: Vec::new(),
         })
         .collect();
     layout_graph(&inputs, &graph_tips(commits))
@@ -705,50 +735,82 @@ fn adversarial_long_recent_name_stays_in_layout() {
     assert_text(&harness, "Recent repositories");
 }
 
+const HISTORY_TITLES: [&str; 5] = ["Branch", "Graph", "Commit Hash", "Commit Message", "Author"];
+
+fn label_rect<State>(harness: &Harness<'_, State>, exact: &str) -> egui::Rect {
+    harness
+        .query_all_by_role(Role::Label)
+        .find(|node| node.value().as_deref() == Some(exact))
+        .unwrap_or_else(|| panic!("missing label {exact:?}\n{}", visible_text(harness)))
+        .rect()
+}
+
 #[test]
-fn branch_names_sit_before_the_graph() {
+fn history_titles_start_where_their_columns_start() {
     let summary = "lantern inventory";
     let mut repo = opened("labels", vec![commit(summary)], false);
-    let harness = ui_harness(|ui| {
-        theme::apply(ui.ctx(), theme::DEFAULT_THEME);
-        let _ = repo_view::show(ui, &mut repo, None, false, false, false, None);
-    });
-    assert_text(&harness, "Branch");
-    assert_text(&harness, "Graph");
-    assert_text(&harness, "Commit");
-    assert_text(&harness, summary);
+    let harness = Harness::builder()
+        .with_size(egui::Vec2::new(1600.0, 500.0))
+        .with_pixels_per_point(PIXELS_PER_POINT)
+        .build_ui(|ui| {
+            theme::apply(ui.ctx(), theme::DEFAULT_THEME);
+            let _ = show_repo(ui, &mut repo, false, false, false);
+        });
 
-    let summary_rect = harness
-        .query_all_by_label_contains(summary)
-        .next()
-        .expect("summary")
-        .rect();
+    let titles: Vec<egui::Rect> = HISTORY_TITLES
+        .iter()
+        .map(|title| label_rect(&harness, title))
+        .collect();
+    for pair in titles.windows(2) {
+        assert!(
+            pair[0].left() < pair[1].left(),
+            "titles should read {HISTORY_TITLES:?}: {titles:?}"
+        );
+    }
+
+    let summary_rect = label_rect(&harness, summary);
     let chip = harness
         .query_all_by_label_contains("main")
         .map(|node| node.rect())
         .find(|rect| (rect.center().y - summary_rect.center().y).abs() < 8.0)
         .expect("branch chip on the commit row");
-    assert!(
-        chip.right() + 24.0 < summary_rect.left(),
-        "the branch name should sit left of the commit, with the graph between \
-         (chip right {}, summary left {})",
-        chip.right(),
-        summary_rect.left()
-    );
-
-    let mut header_x = Vec::new();
-    for header in ["Branch", "Graph", "Commit"] {
-        let rect = harness
-            .query_all_by_role(Role::Label)
-            .find(|node| node.value().as_deref() == Some(header))
-            .unwrap_or_else(|| panic!("missing {header} header\n{}", visible_text(&harness)))
-            .rect();
-        header_x.push(rect.left());
+    let hash = label_rect(&harness, "0123456789ab");
+    let author = label_rect(&harness, "cthulhu");
+    for (title, column) in [
+        ("Branch", chip),
+        ("Commit Hash", hash),
+        ("Commit Message", summary_rect),
+        ("Author", author),
+    ] {
+        let title_rect = label_rect(&harness, title);
+        assert!(
+            (title_rect.left() - column.left()).abs() <= 1.0,
+            "{title} title starts at {} but its column's content at {}",
+            title_rect.left(),
+            column.left()
+        );
+        assert!(
+            title_rect.bottom() <= column.top() + 1.0,
+            "{title} title should sit above its rows"
+        );
     }
     assert!(
-        header_x[0] < header_x[1] && header_x[1] < header_x[2],
-        "headers should read Branch, Graph, Commit: {header_x:?}"
+        chip.right() + 24.0 < hash.left(),
+        "the graph sits between the branch label and the hash (chip right {}, hash left {})",
+        chip.right(),
+        hash.left()
     );
+}
+
+#[test]
+fn a_narrow_history_keeps_its_titles_in_order() {
+    let mut repo = opened("narrow", vec![commit("ritual")], false);
+    let harness = ui_harness(|ui| {
+        theme::apply(ui.ctx(), theme::DEFAULT_THEME);
+        let _ = show_repo(ui, &mut repo, true, true, false);
+    });
+    assert_text(&harness, "Branch");
+    assert_text(&harness, "ritual");
 }
 
 #[test]
@@ -757,7 +819,7 @@ fn adversarial_min_window_long_name_and_bidi_summary() {
     let summary = "port \u{202E}starboard\u{202C} side";
     let mut repo = opened(&name, vec![commit(summary)], false);
     let harness = ui_harness(|ui| {
-        let _ = repo_view::show(ui, &mut repo, None, true, true, false, None);
+        let _ = show_repo(ui, &mut repo, true, true, false);
     });
     assert_text(&harness, &name);
     assert_text(&harness, "\u{202E}");
@@ -775,7 +837,7 @@ fn fetch_and_pull_sit_beside_the_branch_name() {
         behind: 0,
     };
     let harness = ui_harness(|ui| {
-        let _ = repo_view::show(ui, &mut repo, None, true, true, false, None);
+        let _ = show_repo(ui, &mut repo, true, true, false);
     });
     assert_text(&harness, "Fetch");
     assert_text(&harness, "Pull");
@@ -809,7 +871,7 @@ fn fetch_and_pull_sit_beside_the_branch_name() {
         behind: 0,
     };
     let harness = ui_harness(|ui| {
-        let _ = repo_view::show(ui, &mut repo, None, true, true, false, None);
+        let _ = show_repo(ui, &mut repo, true, true, false);
     });
     let row = bottom_bar_buttons(&harness);
     assert_eq!(row.len(), 5);
@@ -829,7 +891,7 @@ fn adversarial_thousand_commits_are_virtualized() {
         .collect();
     let mut repo = opened("bulk-history", commits, true);
     let harness = ui_harness(|ui| {
-        let _ = repo_view::show(ui, &mut repo, None, true, false, false, None);
+        let _ = show_repo(ui, &mut repo, true, false, false);
     });
     assert_text(&harness, "Showing the latest 1000 commits.");
     assert_text(&harness, "Commit history (1000+)");

@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cthulhu_git::git::{
-    Git, GitError, GraphCandidate, GraphTip, Head, History, RepoInfo, SHORT_OID_LEN, Upstream,
-    branch_graph, branches, graph_tips, head_commit_oid, history, inspect, latest_commit,
+    CommitStats, Git, GitError, GraphCandidate, GraphTip, Head, History, Person, Remote, RepoInfo,
+    SHORT_OID_LEN, Upstream, branch_graph, branches, commit_hover, graph_tips, head_commit_oid,
+    history, inspect, latest_commit, remotes,
 };
 use tempfile::TempDir;
 
@@ -322,8 +323,9 @@ fn branches_report_commit_counts_and_ahead_behind() {
         .expect("detail")
         .expect("commit");
     assert_eq!(detail.oid, fixture.git(&["rev-parse", "HEAD"]));
-    assert_eq!(detail.author_name, "cthulhu");
-    assert_eq!(detail.author_email, "cthulhu@example.invalid");
+    assert_eq!(detail.author.name, "cthulhu");
+    assert_eq!(detail.author.email, "cthulhu@example.invalid");
+    assert!(detail.co_authors.is_empty());
     assert!(
         detail
             .message
@@ -338,6 +340,159 @@ fn branches_report_commit_counts_and_ahead_behind() {
         "--format=%ad",
     ]);
     assert_eq!(detail.authored_at, expected_date);
+}
+
+#[test]
+fn graph_and_latest_commit_read_co_author_trailers() {
+    let fixture = Fixture::with_commit();
+    fixture.commit(
+        "Seal the vault\n\nThe body mentions Co-authored-by: inline, which is not a trailer.\n\n\
+         Co-authored-by: Ada Voss <ada@miskatonic.test>\n\
+         Co-authored-by: cthulhu <old-address@example.invalid>\n\
+         Co-authored-by: Ada Voss <ADA@miskatonic.test>",
+    );
+
+    let info = fixture.inspect();
+    let listed = branches(&fixture.git, &info.root, &info.head).expect("branches");
+    let graph = branch_graph(&fixture.git, &info.root, &tips_of(&listed), 10).expect("graph");
+    let sealed = graph
+        .rows
+        .iter()
+        .find(|row| row.summary == "Seal the vault")
+        .expect("sealed row");
+    assert_eq!(sealed.author.name, "cthulhu");
+    assert_eq!(sealed.author.email, "cthulhu@example.invalid");
+    assert_eq!(sealed.author.aliases, ["old-address@example.invalid"]);
+    assert_eq!(
+        sealed.co_authors,
+        [Person::new("Ada Voss", "ada@miskatonic.test")]
+    );
+    let awaken = graph
+        .rows
+        .iter()
+        .find(|row| row.summary == "Awaken")
+        .expect("awaken row");
+    assert!(awaken.co_authors.is_empty());
+    assert!(awaken.author.aliases.is_empty());
+
+    let detail = latest_commit(&fixture.git, &info.root, &info.head)
+        .expect("detail")
+        .expect("commit");
+    assert_eq!(detail.co_authors, sealed.co_authors);
+    assert_eq!(detail.author, sealed.author);
+}
+
+#[test]
+fn commit_hover_reads_the_message_dates_and_short_stat() {
+    let fixture = Fixture::with_commit();
+    fixture.write(
+        "README.md",
+        "Ph'nglui mglw'nafh\nCthulhu R'lyeh\nwgah'nagl fhtagn\n",
+    );
+    fixture.write("notes/one.md", "one\n");
+    fixture.git(&["add", "-A"]);
+    fixture.git(&[
+        "commit",
+        "-m",
+        "Chant\n\nLonger body.\n\nCo-authored-by: Ada Voss <ada@miskatonic.test>",
+    ]);
+    let info = fixture.inspect();
+    let oid = fixture.git(&["rev-parse", "HEAD"]);
+    let hover = commit_hover(&fixture.git, &info.root, &oid).expect("hover");
+    assert_eq!(hover.oid, oid);
+    assert_eq!(hover.author.name, "cthulhu");
+    assert_eq!(
+        hover.co_authors,
+        [Person::new("Ada Voss", "ada@miskatonic.test")]
+    );
+    assert!(hover.message.starts_with("Chant\n\nLonger body."));
+    assert!(!hover.message.ends_with('\n'));
+    assert_eq!(
+        hover.stats,
+        Some(CommitStats {
+            files: 2,
+            insertions: 3,
+            deletions: 0,
+        })
+    );
+    let unix: i64 = fixture
+        .git(&["log", "-1", "--format=%at"])
+        .parse()
+        .expect("unix");
+    assert_eq!(hover.authored_unix, unix);
+
+    let empty_oid = {
+        fixture.commit("Nothing changes");
+        fixture.git(&["rev-parse", "HEAD"])
+    };
+    let empty = commit_hover(&fixture.git, &info.root, &empty_oid).expect("empty commit");
+    assert_eq!(empty.stats, None);
+
+    assert!(commit_hover(&fixture.git, &info.root, "--output=/tmp/x").is_err());
+}
+
+#[test]
+fn remotes_are_listed_in_config_order() {
+    let fixture = Fixture::with_commit();
+    let info = fixture.inspect();
+    assert!(remotes(&fixture.git, &info.root).expect("none").is_empty());
+
+    fixture.git(&[
+        "remote",
+        "add",
+        "origin",
+        "git@github.com:don-linux/Cthulhu-Git.git",
+    ]);
+    fixture.git(&[
+        "remote",
+        "add",
+        "my.fork",
+        "https://github.com/someone/fork.git",
+    ]);
+    let listed = remotes(&fixture.git, &info.root).expect("remotes");
+    assert_eq!(
+        listed,
+        [
+            Remote {
+                name: "origin".to_owned(),
+                url: "git@github.com:don-linux/Cthulhu-Git.git".to_owned(),
+            },
+            Remote {
+                name: "my.fork".to_owned(),
+                url: "https://github.com/someone/fork.git".to_owned(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn graph_authors_follow_the_mailmap() {
+    let fixture = Fixture::with_commit();
+    fixture.write(
+        ".mailmap",
+        "Great Old One <great@rlyeh.test> cthulhu <cthulhu@example.invalid>\n",
+    );
+    let info = fixture.inspect();
+    let listed = branches(&fixture.git, &info.root, &info.head).expect("branches");
+    let graph = branch_graph(&fixture.git, &info.root, &tips_of(&listed), 10).expect("graph");
+    assert_eq!(graph.rows[0].author.name, "Great Old One");
+    assert_eq!(graph.rows[0].author.email, "great@rlyeh.test");
+    // The recorded address stays as an alias, for avatars and for folding.
+    assert_eq!(graph.rows[0].author.aliases, ["cthulhu@example.invalid"]);
+
+    fixture.commit("Rise\n\nCo-authored-by: cthulhu <cthulhu@example.invalid>");
+    let listed = branches(&fixture.git, &info.root, &info.head).expect("branches");
+    let graph = branch_graph(&fixture.git, &info.root, &tips_of(&listed), 10).expect("graph");
+    let risen = graph
+        .rows
+        .iter()
+        .find(|row| row.summary == "Rise")
+        .expect("rise row");
+    assert!(
+        risen.co_authors.is_empty(),
+        "the mailmapped author is not their own co-author: {:?}",
+        risen.co_authors
+    );
 }
 
 fn tips_of(listed: &[cthulhu_git::git::Branch]) -> Vec<GraphTip> {

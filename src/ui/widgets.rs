@@ -1,14 +1,11 @@
 //! Small building blocks shared by the screens. Colors come from the active
 //! theme's palette only.
 
-use cthulhu_git::git::Commit;
-use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
-    self, Align, Button, CursorIcon, Frame, Margin, Response, RichText, Sense, Stroke, Style,
-    TextStyle, Ui, UiBuilder, Vec2,
+    self, Button, CursorIcon, Frame, Margin, Response, RichText, Sense, Stroke, Ui, UiBuilder, Vec2,
 };
 
-use super::theme::{self, Palette};
+use super::theme;
 
 pub const CORNER_RADIUS: u8 = 6;
 
@@ -106,38 +103,4 @@ pub fn list_row(ui: &mut Ui, title: &str, detail: &str, enabled: bool) -> Respon
     } else {
         response
     }
-}
-
-/// `<12-character hash> - <summary>`, the hash in monospace.
-///
-/// `scale` multiplies the resolved font size. The history view uses it to
-/// draw commits a little larger than the rest of the chrome.
-pub fn commit_line(commit: &Commit, palette: &Palette, style: &Style, scale: f32) -> LayoutJob {
-    let format = |text_style: TextStyle, color| {
-        let mut font_id = text_style.resolve(style);
-        font_id.size *= scale;
-        TextFormat {
-            font_id,
-            color,
-            valign: Align::Center,
-            ..TextFormat::default()
-        }
-    };
-    let mut job = LayoutJob::default();
-    job.append(
-        commit.short_oid(),
-        0.0,
-        format(TextStyle::Monospace, palette.hash),
-    );
-    job.append(" - ", 0.0, format(TextStyle::Body, palette.text_muted));
-    job.append(&commit.summary, 0.0, format(TextStyle::Body, palette.text));
-    job
-}
-
-/// Height of one [`commit_line`], for virtualized lists.
-pub fn commit_line_height(ui: &Ui, scale: f32) -> f32 {
-    let base = ui
-        .text_style_height(&TextStyle::Monospace)
-        .max(ui.text_style_height(&TextStyle::Body));
-    base * scale
 }

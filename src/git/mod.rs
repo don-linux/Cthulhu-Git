@@ -10,9 +10,12 @@ mod discover;
 mod exec;
 mod graph;
 mod log;
+mod remotes;
 mod repo;
 mod sync;
 
+#[cfg(test)]
+mod author_tests;
 #[cfg(test)]
 mod proptest_tests;
 
@@ -23,6 +26,10 @@ pub use graph::{
     GraphBranch, GraphCandidate, GraphCommit, GraphRow, GraphTip, GraphTrace, HistoryGraph,
     branch_graph, graph_tips, head_commit_oid, layout_graph,
 };
-pub use log::{Commit, CommitDetail, History, SHORT_OID_LEN, history, latest_commit};
+pub use log::{
+    Commit, CommitDetail, CommitHover, CommitStats, History, Person, SHORT_OID_LEN, commit_hover,
+    email_key, fold_co_authors, history, latest_commit, parse_co_authors,
+};
+pub use remotes::{Remote, remotes};
 pub use repo::{Head, RepoInfo, inspect};
 pub use sync::{fetch, fetch_request, pull_ff_only};

@@ -1,7 +1,8 @@
 # Adversarial testing
 
-Run a pass before a release that changes the Git layer (`src/git/`), settings,
-startup, the window state machine, or the GitHub Actions workflows. A small
+Run a pass before a release that changes the Git layer (`src/git/`), the
+network layer (`src/github/`, `src/ui/avatars.rs`), settings, startup, the
+window state machine, or the GitHub Actions workflows. A small
 patch does not need one. The last write-up is
 [adversarial-reports/v0.0.2.md](adversarial-reports/v0.0.2.md).
 
@@ -30,14 +31,20 @@ until the finding is triaged.
 | ---- | ---- | ------- |
 | A. Git execution | `tests/adversarial_git_security.rs` | Clean and process filters, `include.path`, aliases, inherited `GIT_REPLACE_REF_BASE`, `GIT_SHALLOW_FILE`, `GIT_GRAFT_FILE`, `GIT_TRACE`, `GIT_CONFIG_*`. Mis-typed "not a git repository". Shell quoting of `safe.directory`. A slow `--version`. An output bomb. |
 | B. Repository states | `tests/adversarial_repo_states.rs` | NUL, CR, bidi, and huge subjects. SHA-256. Worktrees, submodules, bare repos, a `.git` directory, a broken gitfile, a corrupt `HEAD`, shallow clones, packed-refs. Directory names ending in CR or LF, quotes, non-UTF-8. `history` limits, including `usize::MAX`. |
-| C. Discovery | `tests/adversarial_discover.rs` | Relative `CTHULHU_GIT`, a symlink to a directory, a sleeping override, `2.15.0-rc0`, quoted `PATH` entries, a broken Xcode shim. `cargo check` for `x86_64-pc-windows-gnu` and `x86_64-apple-darwin`. A real Git 2.15 build is an experiment, not a committed test. |
+| C. Discovery | `tests/adversarial_discover.rs` | Relative `CTHULHU_GIT`, a symlink to a directory, a sleeping override, `2.15.0-rc0`, quoted `PATH` entries, a broken Xcode shim. `cargo check` for `x86_64-pc-windows-gnu` and `x86_64-apple-darwin` (needs MinGW-w64 and an Apple clang toolchain for `ring`'s C code; see the README's Development section). A real Git 2.15 build is an experiment, not a committed test. |
 | D. Settings | `tests/adversarial_settings.rs` | UTF-8 BOM, `null` fields, wrong types, a huge file. A settings symlink and a temp symlink pointing outside the config directory. A read-only parent. Concurrent saves. Torn JSON. |
 | E. Window | `src/ui/adversarial_tests.rs` and the `mod` line in `src/ui/mod.rs` | Headless `egui_kittest` (`Harness::new_eframe`, `run_steps`, never `run` while a spinner is up). Corrupt settings must not be overwritten. Home must keep `last_repository`. Long names, bidi subjects, 1000 commits, the minimum window. Optional Xvfb screenshots of the release binary. |
 | F. Actions | Report only, until the fix is reviewed | `actionlint` and `zizmor`. `${{ }}` inside `run:`. Actions pinned to a tag. Who can publish. Whether Windows and macOS run `cargo test`. |
-| G. Parsers | `src/git/proptest_tests.rs` and the `mod` line in `src/git/mod.rs` | `proptest`, 64 cases, no spawned git. `GitVersion::parse`, `parse_head`, `parse_log`, `classify_failure`, `short_oid`, settings round-trip. No panics. |
+| G. Parsers | `src/git/proptest_tests.rs`, `src/git/author_tests.rs` and their `mod` lines in `src/git/mod.rs` | `proptest`, 64 cases, no spawned git. `GitVersion::parse`, `parse_head`, `parse_log`, the graph log with authors and trailers, `parse_co_authors`, `classify_failure`, `short_oid`, settings round-trip. No panics. |
+| H. Network and token | `src/github/adversarial_tests.rs`, `src/ui/network_tests.rs` and their `mod` lines | Everything from the network is untrusted: JSON, headers, redirects, images (size and dimension limits), rate-limit answers. The host allowlist (userinfo, ports, trailing dots, IDN, downgrades). The token reaches only `api.github.com`, never a log, an error string, `settings.json` or the accessibility tree. Through `FakeTransport` and `AvatarService::disabled()` only: no test touches the network or the real keychain. |
+| I. History table | `src/ui/history_tests.rs` and its `mod` line | Titles start where their columns start, at every width and scroll offset. Resizing one column never changes another. Long names, summaries and co-author lists stay inside their cells. |
 
 `proptest` and `egui_kittest` (feature `eframe`) are already dev-dependencies.
 Do not let a pass edit `Cargo.toml` unless a new harness is required.
+
+The one live check, `CTHULHU_LIVE_GITHUB=1 cargo test live_github -- --ignored`,
+makes one API request and one avatar download. Without the variable it
+returns at once, even under `--include-ignored`.
 
 ## After the pass
 

@@ -24,6 +24,8 @@ pub enum Icon {
     ArrowLeft,
     CloudDownload,
     ArrowDownToLine,
+    CircleUserRound,
+    KeyRound,
 }
 
 impl Icon {
@@ -39,6 +41,8 @@ impl Icon {
             Self::ArrowLeft => "arrow-left",
             Self::CloudDownload => "cloud-download",
             Self::ArrowDownToLine => "arrow-down-to-line",
+            Self::CircleUserRound => "circle-user-round",
+            Self::KeyRound => "key-round",
         }
     }
 
@@ -57,6 +61,10 @@ impl Icon {
             Self::ArrowDownToLine => {
                 include_bytes!(concat!(env!("OUT_DIR"), "/icons/arrow-down-to-line.rgba"))
             }
+            Self::CircleUserRound => {
+                include_bytes!(concat!(env!("OUT_DIR"), "/icons/circle-user-round.rgba"))
+            }
+            Self::KeyRound => include_bytes!(concat!(env!("OUT_DIR"), "/icons/key-round.rgba")),
         }
     }
 
@@ -146,6 +154,8 @@ mod tests {
             Icon::ArrowLeft,
             Icon::CloudDownload,
             Icon::ArrowDownToLine,
+            Icon::CircleUserRound,
+            Icon::KeyRound,
         ] {
             assert_eq!(
                 icon.rgba().len(),

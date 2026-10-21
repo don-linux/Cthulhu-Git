@@ -42,12 +42,111 @@ pub struct Settings {
     /// Font family drawn in the terminal. `None`, blank, or an unknown name
     /// keeps the built-in monospace. A family name, not a file path.
     pub terminal_font: Option<String>,
+    /// Width of each commit history column. A value that is not an object
+    /// keeps every default; a bad field keeps only its own default.
+    #[serde(deserialize_with = "lenient_columns")]
+    pub history_columns: HistoryColumns,
+    /// Author avatars are downloaded from GitHub and Gravatar. Off draws
+    /// initials only and sends nothing.
+    #[serde(default = "default_author_avatars")]
+    pub author_avatars: bool,
+    /// A GitHub token was saved in the system keychain. The token itself is
+    /// never written here; this flag only says whether to look for it, so a
+    /// user without a token never triggers a keychain prompt.
+    pub github_token_in_keyring: bool,
 }
 
 /// Older settings files omit the field. The terminal stays hidden until the
 /// user shows it.
 fn default_terminal_hidden() -> bool {
     true
+}
+
+fn default_author_avatars() -> bool {
+    true
+}
+
+/// Width of each commit history column, in thousandths of the history panel.
+///
+/// The columns are independent: no width is derived from another, and the
+/// sum does not have to be 1000. The defaults add up to 1000, so they fill
+/// the panel exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistoryColumns {
+    #[serde(deserialize_with = "lenient_per_mille")]
+    pub branch: u16,
+    #[serde(deserialize_with = "lenient_per_mille")]
+    pub graph: u16,
+    #[serde(deserialize_with = "lenient_per_mille")]
+    pub hash: u16,
+    #[serde(deserialize_with = "lenient_per_mille")]
+    pub message: u16,
+    #[serde(deserialize_with = "lenient_per_mille")]
+    pub author: u16,
+}
+
+impl HistoryColumns {
+    /// Smallest and largest stored width. A full panel is 1000.
+    pub const RANGE: std::ops::RangeInclusive<u16> = 20..=1000;
+
+    /// Puts each field outside [`Self::RANGE`] back to its own default.
+    pub fn normalized(self) -> Self {
+        let defaults = Self::default();
+        let keep = |value: u16, default: u16| {
+            if Self::RANGE.contains(&value) {
+                value
+            } else {
+                default
+            }
+        };
+        Self {
+            branch: keep(self.branch, defaults.branch),
+            graph: keep(self.graph, defaults.graph),
+            hash: keep(self.hash, defaults.hash),
+            message: keep(self.message, defaults.message),
+            author: keep(self.author, defaults.author),
+        }
+    }
+}
+
+impl Default for HistoryColumns {
+    fn default() -> Self {
+        Self {
+            branch: 180,
+            graph: 140,
+            hash: 110,
+            message: 370,
+            author: 200,
+        }
+    }
+}
+
+/// Anything that is not a whole number in `u16` becomes 0, which
+/// [`HistoryColumns::normalized`] replaces with that field's default.
+fn lenient_per_mille<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    // A hand-edited `180.0` is still 180.
+    let number = value.as_u64().or_else(|| {
+        let float = value.as_f64()?;
+        (float.is_finite() && float >= 0.0 && float.fract() == 0.0).then_some(float as u64)
+    });
+    Ok(number
+        .and_then(|number| u16::try_from(number).ok())
+        .unwrap_or(0))
+}
+
+fn lenient_columns<'de, D>(deserializer: D) -> Result<HistoryColumns, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value::<HistoryColumns>(value)
+        .unwrap_or_default()
+        .normalized())
 }
 
 impl Default for Settings {
@@ -60,6 +159,9 @@ impl Default for Settings {
             detail_sidebar_hidden: false,
             terminal_hidden: default_terminal_hidden(),
             terminal_font: None,
+            history_columns: HistoryColumns::default(),
+            author_avatars: default_author_avatars(),
+            github_token_in_keyring: false,
         }
     }
 }
@@ -121,6 +223,7 @@ impl Settings {
         // direct field assignment consistent with `load_from`.
         let mut stored = self.clone();
         stored.normalize_terminal_font();
+        stored.history_columns = stored.history_columns.normalized();
         let mut json = serde_json::to_vec_pretty(&stored).map_err(|error| fail(error.into()))?;
         json.push(b'\n');
 
@@ -438,6 +541,105 @@ mod tests {
                 hidden
             );
         }
+    }
+
+    #[test]
+    fn older_files_get_the_history_and_avatar_defaults() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        fs::write(&path, r#"{ "theme": "abyss", "terminal_hidden": false }"#).expect("write");
+        let loaded = Settings::load_from(&path).expect("load");
+        assert_eq!(loaded.history_columns, HistoryColumns::default());
+        assert!(loaded.author_avatars);
+        assert!(!loaded.github_token_in_keyring);
+    }
+
+    #[test]
+    fn default_history_columns_fill_the_panel() {
+        let columns = HistoryColumns::default();
+        let sum = columns.branch + columns.graph + columns.hash + columns.message + columns.author;
+        assert_eq!(sum, 1000);
+    }
+
+    #[test]
+    fn history_columns_round_trip_and_stay_independent() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path(&dir);
+        let settings = Settings {
+            history_columns: HistoryColumns {
+                branch: 300,
+                graph: 20,
+                hash: 1000,
+                message: 999,
+                author: 21,
+            },
+            author_avatars: false,
+            github_token_in_keyring: true,
+            ..Settings::default()
+        };
+        settings.save_to(&path).expect("save");
+        assert_eq!(Settings::load_from(&path).expect("load"), settings);
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(
+            !text.contains("token\":"),
+            "no token value is stored: {text}"
+        );
+    }
+
+    #[test]
+    fn a_bad_column_keeps_only_its_own_default() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        let defaults = HistoryColumns::default();
+        fs::write(
+            &path,
+            r#"{ "history_columns": { "branch": 0, "graph": 5000, "hash": "wide",
+                 "message": -3, "author": 250, "future_column": 7 } }"#,
+        )
+        .expect("write");
+        assert_eq!(
+            Settings::load_from(&path).expect("load").history_columns,
+            HistoryColumns {
+                author: 250,
+                ..defaults
+            }
+        );
+
+        fs::write(&path, r#"{ "history_columns": { "graph": 333 } }"#).expect("write");
+        assert_eq!(
+            Settings::load_from(&path).expect("load").history_columns,
+            HistoryColumns {
+                graph: 333,
+                ..defaults
+            }
+        );
+
+        for json in [
+            r#"{ "history_columns": null }"#,
+            r#"{ "history_columns": 12 }"#,
+            r#"{ "history_columns": [1, 2, 3] }"#,
+        ] {
+            fs::write(&path, json).expect("write");
+            assert_eq!(
+                Settings::load_from(&path).expect(json).history_columns,
+                defaults,
+                "{json}"
+            );
+        }
+
+        let out_of_range = Settings {
+            history_columns: HistoryColumns {
+                message: 0,
+                ..defaults
+            },
+            ..Settings::default()
+        };
+        out_of_range.save_to(&path).expect("save");
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
+        assert_eq!(value["history_columns"]["message"], defaults.message);
     }
 
     #[test]

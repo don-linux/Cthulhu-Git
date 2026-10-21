@@ -8,9 +8,15 @@
 //!
 //! The Terminal page draws one prompt line in the chosen font. That shell
 //! ignores pointer and keyboard, and it is not the repository terminal.
+//!
+//! The History page turns author avatars on or off. The GitHub Auth page
+//! holds the optional read-only token.
 
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use cthulhu_git::github::{ApiStatus, TOKEN_TEMPLATE_URL};
+use cthulhu_git::settings::HistoryColumns;
 use eframe::egui::{
     self, Align, Button, Color32, CursorIcon, Frame, Id, Key, Layout, Margin, RichText, ScrollArea,
     Sense, Stroke, TextEdit, Ui, UiBuilder, Vec2,
@@ -18,6 +24,7 @@ use eframe::egui::{
 
 use super::Action;
 use super::fonts::{self, CatalogPhase, FacePhase, FontService};
+use super::github_auth::{GitHubAuth, Notice, Stored, token_field_id};
 use super::icons::{self, Icon};
 use super::terminal::{self, Terminal};
 use super::theme::{self, Palette};
@@ -34,6 +41,8 @@ const PREVIEW_PAD: f32 = 8.0;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Terminal,
+    History,
+    GitHubAuth,
 }
 
 #[derive(Clone, Default)]
@@ -42,12 +51,20 @@ struct FontPicker {
     query: String,
 }
 
+/// What the History and GitHub Auth pages read.
+pub struct SettingsView {
+    pub author_avatars: bool,
+    pub api_status: ApiStatus,
+}
+
 pub fn show(
     ui: &mut Ui,
     terminal_font: Option<&str>,
     fonts: &FontService,
     preview: &mut Option<Terminal>,
     cwd: Option<&Path>,
+    view_state: &SettingsView,
+    github: &mut GitHubAuth,
 ) -> Vec<Action> {
     let palette = theme::current(ui.ctx()).palette;
     let mut actions = Vec::new();
@@ -103,6 +120,16 @@ pub fn show(
                     {
                         page = Page::Terminal;
                     }
+                    if nav_button(ui, "History", Icon::CircleUserRound, page == Page::History)
+                        .clicked()
+                    {
+                        page = Page::History;
+                    }
+                    if nav_button(ui, "GitHub Auth", Icon::KeyRound, page == Page::GitHubAuth)
+                        .clicked()
+                    {
+                        page = Page::GitHubAuth;
+                    }
                 });
         });
 
@@ -130,6 +157,12 @@ pub fn show(
                             ui.add_space(8.0);
                             shell_preview(ui, &palette, preview, cwd);
                         }
+                    }
+                    Page::History => {
+                        history_page(ui, &palette, view_state.author_avatars, &mut actions);
+                    }
+                    Page::GitHubAuth => {
+                        github_page(ui, &palette, github, &view_state.api_status);
                     }
                 }
             });
@@ -184,6 +217,260 @@ fn terminal_page(
     }
     ui.add_space(8.0);
     font_hint(ui, palette, view);
+}
+
+fn page_title(ui: &mut Ui, palette: &Palette, title: &str, subtitle: &str) {
+    ui.add_space(8.0);
+    ui.label(RichText::new(title).size(16.0).strong().color(palette.text));
+    ui.label(RichText::new(subtitle).small().color(palette.text_muted));
+    ui.add_space(12.0);
+}
+
+fn paragraph(ui: &mut Ui, palette: &Palette, text: &str) {
+    ui.label(RichText::new(text).color(palette.text));
+    ui.add_space(6.0);
+}
+
+fn muted(ui: &mut Ui, palette: &Palette, text: &str) {
+    ui.label(RichText::new(text).small().color(palette.text_muted));
+}
+
+fn history_page(ui: &mut Ui, palette: &Palette, avatars_on: bool, actions: &mut Vec<Action>) {
+    page_title(
+        ui,
+        palette,
+        "Commit History",
+        "Author pictures and the width of the history columns.",
+    );
+    let mut on = avatars_on;
+    if ui
+        .checkbox(
+            &mut on,
+            RichText::new("Show author avatars").color(palette.text),
+        )
+        .changed()
+    {
+        actions.push(Action::SetAuthorAvatars(on));
+    }
+    ui.add_space(4.0);
+    muted(
+        ui,
+        palette,
+        "Pictures come from GitHub (no-reply addresses, and the GitHub API for repositories \
+         hosted there) and from Gravatar, which receives a SHA-256 hash of the address, never \
+         the address itself. They are kept for a week in the user cache folder. Off draws \
+         initials and sends nothing.",
+    );
+    ui.add_space(16.0);
+    ui.label(RichText::new("Columns").strong().color(palette.text));
+    muted(
+        ui,
+        palette,
+        "Drag a divider in the history header to resize that column only. Double-click a \
+         divider to restore that column. Widths follow the window and the open sidebars.",
+    );
+    ui.add_space(6.0);
+    if ui
+        .button("Reset all column widths")
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .clicked()
+    {
+        actions.push(Action::SetHistoryColumns(HistoryColumns::default()));
+    }
+}
+
+/// Read-only uses the token has today, and what it could add later with the
+/// extra read permission each one needs.
+const POSSIBLE_LATER: [(&str, &str); 5] = [
+    (
+        "Pull requests on each branch label: number, title, state and reviews",
+        "Pull requests: read",
+    ),
+    (
+        "CI status for each commit, beside its hash",
+        "Commit statuses: read, Checks: read",
+    ),
+    (
+        "Titles of the issues and pull requests a message mentions, in the hover",
+        "Issues: read, Pull requests: read",
+    ),
+    ("Releases and tags with their notes", "Contents: read"),
+    (
+        "Who approved or merged a pull request",
+        "Pull requests: read",
+    ),
+];
+
+fn github_page(ui: &mut Ui, palette: &Palette, github: &mut GitHubAuth, api: &ApiStatus) {
+    page_title(
+        ui,
+        palette,
+        "GitHub Auth",
+        "Optional. Without a token, public repositories still show avatars.",
+    );
+    paragraph(
+        ui,
+        palette,
+        "A GitHub token lets Cthulhu Git read the authors and avatars of your private \
+         repositories, and raises GitHub's limit from 60 to 5,000 requests an hour. It is only \
+         used to read: Cthulhu Git never writes to GitHub with it.",
+    );
+
+    ui.label(
+        RichText::new("1. Create a read-only token")
+            .strong()
+            .color(palette.text),
+    );
+    ui.hyperlink_to(
+        RichText::new("Open GitHub's token form, already set to read-only").color(palette.accent),
+        TOKEN_TEMPLATE_URL,
+    );
+    muted(
+        ui,
+        palette,
+        "The form asks for Contents: read-only and Metadata: read-only. For an organization's \
+         private repositories, choose that organization as the Resource owner.",
+    );
+    ui.add_space(10.0);
+
+    ui.label(
+        RichText::new("2. Paste it here")
+            .strong()
+            .color(palette.text),
+    );
+    let busy = github.busy();
+    ui.horizontal(|ui| {
+        let field = ui.add_enabled(
+            !busy,
+            TextEdit::singleline(&mut github.draft)
+                .id(token_field_id())
+                .password(true)
+                .hint_text("github_pat_…")
+                .desired_width(FORM_WIDTH - 90.0),
+        );
+        let enter = field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+        let save = ui
+            .add_enabled(
+                !busy && !github.draft.trim().is_empty(),
+                Button::new("Save"),
+            )
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .clicked();
+        if (save || enter) && !github.draft.trim().is_empty() {
+            github.save_draft(ui.ctx());
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(!busy, Button::new("Import from GitHub CLI"))
+            .on_hover_text("Runs `gh auth token` and fills the field. Nothing is saved yet.")
+            .clicked()
+        {
+            github.import_gh(ui.ctx());
+        }
+        if cthulhu_git::github::token_from_env().is_some()
+            && ui
+                .add_enabled(!busy, Button::new("Use GH_TOKEN"))
+                .on_hover_text("Fills the field from GH_TOKEN or GITHUB_TOKEN.")
+                .clicked()
+        {
+            github.use_env();
+        }
+    });
+    ui.add_space(10.0);
+
+    ui.label(RichText::new("Status").strong().color(palette.text));
+    let stored = match github.stored() {
+        Stored::None => "No token. Public repositories only.",
+        Stored::Keychain => "Token saved in the system keychain.",
+        Stored::Session => "Token used for this session only; it is not saved.",
+    };
+    ui.label(RichText::new(stored).color(palette.text));
+    if let Some(login) = github.user() {
+        let limit = github
+            .rate()
+            .and_then(|rate| Some((rate.remaining?, rate.limit?)))
+            .map(|(remaining, limit)| format!(" · {remaining}/{limit} requests left this hour"))
+            .unwrap_or_default();
+        ui.label(RichText::new(format!("Connected as {login}{limit}")).color(palette.diff_added));
+    }
+    if api.token_rejected {
+        ui.label(
+            RichText::new("GitHub rejected the token; requests continue without it.")
+                .color(palette.warning),
+        );
+    }
+    if let Some(until) = api.paused_until {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        if until > now {
+            let minutes = (until - now).div_ceil(60);
+            ui.label(
+                RichText::new(format!(
+                    "GitHub's rate limit was reached. The API is asked again in {minutes} min."
+                ))
+                .color(palette.warning),
+            );
+        }
+    }
+    match github.notice() {
+        Some(Notice::Info(text)) => muted(ui, palette, text),
+        Some(Notice::Error(text)) => {
+            ui.label(RichText::new(text).color(palette.error));
+        }
+        None => {}
+    }
+    if busy {
+        ui.spinner();
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(!busy && github.has_token(), Button::new("Verify"))
+            .on_hover_text("Asks GitHub who the token belongs to.")
+            .clicked()
+        {
+            github.verify(ui.ctx());
+        }
+        if ui
+            .add_enabled(!busy && github.has_token(), Button::new("Remove token"))
+            .clicked()
+        {
+            github.remove(ui.ctx());
+        }
+    });
+    muted(
+        ui,
+        palette,
+        "Stored in Keychain on macOS, Credential Manager on Windows, or the Secret Service \
+         (GNOME Keyring, KWallet) on Linux. Never in settings.json. It is sent only to \
+         api.github.com, never to avatar hosts.",
+    );
+    ui.add_space(16.0);
+
+    ui.label(
+        RichText::new("Possible later with this token")
+            .strong()
+            .color(palette.text),
+    );
+    for (feature, permission) in POSSIBLE_LATER {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("• {feature}")).color(palette.text));
+            ui.label(
+                RichText::new(format!("({permission})"))
+                    .small()
+                    .color(palette.text_muted),
+            );
+        });
+    }
+    ui.add_space(4.0);
+    muted(
+        ui,
+        palette,
+        "Writing to GitHub (pushing over HTTPS, opening pull requests) would need a different \
+         token with write access, and is not part of this page.",
+    );
 }
 
 /// One prompt line, clipped out of a normal-sized shell. A one-row PTY scrolls

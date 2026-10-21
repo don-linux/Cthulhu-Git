@@ -6,10 +6,18 @@
 
 #[cfg(test)]
 mod adversarial_tests;
+mod avatars;
 mod folder_picker;
 mod fonts;
+mod github_auth;
+mod history;
+#[cfg(test)]
+mod history_tests;
 mod home;
+mod hover;
 mod icons;
+#[cfg(test)]
+mod network_tests;
 mod repo_view;
 mod settings;
 mod terminal;
@@ -23,10 +31,13 @@ use std::thread;
 use cthulhu_git::git::{
     self, Branch, CommitDetail, Git, GraphCandidate, GraphTip, Head, HistoryGraph, RepoInfo,
 };
-use cthulhu_git::settings::Settings;
+use cthulhu_git::github::{self as gh, GitHubRepo};
+use cthulhu_git::settings::{HistoryColumns, Settings};
 use eframe::egui;
 
+use avatars::AvatarService;
 use folder_picker::FolderPicker;
+use github_auth::GitHubAuth;
 
 /// Newest commits read for the branch graph; the view says when there are more.
 const HISTORY_LIMIT: usize = 1000;
@@ -47,6 +58,11 @@ pub struct OpenedRepo {
     pub view_id: egui::Id,
     /// Shell for this repository. `None` until the terminal strip is shown.
     pub terminal: Option<terminal::Terminal>,
+    /// The GitHub repository behind `upstream`, `origin` or the first GitHub
+    /// remote, for avatars and links.
+    pub github: Option<GitHubRepo>,
+    /// Commit details read for the history hover.
+    pub hover: hover::HoverCache,
 }
 
 /// A local branch and whether it is drawn in the history graph.
@@ -70,6 +86,8 @@ pub enum Action {
     /// `upstream` is `%(upstream:short)`, for example `origin/main`.
     Fetch(String),
     Pull,
+    SetHistoryColumns(HistoryColumns),
+    SetAuthorAvatars(bool),
 }
 
 /// A fetch or pull running against the open repository.
@@ -91,6 +109,7 @@ struct LoadedRepo {
     detached_oid: Option<String>,
     branches: Vec<Branch>,
     latest: Option<CommitDetail>,
+    github: Option<GitHubRepo>,
 }
 
 type OpenResult = Result<LoadedRepo, String>;
@@ -119,6 +138,14 @@ pub struct CthulhuApp {
     graph_load: Option<GraphLoad>,
     graph_generation: u64,
     sync_job: Option<SyncJob>,
+    avatars: AvatarService,
+    github: GitHubAuth,
+}
+
+/// Downloaded avatars, beside the settings in the per-user cache folder.
+fn avatar_cache_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("io.github", "don-linux", "cthulhu-git")
+        .map(|dirs| dirs.cache_dir().join("avatars"))
 }
 
 impl CthulhuApp {
@@ -139,6 +166,17 @@ impl CthulhuApp {
         theme::apply(ctx, theme::resolve(settings.theme.as_deref()));
 
         let startup = command_line.or_else(|| settings.last_repository.clone());
+        // Tests never reach the network.
+        let avatars = if cfg!(test) {
+            AvatarService::disabled()
+        } else {
+            AvatarService::new(avatar_cache_dir(), settings.author_avatars)
+        };
+        let mut github = GitHubAuth::default();
+        // Only a user who saved a token ever reaches the keychain.
+        if settings.github_token_in_keyring {
+            github.load(ctx);
+        }
         let mut app = Self {
             settings,
             settings_path,
@@ -153,11 +191,27 @@ impl CthulhuApp {
             graph_load: None,
             graph_generation: 0,
             sync_job: None,
+            avatars,
+            github,
         };
         if let Some(path) = startup {
             app.open(ctx, path);
         }
         app
+    }
+
+    fn poll_github(&mut self, ctx: &egui::Context) {
+        for change in self.github.poll(ctx) {
+            match change {
+                github_auth::Change::Token(token) => self.avatars.set_token(token),
+                github_auth::Change::InKeychain(stored) => {
+                    if self.settings.github_token_in_keyring != stored {
+                        self.settings.github_token_in_keyring = stored;
+                        self.save_settings();
+                    }
+                }
+            }
+        }
     }
 
     /// Git runs on a worker thread: blocking the UI thread would freeze the window.
@@ -212,6 +266,8 @@ impl CthulhuApp {
                     latest: loaded.latest,
                     view_id: egui::Id::new(("repo-view", self.opened_count)),
                     terminal: None,
+                    github: loaded.github,
+                    hover: hover::HoverCache::default(),
                 }));
             }
             Err(message) => {
@@ -264,6 +320,8 @@ impl eframe::App for CthulhuApp {
         self.poll_graph();
         self.poll_sync();
         self.poll_picker(ui.ctx());
+        self.poll_github(ui.ctx());
+        self.avatars.poll(ui.ctx());
         self.fonts
             .sync(ui.ctx(), self.settings.terminal_font.as_deref());
 
@@ -280,12 +338,18 @@ impl eframe::App for CthulhuApp {
                 Screen::Home => None,
             };
             terminal::service(ui.ctx(), &mut self.font_preview);
+            let view = settings::SettingsView {
+                author_avatars: self.settings.author_avatars,
+                api_status: self.avatars.api_status(),
+            };
             settings::show(
                 ui,
                 self.settings.terminal_font.as_deref(),
                 &self.fonts,
                 &mut self.font_preview,
                 cwd.as_deref(),
+                &view,
+                &mut self.github,
             )
         } else {
             match &mut self.screen {
@@ -303,11 +367,15 @@ impl eframe::App for CthulhuApp {
                 Screen::Repo(repo) => repo_view::show(
                     ui,
                     repo,
-                    self.error.as_deref(),
-                    !self.settings.history_sidebar_hidden,
-                    !self.settings.detail_sidebar_hidden,
-                    !self.settings.terminal_hidden,
-                    syncing,
+                    &repo_view::ViewState {
+                        error: self.error.as_deref(),
+                        branches_open: !self.settings.history_sidebar_hidden,
+                        detail_open: !self.settings.detail_sidebar_hidden,
+                        terminal_open: !self.settings.terminal_hidden,
+                        syncing,
+                        columns: self.settings.history_columns,
+                    },
+                    &mut self.avatars,
                 ),
             }
         };
@@ -363,6 +431,18 @@ impl eframe::App for CthulhuApp {
                 Action::Pull => {
                     self.start_sync(ui.ctx(), SyncCommand::Pull);
                 }
+                Action::SetHistoryColumns(columns) => {
+                    let columns = columns.normalized();
+                    if self.settings.history_columns != columns {
+                        self.settings.history_columns = columns;
+                        self.save_settings();
+                    }
+                }
+                Action::SetAuthorAvatars(on) => {
+                    self.settings.author_avatars = on;
+                    self.avatars.set_enabled(on);
+                    self.save_settings();
+                }
             }
         }
         self.sync_graph(ui.ctx());
@@ -374,6 +454,7 @@ struct Refreshed {
     branches: Vec<Branch>,
     latest: Option<CommitDetail>,
     detached_oid: Option<String>,
+    github: Option<GitHubRepo>,
 }
 
 fn load(path: &Path) -> OpenResult {
@@ -398,6 +479,7 @@ fn load(path: &Path) -> OpenResult {
         detached_oid: refreshed.detached_oid,
         branches: refreshed.branches,
         latest: refreshed.latest,
+        github: refreshed.github,
     })
 }
 
@@ -413,11 +495,16 @@ fn reload_repo(git: &Git, path: &Path) -> Result<Refreshed, String> {
         }
         Head::Branch(_) | Head::Unborn(_) => None,
     };
+    // Remotes only enable avatars and links, so an unreadable config is not an error.
+    let github = git::remotes(git, &info.root)
+        .ok()
+        .and_then(|remotes| gh::github_repo(&remotes));
     Ok(Refreshed {
         info,
         branches,
         latest,
         detached_oid,
+        github,
     })
 }
 
@@ -460,6 +547,7 @@ fn apply_refresh(repo: &mut OpenedRepo, refreshed: Refreshed) {
     repo.info = refreshed.info;
     repo.latest = refreshed.latest;
     repo.detached_oid = refreshed.detached_oid;
+    repo.github = refreshed.github;
     repo.branches = refreshed
         .branches
         .into_iter()

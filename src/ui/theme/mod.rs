@@ -42,6 +42,10 @@ pub struct Palette {
     /// Detached HEAD and other cautions.
     pub warning: Color32,
     pub error: Color32,
+    /// Insertions in a commit's short stat.
+    pub diff_added: Color32,
+    /// Deletions in a commit's short stat.
+    pub diff_removed: Color32,
 }
 
 #[derive(Debug, PartialEq, Eq)]

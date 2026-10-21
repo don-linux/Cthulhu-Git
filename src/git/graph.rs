@@ -11,8 +11,18 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use super::exec::{Git, GitError};
+use super::log::{Person, author_and_co_authors};
 
 const FIELD_SEPARATOR: u8 = 0x1f;
+/// Between the subject and the trailer block: a different byte from the
+/// field separator, so a unit separator in either one stays put.
+const TRAILERS_START: u8 = 0x1e;
+
+/// Oid, parents, author after and before `.mailmap`, subject, then the
+/// trailer block. `%(trailers)` with `only` and `unfold` exists since Git
+/// 2.15, the minimum this app accepts.
+const GRAPH_FORMAT: &str =
+    "--format=%H%x1f%P%x1f%aN%x1f%aE%x1f%an%x1f%ae%x1f%s%x1e%(trailers:only,unfold)";
 
 /// How many lane colors the history view cycles. Principal is always `0`.
 /// The same count lives in the theme palette.
@@ -47,6 +57,10 @@ pub struct GraphCommit {
     pub oid: String,
     pub summary: String,
     pub parents: Vec<String>,
+    /// `%aN <%aE>`, so `.mailmap` applies.
+    pub author: Person,
+    /// From the commit's `Co-authored-by` trailers, without the author.
+    pub co_authors: Vec<Person>,
 }
 
 /// The rows the history view paints, newest first.
@@ -62,6 +76,8 @@ pub struct HistoryGraph {
 pub struct GraphRow {
     pub oid: String,
     pub summary: String,
+    pub author: Person,
+    pub co_authors: Vec<Person>,
     /// Branch tips that point at this commit, in sidebar order.
     pub branches: Vec<GraphBranch>,
     /// Lane of the dot, in this row's top index space.
@@ -265,7 +281,7 @@ pub fn branch_graph(
         "log".to_owned(),
         "--date-order".to_owned(),
         "-z".to_owned(),
-        "--format=%H%x1f%P%x1f%s".to_owned(),
+        GRAPH_FORMAT.to_owned(),
         "--no-color".to_owned(),
         max_count,
     ];
@@ -296,10 +312,11 @@ fn is_oid(oid: &str) -> bool {
     !oid.is_empty() && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Parses `git log -z --format=%H%x1f%P%x1f%s`.
+/// Parses `git log -z` records written with [`GRAPH_FORMAT`].
 ///
-/// Parents are space-separated. A unit separator inside the summary stays in
-/// the summary; the first two separators split the fixed fields.
+/// Parents are space-separated. The first six unit separators split the
+/// fixed fields and the last record separator starts the trailer block, so a
+/// unit separator inside the summary stays in the summary.
 pub(crate) fn parse_graph_log(stdout: &[u8]) -> Option<Vec<GraphCommit>> {
     stdout
         .split(|byte| *byte == 0)
@@ -309,17 +326,23 @@ pub(crate) fn parse_graph_log(stdout: &[u8]) -> Option<Vec<GraphCommit>> {
 }
 
 fn parse_graph_record(record: &[u8]) -> Option<GraphCommit> {
-    let mut parts = record.splitn(3, |byte| *byte == FIELD_SEPARATOR);
+    let mut parts = record.splitn(7, |byte| *byte == FIELD_SEPARATOR);
     let oid = parts.next()?;
     let parents = parts.next()?;
-    let summary = parts.next()?;
+    let identity = [parts.next()?, parts.next()?, parts.next()?, parts.next()?];
+    let rest = parts.next()?;
+    let split = rest.iter().rposition(|byte| *byte == TRAILERS_START)?;
+    let (summary, trailers) = (&rest[..split], &rest[split + 1..]);
     if !is_oid(&String::from_utf8_lossy(oid)) {
         return None;
     }
+    let (author, co_authors) = author_and_co_authors(identity, &String::from_utf8_lossy(trailers));
     Some(GraphCommit {
         oid: String::from_utf8_lossy(oid).into_owned(),
         summary: String::from_utf8_lossy(summary).into_owned(),
         parents: parse_parents(parents)?,
+        author,
+        co_authors,
     })
 }
 
@@ -670,6 +693,8 @@ fn layout_row(commit: &GraphCommit, lanes: &mut Vec<Lane>, ctx: &RowCtx<'_>) -> 
     GraphRow {
         oid: commit.oid.clone(),
         summary: commit.summary.clone(),
+        author: commit.author.clone(),
+        co_authors: commit.co_authors.clone(),
         branches: tip_labels(ctx.tips, &commit.oid),
         commit_lane: lane_idx,
         commit_color,
@@ -787,14 +812,40 @@ mod tests {
     const OID_B: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
     const OID_C: &str = "8b137891791fe96927ad78e64b0aad7bded08eec";
 
-    fn record(oid: &str, parents: &str, summary: &[u8]) -> Vec<u8> {
+    fn record_with(
+        oid: &str,
+        parents: &str,
+        author: (&str, &str),
+        summary: &[u8],
+        trailers: &[u8],
+    ) -> Vec<u8> {
         let mut out = oid.as_bytes().to_vec();
-        out.push(FIELD_SEPARATOR);
-        out.extend_from_slice(parents.as_bytes());
+        for field in [
+            parents.as_bytes(),
+            author.0.as_bytes(),
+            author.1.as_bytes(),
+            author.0.as_bytes(),
+            author.1.as_bytes(),
+        ] {
+            out.push(FIELD_SEPARATOR);
+            out.extend_from_slice(field);
+        }
         out.push(FIELD_SEPARATOR);
         out.extend_from_slice(summary);
+        out.push(TRAILERS_START);
+        out.extend_from_slice(trailers);
         out.push(0);
         out
+    }
+
+    fn record(oid: &str, parents: &str, summary: &[u8]) -> Vec<u8> {
+        record_with(
+            oid,
+            parents,
+            ("cthulhu", "cthulhu@example.invalid"),
+            summary,
+            b"",
+        )
     }
 
     fn commit(oid: &str, summary: &str, parents: &[&str]) -> GraphCommit {
@@ -802,6 +853,8 @@ mod tests {
             oid: oid.to_owned(),
             summary: summary.to_owned(),
             parents: parents.iter().map(|parent| (*parent).to_owned()).collect(),
+            author: Person::new("cthulhu", "cthulhu@example.invalid"),
+            co_authors: Vec::new(),
         }
     }
 
@@ -849,14 +902,47 @@ mod tests {
                     oid: OID_A.to_owned(),
                     summary: "merge\u{1f} topic".to_owned(),
                     parents: vec![OID_B.to_owned(), OID_C.to_owned()],
+                    author: Person::new("cthulhu", "cthulhu@example.invalid"),
+                    co_authors: Vec::new(),
                 },
                 GraphCommit {
                     oid: OID_B.to_owned(),
                     summary: "root".to_owned(),
                     parents: Vec::new(),
+                    author: Person::new("cthulhu", "cthulhu@example.invalid"),
+                    co_authors: Vec::new(),
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parses_the_author_and_co_author_trailers() {
+        let stdout = record_with(
+            OID_A,
+            "",
+            ("Fernando Diaz", "fernando@example.invalid"),
+            b"Improved graph",
+            b"Co-authored-by: Cursor Agent <cursoragent@cursor.com>\n\
+              Co-authored-by: Fernando Diaz <don-linux@users.noreply.github.com>\n",
+        );
+        let commits = parse_graph_log(&stdout).expect("parsable");
+        let commit = &commits[0];
+        assert_eq!(commit.summary, "Improved graph");
+        assert_eq!(commit.author.name, "Fernando Diaz");
+        assert_eq!(commit.author.email, "fernando@example.invalid");
+        assert_eq!(
+            commit.author.aliases,
+            ["don-linux@users.noreply.github.com"]
+        );
+        assert_eq!(
+            commit.co_authors,
+            [Person::new("Cursor Agent", "cursoragent@cursor.com")]
+        );
+
+        let graph = layout_graph(&commits, &[spine("main", OID_A, 0)]);
+        assert_eq!(graph.rows[0].author, commit.author);
+        assert_eq!(graph.rows[0].co_authors, commit.co_authors);
     }
 
     #[test]
@@ -865,6 +951,45 @@ mod tests {
         assert_eq!(parse_graph_log(b"no separator\0"), None);
         assert_eq!(parse_graph_log(&record("not-hex", "", b"x")), None);
         assert_eq!(parse_graph_log(&record(OID_A, "not-a-hash", b"x")), None);
+        // The old three-field format has no author or trailer block.
+        let old = format!("{OID_A}\x1f\x1fsummary\0");
+        assert_eq!(parse_graph_log(old.as_bytes()), None);
+    }
+
+    #[test]
+    fn a_mailmapped_author_named_again_in_a_trailer_is_not_a_co_author() {
+        let mut out = OID_A.as_bytes().to_vec();
+        for field in [
+            "",
+            "Great Old One",
+            "great@rlyeh.test",
+            "cthulhu",
+            "cthulhu@example.invalid",
+        ] {
+            out.push(FIELD_SEPARATOR);
+            out.extend_from_slice(field.as_bytes());
+        }
+        out.push(FIELD_SEPARATOR);
+        out.extend_from_slice(b"Rise\x1fagain");
+        out.push(TRAILERS_START);
+        out.extend_from_slice(
+            b"Co-authored-by: cthulhu <cthulhu@example.invalid>\n\
+              Co-authored-by: cthulhu <second@example.invalid>\n\
+              Co-authored-by: Tag\x1fged <tag@example.invalid>\n",
+        );
+        out.push(0);
+        let commits = parse_graph_log(&out).expect("parsable");
+        let commit = &commits[0];
+        assert_eq!(commit.summary, "Rise\u{1f}again");
+        assert_eq!(commit.author.name, "Great Old One");
+        assert_eq!(
+            commit.author.aliases,
+            ["cthulhu@example.invalid", "second@example.invalid"]
+        );
+        assert_eq!(
+            commit.co_authors,
+            [Person::new("Tag\u{1f}ged", "tag@example.invalid")]
+        );
     }
 
     #[test]
