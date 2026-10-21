@@ -5,9 +5,10 @@
 //! fetch and pull, and the terminal toggle at the right end.
 
 use cthulhu_git::git::{Branch, Commit, GraphBranch, GraphRow, Head, Upstream};
+use eframe::egui::text::{LayoutJob, TextFormat, TextWrapping};
 use eframe::egui::{
     self, Align, Color32, CursorIcon, Frame, Label, Layout, Margin, Pos2, Rect, RichText,
-    ScrollArea, Sense, Stroke, Ui, Vec2,
+    ScrollArea, Sense, Stroke, TextStyle, Ui, Vec2,
 };
 
 use super::icons::{self, Icon};
@@ -16,8 +17,27 @@ use super::theme::{self, Palette};
 use super::widgets;
 use super::{Action, ListedBranch, OpenedRepo, SyncKind};
 
-const LANE_WIDTH: f32 = 14.0;
 const LANE_DOT: f32 = 8.0;
+/// Commit text and branch labels, relative to egui's body size.
+const COMMIT_TEXT_SCALE: f32 = 1.15;
+const BRANCH_COLUMN_RATIO: f32 = 0.20;
+const GRAPH_BUDGET_RATIO: f32 = 0.30;
+const BRANCH_COLUMN_MIN: f32 = 72.0;
+const BRANCH_COLUMN_MAX: f32 = 220.0;
+const LANE_MIN: f32 = 10.0;
+const LANE_MAX: f32 = 20.0;
+const GAP_AFTER_BRANCH: f32 = 8.0;
+const GAP_AFTER_GRAPH: f32 = 16.0;
+const LANE_STROKE: f32 = 2.5;
+const DOT_OUTER: f32 = 6.5;
+const DOT_INNER: f32 = 4.5;
+const CONNECTOR_STROKE: f32 = 1.5;
+const CHIP_ICON: f32 = 14.0;
+const CHIP_PAD: f32 = 4.0;
+const ROW_PAD: f32 = 12.0;
+const ROW_MIN: f32 = 26.0;
+/// Room kept for `hash - message` before the branch column gives up its minimum.
+const TEXT_PREFERRED: f32 = 140.0;
 const SIDEBAR_DEFAULT_WIDTH: f32 = 320.0;
 const SIDEBAR_MIN_WIDTH: f32 = 220.0;
 const SIDEBAR_MAX_WIDTH: f32 = 560.0;
@@ -474,19 +494,132 @@ fn history(ui: &mut Ui, repo: &OpenedRepo, palette: &Palette) {
         );
         ui.add_space(4.0);
     }
-    // Rows touch, so a lane drawn to the bottom of one meets the top of the next.
+    // Measured from the panel on screen, so opening or dragging a sidebar
+    // reflows the columns instead of leaving a fixed graph.
     let columns = repo.graph.columns;
+    history_header(ui, columns, palette);
+    ui.add_space(4.0);
+    // Rows touch, so a lane drawn to the bottom of one meets the top of the next.
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
-        let row_height = (widgets::commit_line_height(ui) + 6.0).max(LANE_WIDTH + 4.0);
+        let line_height = widgets::commit_line_height(ui, COMMIT_TEXT_SCALE);
+        let row_height = (line_height + ROW_PAD).max(ROW_MIN);
         ScrollArea::vertical()
             .id_salt(repo.view_id.with("history"))
             .auto_shrink([false, false])
             .show_rows(ui, row_height, rows.len(), |ui, range| {
+                let layout = history_layout(ui.available_width(), columns);
                 for row in &rows[range] {
-                    graph_row(ui, row, columns, row_height, palette);
+                    graph_row(ui, row, &layout, row_height, palette);
                 }
             });
+    });
+}
+
+/// Branch names, the graph, and the commit text, in that order. Widths come
+/// from the panel so the same row fits a wide window and the minimum one.
+struct HistoryLayout {
+    branch_width: f32,
+    lane_width: f32,
+    graph_width: f32,
+    gap_branch: f32,
+    gap_graph: f32,
+    text_width: f32,
+}
+
+fn history_layout(width: f32, columns: usize) -> HistoryLayout {
+    let columns = columns.max(1);
+    let width = width.max(0.0);
+    let cols = columns as f32;
+    let mut gap_branch = GAP_AFTER_BRANCH;
+    let mut gap_graph = GAP_AFTER_GRAPH;
+    let mut branch = (width * BRANCH_COLUMN_RATIO).clamp(BRANCH_COLUMN_MIN, BRANCH_COLUMN_MAX);
+    // The graph's share of the panel, split across the lanes. A lane stays
+    // between 10 and 20 px; extra lanes shrink toward 10 before the commit
+    // text gives up space.
+    let mut lane = ((width * GRAPH_BUDGET_RATIO) / cols).clamp(LANE_MIN, LANE_MAX);
+
+    let total = |branch: f32, lane: f32, gap_branch: f32, gap_graph: f32| {
+        branch + lane * cols + gap_branch + gap_graph
+    };
+    // A narrow center (both sidebars open) would otherwise spend its minimum
+    // branch column on names and truncate the hash. Names shrink first.
+    let text_now = width - total(branch, lane, gap_branch, gap_graph);
+    if text_now < TEXT_PREFERRED {
+        branch = (width - lane * cols - gap_branch - gap_graph - TEXT_PREFERRED).max(0.0);
+        let after = width - total(branch, lane, gap_branch, gap_graph);
+        if after < TEXT_PREFERRED && lane > LANE_MIN {
+            let need = TEXT_PREFERRED - after;
+            let spare = (lane - LANE_MIN) * cols;
+            lane -= need.min(spare) / cols;
+        }
+    }
+    if total(branch, lane, gap_branch, gap_graph) > width {
+        let room = (width - branch - gap_branch - gap_graph).max(0.0);
+        lane = (room / cols).min(lane);
+    }
+    if lane < LANE_MIN {
+        lane = LANE_MIN;
+        if total(branch, lane, gap_branch, gap_graph) > width {
+            branch = (width - lane * cols - gap_branch - gap_graph).max(0.0);
+        }
+    }
+    if total(branch, lane, gap_branch, gap_graph) > width {
+        let room = (width - branch - gap_branch - gap_graph).max(0.0);
+        lane = room / cols;
+    }
+    if total(branch, lane, gap_branch, gap_graph) > width {
+        let overflow = total(branch, lane, gap_branch, gap_graph) - width;
+        let gaps = gap_branch + gap_graph;
+        if gaps > 0.0 {
+            let keep = ((gaps - overflow) / gaps).max(0.0);
+            gap_branch *= keep;
+            gap_graph *= keep;
+        }
+    }
+    if total(branch, lane, gap_branch, gap_graph) > width {
+        let room = (width - branch - gap_branch - gap_graph).max(0.0);
+        lane = room / cols;
+    }
+
+    let graph = lane * cols;
+    HistoryLayout {
+        branch_width: branch,
+        lane_width: lane,
+        graph_width: graph,
+        gap_branch,
+        gap_graph,
+        text_width: (width - branch - graph - gap_branch - gap_graph).max(0.0),
+    }
+}
+
+fn history_header(ui: &mut Ui, columns: usize, palette: &Palette) {
+    let layout = history_layout(ui.available_width(), columns);
+    let width = ui.available_width();
+    let height = ui.text_style_height(&TextStyle::Small);
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::ZERO;
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+        let label = |text: &str| RichText::new(text).small().color(palette.text_muted);
+        let branch_rect = Rect::from_min_size(
+            rect.min,
+            Vec2::new(layout.branch_width.min(rect.width()), height),
+        );
+        let graph_x = (rect.left() + layout.branch_width + layout.gap_branch).min(rect.right());
+        // The word may use the gap after the lanes. One lane is narrower than
+        // the word, and the commit column still starts after that gap.
+        let graph_span = (layout.graph_width + layout.gap_graph).min(rect.right() - graph_x);
+        let graph_rect = Rect::from_min_size(
+            Pos2::new(graph_x, rect.top()),
+            Vec2::new(graph_span, height),
+        );
+        let text_rect = Rect::from_min_max(
+            Pos2::new(graph_rect.right().min(rect.right()), rect.top()),
+            rect.max,
+        );
+        ui.put(branch_rect, Label::new(label("Branch")).truncate());
+        ui.put(graph_rect, Label::new(label("Graph")).truncate());
+        ui.put(text_rect, Label::new(label("Commit")).truncate());
     });
 }
 
@@ -507,37 +640,93 @@ fn empty_history(repo: &OpenedRepo) -> &'static str {
     }
 }
 
-fn graph_row(ui: &mut Ui, row: &GraphRow, columns: usize, row_height: f32, palette: &Palette) {
+fn graph_row(
+    ui: &mut Ui,
+    row: &GraphRow,
+    layout: &HistoryLayout,
+    row_height: f32,
+    palette: &Palette,
+) {
     let width = ui.available_width();
-    ui.allocate_ui_with_layout(
-        Vec2::new(width, row_height),
-        Layout::left_to_right(Align::Center),
-        |ui| {
-            let graph_width = columns.max(1) as f32 * LANE_WIDTH;
-            let (graph_rect, _) =
-                ui.allocate_exact_size(Vec2::new(graph_width, row_height), Sense::hover());
-            paint_lanes(ui.painter(), graph_rect, row, palette);
-            for branch in &row.branches {
-                branch_chip(ui, branch, row_height, palette);
-            }
-            let commit = Commit {
-                oid: row.oid.clone(),
-                summary: row.summary.clone(),
-            };
-            ui.add(Label::new(widgets::commit_line(&commit, palette, ui.style())).truncate());
-        },
-    );
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::ZERO;
+        ui.allocate_ui_with_layout(
+            Vec2::new(width, row_height),
+            Layout::left_to_right(Align::Center).with_main_wrap(false),
+            |ui| {
+                let (branch_rect, _) = ui.allocate_exact_size(
+                    Vec2::new(layout.branch_width, row_height),
+                    Sense::hover(),
+                );
+                let _ = ui
+                    .allocate_exact_size(Vec2::new(layout.gap_branch, row_height), Sense::hover());
+                let (graph_rect, _) = ui
+                    .allocate_exact_size(Vec2::new(layout.graph_width, row_height), Sense::hover());
+                let _ =
+                    ui.allocate_exact_size(Vec2::new(layout.gap_graph, row_height), Sense::hover());
+
+                let chip = branch_chip(ui, branch_rect, row, palette);
+                // The connector goes under the lanes, so a vertical stroke
+                // stays continuous where the label's line crosses it.
+                {
+                    let painter = ui.painter();
+                    if let Some(chip) = &chip {
+                        let dot_x = lane_center(graph_rect, row.commit_lane, layout.lane_width);
+                        let y = graph_rect.center().y;
+                        if dot_x - chip.rect.right() > 0.5 {
+                            painter.line_segment(
+                                [Pos2::new(chip.rect.right(), y), Pos2::new(dot_x, y)],
+                                Stroke::new(CONNECTOR_STROKE, palette.graph_connector(chip.color)),
+                            );
+                        }
+                    }
+                    paint_lanes(painter, graph_rect, row, palette, layout.lane_width);
+                }
+                if let Some(chip) = &chip {
+                    paint_branch_chip(ui, chip, palette);
+                }
+                let commit = Commit {
+                    oid: row.oid.clone(),
+                    summary: row.summary.clone(),
+                };
+                ui.allocate_ui_with_layout(
+                    Vec2::new(layout.text_width, row_height),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.add(
+                            Label::new(widgets::commit_line(
+                                &commit,
+                                palette,
+                                ui.style(),
+                                COMMIT_TEXT_SCALE,
+                            ))
+                            .truncate(),
+                        );
+                    },
+                );
+            },
+        );
+    });
 }
 
-fn paint_lanes(painter: &egui::Painter, rect: Rect, row: &GraphRow, palette: &Palette) {
-    let dot = Pos2::new(lane_center(rect, row.commit_lane), rect.center().y);
+fn paint_lanes(
+    painter: &egui::Painter,
+    rect: Rect,
+    row: &GraphRow,
+    palette: &Palette,
+    lane_width: f32,
+) {
+    let dot = Pos2::new(
+        lane_center(rect, row.commit_lane, lane_width),
+        rect.center().y,
+    );
     for trace in &row.traces {
         let start = match trace.from_lane {
-            Some(lane) => Pos2::new(lane_center(rect, lane), rect.top()),
+            Some(lane) => Pos2::new(lane_center(rect, lane, lane_width), rect.top()),
             None => dot,
         };
         let end = match trace.to_lane {
-            Some(lane) => Pos2::new(lane_center(rect, lane), rect.bottom()),
+            Some(lane) => Pos2::new(lane_center(rect, lane, lane_width), rect.bottom()),
             None => dot,
         };
         if start.distance(end) < 0.5 {
@@ -545,51 +734,142 @@ fn paint_lanes(painter: &egui::Painter, rect: Rect, row: &GraphRow, palette: &Pa
         }
         painter.line_segment(
             [start, end],
-            Stroke::new(2.0, palette.graph_color(trace.color)),
+            Stroke::new(LANE_STROKE, palette.graph_color(trace.color)),
         );
     }
-    painter.circle_filled(dot, 5.0, palette.background);
-    painter.circle_filled(dot, 3.5, palette.graph_color(row.commit_color));
+    painter.circle_filled(dot, DOT_OUTER, palette.background);
+    painter.circle_filled(dot, DOT_INNER, palette.graph_color(row.commit_color));
 }
 
-fn lane_center(rect: Rect, lane: usize) -> f32 {
-    rect.left() + lane as f32 * LANE_WIDTH + LANE_WIDTH / 2.0
+fn lane_center(rect: Rect, lane: usize, lane_width: f32) -> f32 {
+    rect.left() + lane as f32 * lane_width + lane_width / 2.0
 }
 
-fn branch_chip(ui: &mut Ui, branch: &GraphBranch, row_height: f32, palette: &Palette) {
-    let color = palette.graph_color(branch.color);
-    let font = egui::TextStyle::Small.resolve(ui.style());
-    let galley = ui
-        .painter()
-        .layout_no_wrap(chip_text(&branch.name), font, color);
-    let width = galley.size().x + 8.0;
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, row_height), Sense::hover());
-    response.on_hover_text(&branch.name);
-    let chip = Rect::from_center_size(
-        rect.center(),
-        Vec2::new(width, (galley.size().y + 4.0).min(row_height)),
-    );
-    ui.painter()
-        .rect_filled(chip, 4, palette.graph_chip(branch.color));
-    ui.painter().galley(
-        Pos2::new(chip.left() + 4.0, chip.center().y - galley.size().y / 2.0),
-        galley,
-        color,
-    );
+/// Checked-out branch first, then the sidebar order the row already has.
+fn ordered_branches(branches: &[GraphBranch]) -> Vec<&GraphBranch> {
+    let mut order: Vec<_> = branches.iter().enumerate().collect();
+    order.sort_by_key(|(index, branch)| (!branch.current, *index));
+    order.into_iter().map(|(_, branch)| branch).collect()
 }
 
-/// Long branch names stay on the row; the full name is on the chip's tooltip.
-fn chip_text(name: &str) -> String {
-    const MAX: usize = 32;
-    let mut chars = name.chars();
-    let short: String = chars.by_ref().take(MAX).collect();
-    if chars.next().is_some() {
-        let mut trimmed: String = short.chars().take(MAX - 1).collect();
-        trimmed.push('…');
-        trimmed
+struct BranchChip {
+    rect: Rect,
+    color: usize,
+    current: bool,
+    tooltip: String,
+    oid: String,
+    text: std::sync::Arc<egui::Galley>,
+    plus: Option<std::sync::Arc<egui::Galley>>,
+}
+
+/// The label sits at the right of the branch column, against the graph.
+/// Several tips on one commit show the first name and a `+N`; the tooltip
+/// lists every name. The text ellipsizes to the column instead of a fixed
+/// character count.
+fn branch_chip(ui: &Ui, column: Rect, row: &GraphRow, palette: &Palette) -> Option<BranchChip> {
+    let ordered = ordered_branches(&row.branches);
+    let primary = *ordered.first()?;
+    let color = palette.graph_color(primary.color);
+    let mut font = TextStyle::Body.resolve(ui.style());
+    font.size *= COMMIT_TEXT_SCALE;
+
+    let extra = ordered.len().saturating_sub(1);
+    let plus = if extra > 0 {
+        Some(
+            ui.painter()
+                .layout_no_wrap(format!("+{extra}"), font.clone(), color),
+        )
     } else {
-        short
+        None
+    };
+    let plus_width = plus.as_ref().map(|galley| galley.size().x).unwrap_or(0.0);
+    let plus_gap = if plus.is_some() { CHIP_PAD } else { 0.0 };
+    let chrome = CHIP_PAD + CHIP_ICON + CHIP_PAD + plus_gap + plus_width + CHIP_PAD;
+    let text_width = (column.width() - chrome).max(0.0);
+
+    let mut job = LayoutJob::single_section(
+        primary.name.clone(),
+        TextFormat {
+            font_id: font,
+            color,
+            valign: Align::Center,
+            ..TextFormat::default()
+        },
+    );
+    job.wrap = TextWrapping {
+        max_width: text_width,
+        max_rows: 1,
+        // Branch names are one token (`feature/alertas-ritual`), so the
+        // ellipsis has to be allowed to land inside the word.
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let text = ui.painter().layout_job(job);
+    let chip_width = (chrome + text.size().x).min(column.width());
+    let chip_height = (text.size().y.max(CHIP_ICON) + CHIP_PAD).min(column.height());
+    let rect = Rect::from_min_size(
+        Pos2::new(
+            column.right() - chip_width,
+            column.center().y - chip_height / 2.0,
+        ),
+        Vec2::new(chip_width, chip_height),
+    );
+    let tooltip = ordered
+        .iter()
+        .map(|branch| branch.name.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(BranchChip {
+        rect,
+        color: primary.color,
+        current: primary.current,
+        tooltip,
+        oid: row.oid.clone(),
+        text,
+        plus,
+    })
+}
+
+fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette) {
+    let color = palette.graph_color(chip.color);
+    let icon_rect = Rect::from_center_size(
+        Pos2::new(
+            chip.rect.left() + CHIP_PAD + CHIP_ICON / 2.0,
+            chip.rect.center().y,
+        ),
+        Vec2::splat(CHIP_ICON),
+    );
+    {
+        let painter = ui.painter();
+        painter.rect_filled(chip.rect, 4.0, palette.graph_chip(chip.color, chip.current));
+        icons::paint_icon(painter, ui.ctx(), icon_rect, Icon::GitBranch, color);
+        let text_x = icon_rect.right() + CHIP_PAD;
+        painter.galley(
+            Pos2::new(text_x, chip.rect.center().y - chip.text.size().y / 2.0),
+            chip.text.clone(),
+            color,
+        );
+        if let Some(plus) = &chip.plus {
+            painter.galley(
+                Pos2::new(
+                    chip.rect.right() - CHIP_PAD - plus.size().x,
+                    chip.rect.center().y - plus.size().y / 2.0,
+                ),
+                plus.clone(),
+                color,
+            );
+        }
     }
+    let response = ui.interact(
+        chip.rect,
+        ui.id().with(("branch-label", chip.oid.as_str())),
+        Sense::hover(),
+    );
+    // Painted text is invisible to accesskit unless the widget carries it.
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, chip.tooltip.as_str())
+    });
+    response.on_hover_text(&chip.tooltip);
 }
 
 struct SyncOffer {
@@ -824,6 +1104,88 @@ mod tests {
         assert_eq!(
             detached.fetch_hover,
             "Detached HEAD has no branch to fetch."
+        );
+    }
+
+    #[test]
+    fn history_layout_fills_the_width_without_negative_columns() {
+        let cases = [
+            (1200.0, 1),
+            (600.0, 1),
+            (600.0, 10),
+            (600.0, 40),
+            (320.0, 3),
+            (80.0, 1),
+            (80.0, 12),
+            (0.0, 0),
+        ];
+        for (width, columns) in cases {
+            let layout = history_layout(width, columns);
+            let sum = layout.branch_width
+                + layout.graph_width
+                + layout.gap_branch
+                + layout.gap_graph
+                + layout.text_width;
+            assert!(
+                (sum - width).abs() < 0.05,
+                "width {width} columns {columns} summed to {sum}"
+            );
+            for (name, value) in [
+                ("branch", layout.branch_width),
+                ("lane", layout.lane_width),
+                ("graph", layout.graph_width),
+                ("text", layout.text_width),
+                ("gap_branch", layout.gap_branch),
+                ("gap_graph", layout.gap_graph),
+            ] {
+                assert!(value.is_finite() && value >= 0.0, "{name} = {value}");
+            }
+        }
+
+        let wide = history_layout(1200.0, 1);
+        assert!((wide.branch_width - 220.0).abs() < 0.01);
+        assert!((wide.lane_width - 20.0).abs() < 0.01);
+        assert!((wide.gap_branch - 8.0).abs() < 0.01);
+        assert!((wide.gap_graph - 16.0).abs() < 0.01);
+        assert!(wide.text_width > 0.0);
+
+        let many = history_layout(600.0, 40);
+        assert!((many.lane_width - 10.0).abs() < 0.01);
+        assert!(many.text_width + 0.01 >= TEXT_PREFERRED);
+
+        // Both sidebars open in the default window: the hash still fits.
+        let cramped = history_layout(196.0, 1);
+        assert!(cramped.text_width + 0.01 >= TEXT_PREFERRED);
+        assert!((cramped.lane_width - 20.0).abs() < 0.01);
+        assert!(cramped.branch_width < BRANCH_COLUMN_MIN);
+    }
+
+    #[test]
+    fn the_checked_out_branch_is_labeled_before_the_others() {
+        let branches = [
+            GraphBranch {
+                name: "feature".to_owned(),
+                color: 1,
+                current: false,
+            },
+            GraphBranch {
+                name: "main".to_owned(),
+                color: 0,
+                current: true,
+            },
+            GraphBranch {
+                name: "topic".to_owned(),
+                color: 2,
+                current: false,
+            },
+        ];
+        let ordered = ordered_branches(&branches);
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|branch| branch.name.as_str())
+                .collect::<Vec<_>>(),
+            ["main", "feature", "topic"]
         );
     }
 }

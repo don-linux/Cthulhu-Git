@@ -3,8 +3,8 @@
 //! the theme.
 
 use eframe::egui::{
-    Button, Color32, ColorImage, Context, CursorIcon, Id, Image, Response, RichText, TextureHandle,
-    TextureOptions, Ui, Vec2,
+    Button, Color32, ColorImage, Context, CursorIcon, Id, Image, Painter, Pos2, Rect, Response,
+    RichText, TextureHandle, TextureOptions, Ui, Vec2,
 };
 
 /// Side of the textures written by `build.rs` (`UI_ICON_SIZE`).
@@ -92,6 +92,18 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, tint: Color32, hover_text: &str) -> 
 
 pub fn icon(ui: &mut Ui, icon: Icon, tint: Color32) -> Response {
     ui.add(icon.image(ui.ctx(), tint))
+}
+
+/// Draws `icon` into `rect`, tinted. Used where the icon sits inside a painted
+/// row rather than as its own widget.
+pub fn paint_icon(painter: &Painter, ctx: &Context, rect: Rect, icon: Icon, tint: Color32) {
+    let texture = icon.texture(ctx);
+    painter.image(
+        texture.id(),
+        rect,
+        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+        tint,
+    );
 }
 
 /// Icon with a word beside it. The whole control is one click, and the frame

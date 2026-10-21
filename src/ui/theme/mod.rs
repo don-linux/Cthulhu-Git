@@ -36,7 +36,8 @@ pub struct Palette {
     pub selection: Color32,
     /// Commit hashes.
     pub hash: Color32,
-    /// Commit-graph lanes. [`Palette::graph_color`] cycles them.
+    /// Commit-graph lanes. Index 0 is the principal branch. [`Palette::graph_color`]
+    /// cycles the rest when a graph has more lanes than colors.
     pub graph: [Color32; GRAPH_LANE_COUNT],
     /// Detached HEAD and other cautions.
     pub warning: Color32,
@@ -153,10 +154,18 @@ impl Palette {
         self.graph[index % GRAPH_LANE_COUNT]
     }
 
-    /// Faded lane color drawn behind a branch name on its tip commit.
-    pub fn graph_chip(self, index: usize) -> Color32 {
+    /// Faded lane color drawn behind a branch name. The checked-out branch is a
+    /// little stronger so it reads as the one you are on.
+    pub fn graph_chip(self, index: usize, current: bool) -> Color32 {
         let color = self.graph_color(index);
-        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 48)
+        let alpha = if current { 88 } else { 48 };
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+    }
+
+    /// Translucent lane color for the stroke that joins a branch label to its commit.
+    pub fn graph_connector(self, index: usize) -> Color32 {
+        let color = self.graph_color(index);
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 160)
     }
 }
 

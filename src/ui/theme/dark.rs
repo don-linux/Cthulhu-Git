@@ -20,10 +20,11 @@ pub const THEME: Theme = Theme {
         selection: Color32::from_rgb(0x1f, 0x4e, 0x4a),
         hash: Color32::from_rgb(0xc7, 0x92, 0xea),
         graph: [
-            Color32::from_rgb(0x3f, 0xb6, 0xa8),
+            // Principal branch. The other lanes stay clear of this blue.
+            Color32::from_rgb(0x37, 0x94, 0xff),
             Color32::from_rgb(0xc7, 0x92, 0xea),
             Color32::from_rgb(0xf0, 0x88, 0x3e),
-            Color32::from_rgb(0x6c, 0xb6, 0xff),
+            Color32::from_rgb(0x3f, 0xb6, 0xa8),
             Color32::from_rgb(0xe3, 0xb3, 0x41),
             Color32::from_rgb(0xf7, 0x78, 0xba),
             Color32::from_rgb(0x7e, 0xe7, 0x87),

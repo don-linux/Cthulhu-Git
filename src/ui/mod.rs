@@ -742,20 +742,24 @@ mod selection_tests {
     }
 
     #[test]
-    fn checking_another_branch_adds_it_beside_the_current_one() {
+    fn checking_main_makes_it_the_principal_lane() {
         let mut branches = vec![listed("feature", true, true), listed("main", false, false)];
         let alone = selected_tips(&branches, None);
         assert_eq!(alone.len(), 1);
         assert!(alone[0].principal);
+        assert!(alone[0].current);
         assert_eq!(alone[0].name, "feature");
 
         branches[1].checked = true;
         let both = selected_tips(&branches, None);
         assert_eq!(both.len(), 2);
-        assert!(both.iter().any(|tip| tip.name == "main" && !tip.principal));
         assert!(
             both.iter()
-                .any(|tip| tip.name == "feature" && tip.principal && tip.color == 0)
+                .any(|tip| tip.name == "main" && tip.principal && tip.color == 0 && !tip.current)
+        );
+        assert!(
+            both.iter()
+                .any(|tip| tip.name == "feature" && !tip.principal && tip.current)
         );
     }
 }

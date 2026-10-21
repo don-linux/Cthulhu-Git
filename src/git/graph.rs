@@ -28,6 +28,8 @@ pub struct GraphTip {
     pub color: usize,
     /// This tip owns the left lane and the color of the shared history.
     pub principal: bool,
+    /// Checked out. Detached `HEAD` counts. Its label is drawn first.
+    pub current: bool,
 }
 
 /// One sidebar row [`graph_tips`] can turn into a [`GraphTip`].
@@ -72,6 +74,8 @@ pub struct GraphRow {
 pub struct GraphBranch {
     pub name: String,
     pub color: usize,
+    /// Checked out. The history draws this label first and a little stronger.
+    pub current: bool,
 }
 
 /// A stroke on one row.
@@ -138,21 +142,20 @@ fn parse_oid(stdout: &[u8]) -> Option<String> {
 
 /// Checked branches, in sidebar order, plus detached `HEAD`.
 ///
-/// The principal tip is the checked-out branch when it is checked. Detached
-/// `HEAD` is principal in its place. Otherwise `main`, then `master`, then
-/// `trunk`. Otherwise the newest committer time, and a tie keeps the earlier
-/// sidebar row. That tip is color `0`. Every other checked branch keeps a
-/// color tied to its sidebar index.
+/// The principal tip is `main`, then `master`, then `trunk`, when that branch
+/// is checked. Otherwise detached `HEAD`. Otherwise the newest committer time,
+/// and a tie keeps the earlier sidebar row. Being checked out does not win a
+/// lane. That tip is color `0`. Every other checked branch keeps a color tied
+/// to its sidebar index. Detached `HEAD`, when it is not principal, is colored
+/// as a row after the last branch.
 pub fn graph_tips(branches: &[GraphCandidate<'_>], detached_oid: Option<&str>) -> Vec<GraphTip> {
     let detached = detached_oid.filter(|oid| is_oid(oid));
-    let current = branches
-        .iter()
-        .position(|branch| branch.current && branch.checked && branch.oid.is_some_and(is_oid));
-    let head_is_principal = detached.is_some() && current.is_none();
+    let named = named_principal(branches);
+    let head_is_principal = named.is_none() && detached.is_some();
     let principal = if head_is_principal {
         None
     } else {
-        current.or_else(|| fallback_principal(branches))
+        named.or_else(|| newest_principal(branches))
     };
 
     let mut tips = Vec::new();
@@ -169,22 +172,27 @@ pub fn graph_tips(branches: &[GraphCandidate<'_>], detached_oid: Option<&str>) -
             oid: oid.to_owned(),
             color: lane_color(index, is_principal),
             principal: is_principal,
+            current: branch.current,
         });
     }
     if let Some(oid) = detached {
         tips.push(GraphTip {
             name: "HEAD".to_owned(),
             oid: oid.to_owned(),
-            color: 0,
+            color: if head_is_principal {
+                0
+            } else {
+                lane_color(branches.len(), false)
+            },
             principal: head_is_principal,
+            current: true,
         });
     }
     tips
 }
 
-/// `main`, then `master`, then `trunk`. Otherwise the newest tip, with the
-/// earlier sidebar row winning a tie. Times that are missing sort as oldest.
-fn fallback_principal(branches: &[GraphCandidate<'_>]) -> Option<usize> {
+/// `main`, then `master`, then `trunk`, when that branch is checked and has a commit.
+fn named_principal(branches: &[GraphCandidate<'_>]) -> Option<usize> {
     const NAMES: [&str; 3] = ["main", "master", "trunk"];
     for name in NAMES {
         if let Some(index) = branches.iter().position(|branch| {
@@ -193,6 +201,12 @@ fn fallback_principal(branches: &[GraphCandidate<'_>]) -> Option<usize> {
             return Some(index);
         }
     }
+    None
+}
+
+/// The newest checked tip. The earlier sidebar row wins a tie. A missing time
+/// sorts as oldest.
+fn newest_principal(branches: &[GraphCandidate<'_>]) -> Option<usize> {
     branches
         .iter()
         .enumerate()
@@ -329,9 +343,12 @@ fn parse_parents(bytes: &[u8]) -> Option<Vec<String>> {
 /// nowhere.
 ///
 /// When a tip is [`GraphTip::principal`], its first-parent chain stays in
-/// lane 0 and keeps that tip's color, even if some other branch was committed
-/// more recently. Those other branches use lanes to the right until they reach
-/// a commit on the chain.
+/// lane 0, even if some other branch was committed more recently. Those other
+/// branches use lanes to the right until they reach a commit on the chain.
+///
+/// Color is not the lane. The principal chain, and every commit reachable
+/// from it that no selected branch claimed, uses the principal color. Each
+/// other selected branch keeps the color of its own first-parent chain.
 pub fn layout_graph(commits: &[GraphCommit], tips: &[GraphTip]) -> HistoryGraph {
     let trunk = trunk_oids(commits, tips);
     let spine_color = tips
@@ -339,13 +356,9 @@ pub fn layout_graph(commits: &[GraphCommit], tips: &[GraphTip]) -> HistoryGraph 
         .find(|tip| tip.principal)
         .map(|tip| tip.color)
         .unwrap_or(0);
+    let colors = commit_colors(commits, tips, &trunk, spine_color);
     let mut remaining: HashSet<String> = commits.iter().map(|commit| commit.oid.clone()).collect();
     let mut lanes: Vec<Lane> = Vec::new();
-    let mut extra_color = tips
-        .iter()
-        .map(|tip| tip.color)
-        .max()
-        .map_or(0, |color| color.saturating_add(1));
     let mut rows = Vec::with_capacity(commits.len());
 
     for commit in commits {
@@ -361,12 +374,12 @@ pub fn layout_graph(commits: &[GraphCommit], tips: &[GraphTip]) -> HistoryGraph 
         rows.push(layout_row(
             commit,
             &mut lanes,
-            &mut extra_color,
             &RowCtx {
                 tips,
                 remaining: &remaining,
                 trunk: &trunk,
                 spine_color,
+                colors: &colors,
             },
         ));
     }
@@ -430,8 +443,7 @@ fn occupy(
     commit_oid: &str,
     on_trunk: bool,
     spine_color: usize,
-    tips: &[GraphTip],
-    extra_color: &mut usize,
+    commit_color: usize,
 ) -> (usize, bool) {
     if on_trunk {
         if let Some(lane) = lanes.first_mut() {
@@ -459,14 +471,9 @@ fn occupy(
         return (index, false);
     }
 
-    let color = if on_trunk {
-        spine_color
-    } else {
-        tip_color(tips, commit_oid).unwrap_or_else(|| take_color(extra_color))
-    };
     lanes.push(Lane {
         next: Some(commit_oid.to_owned()),
-        color,
+        color: commit_color,
         placeholder: false,
     });
     (lanes.len() - 1, true)
@@ -477,6 +484,7 @@ struct RowCtx<'a> {
     remaining: &'a HashSet<String>,
     trunk: &'a HashSet<String>,
     spine_color: usize,
+    colors: &'a HashMap<String, usize>,
 }
 
 /// Lane already expecting `oid`, if joining it would not hide a second branch
@@ -492,26 +500,14 @@ fn lane_waiting_for(lanes: &[Lane], oid: &str, trunk: &HashSet<String>) -> Optio
     }
 }
 
-fn layout_row(
-    commit: &GraphCommit,
-    lanes: &mut Vec<Lane>,
-    extra_color: &mut usize,
-    ctx: &RowCtx<'_>,
-) -> GraphRow {
+fn layout_row(commit: &GraphCommit, lanes: &mut Vec<Lane>, ctx: &RowCtx<'_>) -> GraphRow {
     let on_trunk = ctx.trunk.contains(&commit.oid);
-    let (lane_idx, spawned) = occupy(
-        lanes,
-        &commit.oid,
-        on_trunk,
-        ctx.spine_color,
-        ctx.tips,
-        extra_color,
-    );
-    let commit_color = if on_trunk {
-        ctx.spine_color
-    } else {
-        lanes[lane_idx].color
-    };
+    let commit_color = ctx
+        .colors
+        .get(&commit.oid)
+        .copied()
+        .unwrap_or(ctx.spine_color);
+    let (lane_idx, spawned) = occupy(lanes, &commit.oid, on_trunk, ctx.spine_color, commit_color);
     let top = lanes.clone();
 
     let parents = kept_parents(&commit.parents, ctx.remaining);
@@ -540,7 +536,9 @@ fn layout_row(
         if into_top.is_some() && into_top == merges_into {
             continue;
         }
-        let color = tip_color(ctx.tips, parent).unwrap_or_else(|| take_color(extra_color));
+        // A merge stroke takes the color of the parent it is joining, so a
+        // selected branch stays visible up to the merge commit.
+        let color = ctx.colors.get(parent).copied().unwrap_or(ctx.spine_color);
         extras.push(ExtraParent {
             parent: parent.clone(),
             color,
@@ -691,24 +689,92 @@ fn kept_parents(parents: &[String], remaining: &HashSet<String>) -> Vec<String> 
     kept
 }
 
-fn tip_color(tips: &[GraphTip], oid: &str) -> Option<usize> {
-    tips.iter().find(|tip| tip.oid == oid).map(|tip| tip.color)
-}
-
 fn tip_labels(tips: &[GraphTip], oid: &str) -> Vec<GraphBranch> {
     tips.iter()
         .filter(|tip| tip.oid == oid)
         .map(|tip| GraphBranch {
             name: tip.name.clone(),
             color: tip.color,
+            current: tip.current,
         })
         .collect()
 }
 
-fn take_color(next: &mut usize) -> usize {
-    let color = *next;
-    *next = next.saturating_add(1);
-    color
+/// Color of every commit in `commits`.
+///
+/// The principal first-parent chain is the spine color. Other selected
+/// branches then claim their own first-parent chain, oldest tip first, and
+/// stop where a commit is already colored: a branch grown from another keeps
+/// only the commits that are its alone. Anything still uncolored but reachable
+/// from the principal (a merged branch that is not selected) takes the spine
+/// color too. A commit that only a side branch brought in inherits the color
+/// of the newest child that names it as a parent.
+fn commit_colors(
+    commits: &[GraphCommit],
+    tips: &[GraphTip],
+    trunk: &HashSet<String>,
+    spine_color: usize,
+) -> HashMap<String, usize> {
+    let mut by_oid: HashMap<&str, &GraphCommit> = HashMap::new();
+    for commit in commits {
+        by_oid.insert(commit.oid.as_str(), commit);
+    }
+    let mut colors: HashMap<String, usize> = HashMap::new();
+    for oid in trunk {
+        colors.insert(oid.clone(), spine_color);
+    }
+
+    let mut claim: Vec<&GraphTip> = tips.iter().filter(|tip| !tip.principal).collect();
+    claim.sort_by_key(|tip| {
+        let at = commits
+            .iter()
+            .position(|commit| commit.oid == tip.oid)
+            .unwrap_or(0);
+        std::cmp::Reverse(at)
+    });
+    for tip in claim {
+        let mut cursor = Some(tip.oid.as_str());
+        while let Some(oid) = cursor {
+            if colors.contains_key(oid) || !by_oid.contains_key(oid) {
+                break;
+            }
+            colors.insert(oid.to_owned(), tip.color);
+            cursor = by_oid
+                .get(oid)
+                .and_then(|commit| commit.parents.first().map(String::as_str));
+        }
+    }
+
+    if let Some(start) = tips.iter().find(|tip| tip.principal) {
+        let mut stack = vec![start.oid.as_str()];
+        let mut seen = HashSet::new();
+        while let Some(oid) = stack.pop() {
+            if !seen.insert(oid) {
+                continue;
+            }
+            let Some(commit) = by_oid.get(oid) else {
+                continue;
+            };
+            colors.entry(oid.to_owned()).or_insert(spine_color);
+            for parent in &commit.parents {
+                if by_oid.contains_key(parent.as_str()) {
+                    stack.push(parent.as_str());
+                }
+            }
+        }
+    }
+
+    for commit in commits {
+        let Some(&color) = colors.get(&commit.oid) else {
+            continue;
+        };
+        for parent in &commit.parents {
+            if by_oid.contains_key(parent.as_str()) {
+                colors.entry(parent.clone()).or_insert(color);
+            }
+        }
+    }
+    colors
 }
 
 #[cfg(test)]
@@ -745,6 +811,7 @@ mod tests {
             oid: oid.to_owned(),
             color,
             principal: false,
+            current: false,
         }
     }
 
@@ -1078,6 +1145,118 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn merged_history_is_one_color_when_only_the_principal_is_selected() {
+        let commits = vec![
+            commit("m", "merge", &["a", "b"]),
+            commit("a", "left", &["c"]),
+            commit("b", "right", &["c"]),
+            commit("c", "base", &[]),
+        ];
+        let graph = layout_graph(&commits, &[spine("main", "m", 0)]);
+        assert!(connected(&graph.rows));
+        assert!(graph.rows.iter().all(|row| row.commit_color == 0));
+        assert!(
+            graph
+                .rows
+                .iter()
+                .all(|row| row.traces.iter().all(|trace| trace.color == 0))
+        );
+    }
+
+    #[test]
+    fn a_selected_branch_keeps_its_color_through_two_merges() {
+        let commits = vec![
+            commit("m2", "merge again", &["m1", "f2"]),
+            commit("f2", "feature again", &["f1"]),
+            commit("m1", "merge", &["base", "f1"]),
+            commit("f1", "feature", &["base"]),
+            commit("base", "base", &[]),
+        ];
+        let graph = layout_graph(&commits, &[spine("main", "m2", 0), tip("feature", "f2", 1)]);
+        assert!(connected(&graph.rows));
+        assert_eq!(row_named(&graph, "merge again").commit_color, 0);
+        assert_eq!(row_named(&graph, "merge").commit_color, 0);
+        assert_eq!(row_named(&graph, "base").commit_color, 0);
+        assert_eq!(row_named(&graph, "feature again").commit_color, 1);
+        assert_eq!(row_named(&graph, "feature").commit_color, 1);
+        for summary in ["merge again", "merge"] {
+            let row = row_named(&graph, summary);
+            assert!(
+                row.traces.iter().any(|trace| trace.color == 1),
+                "{summary} lost the feature color: {:?}",
+                row.traces
+            );
+        }
+    }
+
+    #[test]
+    fn an_unselected_branch_merged_into_a_selected_one_inherits_its_color() {
+        let commits = vec![
+            commit("feature", "feature", &["merge"]),
+            commit("main", "main", &["base"]),
+            commit("merge", "merge side", &["fline", "side"]),
+            commit("side", "side", &["base"]),
+            commit("fline", "feature line", &["base"]),
+            commit("base", "base", &[]),
+        ];
+        let graph = layout_graph(
+            &commits,
+            &[spine("main", "main", 0), tip("feature", "feature", 1)],
+        );
+        assert!(connected(&graph.rows));
+        assert_eq!(row_named(&graph, "feature").commit_color, 1);
+        assert_eq!(row_named(&graph, "merge side").commit_color, 1);
+        assert_eq!(row_named(&graph, "side").commit_color, 1);
+        assert_eq!(row_named(&graph, "main").commit_color, 0);
+        assert_eq!(row_named(&graph, "base").commit_color, 0);
+        let side = row_named(&graph, "side");
+        assert!(
+            side.traces.iter().any(|trace| trace.color == 1),
+            "side branch lost the feature color: {:?}",
+            side.traces
+        );
+        // main's lane still crosses this row, in the principal color.
+        assert!(side.traces.iter().any(|trace| trace.color == 0));
+    }
+
+    #[test]
+    fn a_branch_based_on_another_selected_branch_only_colors_its_own_commits() {
+        let commits = vec![
+            commit("feature", "feature", &["topic"]),
+            commit("topic", "topic", &["base"]),
+            commit("main", "main", &["base"]),
+            commit("base", "base", &[]),
+        ];
+        let graph = layout_graph(
+            &commits,
+            &[
+                spine("main", "main", 0),
+                tip("feature", "feature", 1),
+                tip("topic", "topic", 2),
+            ],
+        );
+        assert!(connected(&graph.rows));
+        assert_eq!(row_named(&graph, "feature").commit_color, 1);
+        assert_eq!(row_named(&graph, "topic").commit_color, 2);
+        assert_eq!(row_named(&graph, "main").commit_color, 0);
+        assert_eq!(row_named(&graph, "base").commit_color, 0);
+    }
+
+    #[test]
+    fn the_checked_out_tip_is_marked_current_on_its_row() {
+        let mut feature = tip("feature", "a", 1);
+        feature.current = true;
+        let graph = layout_graph(
+            &[commit("a", "shared", &[])],
+            &[spine("main", "a", 0), feature],
+        );
+        let labels = &graph.rows[0].branches;
+        assert!(!labels[0].current);
+        assert!(labels[1].current);
+        assert_eq!(labels[1].name, "feature");
+    }
+
     fn row_named<'a>(graph: &'a HistoryGraph, summary: &str) -> &'a GraphRow {
         graph
             .rows
@@ -1103,7 +1282,7 @@ mod tests {
     }
 
     #[test]
-    fn the_checked_out_branch_is_principal_even_when_it_is_older() {
+    fn a_checked_main_is_principal_even_when_another_branch_is_checked_out() {
         let branches = [
             choice("feature", OID_A, true, Some(1), true),
             choice("main", OID_B, false, Some(50), true),
@@ -1111,13 +1290,30 @@ mod tests {
         ];
         let tips = graph_tips(&branches, None);
         let principal = tips.iter().find(|tip| tip.principal).expect("principal");
-        assert_eq!(principal.name, "feature");
+        assert_eq!(principal.name, "main");
         assert_eq!(principal.color, 0);
-        assert_eq!(tips.iter().find(|tip| tip.name == "main").unwrap().color, 1);
+        assert!(!principal.current);
+        let feature = tips.iter().find(|tip| tip.name == "feature").unwrap();
+        assert!(feature.current);
+        assert!(!feature.principal);
+        assert_eq!(feature.color, 1);
         assert_eq!(
             tips.iter().find(|tip| tip.name == "topic").unwrap().color,
             2
         );
+    }
+
+    #[test]
+    fn the_checked_out_branch_is_not_principal_just_for_being_current() {
+        let branches = [
+            choice("feature", OID_A, true, Some(1), true),
+            choice("topic", OID_B, false, Some(40), true),
+        ];
+        let tips = graph_tips(&branches, None);
+        assert_eq!(principal_name(&tips), "topic");
+        let feature = tips.iter().find(|tip| tip.name == "feature").unwrap();
+        assert!(feature.current);
+        assert!(!feature.principal);
     }
 
     #[test]
@@ -1129,20 +1325,37 @@ mod tests {
         ];
         let hidden = [
             choice("feature", OID_A, true, Some(1), true),
-            choice("main", OID_B, false, Some(50), false),
-            choice("topic", OID_C, false, Some(40), true),
+            choice("main", OID_B, false, Some(50), true),
+            choice("topic", OID_C, false, Some(40), false),
         ];
         let before = graph_tips(&shown, None);
         let after = graph_tips(&hidden, None);
         assert_eq!(
-            before.iter().find(|tip| tip.name == "topic").unwrap().color,
-            after.iter().find(|tip| tip.name == "topic").unwrap().color
+            before
+                .iter()
+                .find(|tip| tip.name == "feature")
+                .unwrap()
+                .color,
+            after
+                .iter()
+                .find(|tip| tip.name == "feature")
+                .unwrap()
+                .color
         );
         assert_eq!(
-            after.iter().find(|tip| tip.name == "topic").unwrap().color,
-            2
+            after
+                .iter()
+                .find(|tip| tip.name == "feature")
+                .unwrap()
+                .color,
+            1
         );
-        assert!(after.iter().all(|tip| tip.name != "main"));
+        assert!(
+            after
+                .iter()
+                .any(|tip| tip.name == "main" && tip.principal && tip.color == 0)
+        );
+        assert!(after.iter().all(|tip| tip.name != "topic"));
     }
 
     #[test]
@@ -1189,16 +1402,32 @@ mod tests {
     }
 
     #[test]
-    fn detached_head_is_the_principal_lane() {
+    fn a_checked_main_is_principal_ahead_of_detached_head() {
         let branches = [choice("main", OID_A, false, Some(10), true)];
+        let tips = graph_tips(&branches, Some(OID_B));
+        let main = tips.iter().find(|tip| tip.name == "main").unwrap();
+        assert!(main.principal);
+        assert_eq!(main.color, 0);
+        assert!(!main.current);
+        let head = tips.iter().find(|tip| tip.name == "HEAD").expect("head");
+        assert!(!head.principal);
+        assert!(head.current);
+        assert_eq!(head.color, 1);
+        assert_eq!(head.oid, OID_B);
+    }
+
+    #[test]
+    fn detached_head_is_principal_when_no_default_branch_is_checked() {
+        let branches = [choice("feature", OID_A, false, Some(10), true)];
         let tips = graph_tips(&branches, Some(OID_B));
         let head = tips.iter().find(|tip| tip.name == "HEAD").expect("head");
         assert!(head.principal);
+        assert!(head.current);
         assert_eq!(head.color, 0);
         assert_eq!(head.oid, OID_B);
-        let main = tips.iter().find(|tip| tip.name == "main").unwrap();
-        assert!(!main.principal);
-        assert_eq!(main.color, 1);
+        let feature = tips.iter().find(|tip| tip.name == "feature").unwrap();
+        assert!(!feature.principal);
+        assert_eq!(feature.color, 1);
     }
 
     #[test]
@@ -1239,7 +1468,7 @@ mod tests {
                     name,
                     oid,
                     index == 0,
-                    Some(index as i64),
+                    Some((names.len() - index) as i64),
                     index == 0 || index == 8,
                 )
             })

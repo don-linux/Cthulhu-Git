@@ -109,12 +109,19 @@ pub fn list_row(ui: &mut Ui, title: &str, detail: &str, enabled: bool) -> Respon
 }
 
 /// `<12-character hash> - <summary>`, the hash in monospace.
-pub fn commit_line(commit: &Commit, palette: &Palette, style: &Style) -> LayoutJob {
-    let format = |text_style: TextStyle, color| TextFormat {
-        font_id: text_style.resolve(style),
-        color,
-        valign: Align::Center,
-        ..TextFormat::default()
+///
+/// `scale` multiplies the resolved font size. The history view uses it to
+/// draw commits a little larger than the rest of the chrome.
+pub fn commit_line(commit: &Commit, palette: &Palette, style: &Style, scale: f32) -> LayoutJob {
+    let format = |text_style: TextStyle, color| {
+        let mut font_id = text_style.resolve(style);
+        font_id.size *= scale;
+        TextFormat {
+            font_id,
+            color,
+            valign: Align::Center,
+            ..TextFormat::default()
+        }
     };
     let mut job = LayoutJob::default();
     job.append(
@@ -128,7 +135,9 @@ pub fn commit_line(commit: &Commit, palette: &Palette, style: &Style) -> LayoutJ
 }
 
 /// Height of one [`commit_line`], for virtualized lists.
-pub fn commit_line_height(ui: &Ui) -> f32 {
-    ui.text_style_height(&TextStyle::Monospace)
-        .max(ui.text_style_height(&TextStyle::Body))
+pub fn commit_line_height(ui: &Ui, scale: f32) -> f32 {
+    let base = ui
+        .text_style_height(&TextStyle::Monospace)
+        .max(ui.text_style_height(&TextStyle::Body));
+    base * scale
 }

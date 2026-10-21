@@ -46,7 +46,7 @@ code that touches `egui::Visuals`. Views never write `Color32` literals.
 | `on_accent` | Text on `accent` |
 | `selection` | Selected text background |
 | `hash` | Commit hashes |
-| `graph` | Commit-graph lanes. The same hues, faded, fill the branch-name chips. Cycled when there are more lanes than colors |
+| `graph` | Commit-graph lanes. Index 0 is the principal branch (`#3794FF` in the dark theme); the rest cycle when there are more lanes than colors. The same hues, faded, fill the branch-name labels, and a translucent stroke of the same hue joins a label to its commit |
 | `warning` | Detached HEAD |
 | `error` | Error banner |
 

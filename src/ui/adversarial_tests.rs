@@ -27,6 +27,7 @@ use tempfile::TempDir;
 
 use super::home::{self, HomeState};
 use super::repo_view;
+use super::theme;
 use super::{CthulhuApp, ListedBranch, OpenedRepo, Screen};
 
 const CHILD_ENV: &str = "CTHULHU_ADVERSARIAL_UI_CHILD";
@@ -426,6 +427,7 @@ fn graph_tips(commits: &[Commit]) -> Vec<GraphTip> {
             oid: commit.oid.clone(),
             color: 0,
             principal: true,
+            current: true,
         })
         .into_iter()
         .collect()
@@ -701,6 +703,52 @@ fn adversarial_long_recent_name_stays_in_layout() {
     });
     assert_text(&harness, &name);
     assert_text(&harness, "Recent repositories");
+}
+
+#[test]
+fn branch_names_sit_before_the_graph() {
+    let summary = "lantern inventory";
+    let mut repo = opened("labels", vec![commit(summary)], false);
+    let harness = ui_harness(|ui| {
+        theme::apply(ui.ctx(), theme::DEFAULT_THEME);
+        let _ = repo_view::show(ui, &mut repo, None, false, false, false, None);
+    });
+    assert_text(&harness, "Branch");
+    assert_text(&harness, "Graph");
+    assert_text(&harness, "Commit");
+    assert_text(&harness, summary);
+
+    let summary_rect = harness
+        .query_all_by_label_contains(summary)
+        .next()
+        .expect("summary")
+        .rect();
+    let chip = harness
+        .query_all_by_label_contains("main")
+        .map(|node| node.rect())
+        .find(|rect| (rect.center().y - summary_rect.center().y).abs() < 8.0)
+        .expect("branch chip on the commit row");
+    assert!(
+        chip.right() + 24.0 < summary_rect.left(),
+        "the branch name should sit left of the commit, with the graph between \
+         (chip right {}, summary left {})",
+        chip.right(),
+        summary_rect.left()
+    );
+
+    let mut header_x = Vec::new();
+    for header in ["Branch", "Graph", "Commit"] {
+        let rect = harness
+            .query_all_by_role(Role::Label)
+            .find(|node| node.value().as_deref() == Some(header))
+            .unwrap_or_else(|| panic!("missing {header} header\n{}", visible_text(&harness)))
+            .rect();
+        header_x.push(rect.left());
+    }
+    assert!(
+        header_x[0] < header_x[1] && header_x[1] < header_x[2],
+        "headers should read Branch, Graph, Commit: {header_x:?}"
+    );
 }
 
 #[test]

@@ -486,7 +486,16 @@ fn detached_head_stays_on_the_graph() {
         })
         .collect();
     let tips = graph_tips(&candidates, Some(head.as_str()));
-    assert!(tips.iter().any(|tip| tip.name == "HEAD" && tip.principal));
+    // main is still checked, so it keeps the blue lane. Detached HEAD stays
+    // on the graph beside it.
+    assert!(
+        tips.iter()
+            .any(|tip| tip.name == "main" && tip.principal && tip.color == 0)
+    );
+    assert!(
+        tips.iter()
+            .any(|tip| tip.name == "HEAD" && !tip.principal && tip.current)
+    );
     let graph = branch_graph(&fixture.git, &info.root, &tips, 10).expect("graph");
     assert!(
         graph
