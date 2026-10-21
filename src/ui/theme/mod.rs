@@ -7,7 +7,8 @@ mod dark;
 use eframe::egui::{self, Color32, Context, Id, Stroke, Visuals};
 
 /// How many distinct lane colors a theme provides. Extra lanes cycle through them.
-pub const GRAPH_LANE_COUNT: usize = 8;
+/// This is the git layer's count, so the palette and the assignment cannot diverge.
+pub const GRAPH_LANE_COUNT: usize = cthulhu_git::git::LANE_COLORS;
 
 /// Semantic colors. Views ask for a role (`text_muted`, `hash`), never for a
 /// literal color, so a new theme only has to fill in this struct.

@@ -7,8 +7,22 @@ use super::repo::Head;
 /// Linux kernel convention: unique in practice even in very large histories.
 pub const SHORT_OID_LEN: usize = 12;
 
-/// Separates the hash from the subject inside one `git log -z` record.
-const FIELD_SEPARATOR: u8 = 0x1f;
+/// Separates fields inside one `git log -z` record. Shared by the graph,
+/// detail, and hover parsers. Each parser still cuts the trailer byte its
+/// own way: the graph subject is before the trailers, the message is after.
+pub(crate) const FIELD_SEPARATOR: u8 = 0x1f;
+
+/// The first `count` fields of `record`, split on [`FIELD_SEPARATOR`].
+/// The last field keeps any further separators, which is where a subject or
+/// a message is allowed to contain `0x1f`.
+pub(crate) fn split_fields(record: &[u8], count: usize) -> Option<Vec<&[u8]>> {
+    let mut parts = record.splitn(count, |byte| *byte == FIELD_SEPARATOR);
+    let mut fields = Vec::with_capacity(count);
+    for _ in 0..count {
+        fields.push(parts.next()?);
+    }
+    Some(fields)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
@@ -252,11 +266,11 @@ pub(crate) fn parse_commit_detail(stdout: &[u8]) -> Option<CommitDetail> {
         }
     }
 
-    let mut parts = record.splitn(7, |byte| *byte == FIELD_SEPARATOR);
-    let oid = parts.next()?;
-    let identity = [parts.next()?, parts.next()?, parts.next()?, parts.next()?];
-    let authored_at = parts.next()?;
-    let (trailers, message) = split_trailers(parts.next()?)?;
+    let parts = split_fields(&record, 7)?;
+    let oid = parts[0];
+    let identity = [parts[1], parts[2], parts[3], parts[4]];
+    let authored_at = parts[5];
+    let (trailers, message) = split_trailers(parts[6])?;
     if oid.is_empty() || !oid.iter().all(u8::is_ascii_hexdigit) || authored_at.is_empty() {
         return None;
     }
@@ -335,12 +349,12 @@ pub fn commit_hover(git: &Git, root: &Path, oid: &str) -> Result<CommitHover, Gi
 pub(crate) fn parse_commit_hover(stdout: &[u8]) -> Option<CommitHover> {
     let end = stdout.iter().rposition(|byte| *byte == RECORD_END)?;
     let (record, stat) = (&stdout[..end], &stdout[end + 1..]);
-    let mut parts = record.splitn(8, |byte| *byte == FIELD_SEPARATOR);
-    let oid = parts.next()?;
-    let identity = [parts.next()?, parts.next()?, parts.next()?, parts.next()?];
-    let unix = parts.next()?;
-    let authored_at = parts.next()?;
-    let (trailers, message) = split_trailers(parts.next()?)?;
+    let parts = split_fields(record, 8)?;
+    let oid = parts[0];
+    let identity = [parts[1], parts[2], parts[3], parts[4]];
+    let unix = parts[5];
+    let authored_at = parts[6];
+    let (trailers, message) = split_trailers(parts[7])?;
     if oid.is_empty() || !oid.iter().all(u8::is_ascii_hexdigit) {
         return None;
     }
@@ -384,7 +398,7 @@ pub(crate) fn parse_shortstat(text: &str) -> Option<CommitStats> {
     saw_files.then_some(stats)
 }
 
-pub(crate) fn short_oid(oid: &str) -> &str {
+pub fn short_oid(oid: &str) -> &str {
     oid.get(..SHORT_OID_LEN).unwrap_or(oid)
 }
 
