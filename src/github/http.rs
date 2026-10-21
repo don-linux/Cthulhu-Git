@@ -43,22 +43,48 @@ impl HttpResponse {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HttpError {
     /// Not HTTPS, a host outside [`ALLOWED_HOSTS`], or a URL with credentials or a port.
+    #[error("refused to request {0}")]
     NotAllowed(String),
+    #[error("too many redirects")]
     TooManyRedirects,
-    /// DNS, TLS, timeout, or a body over [`MAX_BODY`].
+    #[error("the request timed out")]
+    TimedOut,
+    #[error("could not connect")]
+    Connect,
+    #[error("the TLS handshake failed: {0}")]
+    Tls(String),
+    #[error("the response is larger than the limit")]
+    TooLarge,
+    /// Anything else the transport reported. The message is not matched on.
+    #[error("{0}")]
     Transport(String),
 }
 
-impl std::fmt::Display for HttpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotAllowed(url) => write!(f, "refused to request {url}"),
-            Self::TooManyRedirects => f.write_str("too many redirects"),
-            Self::Transport(message) => f.write_str(message),
-        }
+fn classify_ureq(error: ureq::Error) -> HttpError {
+    match error {
+        ureq::Error::Timeout(_) => HttpError::TimedOut,
+        ureq::Error::ConnectionFailed | ureq::Error::HostNotFound => HttpError::Connect,
+        ureq::Error::Tls(message) => HttpError::Tls(message.to_owned()),
+        ureq::Error::TlsRequired => HttpError::Tls("TLS is required".to_owned()),
+        ureq::Error::Io(error) => classify_io(&error),
+        other => HttpError::Transport(other.to_string()),
+    }
+}
+
+fn classify_io(error: &std::io::Error) -> HttpError {
+    match error.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => HttpError::TimedOut,
+        std::io::ErrorKind::ConnectionRefused
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::NotConnected
+        | std::io::ErrorKind::NetworkUnreachable
+        | std::io::ErrorKind::HostUnreachable
+        | std::io::ErrorKind::AddrNotAvailable => HttpError::Connect,
+        _ => HttpError::Transport(error.to_string()),
     }
 }
 
@@ -92,9 +118,7 @@ impl Transport for UreqTransport {
         for (name, value) in headers {
             request = request.header(*name, value.as_str());
         }
-        let mut response = request
-            .call()
-            .map_err(|error| HttpError::Transport(error.to_string()))?;
+        let mut response = request.call().map_err(classify_ureq)?;
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -127,12 +151,10 @@ fn read_capped(reader: &mut impl std::io::Read, limit: usize) -> Result<Vec<u8>,
             Ok(0) => return Ok(body),
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(HttpError::Transport(error.to_string())),
+            Err(error) => return Err(classify_io(&error)),
         };
         if body.len() + read > limit {
-            return Err(HttpError::Transport(format!(
-                "the response is larger than {limit} bytes"
-            )));
+            return Err(HttpError::TooLarge);
         }
         body.extend_from_slice(&buffer[..read]);
     }
@@ -306,7 +328,7 @@ mod tests {
         );
         assert!(matches!(
             read_capped(&mut big.as_slice(), 9_999),
-            Err(HttpError::Transport(_))
+            Err(HttpError::TooLarge)
         ));
     }
 

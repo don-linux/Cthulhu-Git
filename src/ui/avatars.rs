@@ -315,6 +315,7 @@ fn load(
         *lock(status) = resolver.status().clone();
         (answer, resolver.transport())
     };
+    let mut retryable = false;
     for url in &answer.urls {
         match fetch_image(transport.as_ref(), url) {
             Ok(bytes) => {
@@ -325,10 +326,12 @@ fn load(
                     return Loaded::Image(image);
                 }
             }
-            Err(FetchError::Missing) => {}
-            // Offline or a server error: try again next launch, not now.
-            Err(FetchError::Failed(_)) => return Loaded::Missing,
+            Err(FetchError::Missing) | Err(FetchError::Failed(_)) => {}
+            Err(FetchError::Unavailable) => retryable = true,
         }
+    }
+    if retryable {
+        return Loaded::RetryAt(Instant::now() + RETRY_AFTER);
     }
     if answer.provisional {
         // The API may still find this person: do not remember a miss.
@@ -688,5 +691,107 @@ mod tests {
             Some(Entry::Missing)
         ));
         assert!(service.texture(&ctx, &ada, None, None).is_none());
+    }
+
+    struct FirstTimeout {
+        direct: String,
+        gravatar: String,
+        picture: Vec<u8>,
+    }
+
+    impl Transport for FirstTimeout {
+        fn get_once(&self, url: &str, _: &[(&str, String)]) -> Result<HttpResponse, HttpError> {
+            if url == self.direct {
+                return Err(HttpError::TimedOut);
+            }
+            if url == self.gravatar {
+                return Ok(HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: self.picture.clone(),
+                });
+            }
+            Err(HttpError::NotAllowed(url.to_owned()))
+        }
+    }
+
+    #[test]
+    fn a_timeout_tries_the_next_avatar_url() {
+        let email = "1+ada@users.noreply.github.com";
+        let direct = cthulhu_git::github::direct_avatar_url(email).expect("direct");
+        let gravatar = cthulhu_git::github::gravatar_url(email);
+        let transport = Arc::new(FirstTimeout {
+            direct,
+            gravatar,
+            picture: png(8, 8),
+        });
+        let ctx = Context::default();
+        let mut service = AvatarService::with_transport(transport, None, true);
+        let ada = person("Ada", email);
+        assert!(service.texture(&ctx, &ada, None, None).is_none());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !matches!(
+            service.entries.get(email),
+            Some(Entry::Ready(_)) | Some(Entry::Missing) | Some(Entry::Retry(_))
+        ) && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+            service.poll(&ctx);
+        }
+        assert!(
+            matches!(service.entries.get(email), Some(Entry::Ready(_))),
+            "the gravatar should be used after the github avatar times out, got {:?}",
+            service
+                .entries
+                .get(email)
+                .map(std::mem::discriminant)
+        );
+    }
+
+    struct AlwaysTimeout;
+
+    impl Transport for AlwaysTimeout {
+        fn get_once(&self, _: &str, _: &[(&str, String)]) -> Result<HttpResponse, HttpError> {
+            Err(HttpError::TimedOut)
+        }
+    }
+
+    #[test]
+    fn every_timeout_retries_without_a_miss_file() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let ctx = Context::default();
+        let mut service = AvatarService::with_transport(
+            Arc::new(AlwaysTimeout),
+            Some(DiskCache {
+                dir: dir.path().to_path_buf(),
+            }),
+            true,
+        );
+        let email = "1+ada@users.noreply.github.com";
+        let ada = person("Ada", email);
+        assert!(service.texture(&ctx, &ada, None, None).is_none());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !matches!(service.entries.get(email), Some(Entry::Retry(_)))
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+            service.poll(&ctx);
+        }
+        assert!(
+            matches!(service.entries.get(email), Some(Entry::Retry(_))),
+            "got {:?}",
+            service
+                .entries
+                .get(email)
+                .map(std::mem::discriminant)
+        );
+        let files: Vec<_> = fs::read_dir(dir.path())
+            .expect("dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert!(
+            files.is_empty(),
+            "a timeout must not be stored as a miss: {files:?}"
+        );
     }
 }
