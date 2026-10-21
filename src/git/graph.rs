@@ -1037,7 +1037,11 @@ mod tests {
                     } else {
                         vec![format!("{:040x}", length - index - 1)]
                     };
-                    commit(&oid, "step", &parents.iter().map(String::as_str).collect::<Vec<_>>())
+                    commit(
+                        &oid,
+                        "step",
+                        &parents.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )
                 })
                 .collect();
             let graph = layout_graph(&commits, &[spine("main", &commits[0].oid, 0)]);

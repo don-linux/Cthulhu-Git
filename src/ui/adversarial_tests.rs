@@ -12,7 +12,9 @@
 use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Output;
 use std::thread;
 use std::time::Duration;
 
@@ -42,6 +44,7 @@ fn spawned() -> bool {
     std::env::var_os(CHILD_ENV).is_some()
 }
 
+#[cfg(unix)]
 fn reexec(test_name: &str) -> Output {
     let config = TempDir::with_prefix("cthulhu-adv-ui-config-").expect("temp config dir");
     let home = TempDir::with_prefix("cthulhu-adv-ui-home-").expect("temp home dir");
@@ -64,6 +67,7 @@ fn reexec(test_name: &str) -> Output {
         .expect("spawn child test")
 }
 
+#[cfg(unix)]
 fn assert_child_ok(output: &Output, marker: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -84,6 +88,7 @@ fn assert_child_ok(output: &Output, marker: &str) {
     );
 }
 
+#[cfg(unix)]
 fn child_name(name: &str) -> String {
     format!("ui::adversarial_tests::{name}")
 }

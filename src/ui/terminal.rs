@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::{self, JoinHandle};
+#[cfg(unix)]
 use std::time::Duration;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
@@ -506,24 +507,18 @@ fn pty_pid(pty: &Pty) -> u32 {
 
 /// `true` when `pid` is a live process we are allowed to signal.
 /// A reaped pid, pid 1, and this process are not.
+#[cfg(unix)]
 fn should_signal(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        if pid <= 1 {
-            return false;
-        }
-        let Some(parsed) = rustix::process::Pid::from_raw(pid as i32) else {
-            return false;
-        };
-        if parsed == rustix::process::getpid() || parsed == rustix::process::getpgrp() {
-            return false;
-        }
-        rustix::process::test_kill_process(parsed).is_ok()
+    if pid <= 1 {
+        return false;
     }
-    #[cfg(not(unix))]
-    {
-        pid > 1
+    let Some(parsed) = rustix::process::Pid::from_raw(pid as i32) else {
+        return false;
+    };
+    if parsed == rustix::process::getpid() || parsed == rustix::process::getpgrp() {
+        return false;
     }
+    rustix::process::test_kill_process(parsed).is_ok()
 }
 
 /// Stop the shell's session. A reaped leader is left alone so the pid cannot

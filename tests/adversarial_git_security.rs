@@ -1172,9 +1172,9 @@ fn background_writer_does_not_pin_a_finished_git() {
     let (tx, rx) = mpsc::channel();
     let cwd = tmp.path().to_path_buf();
     thread::spawn(move || {
-        let _keep = tmp;
         let _ = tx.send(git.run(&cwd, &["status"]).map(|_| ()));
     });
+    // `tmp` stays here so the grandchild pid file is not deleted before the assert.
     match rx.recv_timeout(Duration::from_secs(2)) {
         Ok(result) => {
             result.expect("a git that already exited must return, not wait on its grandchild");
@@ -1187,6 +1187,7 @@ fn background_writer_does_not_pin_a_finished_git() {
         }
     }
     assert_recorded_pid_is_dead(&writer);
+    drop(tmp);
 }
 
 #[test]

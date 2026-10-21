@@ -69,7 +69,10 @@ impl Repo {
             .env_remove("GIT_WORK_TREE")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", self.tmp.path().join("empty.gitconfig"))
-            .env("GIT_CONFIG_SYSTEM", self.tmp.path().join("empty.system.gitconfig"))
+            .env(
+                "GIT_CONFIG_SYSTEM",
+                self.tmp.path().join("empty.system.gitconfig"),
+            )
             .args(["-c", "commit.gpgSign=false"]);
         let hooks = self.tmp.path().join("empty-hooks");
         let _ = fs::create_dir_all(&hooks);

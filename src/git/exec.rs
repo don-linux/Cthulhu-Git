@@ -534,6 +534,7 @@ fn reader_abandoned() -> CappedRead {
 }
 
 enum GroupSignal {
+    #[cfg(unix)]
     Term,
     Kill,
 }
@@ -563,15 +564,16 @@ fn signal_group(pid: u32, signal: GroupSignal) {
 /// `wait` is not used: a process stuck in uninterruptible I/O would pin the
 /// caller, which is the stall this timeout exists to bound.
 fn stop_group(pid: u32, child: &mut Child) {
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-    }
     #[cfg(unix)]
     {
         signal_group(pid, GroupSignal::Term);
         reap(child, Duration::from_millis(50));
         signal_group(pid, GroupSignal::Kill);
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no process group here; the direct child is the one to stop.
+        let _ = (pid, child.kill());
     }
     reap(child, Duration::from_millis(50));
 }

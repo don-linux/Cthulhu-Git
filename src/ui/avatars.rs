@@ -741,10 +741,7 @@ mod tests {
         assert!(
             matches!(service.entries.get(email), Some(Entry::Ready(_))),
             "the gravatar should be used after the github avatar times out, got {:?}",
-            service
-                .entries
-                .get(email)
-                .map(std::mem::discriminant)
+            service.entries.get(email).map(std::mem::discriminant)
         );
     }
 
@@ -780,10 +777,7 @@ mod tests {
         assert!(
             matches!(service.entries.get(email), Some(Entry::Retry(_))),
             "got {:?}",
-            service
-                .entries
-                .get(email)
-                .map(std::mem::discriminant)
+            service.entries.get(email).map(std::mem::discriminant)
         );
         let files: Vec<_> = fs::read_dir(dir.path())
             .expect("dir")
