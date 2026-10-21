@@ -314,11 +314,23 @@ impl Fixture {
                 "-c",
                 "core.fsmonitor=false",
                 "--no-pager",
-            ])
-            .args(args);
+            ]);
         for var in CLEARED_ENV {
             command.env_remove(var);
         }
+        let hooks = self.tmp.path().join("empty-hooks");
+        let global = self.tmp.path().join("empty.gitconfig");
+        let system = self.tmp.path().join("empty.system.gitconfig");
+        let _ = fs::create_dir_all(&hooks);
+        let _ = fs::write(&global, "");
+        let _ = fs::write(&system, "");
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_SYSTEM", &system)
+            .arg("-c")
+            .arg(format!("core.hooksPath={}", hooks.display()))
+            .args(args);
         let output = command.output().expect("run git");
         assert!(
             output.status.success(),
@@ -1102,10 +1114,10 @@ fn slow_version_probe_does_not_block_discovery() {
     let fast_path = fast.clone();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let _keep = tmp;
         let found = discover_with(&inputs).map(|git| git.path);
         let _ = tx.send(found);
     });
+    // `tmp` stays here so the sleeper pid file is not deleted before the assert.
 
     match rx.recv_timeout(Duration::from_secs(1)) {
         Ok(Ok(path)) => {
@@ -1123,6 +1135,7 @@ fn slow_version_probe_does_not_block_discovery() {
             panic!("discover thread exited without a result");
         }
     }
+    drop(tmp);
 }
 
 #[test]

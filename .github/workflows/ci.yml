@@ -42,8 +42,17 @@ jobs:
       - name: Test
         shell: bash
         run: |
+          set -Eeuo pipefail
           rustup toolchain install
+          cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked
+      - name: Check the Intel macOS build
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rustup target add x86_64-apple-darwin
+          cargo check --locked --target x86_64-apple-darwin --lib --bins
 
   build:
     uses: ./.github/workflows/build.yml

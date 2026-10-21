@@ -45,6 +45,7 @@ jobs:
       # rust-toolchain.toml pins the compiler; this installs exactly that one.
       - name: Rust toolchain
         run: |
+          set -Eeuo pipefail
           rustup toolchain install
           rustup target add "$TARGET"
       # No compiler cache: published binaries never build from outputs
@@ -53,6 +54,7 @@ jobs:
 
       - name: Packaging tools
         run: |
+          set -Eeuo pipefail
           sudo apt-get update
           sudo apt-get install -y rpm desktop-file-utils
           mkdir -p "$RUNNER_TEMP/tools"
@@ -74,6 +76,7 @@ jobs:
       # feDropShadow, so installing icon.svg itself would render it broken.
       - name: Icons
         run: |
+          set -Eeuo pipefail
           for size in 16 22 24 32 48 64 128 256 512; do
             dir="target/icons/hicolor/${size}x${size}/apps"
             mkdir -p "$dir"
@@ -83,6 +86,7 @@ jobs:
 
       - name: Archive
         run: |
+          set -Eeuo pipefail
           name="cthulhu-git-${LABEL}-$TARGET"
           mkdir -p "dist/$name/share/applications" "dist/$name/share/icons"
           cp "target/$TARGET/release/cthulhu-git" README.md LICENSE "dist/$name/"
@@ -93,11 +97,13 @@ jobs:
 
       - name: Debian package
         run: |
+          set -Eeuo pipefail
           cargo deb --no-build --target "$TARGET" \
             --output "dist/cthulhu-git-${LABEL}-x86_64.deb"
 
       - name: RPM package
         run: |
+          set -Eeuo pipefail
           cargo generate-rpm --target "$TARGET" \
             --output "dist/cthulhu-git-${LABEL}-x86_64.rpm"
 
@@ -105,6 +111,7 @@ jobs:
       # libraries of the machine it runs on, as the AppImage excludelist advises.
       - name: AppImage
         run: |
+          set -Eeuo pipefail
           appdir="$RUNNER_TEMP/AppDir"
           mkdir -p "$appdir/usr/bin" "$appdir/usr/share/applications" "$appdir/usr/share/icons"
           cp "target/$TARGET/release/cthulhu-git" "$appdir/usr/bin/"
@@ -112,14 +119,15 @@ jobs:
           cp packaging/linux/cthulhu-git.desktop "$appdir/usr/share/applications/"
           cp -R target/icons/hicolor "$appdir/usr/share/icons/"
           cp target/icons/hicolor/256x256/apps/cthulhu-git.png "$appdir/cthulhu-git.png"
-          ln -s cthulhu-git.png "$appdir/.DirIcon"
-          ln -s usr/bin/cthulhu-git "$appdir/AppRun"
+          ln -sfn cthulhu-git.png "$appdir/.DirIcon"
+          ln -sfn usr/bin/cthulhu-git "$appdir/AppRun"
           # The runner has no FUSE; extract-and-run avoids needing it.
           APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 appimagetool --no-appstream \
             "$appdir" "dist/cthulhu-git-${LABEL}-x86_64.AppImage"
 
       - name: Check the packages
         run: |
+          set -Eeuo pipefail
           deb="dist/cthulhu-git-${LABEL}-x86_64.deb"
           rpm="dist/cthulhu-git-${LABEL}-x86_64.rpm"
           appimage="dist/cthulhu-git-${LABEL}-x86_64.AppImage"
@@ -136,6 +144,7 @@ jobs:
           rpm -qpl "$rpm" | grep -qx /usr/share/applications/cthulhu-git.desktop
 
           cd "$RUNNER_TEMP"
+          rm -rf -- "$RUNNER_TEMP/squashfs-root"
           "$GITHUB_WORKSPACE/$appimage" --appimage-extract > /dev/null
           test -x squashfs-root/AppRun
           test -f squashfs-root/cthulhu-git.desktop
@@ -164,6 +173,7 @@ jobs:
       - name: Rust toolchain
         shell: bash
         run: |
+          set -Eeuo pipefail
           rustup toolchain install
           rustup target add "$TARGET"
       # build.rs embeds the icon and VERSIONINFO into the executable.
@@ -188,6 +198,7 @@ jobs:
       - name: Archive
         shell: bash
         run: |
+          set -Eeuo pipefail
           name="cthulhu-git-${LABEL}-$TARGET"
           mkdir -p "dist/$name"
           cp "target/$TARGET/release/cthulhu-git.exe" README.md LICENSE "dist/$name/"
@@ -212,16 +223,19 @@ jobs:
           persist-credentials: false
       - name: Rust toolchain
         run: |
+          set -Eeuo pipefail
           rustup toolchain install
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Build both architectures
         run: |
+          set -Eeuo pipefail
           cargo build --release --locked --target aarch64-apple-darwin
           cargo build --release --locked --target x86_64-apple-darwin
 
       # macos-latest runs on Apple Silicon.
       - name: resvg
         run: |
+          set -Eeuo pipefail
           mkdir -p "$RUNNER_TEMP/tools"
           cd "$RUNNER_TEMP/tools"
           curl -fsSL -o resvg.zip \
@@ -233,6 +247,7 @@ jobs:
       # icon-macos.svg places icon.svg on Apple's grid (824 of 1024).
       - name: App icon
         run: |
+          set -Eeuo pipefail
           iconset="$RUNNER_TEMP/AppIcon.iconset"
           mkdir -p "$iconset"
           for size in 16 32 128 256 512; do
@@ -244,6 +259,7 @@ jobs:
 
       - name: App bundle
         run: |
+          set -Eeuo pipefail
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
           app="dist/Cthulhu Git.app"
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
@@ -263,10 +279,11 @@ jobs:
 
       - name: Disk image
         run: |
+          set -Eeuo pipefail
           staging="$RUNNER_TEMP/dmg"
           mkdir -p "$staging"
           cp -R "dist/Cthulhu Git.app" "$staging/"
-          ln -s /Applications "$staging/Applications"
+          ln -sfn /Applications "$staging/Applications"
           cp README.md LICENSE "$staging/"
           hdiutil create -volname "Cthulhu Git" -srcfolder "$staging" -ov -format UDZO \
             "dist/cthulhu-git-${LABEL}-macos-universal.dmg"

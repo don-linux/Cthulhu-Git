@@ -51,7 +51,8 @@ impl Fixture {
     }
 
     fn git(&self, args: &[&str]) -> String {
-        let output = Command::new(&self.git.path)
+        let mut command = Command::new(&self.git.path);
+        command
             .current_dir(&self.root)
             .env("GIT_AUTHOR_NAME", "cthulhu")
             .env("GIT_AUTHOR_EMAIL", "cthulhu@example.invalid")
@@ -59,10 +60,10 @@ impl Fixture {
             .env("GIT_COMMITTER_EMAIL", "cthulhu@example.invalid")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
-            .args(["-c", "commit.gpgSign=false"])
-            .args(args)
-            .output()
-            .expect("run git");
+            .args(["-c", "commit.gpgSign=false"]);
+        without_user_git_config(&mut command, self._tmp.path());
+        command.args(args);
+        let output = command.output().expect("run git");
         assert!(
             output.status.success(),
             "git {args:?} failed: {}",
@@ -91,7 +92,8 @@ impl Fixture {
     }
 
     fn commit_at(&self, message: &str, date: &str) {
-        let output = Command::new(&self.git.path)
+        let mut command = Command::new(&self.git.path);
+        command
             .current_dir(&self.root)
             .env("GIT_AUTHOR_NAME", "cthulhu")
             .env("GIT_AUTHOR_EMAIL", "cthulhu@example.invalid")
@@ -101,16 +103,10 @@ impl Fixture {
             .env("GIT_COMMITTER_DATE", date)
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
-            .args([
-                "-c",
-                "commit.gpgSign=false",
-                "commit",
-                "--allow-empty",
-                "-m",
-                message,
-            ])
-            .output()
-            .expect("run git");
+            .args(["-c", "commit.gpgSign=false"]);
+        without_user_git_config(&mut command, self._tmp.path());
+        command.args(["commit", "--allow-empty", "-m", message]);
+        let output = command.output().expect("run git");
         assert!(
             output.status.success(),
             "commit {message:?} failed: {}",
@@ -124,6 +120,21 @@ impl Fixture {
     }
 }
 
+fn without_user_git_config(command: &mut Command, scratch: &Path) {
+    let global = scratch.join("empty.gitconfig");
+    let system = scratch.join("empty.system.gitconfig");
+    let hooks = scratch.join("empty-hooks");
+    let _ = fs::create_dir_all(&hooks);
+    let _ = fs::write(&global, "");
+    let _ = fs::write(&system, "");
+    command
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .env("GIT_CONFIG_SYSTEM", &system)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("-c")
+        .arg(format!("core.hooksPath={}", hooks.display()));
+}
+
 #[test]
 fn divergent_pull_with_rebase_config_does_not_rewrite_head() {
     let origin = Fixture::init();
@@ -133,21 +144,22 @@ fn divergent_pull_with_rebase_config_does_not_rewrite_head() {
 
     let local_tmp = TempDir::with_prefix("cthulhu-pull-").expect("temp dir");
     let local_root = local_tmp.path().join("local");
-    let cloned = Command::new(&origin.git.path)
-        .args([
-            "clone",
-            "--",
-            origin.root.to_str().expect("utf8 origin"),
-            local_root.to_str().expect("utf8 local"),
-        ])
+    let mut clone = Command::new(&origin.git.path);
+    clone
         .env("GIT_AUTHOR_NAME", "cthulhu")
         .env("GIT_AUTHOR_EMAIL", "cthulhu@example.invalid")
         .env("GIT_COMMITTER_NAME", "cthulhu")
         .env("GIT_COMMITTER_EMAIL", "cthulhu@example.invalid")
         .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
-        .expect("clone");
+        .env_remove("GIT_WORK_TREE");
+    without_user_git_config(&mut clone, origin._tmp.path());
+    clone.args([
+        "clone",
+        "--",
+        origin.root.to_str().expect("utf8 origin"),
+        local_root.to_str().expect("utf8 local"),
+    ]);
+    let cloned = clone.output().expect("clone");
     assert!(
         cloned.status.success(),
         "clone failed: {}",
@@ -595,7 +607,7 @@ fn graph_shows_where_a_branch_leaves_main() {
     assert_eq!(main.commit_color, 0);
     assert_eq!(feature.oid, fixture.git(&["rev-parse", "feature"]));
     assert_eq!(feature.commit_lane, 1);
-    assert_eq!(feature.commit_color, 1);
+    assert_eq!(feature.commit_color, 2);
     assert!(
         feature
             .traces

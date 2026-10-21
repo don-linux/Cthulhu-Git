@@ -28,6 +28,7 @@ jobs:
 
       - name: Tag format
         run: |
+          set -Eeuo pipefail
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Tag $TAG is not vMAJOR.MINOR.PATCH, e.g. v0.0.1"
             exit 1
@@ -35,6 +36,7 @@ jobs:
 
       - name: Tag matches Cargo.toml
         run: |
+          set -Eeuo pipefail
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
           if [ "$TAG" != "v$version" ]; then
             echo "::error::Tag $TAG does not match Cargo.toml version $version"
@@ -43,6 +45,7 @@ jobs:
 
       - name: Release notes exist
         run: |
+          set -Eeuo pipefail
           notes="docs/release-notes/$TAG.md"
           if [ ! -s "$notes" ]; then
             echo "::error::Missing $notes; see docs/HOW-TO-CHANGELOG.md"
@@ -51,6 +54,7 @@ jobs:
 
       - name: Tagged commit is on main
         run: |
+          set -Eeuo pipefail
           git fetch --no-tags origin main
           if ! git merge-base --is-ancestor "$(git rev-parse "$TAG^{commit}")" origin/main; then
             echo "::error::$TAG points to a commit that is not on main"
