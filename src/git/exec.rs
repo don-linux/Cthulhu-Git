@@ -1,9 +1,10 @@
 use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,30 +13,21 @@ pub const MIN_GIT_VERSION: (u32, u32, u32) = (2, 15, 0);
 
 const VERSION_PREFIX: &str = "git version ";
 
-/// Variables that make git operate on a repository other than the one in `cwd`,
-/// e.g. when the app is launched from a hook or from a shell that exported them.
-const REPO_LOCATION_VARS: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_COMMON_DIR",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_NAMESPACE",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-    "GIT_PREFIX",
-    // A parent process can rewrite history or drop commits without changing cwd.
-    "GIT_REPLACE_REF_BASE",
-    "GIT_SHALLOW_FILE",
-    "GIT_GRAFT_FILE",
-    // Trace variables create files as a side effect of a read.
-    "GIT_TRACE",
-    "GIT_TRACE2",
-    "GIT_TRACE2_EVENT",
-    "GIT_TRACE2_PERF",
-    "GIT_TRACE_PACKET",
+/// Inherited `GIT_*` names that stay. Everything else starting with `GIT_` is
+/// removed: a fixed list cannot cover `GIT_CONFIG_KEY_<n>` or `GIT_EXEC_PATH`.
+/// `SSH_AUTH_SOCK`, `HOME`, and `PATH` are not `GIT_` names, so they stay too.
+const KEPT_GIT_VARS: &[&str] = &[
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH_VARIANT",
+    "GIT_ASKPASS",
 ];
+
+/// `true` when `name` is an inherited `GIT_*` variable that redirects git,
+/// rewrites history, or points at another exec path.
+pub(crate) fn inherited_git_var_is_cleared(name: &str) -> bool {
+    name.starts_with("GIT_") && !KEPT_GIT_VARS.contains(&name)
+}
 
 /// `git --version` should be nearly instant. A candidate that does not answer
 /// is skipped so one hung executable cannot hide a later, working git.
@@ -123,8 +115,8 @@ impl Git {
     ///
     /// `--no-optional-locks` skips locks a read does not need. A command that
     /// must write, such as pull, still takes its required locks. The user's
-    /// environment is inherited (credential helpers, ssh-agent) except for
-    /// variables that would redirect git to another repository.
+    /// environment is inherited (credential helpers, ssh-agent) except every
+    /// `GIT_*` variable other than [`KEPT_GIT_VARS`].
     pub fn run(&self, cwd: &Path, args: &[&str]) -> Result<GitOutput, GitError> {
         self.run_for(cwd, args, COMMAND_TIMEOUT)
     }
@@ -303,7 +295,17 @@ fn command(program: &Path) -> Command {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // Remove inherited names before setting the ones this process owns.
+    // `env_remove` after `env` would drop `GIT_TERMINAL_PROMPT` too.
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(inherited_git_var_is_cleared) {
+            command.env_remove(key);
+        }
+    }
+
+    command
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_PAGER", "cat")
@@ -311,8 +313,12 @@ fn command(program: &Path) -> Command {
         .env("LC_ALL", "C")
         .env("LANGUAGE", "C");
 
-    for var in REPO_LOCATION_VARS {
-        command.env_remove(var);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // The child's pid becomes the process-group id, so a timeout can
+        // signal git and the helpers it spawned (`ssh`, `git-remote-https`).
+        command.process_group(0);
     }
 
     #[cfg(windows)]
@@ -328,6 +334,9 @@ fn command(program: &Path) -> Command {
 struct CappedRead {
     bytes: Vec<u8>,
     exceeded: bool,
+    /// A read error is not EOF. Treating it as EOF would accept a partial
+    /// `rev-parse` as a repository root.
+    error: Option<io::Error>,
 }
 
 fn read_capped(mut reader: impl Read, limit: usize, exceeded_flag: &AtomicBool) -> CappedRead {
@@ -343,17 +352,30 @@ fn read_capped(mut reader: impl Read, limit: usize, exceeded_flag: &AtomicBool) 
                     return CappedRead {
                         bytes,
                         exceeded: true,
+                        error: None,
                     };
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(error) => {
+                    return CappedRead {
+                        bytes,
+                        exceeded: false,
+                        error: Some(error),
+                    };
+                }
             }
         }
         let read = match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(error) => {
+                return CappedRead {
+                    bytes,
+                    exceeded: false,
+                    error: Some(error),
+                };
+            }
         };
         if read > room {
             bytes.extend_from_slice(&buf[..room]);
@@ -361,6 +383,7 @@ fn read_capped(mut reader: impl Read, limit: usize, exceeded_flag: &AtomicBool) 
             return CappedRead {
                 bytes,
                 exceeded: true,
+                error: None,
             };
         }
         bytes.extend_from_slice(&buf[..read]);
@@ -368,8 +391,30 @@ fn read_capped(mut reader: impl Read, limit: usize, exceeded_flag: &AtomicBool) 
     CappedRead {
         bytes,
         exceeded: false,
+        error: None,
     }
 }
+
+fn output_limit(command_name: &str) -> GitError {
+    GitError::Failed {
+        command: command_name.to_owned(),
+        status: "output limit".to_owned(),
+        stderr: "git output exceeded the limit".to_owned(),
+    }
+}
+
+fn timed_out(command_name: &str) -> GitError {
+    GitError::Failed {
+        command: command_name.to_owned(),
+        status: "timed out".to_owned(),
+        stderr: "git exceeded the time limit".to_owned(),
+    }
+}
+
+/// How long to let a reader finish after the child has exited or been killed.
+/// Long enough for a pipe to close, short enough that a grandchild holding
+/// stdout cannot pin the caller.
+const READER_BUDGET: Duration = Duration::from_millis(200);
 
 fn capture(
     command: &mut Command,
@@ -377,6 +422,7 @@ fn capture(
     command_name: &str,
 ) -> Result<GitOutput, GitError> {
     let mut child = command.spawn().map_err(GitError::Spawn)?;
+    let pid = child.id();
     let stdout = child
         .stdout
         .take()
@@ -396,55 +442,38 @@ fn capture(
     let started = Instant::now();
     let status = loop {
         if exceeded.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
-            return Err(GitError::Failed {
-                command: command_name.to_owned(),
-                status: "output limit".to_owned(),
-                stderr: "git output exceeded the limit".to_owned(),
-            });
+            stop_group(pid, &mut child);
+            let _ = finish_reader(stdout_thread, READER_BUDGET);
+            let _ = finish_reader(stderr_thread, READER_BUDGET);
+            return Err(output_limit(command_name));
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                // A shell script can leave `sleep` (or another grandchild)
-                // holding the inherited stdout pipe. Joining the readers would
-                // wait for that grandchild. Detach them; the pipe closes when
-                // the grandchild exits, and this call has already given up.
-                return Err(GitError::Failed {
-                    command: command_name.to_owned(),
-                    status: "timed out".to_owned(),
-                    stderr: "git exceeded the time limit".to_owned(),
-                });
+                stop_group(pid, &mut child);
+                let _ = finish_reader(stdout_thread, READER_BUDGET);
+                let _ = finish_reader(stderr_thread, READER_BUDGET);
+                return Err(timed_out(command_name));
             }
             Ok(None) => thread::sleep(Duration::from_millis(5)),
             Err(error) => {
-                let _ = child.kill();
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
+                stop_group(pid, &mut child);
+                let _ = finish_reader(stdout_thread, READER_BUDGET);
+                let _ = finish_reader(stderr_thread, READER_BUDGET);
                 return Err(GitError::Spawn(error));
             }
         }
     };
 
-    let stdout = stdout_thread.join().unwrap_or(CappedRead {
-        bytes: Vec::new(),
-        exceeded: true,
-    });
-    let stderr = stderr_thread.join().unwrap_or(CappedRead {
-        bytes: Vec::new(),
-        exceeded: true,
-    });
+    let (stdout, stderr) = finish_both(stdout_thread, stderr_thread, pid);
+    if let Some(error) = stdout.error.or(stderr.error) {
+        // The child already exited. A grandchild may still hold a pipe.
+        stop_group(pid, &mut child);
+        return Err(GitError::Spawn(error));
+    }
     if stdout.exceeded || stderr.exceeded {
-        return Err(GitError::Failed {
-            command: command_name.to_owned(),
-            status: status.to_string(),
-            stderr: "git output exceeded the limit".to_owned(),
-        });
+        stop_group(pid, &mut child);
+        return Err(output_limit(command_name));
     }
 
     Ok(GitOutput {
@@ -452,6 +481,121 @@ fn capture(
         stderr: String::from_utf8_lossy(&stderr.bytes).trim().to_owned(),
         status,
     })
+}
+
+fn finish_both(
+    stdout_thread: thread::JoinHandle<CappedRead>,
+    stderr_thread: thread::JoinHandle<CappedRead>,
+    pid: u32,
+) -> (CappedRead, CappedRead) {
+    let stdout_pending = pending_reader(stdout_thread);
+    let stderr_pending = pending_reader(stderr_thread);
+    match (
+        recv_reader(&stdout_pending, READER_BUDGET),
+        recv_reader(&stderr_pending, READER_BUDGET),
+    ) {
+        (Some(stdout), Some(stderr)) => (stdout, stderr),
+        (stdout, stderr) => {
+            // The direct child has exited, but a grandchild still holds a pipe.
+            signal_group(pid, GroupSignal::Kill);
+            let stdout = stdout.unwrap_or_else(|| {
+                recv_reader(&stdout_pending, READER_BUDGET).unwrap_or_else(reader_abandoned)
+            });
+            let stderr = stderr.unwrap_or_else(|| {
+                recv_reader(&stderr_pending, READER_BUDGET).unwrap_or_else(reader_abandoned)
+            });
+            (stdout, stderr)
+        }
+    }
+}
+
+struct PendingRead {
+    rx: mpsc::Receiver<thread::Result<CappedRead>>,
+}
+
+fn pending_reader(handle: thread::JoinHandle<CappedRead>) -> PendingRead {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(handle.join());
+    });
+    PendingRead { rx }
+}
+
+fn recv_reader(pending: &PendingRead, budget: Duration) -> Option<CappedRead> {
+    match pending.rx.recv_timeout(budget) {
+        Ok(Ok(read)) => Some(read),
+        Ok(Err(_)) => Some(CappedRead {
+            bytes: Vec::new(),
+            exceeded: false,
+            error: Some(io::Error::other("git output reader panicked")),
+        }),
+        Err(_) => None,
+    }
+}
+
+fn finish_reader(handle: thread::JoinHandle<CappedRead>, budget: Duration) -> Option<CappedRead> {
+    recv_reader(&pending_reader(handle), budget)
+}
+
+fn reader_abandoned() -> CappedRead {
+    CappedRead {
+        bytes: Vec::new(),
+        exceeded: false,
+        error: Some(io::Error::other("git output reader did not finish")),
+    }
+}
+
+enum GroupSignal {
+    Term,
+    Kill,
+}
+
+fn signal_group(pid: u32, signal: GroupSignal) {
+    #[cfg(unix)]
+    {
+        let Some(pid) = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap_or(0)) else {
+            return;
+        };
+        if pid == rustix::process::getpid() || pid == rustix::process::getpgrp() {
+            return;
+        }
+        let signal = match signal {
+            GroupSignal::Term => rustix::process::Signal::TERM,
+            GroupSignal::Kill => rustix::process::Signal::KILL,
+        };
+        let _ = rustix::process::kill_process_group(pid, signal);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, signal);
+    }
+}
+
+/// `SIGTERM`, a short grace, then `SIGKILL` of the child's process group.
+/// `wait` is not used: a process stuck in uninterruptible I/O would pin the
+/// caller, which is the stall this timeout exists to bound.
+fn stop_group(pid: u32, child: &mut Child) {
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+    #[cfg(unix)]
+    {
+        signal_group(pid, GroupSignal::Term);
+        reap(child, Duration::from_millis(50));
+        signal_group(pid, GroupSignal::Kill);
+    }
+    reap(child, Duration::from_millis(50));
+}
+
+fn reap(child: &mut Child, budget: Duration) {
+    let started = Instant::now();
+    while started.elapsed() < budget {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(5)),
+        }
+    }
 }
 
 pub(crate) fn classify_failure(
@@ -725,6 +869,57 @@ mod tests {
             error.to_string(),
             "`git status --porcelain=v2` failed (signal: 9 (SIGKILL))"
         );
+    }
+
+    #[test]
+    fn a_read_error_is_not_an_empty_success() {
+        struct ThenBoom {
+            sent: bool,
+        }
+        impl Read for ThenBoom {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if !self.sent {
+                    self.sent = true;
+                    buf[0] = b'x';
+                    return Ok(1);
+                }
+                Err(io::Error::other("mid-read"))
+            }
+        }
+        let flag = AtomicBool::new(false);
+        let read = read_capped(ThenBoom { sent: false }, 64, &flag);
+        assert!(
+            read.error.is_some(),
+            "a mid-read error must not look like EOF"
+        );
+        assert!(!read.exceeded);
+        assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn kept_git_variables_are_ssh_and_askpass_only() {
+        for cleared in [
+            "GIT_DIR",
+            "GIT_EXEC_PATH",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_TRACE",
+        ] {
+            assert!(inherited_git_var_is_cleared(cleared), "{cleared}");
+        }
+        for kept in [
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_SSH_VARIANT",
+            "GIT_ASKPASS",
+            "SSH_AUTH_SOCK",
+            "PATH",
+            "HOME",
+            "GH_TOKEN",
+        ] {
+            assert!(!inherited_git_var_is_cleared(kept), "{kept}");
+        }
     }
 
     #[test]

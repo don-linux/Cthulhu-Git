@@ -184,12 +184,15 @@ does not stop the search.
   for input or follow replace refs. Optional locks are skipped; a fast-forward
   pull still updates the index and working tree;
 - `LC_ALL=C` so the messages the app matches on stay in English;
-- `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_REPLACE_REF_BASE`,
-  `GIT_SHALLOW_FILE`, `GIT_GRAFT_FILE`, `GIT_TRACE` and similar variables are
-  removed, so launching the app from a hook or a shell that exported them
-  cannot redirect it to another repository or rewrite the history it shows;
+- every inherited `GIT_*` variable is removed, except `GIT_SSH`,
+  `GIT_SSH_COMMAND`, `GIT_SSH_VARIANT`, and `GIT_ASKPASS`. A fixed list cannot
+  cover `GIT_EXEC_PATH` or `GIT_CONFIG_KEY_<n>`. `SSH_AUTH_SOCK`, `HOME`, and
+  `PATH` stay. Launching the app from a hook cannot redirect it to another
+  repository, choose `core.sshCommand`, or run a planted `git-remote-*`;
 - stdout and stderr are capped at 8 MiB. `git --version` is killed after
-  250 ms, reads after 60 s, and fetch or pull after 3 minutes;
+  250 ms, reads after 60 s, and fetch or pull after 3 minutes. On Linux and
+  macOS the limit signals the whole process group, so a helper git spawned
+  does not keep the pipe open;
 - on Windows the process is created with `CREATE_NO_WINDOW` so no console
   flashes.
 
