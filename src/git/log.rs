@@ -228,10 +228,11 @@ pub fn latest_commit(
     ];
     let output = git.require_ok(root, &args)?;
     parse_commit_detail(&output.stdout)
-        .ok_or_else(|| GitError::Failed {
-            command: format!("git {}", args.join(" ")),
-            status: output.status.to_string(),
-            stderr: "unrecognized log output".to_owned(),
+        .ok_or_else(|| {
+            super::exec::rejected(
+                &format!("git {}", args.join(" ")),
+                "unrecognized log output",
+            )
         })
         .map(Some)
 }
@@ -305,11 +306,10 @@ const HOVER_FORMAT: &str =
 /// hover opens, because `--shortstat` over the whole history would be slow.
 pub fn commit_hover(git: &Git, root: &Path, oid: &str) -> Result<CommitHover, GitError> {
     if oid.is_empty() || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(GitError::Failed {
-            command: "git show".to_owned(),
-            status: "invalid oid".to_owned(),
-            stderr: format!("{oid} is not a commit hash"),
-        });
+        return Err(super::exec::rejected(
+            "git show",
+            format!("{oid} is not a commit hash"),
+        ));
     }
     let args = [
         "show",
@@ -321,10 +321,11 @@ pub fn commit_hover(git: &Git, root: &Path, oid: &str) -> Result<CommitHover, Gi
         "--",
     ];
     let output = git.require_ok(root, &args)?;
-    parse_commit_hover(&output.stdout).ok_or_else(|| GitError::Failed {
-        command: format!("git {}", args.join(" ")),
-        status: output.status.to_string(),
-        stderr: "unrecognized show output".to_owned(),
+    parse_commit_hover(&output.stdout).ok_or_else(|| {
+        super::exec::rejected(
+            &format!("git {}", args.join(" ")),
+            "unrecognized show output",
+        )
     })
 }
 
@@ -412,10 +413,11 @@ pub fn history(git: &Git, root: &Path, head: &Head, limit: usize) -> Result<Hist
         "--",
     ];
     let output = git.require_ok(root, &args)?;
-    let mut commits = parse_log(&output.stdout).ok_or_else(|| GitError::Failed {
-        command: format!("git {}", args.join(" ")),
-        status: output.status.to_string(),
-        stderr: "unrecognized log output".to_owned(),
+    let mut commits = parse_log(&output.stdout).ok_or_else(|| {
+        super::exec::rejected(
+            &format!("git {}", args.join(" ")),
+            "unrecognized log output",
+        )
     })?;
 
     let truncated = commits.len() > limit;

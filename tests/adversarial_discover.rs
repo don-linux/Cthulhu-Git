@@ -336,7 +336,6 @@ fn release_candidate_2_15_0_rc0_override_does_not_meet_the_floor() {
             assert!(!version.is_supported(), "{version:?}");
             assert!(version.raw.contains("rc"), "{version:?}");
         }
-        Err(GitError::Failed { .. }) => {}
         Err(error) => panic!("expected 2.15.0-rc0 to be rejected, got {error:?}"),
     }
 }
@@ -390,8 +389,8 @@ fn garbage_stdout_is_an_error_not_a_panic() {
     inputs.override_path = Some(pinned.into());
     let error = discover_with(&inputs).expect_err("garbage stdout must be an error");
     assert!(
-        matches!(error, GitError::Failed { .. }),
-        "garbage stdout must be Failed, not a panic or another variant: {error:?}"
+        matches!(error, GitError::Rejected { .. }),
+        "garbage stdout must be Rejected, not a panic or another variant: {error:?}"
     );
 }
 

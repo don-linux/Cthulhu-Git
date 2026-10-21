@@ -60,7 +60,7 @@ fn repository_root(git: &Git, dir: &Path) -> Result<PathBuf, GitError> {
         return Err(super::exec::classify_failure(
             dir,
             &["rev-parse", "--is-bare-repository"],
-            bare.status.to_string(),
+            bare.status,
             &bare.stderr,
         ));
     }
@@ -90,11 +90,7 @@ fn git_path(stdout: Vec<u8>) -> Result<PathBuf, GitError> {
         stdout.pop();
     }
     if stdout.is_empty() {
-        return Err(GitError::Failed {
-            command: "git rev-parse".to_owned(),
-            status: "exit status: 0".to_owned(),
-            stderr: "empty output".to_owned(),
-        });
+        return Err(super::exec::rejected("git rev-parse", "empty output"));
     }
 
     // Git for Windows prints `C:/...`; canonicalizing gives native separators.
@@ -122,7 +118,7 @@ fn read_head(git: &Git, root: &Path) -> Result<Head, GitError> {
     Err(super::exec::classify_failure(
         root,
         &["symbolic-ref", "--quiet", "HEAD"],
-        symbolic.status.to_string(),
+        symbolic.status,
         &symbolic.stderr,
     ))
 }
@@ -136,11 +132,10 @@ fn detached_head(git: &Git, root: &Path) -> Result<Head, GitError> {
     let output = git.require_ok(root, &["rev-parse", "--verify", "HEAD"])?;
     let oid = stdout_text(&output.stdout);
     if oid.is_empty() {
-        return Err(GitError::Failed {
-            command: "git rev-parse --verify HEAD".to_owned(),
-            status: output.status.to_string(),
-            stderr: "empty output".to_owned(),
-        });
+        return Err(super::exec::rejected(
+            "git rev-parse --verify HEAD",
+            "empty output",
+        ));
     }
     Ok(Head::Detached {
         short_oid: short_oid(&oid).to_owned(),

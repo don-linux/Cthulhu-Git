@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use super::exec::{Git, GitError};
+use super::exec::{Git, GitError, rejected};
 
 /// Fetch and pull talk to a network. A local read stays on the shorter limit.
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(3 * 60);
@@ -76,11 +76,8 @@ fn refspec_forbidden(ch: char) -> bool {
 
 /// Fetches the upstream named by `upstream_short` into its remote-tracking ref.
 pub fn fetch(git: &Git, root: &Path, upstream_short: &str) -> Result<(), GitError> {
-    let request = fetch_request(upstream_short).ok_or_else(|| GitError::Failed {
-        command: "git fetch".to_owned(),
-        status: "rejected".to_owned(),
-        stderr: "the upstream name cannot be fetched".to_owned(),
-    })?;
+    let request = fetch_request(upstream_short)
+        .ok_or_else(|| rejected("git fetch", "the upstream name cannot be fetched"))?;
     let args = request.args();
     git.require_ok_for(root, &args, NETWORK_TIMEOUT)?;
     Ok(())

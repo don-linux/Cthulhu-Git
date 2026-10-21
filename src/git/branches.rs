@@ -61,10 +61,11 @@ pub fn branches(git: &Git, root: &Path, head: &Head) -> Result<Vec<Branch>, GitE
     );
     let args = ["for-each-ref", format.as_str(), "refs/heads"];
     let output = git.require_ok(root, &args)?;
-    let refs = parse_refs(&output.stdout).ok_or_else(|| GitError::Failed {
-        command: format!("git {}", args.join(" ")),
-        status: output.status.to_string(),
-        stderr: "unrecognized for-each-ref output".to_owned(),
+    let refs = parse_refs(&output.stdout).ok_or_else(|| {
+        super::exec::rejected(
+            &format!("git {}", args.join(" ")),
+            "unrecognized for-each-ref output",
+        )
     })?;
 
     let mut rows = Vec::with_capacity(refs.len());
@@ -89,10 +90,11 @@ fn commit_count(git: &Git, root: &Path, name: &str) -> Result<u64, GitError> {
     // a path and reject the command.
     let args = ["rev-list", "--count", spec.as_str()];
     let output = git.require_ok(root, &args)?;
-    parse_count(&output.stdout).ok_or_else(|| GitError::Failed {
-        command: format!("git {}", args.join(" ")),
-        status: output.status.to_string(),
-        stderr: "unrecognized rev-list output".to_owned(),
+    parse_count(&output.stdout).ok_or_else(|| {
+        super::exec::rejected(
+            &format!("git {}", args.join(" ")),
+            "unrecognized rev-list output",
+        )
     })
 }
 

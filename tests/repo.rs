@@ -171,7 +171,7 @@ fn divergent_pull_with_rebase_config_does_not_rewrite_head() {
     let head = local.git(&["rev-parse", "HEAD"]);
     let error = pull_ff_only(&local.git, &local.root).expect_err("divergent pull");
     assert!(
-        matches!(error, GitError::Failed { .. }),
+        matches!(error, GitError::Command { .. }),
         "pull must fail without rewriting, got {error:?}"
     );
     assert_eq!(local.git(&["rev-parse", "HEAD"]), head);

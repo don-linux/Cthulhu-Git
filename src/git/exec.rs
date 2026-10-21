@@ -65,22 +65,81 @@ pub struct GitOutput {
     pub status: ExitStatus,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum GitError {
-    NotFound {
-        tried: Vec<PathBuf>,
-    },
+    #[error("{}", format_not_found(tried))]
+    NotFound { tried: Vec<PathBuf> },
+    #[error("CTHULHU_GIT is set to {path}, which is not an executable file.", path = display_path(.0))]
     BadOverride(PathBuf),
+    #[error(
+        "Git {0} is too old; version {major}.{minor}.{patch} or newer is required.",
+        major = MIN_GIT_VERSION.0,
+        minor = MIN_GIT_VERSION.1,
+        patch = MIN_GIT_VERSION.2
+    )]
     TooOld(GitVersion),
+    #[error("{path} is not a directory.", path = display_path(.0))]
     NotADirectory(PathBuf),
+    #[error("{path} is not inside a Git repository.", path = display_path(.0))]
     NotARepository(PathBuf),
+    #[error("{}", format_unsafe(.0))]
     UnsafeRepository(PathBuf),
-    Spawn(io::Error),
-    Failed {
+    #[error("Could not run git: {0}")]
+    Spawn(#[source] io::Error),
+    #[error("`{command}` failed (timed out): git exceeded the time limit")]
+    TimedOut { command: String, limit: Duration },
+    #[error("`{command}` failed (output limit): git output exceeded the limit")]
+    OutputLimit { command: String },
+    #[error("`{command}` failed (rejected): {stderr}")]
+    Rejected { command: String, stderr: String },
+    #[error("`{command}` failed ({status}){suffix}", suffix = stderr_suffix(stderr))]
+    Command {
         command: String,
-        status: String,
+        status: ExitStatus,
         stderr: String,
     },
+}
+
+fn display_path(path: &Path) -> String {
+    path.display().to_string()
+}
+
+fn format_not_found(tried: &[PathBuf]) -> String {
+    let mut message = String::from(
+        "Git was not found. Install Git or set CTHULHU_GIT to the full path of the git executable.",
+    );
+    if !tried.is_empty() {
+        let tried: Vec<_> = tried
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        message.push_str(&format!(" Searched: {}", tried.join(", ")));
+    }
+    message
+}
+
+fn format_unsafe(path: &Path) -> String {
+    format!(
+        "Git refuses to open {0} because it is owned by another user. \
+         If you trust it, run: git config --global --add safe.directory {1}",
+        path.display(),
+        shell_single_quote(&path.to_string_lossy())
+    )
+}
+
+fn stderr_suffix(stderr: &str) -> String {
+    if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr}")
+    }
+}
+
+pub(crate) fn rejected(command: &str, stderr: impl Into<String>) -> GitError {
+    GitError::Rejected {
+        command: command.to_owned(),
+        stderr: stderr.into(),
+    }
 }
 
 impl Git {
@@ -91,19 +150,21 @@ impl Git {
             PROBE_TIMEOUT,
             "git --version",
         )?;
-        let failed = |stderr: String| GitError::Failed {
-            command: "git --version".to_owned(),
-            status: output.status.to_string(),
-            stderr,
-        };
-
         if !output.status.success() {
-            return Err(failed(output.stderr.clone()));
+            return Err(GitError::Command {
+                command: "git --version".to_owned(),
+                status: output.status,
+                stderr: output.stderr.clone(),
+            });
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let version = GitVersion::parse(&stdout)
-            .ok_or_else(|| failed(format!("unrecognized version output: {}", stdout.trim())))?;
+        let version = GitVersion::parse(&stdout).ok_or_else(|| {
+            rejected(
+                "git --version",
+                format!("unrecognized version output: {}", stdout.trim()),
+            )
+        })?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -161,12 +222,7 @@ impl Git {
             return Ok(output);
         }
 
-        Err(classify_failure(
-            cwd,
-            args,
-            output.status.to_string(),
-            &output.stderr,
-        ))
+        Err(classify_failure(cwd, args, output.status, &output.stderr))
     }
 }
 
@@ -220,71 +276,6 @@ fn is_prerelease(raw: &str) -> bool {
 impl fmt::Display for GitVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.raw)
-    }
-}
-
-impl fmt::Display for GitError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotFound { tried } => {
-                write!(
-                    f,
-                    "Git was not found. Install Git or set CTHULHU_GIT to the full path of the git executable."
-                )?;
-                if !tried.is_empty() {
-                    let tried: Vec<_> = tried
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect();
-                    write!(f, " Searched: {}", tried.join(", "))?;
-                }
-                Ok(())
-            }
-            Self::BadOverride(path) => write!(
-                f,
-                "CTHULHU_GIT is set to {}, which is not an executable file.",
-                path.display()
-            ),
-            Self::TooOld(version) => {
-                let (major, minor, patch) = MIN_GIT_VERSION;
-                write!(
-                    f,
-                    "Git {version} is too old; version {major}.{minor}.{patch} or newer is required."
-                )
-            }
-            Self::NotADirectory(path) => write!(f, "{} is not a directory.", path.display()),
-            Self::NotARepository(path) => {
-                write!(f, "{} is not inside a Git repository.", path.display())
-            }
-            Self::UnsafeRepository(path) => write!(
-                f,
-                "Git refuses to open {0} because it is owned by another user. \
-                 If you trust it, run: git config --global --add safe.directory {1}",
-                path.display(),
-                shell_single_quote(&path.to_string_lossy())
-            ),
-            Self::Spawn(error) => write!(f, "Could not run git: {error}"),
-            Self::Failed {
-                command,
-                status,
-                stderr,
-            } => {
-                write!(f, "`{command}` failed ({status})")?;
-                if !stderr.is_empty() {
-                    write!(f, ": {stderr}")?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-impl std::error::Error for GitError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Spawn(error) => Some(error),
-            _ => None,
-        }
     }
 }
 
@@ -396,18 +387,15 @@ fn read_capped(mut reader: impl Read, limit: usize, exceeded_flag: &AtomicBool) 
 }
 
 fn output_limit(command_name: &str) -> GitError {
-    GitError::Failed {
+    GitError::OutputLimit {
         command: command_name.to_owned(),
-        status: "output limit".to_owned(),
-        stderr: "git output exceeded the limit".to_owned(),
     }
 }
 
-fn timed_out(command_name: &str) -> GitError {
-    GitError::Failed {
+fn timed_out(command_name: &str, limit: Duration) -> GitError {
+    GitError::TimedOut {
         command: command_name.to_owned(),
-        status: "timed out".to_owned(),
-        stderr: "git exceeded the time limit".to_owned(),
+        limit,
     }
 }
 
@@ -453,7 +441,7 @@ fn capture(
                 stop_group(pid, &mut child);
                 let _ = finish_reader(stdout_thread, READER_BUDGET);
                 let _ = finish_reader(stderr_thread, READER_BUDGET);
-                return Err(timed_out(command_name));
+                return Err(timed_out(command_name, timeout));
             }
             Ok(None) => thread::sleep(Duration::from_millis(5)),
             Err(error) => {
@@ -601,7 +589,7 @@ fn reap(child: &mut Child, budget: Duration) {
 pub(crate) fn classify_failure(
     cwd: &Path,
     args: &[&str],
-    status: String,
+    status: ExitStatus,
     stderr: &str,
 ) -> GitError {
     if is_not_a_repository_message(stderr) {
@@ -615,7 +603,7 @@ pub(crate) fn classify_failure(
         return GitError::UnsafeRepository(path);
     }
 
-    GitError::Failed {
+    GitError::Command {
         command: format!("git {}", args.join(" ")),
         status,
         stderr: stderr.to_owned(),
@@ -715,6 +703,19 @@ fn shell_single_quote(text: &str) -> String {
 mod tests {
     use super::*;
 
+    fn status_raw(raw: i32) -> ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(raw)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(raw as u32)
+        }
+    }
+
     fn version(output: &str) -> GitVersion {
         GitVersion::parse(output).expect("parsable version")
     }
@@ -776,7 +777,7 @@ mod tests {
         let older = classify_failure(
             Path::new("/tmp/plain"),
             &["rev-parse", "--show-toplevel"],
-            "exit status: 128".to_owned(),
+            status_raw(128),
             "fatal: Not a git repository (or any of the parent directories): .git",
         );
         assert!(matches!(older, GitError::NotARepository(_)), "{older:?}");
@@ -784,11 +785,11 @@ mod tests {
         let mentioned = classify_failure(
             Path::new("/tmp/plain"),
             &["rev-parse"],
-            "exit status: 128".to_owned(),
+            status_raw(128),
             "fatal: cannot change to 'not a git repository': No such file or directory",
         );
         assert!(
-            matches!(mentioned, GitError::Failed { .. }),
+            matches!(mentioned, GitError::Command { .. }),
             "{mentioned:?}"
         );
     }
@@ -827,7 +828,7 @@ mod tests {
         let error = classify_failure(
             Path::new("/tmp/somewhere"),
             &["rev-parse", "--show-toplevel"],
-            "exit status: 128".to_owned(),
+            status_raw(128),
             "fatal: not a git repository (or any of the parent directories): .git",
         );
         assert!(
@@ -843,7 +844,7 @@ mod tests {
         let error = classify_failure(
             Path::new("/srv/shared/repo/sub"),
             &["rev-parse"],
-            "exit status: 128".to_owned(),
+            status_raw(128),
             stderr,
         );
         let GitError::UnsafeRepository(path) = &error else {
@@ -859,15 +860,17 @@ mod tests {
 
     #[test]
     fn other_failures_keep_command_status_and_stderr() {
+        let status = status_raw(9);
         let error = classify_failure(
             Path::new("/repo"),
             &["status", "--porcelain=v2"],
-            "signal: 9 (SIGKILL)".to_owned(),
+            status,
             "",
         );
+        assert!(matches!(error, GitError::Command { .. }), "{error:?}");
         assert_eq!(
             error.to_string(),
-            "`git status --porcelain=v2` failed (signal: 9 (SIGKILL))"
+            format!("`git status --porcelain=v2` failed ({status})")
         );
     }
 

@@ -135,10 +135,11 @@ struct ExtraParent {
 pub fn head_commit_oid(git: &Git, root: &Path) -> Result<String, GitError> {
     let args = ["rev-parse", "--verify", "HEAD"];
     let output = git.require_ok(root, &args)?;
-    parse_oid(&output.stdout).ok_or_else(|| GitError::Failed {
-        command: format!("git {}", args.join(" ")),
-        status: output.status.to_string(),
-        stderr: "unrecognized rev-parse output".to_owned(),
+    parse_oid(&output.stdout).ok_or_else(|| {
+        super::exec::rejected(
+            &format!("git {}", args.join(" ")),
+            "unrecognized rev-parse output",
+        )
     })
 }
 
@@ -264,11 +265,10 @@ pub fn branch_graph(
 
     for tip in tips {
         if !is_oid(&tip.oid) {
-            return Err(GitError::Failed {
-                command: "git log".to_owned(),
-                status: "invalid tip".to_owned(),
-                stderr: format!("{} does not point at a commit hash", tip.name),
-            });
+            return Err(super::exec::rejected(
+                "git log",
+                format!("{} does not point at a commit hash", tip.name),
+            ));
         }
     }
 
@@ -295,10 +295,11 @@ pub fn branch_graph(
     let args: Vec<&str> = owned.iter().map(String::as_str).collect();
 
     let output = git.require_ok(root, &args)?;
-    let mut commits = parse_graph_log(&output.stdout).ok_or_else(|| GitError::Failed {
-        command: format!("git {}", args.join(" ")),
-        status: output.status.to_string(),
-        stderr: "unrecognized log output".to_owned(),
+    let mut commits = parse_graph_log(&output.stdout).ok_or_else(|| {
+        super::exec::rejected(
+            &format!("git {}", args.join(" ")),
+            "unrecognized log output",
+        )
     })?;
     let truncated = commits.len() > limit;
     commits.truncate(limit);

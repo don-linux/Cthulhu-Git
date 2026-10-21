@@ -433,7 +433,7 @@ fn broken_gitfile_is_a_typed_error() {
         matches!(
             &error,
             GitError::NotARepository(path) if path == &broken || path == &canonical
-        ) || matches!(error, GitError::Failed { .. }),
+        ) || matches!(error, GitError::Command { .. } | GitError::Rejected { .. }),
         "typed error, got {error:?}"
     );
     let _ = error.to_string();
@@ -460,7 +460,12 @@ fn missing_head_target_is_unborn_or_typed_error() {
         }
         Err(error) => {
             assert!(
-                matches!(error, GitError::Failed { .. } | GitError::NotARepository(_)),
+                matches!(
+                    error,
+                    GitError::Command { .. }
+                        | GitError::Rejected { .. }
+                        | GitError::NotARepository(_)
+                ),
                 "typed error, got {error:?}"
             );
             let _ = error.to_string();
@@ -487,7 +492,12 @@ fn garbage_head_is_typed_error_or_unborn() {
         }
         Err(error) => {
             assert!(
-                matches!(error, GitError::Failed { .. } | GitError::NotARepository(_)),
+                matches!(
+                    error,
+                    GitError::Command { .. }
+                        | GitError::Rejected { .. }
+                        | GitError::NotARepository(_)
+                ),
                 "typed error, got {error:?}"
             );
             let _ = error.to_string();
@@ -688,7 +698,10 @@ fn unreadable_git_dir_is_a_typed_error() {
     assert!(
         matches!(
             error,
-            GitError::NotARepository(_) | GitError::Failed { .. } | GitError::Spawn(_)
+            GitError::NotARepository(_)
+                | GitError::Command { .. }
+                | GitError::Rejected { .. }
+                | GitError::Spawn(_)
         ),
         "typed error, got {error:?}"
     );

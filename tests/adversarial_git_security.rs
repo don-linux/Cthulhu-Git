@@ -1008,7 +1008,7 @@ fn not_a_repository_substring_inside_a_different_fatal_is_not_that_error() {
             "a fatal whose primary message is not \"not a git repository\" was classified as NotARepository: {}",
             brief_error(&error)
         ),
-        GitError::Failed {
+        GitError::Command {
             stderr, command, ..
         } => {
             assert!(
@@ -1139,7 +1139,7 @@ fn rev_parse_output_bomb_is_refused() {
             "inspect accepted unbounded rev-parse stdout as a repository root ({} bytes)",
             info.root.as_os_str().len()
         ),
-        Err(GitError::Failed { stderr, .. }) if stderr_refuses_unbounded_output(&stderr) => {
+        Err(GitError::OutputLimit { .. }) => {
             assert_recorded_pid_is_dead(&sidecar(&fake, ".producer"));
         }
         Err(error) => panic!(
@@ -1220,13 +1220,6 @@ fn inherited_git_config_count_cannot_set_ssh_command_on_fetch() {
         config_value: Some(&command),
         extra_env: &extra,
     });
-}
-
-fn stderr_refuses_unbounded_output(stderr: &str) -> bool {
-    let lower = stderr.to_ascii_lowercase();
-    ["limit", "too large", "too long", "exceed", "unbounded"]
-        .iter()
-        .any(|needle| lower.contains(needle))
 }
 
 #[test]

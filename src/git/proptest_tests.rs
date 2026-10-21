@@ -11,6 +11,7 @@
 use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 
 use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
@@ -19,6 +20,19 @@ use super::exec::{GitError, GitVersion, MIN_GIT_VERSION, classify_failure};
 use super::log::{SHORT_OID_LEN, parse_log, short_oid};
 use super::repo::{Head, parse_head};
 use crate::settings::{FILE_NAME, HistoryColumns, MAX_RECENT_REPOSITORIES, Settings};
+
+fn status_raw(raw: i32) -> ExitStatus {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(raw)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(raw as u32)
+    }
+}
 
 fn proptest_config() -> ProptestConfig {
     ProptestConfig {
@@ -455,12 +469,13 @@ proptest! {
     fn classify_failure_never_panics(
         cwd in arb_text(80),
         args in prop::collection::vec(arb_text(24), 0..6),
-        status in arb_text(32),
+        status_bits in any::<i32>(),
         stderr in arb_stderr(),
     ) {
         let cwd_path = Path::new(&cwd);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let error = classify_failure(cwd_path, &arg_refs, status.clone(), &stderr);
+        let status = status_raw(status_bits);
+        let error = classify_failure(cwd_path, &arg_refs, status, &stderr);
         let rendered = error.to_string();
         assert!(!rendered.is_empty());
 
@@ -501,16 +516,16 @@ proptest! {
             }
         } else {
             match &error {
-                GitError::Failed {
+                GitError::Command {
                     command,
                     status: got_status,
                     stderr: got_stderr,
                 } => {
-                    assert_eq!(got_status, &status);
+                    assert_eq!(got_status.to_string(), status.to_string());
                     assert_eq!(got_stderr, &stderr);
                     assert_eq!(command, &format!("git {}", args.join(" ")));
                 }
-                other => panic!("expected Failed, got {other:?}"),
+                other => panic!("expected Command, got {other:?}"),
             }
         }
     }
@@ -877,25 +892,26 @@ fn parse_head_detached_short_oid_is_not_capped_at_twelve() {
 
 #[test]
 fn classify_failure_empty_and_interior_nul() {
-    let empty = classify_failure(Path::new(""), &[], String::new(), "");
+    let status = status_raw(0);
+    let empty = classify_failure(Path::new(""), &[], status, "");
     match &empty {
-        GitError::Failed {
+        GitError::Command {
             command,
-            status,
+            status: got,
             stderr,
         } => {
             assert_eq!(command, "git ");
-            assert_eq!(status, "");
+            assert_eq!(got.to_string(), status.to_string());
             assert_eq!(stderr, "");
         }
-        other => panic!("expected Failed, got {other:?}"),
+        other => panic!("expected Command, got {other:?}"),
     }
-    assert_eq!(empty.to_string(), "`git ` failed ()");
+    assert_eq!(empty.to_string(), format!("`git ` failed ({status})"));
 
     let error = classify_failure(
         Path::new("/tmp/a\0b"),
         &["status", "arg\0two"],
-        "exit\0status".to_owned(),
+        status_raw(1),
         "fatal: not a git repository\0still the same string",
     );
     assert!(matches!(error, GitError::NotARepository(ref path) if path == Path::new("/tmp/a\0b")));
@@ -904,7 +920,7 @@ fn classify_failure_empty_and_interior_nul() {
     let dubious = classify_failure(
         Path::new("/cwd"),
         &["status"],
-        "exit status: 128".to_owned(),
+        status_raw(128),
         "fatal: detected dubious ownership in repository at '/tmp/a\0b'",
     );
     assert!(
@@ -925,7 +941,7 @@ To add an exception for this directory, call:
     let error = classify_failure(
         Path::new("/cwd"),
         &["status", "--porcelain=v2"],
-        "exit status: 128".to_owned(),
+        status_raw(128),
         stderr,
     );
     assert!(
@@ -939,11 +955,11 @@ To add an exception for this directory, call:
     let mentioned = classify_failure(
         Path::new("/cwd"),
         &["status"],
-        "exit status: 1".to_owned(),
+        status_raw(1),
         "note: the handbook says this is not a git repository wording; real fault is permissions",
     );
     assert!(
-        matches!(mentioned, GitError::Failed { .. }),
+        matches!(mentioned, GitError::Command { .. }),
         "got {mentioned:?}"
     );
 }
@@ -959,7 +975,7 @@ To add an exception for this directory, call:
     let error = classify_failure(
         Path::new("/cwd"),
         &["rev-parse", "--show-toplevel"],
-        "exit status: 128".to_owned(),
+        status_raw(128),
         stderr,
     );
     let GitError::UnsafeRepository(path) = &error else {
@@ -977,7 +993,7 @@ fn dubious_ownership_empty_quotes_fall_back_to_cwd() {
     let error = classify_failure(
         Path::new("/actual/cwd"),
         &["status"],
-        "exit status: 128".to_owned(),
+        status_raw(128),
         "fatal: detected dubious ownership in repository at ''",
     );
     let GitError::UnsafeRepository(path) = &error else {
