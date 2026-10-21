@@ -18,6 +18,9 @@ pub struct Branch {
     /// Full hash of the commit this branch points at. `None` when the branch
     /// has no commits yet.
     pub oid: Option<String>,
+    /// Committer time of that commit, seconds since the Unix epoch.
+    /// `None` when the branch has no commits yet.
+    pub committer_time: Option<i64>,
     /// Commits reachable from the branch tip, including ancestors.
     pub commit_count: u64,
     pub upstream: Upstream,
@@ -42,6 +45,7 @@ pub enum Upstream {
 struct ParsedRef {
     name: String,
     oid: Option<String>,
+    committer_time: Option<i64>,
     upstream: Upstream,
 }
 
@@ -53,7 +57,7 @@ struct ParsedRef {
 pub fn branches(git: &Git, root: &Path, head: &Head) -> Result<Vec<Branch>, GitError> {
     let separator = FIELD_SEPARATOR as char;
     let format = format!(
-        "--format=%(refname:short){separator}%(objectname){separator}%(upstream:short){separator}%(upstream:track)"
+        "--format=%(refname:short){separator}%(objectname){separator}%(upstream:short){separator}%(upstream:track){separator}%(committerdate:unix)"
     );
     let args = ["for-each-ref", format.as_str(), "refs/heads"];
     let output = git.require_ok(root, &args)?;
@@ -69,6 +73,7 @@ pub fn branches(git: &Git, root: &Path, head: &Head) -> Result<Vec<Branch>, GitE
         rows.push(Branch {
             name: parsed.name,
             oid: parsed.oid,
+            committer_time: parsed.committer_time,
             commit_count,
             upstream: parsed.upstream,
             current: false,
@@ -105,7 +110,8 @@ fn parse_count(stdout: &[u8]) -> Option<u64> {
     std::str::from_utf8(&bytes).ok()?.parse().ok()
 }
 
-/// `name SEP oid SEP upstream SEP track`, one branch per line.
+/// `name SEP oid SEP upstream SEP track SEP committer-time`, one branch per line.
+/// The committer time is Unix seconds, empty when the ref has no commit.
 fn parse_refs(stdout: &[u8]) -> Option<Vec<ParsedRef>> {
     let mut refs = Vec::new();
     for mut line in stdout.split(|byte| *byte == b'\n') {
@@ -121,11 +127,12 @@ fn parse_refs(stdout: &[u8]) -> Option<Vec<ParsedRef>> {
 }
 
 fn parse_ref_line(line: &[u8]) -> Option<ParsedRef> {
-    let mut parts = line.splitn(4, |byte| *byte == FIELD_SEPARATOR);
+    let mut parts = line.splitn(5, |byte| *byte == FIELD_SEPARATOR);
     let name = parts.next()?;
     let oid = parts.next()?;
     let upstream = parts.next()?;
     let track = parts.next()?;
+    let committer_time = parts.next()?;
     if name.is_empty() {
         return None;
     }
@@ -142,8 +149,23 @@ fn parse_ref_line(line: &[u8]) -> Option<ParsedRef> {
     Some(ParsedRef {
         name,
         oid,
+        committer_time: parse_committer_time(committer_time)?,
         upstream: classify_upstream(&upstream, &track)?,
     })
+}
+
+/// Empty when the branch has no commit. Anything that is not an integer rejects
+/// the whole record.
+fn parse_committer_time(bytes: &[u8]) -> Option<Option<i64>> {
+    if bytes.is_empty() {
+        return Some(None);
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(Some(text.parse().ok()?))
 }
 
 /// `%(upstream:track)` is empty when there is no upstream and when the branch
@@ -199,6 +221,7 @@ fn finish(mut branches: Vec<Branch>, head: &Head) -> Vec<Branch> {
             None => branches.push(Branch {
                 name: name.to_owned(),
                 oid: None,
+                committer_time: None,
                 commit_count: 0,
                 upstream: Upstream::None,
                 current: true,
@@ -221,12 +244,12 @@ mod tests {
     const OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
     fn line(name: &str, upstream: &str, track: &str) -> Vec<u8> {
-        line_with_oid(name, OID, upstream, track)
+        line_with_oid(name, OID, upstream, track, "1700000000")
     }
 
-    fn line_with_oid(name: &str, oid: &str, upstream: &str, track: &str) -> Vec<u8> {
+    fn line_with_oid(name: &str, oid: &str, upstream: &str, track: &str, when: &str) -> Vec<u8> {
         let mut out = name.as_bytes().to_vec();
-        for field in [oid, upstream, track] {
+        for field in [oid, upstream, track, when] {
             out.push(FIELD_SEPARATOR);
             out.extend_from_slice(field.as_bytes());
         }
@@ -321,15 +344,31 @@ mod tests {
         assert!(parse_refs(&line("feature", "main", "[ahead]")).is_none());
         assert!(parse_refs(&line("feature", "main", "ahead 1")).is_none());
         assert!(parse_refs(&line("feature", "main", "[behind 1, ahead 2]")).is_none());
-        assert!(parse_refs(&line_with_oid("feature", "not-hex", "main", "")).is_none());
-        // The previous three-field record is no longer a complete branch.
+        assert!(parse_refs(&line_with_oid("feature", "not-hex", "main", "", "1")).is_none());
+        assert!(parse_refs(&line_with_oid("feature", OID, "", "", "yesterday")).is_none());
+        // A record from before the committer time was added is no longer complete.
+        assert!(
+            parse_refs(b"feature\x1f4b825dc642cb6eb9a060e54bf8d69288fbee4904\x1f\x1f\n").is_none()
+        );
         assert!(parse_refs(b"feature\x1fmain\x1f\n").is_none());
     }
 
     #[test]
+    fn committer_time_is_unix_seconds_or_absent() {
+        let dated = parsed(&line_with_oid("feature", OID, "", "", "1700000000"));
+        assert_eq!(dated[0].committer_time, Some(1_700_000_000));
+        let ancient = parsed(&line_with_oid("old", OID, "", "", "-10"));
+        assert_eq!(ancient[0].committer_time, Some(-10));
+        let unborn = parsed(&line_with_oid("main", "", "", "", ""));
+        assert_eq!(unborn[0].oid, None);
+        assert_eq!(unborn[0].committer_time, None);
+    }
+
+    #[test]
     fn empty_oid_is_a_branch_with_no_commit() {
-        let refs = parsed(&line_with_oid("main", "", "", ""));
+        let refs = parsed(&line_with_oid("main", "", "", "", ""));
         assert_eq!(refs[0].oid, None);
+        assert_eq!(refs[0].committer_time, None);
     }
 
     #[test]
@@ -344,6 +383,7 @@ mod tests {
         Branch {
             name: name.to_owned(),
             oid: None,
+            committer_time: None,
             commit_count: count,
             upstream: Upstream::None,
             current: false,
@@ -365,6 +405,7 @@ mod tests {
             vec![Branch {
                 name: "main".to_owned(),
                 oid: None,
+                committer_time: None,
                 commit_count: 0,
                 upstream: Upstream::None,
                 current: true,

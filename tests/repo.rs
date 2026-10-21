@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cthulhu_git::git::{
-    Git, GitError, GraphTip, Head, History, RepoInfo, SHORT_OID_LEN, Upstream, branch_graph,
-    branches, head_commit_oid, history, inspect, latest_commit,
+    Git, GitError, GraphCandidate, GraphTip, Head, History, RepoInfo, SHORT_OID_LEN, Upstream,
+    branch_graph, branches, graph_tips, head_commit_oid, history, inspect, latest_commit,
 };
 use tempfile::TempDir;
 
@@ -275,6 +275,7 @@ fn unborn_repository_lists_its_branch_and_has_no_commit_detail() {
     assert!(listed[0].current);
     assert_eq!(listed[0].commit_count, 0);
     assert_eq!(listed[0].oid, None);
+    assert_eq!(listed[0].committer_time, None);
     assert_eq!(listed[0].upstream, Upstream::None);
     assert_eq!(
         latest_commit(&fixture.git, &info.root, &info.head).expect("detail"),
@@ -314,6 +315,8 @@ fn branches_report_commit_counts_and_ahead_behind() {
     assert_eq!(main.upstream, Upstream::None);
     assert!(feature.oid.is_some());
     assert_ne!(feature.oid, main.oid);
+    assert!(feature.committer_time.is_some());
+    assert!(main.committer_time.is_some());
 
     let detail = latest_commit(&fixture.git, &info.root, &info.head)
         .expect("detail")
@@ -338,17 +341,17 @@ fn branches_report_commit_counts_and_ahead_behind() {
 }
 
 fn tips_of(listed: &[cthulhu_git::git::Branch]) -> Vec<GraphTip> {
-    listed
+    let candidates: Vec<GraphCandidate<'_>> = listed
         .iter()
-        .enumerate()
-        .filter_map(|(index, branch)| {
-            branch.oid.as_ref().map(|oid| GraphTip {
-                name: branch.name.clone(),
-                oid: oid.clone(),
-                color: index,
-            })
+        .map(|branch| GraphCandidate {
+            name: branch.name.as_str(),
+            oid: branch.oid.as_deref(),
+            current: branch.current,
+            committer_time: branch.committer_time,
+            checked: true,
         })
-        .collect()
+        .collect();
+    graph_tips(&candidates, None)
 }
 
 #[test]
@@ -407,6 +410,61 @@ fn graph_shows_where_a_branch_leaves_main() {
 }
 
 #[test]
+fn a_newer_feature_joins_main_instead_of_taking_its_lane() {
+    let fixture = Fixture::init();
+    fixture.commit_at("Base", "2020-01-01T00:00:00");
+    fixture.git(&["branch", "feature"]);
+    fixture.commit_at("On main", "2020-01-02T00:00:00");
+    fixture.git(&["switch", "feature"]);
+    fixture.commit_at("On feature", "2020-01-03T00:00:00");
+    fixture.git(&["switch", "main"]);
+
+    let info = fixture.inspect();
+    let listed = branches(&fixture.git, &info.root, &info.head).expect("branches");
+    let feature_time = listed
+        .iter()
+        .find(|branch| branch.name == "feature")
+        .and_then(|branch| branch.committer_time);
+    let main_time = listed
+        .iter()
+        .find(|branch| branch.name == "main")
+        .and_then(|branch| branch.committer_time);
+    assert!(feature_time > main_time);
+
+    let tips = tips_of(&listed);
+    assert!(
+        tips.iter()
+            .any(|tip| tip.name == "main" && tip.principal && tip.color == 0)
+    );
+    let graph = branch_graph(&fixture.git, &info.root, &tips, 20).expect("graph");
+    let main_row = graph
+        .rows
+        .iter()
+        .find(|row| row.branches.iter().any(|branch| branch.name == "main"))
+        .expect("main");
+    let feature_row = graph
+        .rows
+        .iter()
+        .find(|row| row.branches.iter().any(|branch| branch.name == "feature"))
+        .expect("feature");
+    assert_eq!(main_row.commit_lane, 0);
+    assert_eq!(main_row.commit_color, 0);
+    assert_eq!(feature_row.commit_lane, 1);
+    assert_ne!(feature_row.commit_color, 0);
+
+    let base = graph
+        .rows
+        .iter()
+        .find(|row| row.summary == "Base")
+        .expect("base");
+    assert_eq!(base.commit_lane, 0);
+    assert_eq!(base.commit_color, 0);
+    assert!(base.traces.iter().any(|trace| {
+        trace.from_lane == Some(feature_row.commit_lane) && trace.to_lane.is_none()
+    }));
+}
+
+#[test]
 fn detached_head_stays_on_the_graph() {
     let fixture = Fixture::with_commit();
     fixture.commit("Second");
@@ -415,14 +473,20 @@ fn detached_head_stays_on_the_graph() {
     let info = fixture.inspect();
     let listed = branches(&fixture.git, &info.root, &info.head).expect("branches");
     assert!(listed.iter().all(|branch| !branch.current));
-    let mut tips = tips_of(&listed);
     let head = head_commit_oid(&fixture.git, &info.root).expect("head oid");
     assert_eq!(head, fixture.git(&["rev-parse", "HEAD"]));
-    tips.push(GraphTip {
-        name: "HEAD".to_owned(),
-        oid: head,
-        color: listed.len(),
-    });
+    let candidates: Vec<GraphCandidate<'_>> = listed
+        .iter()
+        .map(|branch| GraphCandidate {
+            name: branch.name.as_str(),
+            oid: branch.oid.as_deref(),
+            current: branch.current,
+            committer_time: branch.committer_time,
+            checked: true,
+        })
+        .collect();
+    let tips = graph_tips(&candidates, Some(head.as_str()));
+    assert!(tips.iter().any(|tip| tip.name == "HEAD" && tip.principal));
     let graph = branch_graph(&fixture.git, &info.root, &tips, 10).expect("graph");
     assert!(
         graph

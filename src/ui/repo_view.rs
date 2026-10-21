@@ -17,6 +17,7 @@ use super::widgets;
 use super::{Action, ListedBranch, OpenedRepo, SyncKind};
 
 const LANE_WIDTH: f32 = 14.0;
+const LANE_DOT: f32 = 8.0;
 const SIDEBAR_DEFAULT_WIDTH: f32 = 320.0;
 const SIDEBAR_MIN_WIDTH: f32 = 220.0;
 const SIDEBAR_MAX_WIDTH: f32 = 560.0;
@@ -304,22 +305,35 @@ fn branches_panel(ui: &mut Ui, repo: &mut OpenedRepo, palette: &Palette) {
         return;
     }
 
+    let tips = super::selected_tips(&repo.branches, repo.detached_oid.as_deref());
     ScrollArea::vertical()
         .id_salt(repo.view_id.with("branches"))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for listed in &mut repo.branches {
-                branch_row(ui, listed, palette);
+                let lane = tips
+                    .iter()
+                    .find(|tip| tip.name == listed.branch.name)
+                    .map(|tip| tip.color);
+                branch_row(ui, listed, lane, palette);
             }
         });
 }
 
-fn branch_row(ui: &mut Ui, listed: &mut ListedBranch, palette: &Palette) {
+fn branch_row(ui: &mut Ui, listed: &mut ListedBranch, lane: Option<usize>, palette: &Palette) {
     let width = ui.available_width();
     ui.push_id(&listed.branch.name, |ui| {
         ui.set_max_width(width);
         ui.horizontal(|ui| {
             ui.add(egui::Checkbox::without_text(&mut listed.checked));
+            let (dot, _) = ui.allocate_exact_size(Vec2::splat(LANE_DOT), Sense::hover());
+            if let Some(color) = lane {
+                ui.painter().circle_filled(
+                    dot.center(),
+                    LANE_DOT / 2.0,
+                    palette.graph_color(color),
+                );
+            }
             let mut name = RichText::new(&listed.branch.name).color(palette.text);
             if listed.branch.current {
                 name = name.strong();
@@ -337,7 +351,7 @@ fn branch_row(ui: &mut Ui, listed: &mut ListedBranch, palette: &Palette) {
             }
         });
 
-        let indent = ui.spacing().icon_width + ui.spacing().item_spacing.x;
+        let indent = ui.spacing().icon_width + LANE_DOT + ui.spacing().item_spacing.x * 2.0;
         ui.horizontal(|ui| {
             ui.add_space(indent);
             ui.add(
@@ -687,6 +701,7 @@ mod tests {
         Branch {
             name: "main".to_owned(),
             oid: None,
+            committer_time: None,
             commit_count: count,
             upstream,
             current: true,

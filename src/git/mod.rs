@@ -20,8 +20,8 @@ pub use branches::{Branch, Upstream, branches};
 pub use discover::{DiscoverInputs, OVERRIDE_VAR, discover_with};
 pub use exec::{Git, GitError, GitOutput, GitVersion, MIN_GIT_VERSION};
 pub use graph::{
-    GraphBranch, GraphCommit, GraphRow, GraphTip, GraphTrace, HistoryGraph, branch_graph,
-    head_commit_oid, layout_graph,
+    GraphBranch, GraphCandidate, GraphCommit, GraphRow, GraphTip, GraphTrace, HistoryGraph,
+    branch_graph, graph_tips, head_commit_oid, layout_graph,
 };
 pub use log::{Commit, CommitDetail, History, SHORT_OID_LEN, history, latest_commit};
 pub use repo::{Head, RepoInfo, inspect};

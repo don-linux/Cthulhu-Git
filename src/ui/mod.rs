@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
-use cthulhu_git::git::{self, Branch, CommitDetail, Git, GraphTip, Head, HistoryGraph, RepoInfo};
+use cthulhu_git::git::{
+    self, Branch, CommitDetail, Git, GraphCandidate, GraphTip, Head, HistoryGraph, RepoInfo,
+};
 use cthulhu_git::settings::Settings;
 use eframe::egui;
 
@@ -203,8 +205,8 @@ impl CthulhuApp {
                         .branches
                         .into_iter()
                         .map(|branch| ListedBranch {
+                            checked: checked_when_opened(&branch),
                             branch,
-                            checked: true,
                         })
                         .collect(),
                     latest: loaded.latest,
@@ -382,8 +384,8 @@ fn load(path: &Path) -> OpenResult {
         .iter()
         .cloned()
         .map(|branch| ListedBranch {
+            checked: checked_when_opened(&branch),
             branch,
-            checked: true,
         })
         .collect();
     let tips = selected_tips(&listed, refreshed.detached_oid.as_deref());
@@ -443,7 +445,16 @@ fn run_sync(root: &Path, command: SyncCommand) -> Result<Refreshed, String> {
     reload_repo(&git, root)
 }
 
-/// Keeps the sidebar checkboxes. New branches start checked, same as an open.
+/// The branch that is checked the first time a repository opens.
+///
+/// Every other branch starts off, so the graph is one line until the user
+/// marks more. A branch that appears later, after fetch or pull, stays off too.
+fn checked_when_opened(branch: &Branch) -> bool {
+    branch.current
+}
+
+/// Keeps the sidebar checkboxes. A branch that was not in the list yet stays
+/// unchecked, so a fetch does not pull it into the graph.
 fn apply_refresh(repo: &mut OpenedRepo, refreshed: Refreshed) {
     let previous = std::mem::take(&mut repo.branches);
     repo.info = refreshed.info;
@@ -457,35 +468,28 @@ fn apply_refresh(repo: &mut OpenedRepo, refreshed: Refreshed) {
                 .iter()
                 .find(|listed| listed.branch.name == branch.name)
                 .map(|listed| listed.checked)
-                .unwrap_or(true);
+                .unwrap_or(false);
             ListedBranch { branch, checked }
         })
         .collect();
 }
 
 /// Checked branches that have commits, in sidebar order, plus detached HEAD.
+///
+/// Colors and the principal lane come from [`git::graph_tips`], which the
+/// branch list uses as well.
 fn selected_tips(branches: &[ListedBranch], detached_oid: Option<&str>) -> Vec<GraphTip> {
-    let mut tips = Vec::new();
-    for (index, listed) in branches.iter().enumerate() {
-        if !listed.checked {
-            continue;
-        }
-        if let Some(oid) = &listed.branch.oid {
-            tips.push(GraphTip {
-                name: listed.branch.name.clone(),
-                oid: oid.clone(),
-                color: index,
-            });
-        }
-    }
-    if let Some(oid) = detached_oid {
-        tips.push(GraphTip {
-            name: "HEAD".to_owned(),
-            oid: oid.to_owned(),
-            color: branches.len(),
-        });
-    }
-    tips
+    let candidates: Vec<GraphCandidate<'_>> = branches
+        .iter()
+        .map(|listed| GraphCandidate {
+            name: listed.branch.name.as_str(),
+            oid: listed.branch.oid.as_deref(),
+            current: listed.branch.current,
+            committer_time: listed.branch.committer_time,
+            checked: listed.checked,
+        })
+        .collect();
+    git::graph_tips(&candidates, detached_oid)
 }
 
 struct GraphLoad {
@@ -706,4 +710,52 @@ impl CthulhuApp {
 fn reload_graph(root: &Path, tips: &[GraphTip]) -> Result<HistoryGraph, String> {
     let git = Git::discover().map_err(|error| error.to_string())?;
     git::branch_graph(&git, root, tips, HISTORY_LIMIT).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::{ListedBranch, checked_when_opened, selected_tips};
+    use cthulhu_git::git::{Branch, Upstream};
+
+    fn branch(name: &str, current: bool) -> Branch {
+        Branch {
+            name: name.to_owned(),
+            oid: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+            committer_time: Some(10),
+            commit_count: 1,
+            upstream: Upstream::None,
+            current,
+        }
+    }
+
+    fn listed(name: &str, current: bool, checked: bool) -> ListedBranch {
+        ListedBranch {
+            branch: branch(name, current),
+            checked,
+        }
+    }
+
+    #[test]
+    fn opening_checks_only_the_current_branch() {
+        assert!(checked_when_opened(&branch("feature", true)));
+        assert!(!checked_when_opened(&branch("main", false)));
+    }
+
+    #[test]
+    fn checking_another_branch_adds_it_beside_the_current_one() {
+        let mut branches = vec![listed("feature", true, true), listed("main", false, false)];
+        let alone = selected_tips(&branches, None);
+        assert_eq!(alone.len(), 1);
+        assert!(alone[0].principal);
+        assert_eq!(alone[0].name, "feature");
+
+        branches[1].checked = true;
+        let both = selected_tips(&branches, None);
+        assert_eq!(both.len(), 2);
+        assert!(both.iter().any(|tip| tip.name == "main" && !tip.principal));
+        assert!(
+            both.iter()
+                .any(|tip| tip.name == "feature" && tip.principal && tip.color == 0)
+        );
+    }
 }

@@ -388,6 +388,7 @@ fn opened(name: &str, commits: Vec<Commit>, truncated: bool) -> OpenedRepo {
             branch: Branch {
                 name: "main".to_owned(),
                 oid: commits.first().map(|commit| commit.oid.clone()),
+                committer_time: Some(1_700_000_000),
                 commit_count,
                 upstream: Upstream::None,
                 current: true,
@@ -424,6 +425,7 @@ fn graph_tips(commits: &[Commit]) -> Vec<GraphTip> {
             name: "main".to_owned(),
             oid: commit.oid.clone(),
             color: 0,
+            principal: true,
         })
         .into_iter()
         .collect()
