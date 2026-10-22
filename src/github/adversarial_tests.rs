@@ -9,7 +9,7 @@ use proptest::prelude::*;
 use proptest::string::string_regex;
 use proptest::test_runner::FileFailurePersistence;
 
-use super::client::{check, parse_commit_accounts};
+use super::client::{FetchError, check, fetch_image, parse_commit_accounts};
 use super::http::fake::FakeTransport;
 use super::http::{allowed_host, get};
 use super::*;
@@ -924,6 +924,71 @@ fn noreply_addresses_never_hit_the_api() {
         NOW,
     );
     assert_eq!(fake.urls(), vec![warm]);
+}
+
+#[test]
+fn hostile_author_avatar_urls_never_leave_the_allowlist_or_leak_tokens_in_errors() {
+    const SENTINEL: &str = "ghp_SentinelTokenValue0000";
+    let avatars = [
+        "https://evil.example/a.png",
+        "http://avatars.githubusercontent.com/u/1",
+        "https://ghp_SentinelTokenValue0000@evil.example/a.png",
+        "https://avatars.githubusercontent.com.evil.example/u/1",
+    ];
+    let context = context();
+    let email = "person@example.com";
+    let emails = vec![email.to_owned()];
+
+    for (index, avatar) in avatars.iter().enumerate() {
+        let fake = Arc::new(FakeTransport::default());
+        let sha = format!("{index:040x}");
+        let warm = list_url(100, Some("aaa111"));
+        fake.reply(
+            &warm,
+            200,
+            &[("x-ratelimit-remaining", "50")],
+            format!("[{}]", commit_json(&sha, email, Some(avatar))).as_bytes(),
+        );
+        let mut resolver = resolver(&fake);
+        let urls = resolver.candidates(
+            &AvatarQuery {
+                emails: &emails,
+                repo: Some(&context),
+                authored: Some(&sha),
+            },
+            NOW,
+        );
+        assert!(!urls.is_empty(), "case {index}");
+        let transport = fake.clone() as Arc<dyn Transport>;
+        for url in &urls {
+            if let Err(FetchError::Failed(message)) = fetch_image(transport.as_ref(), url) {
+                assert!(
+                    !message.contains(SENTINEL),
+                    "fetch_image leaked the sentinel in {message}"
+                );
+            }
+            if let Err(error) = get(transport.as_ref(), url, None) {
+                let message = error.to_string();
+                assert!(
+                    !message.contains(SENTINEL),
+                    "get leaked the sentinel in {message}"
+                );
+            }
+        }
+        for (url, _) in fake.requests.lock().expect("requests").iter() {
+            let host = allowed_host(url).unwrap_or_else(|error| {
+                panic!("requested a refused url {url}: {error}");
+            });
+            assert!(ALLOWED.contains(&host.as_str()), "{url} reached {host}");
+        }
+        assert!(
+            fake.urls().iter().all(|url| {
+                allowed_host(url).is_ok_and(|host| ALLOWED.contains(&host.as_str()))
+            }),
+            "case {index}: {:?}",
+            fake.urls()
+        );
+    }
 }
 
 #[test]

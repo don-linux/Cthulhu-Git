@@ -43,24 +43,61 @@ impl HttpResponse {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpError {
     /// Not HTTPS, a host outside [`ALLOWED_HOSTS`], or a URL with credentials or a port.
-    #[error("refused to request {0}")]
     NotAllowed(String),
-    #[error("too many redirects")]
     TooManyRedirects,
-    #[error("the request timed out")]
     TimedOut,
-    #[error("could not connect")]
     Connect,
-    #[error("the TLS handshake failed: {0}")]
     Tls(String),
-    #[error("the response is larger than the limit")]
     TooLarge,
     /// Anything else the transport reported. The message is not matched on.
-    #[error("{0}")]
     Transport(String),
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAllowed(url) => {
+                write!(f, "refused to request {}", url_without_credentials(url))
+            }
+            Self::TooManyRedirects => f.write_str("too many redirects"),
+            Self::TimedOut => f.write_str("the request timed out"),
+            Self::Connect => f.write_str("could not connect"),
+            Self::Tls(message) => write!(f, "the TLS handshake failed: {message}"),
+            Self::TooLarge => f.write_str("the response is larger than the limit"),
+            Self::Transport(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+/// Omits userinfo from a URL string for error messages.
+fn url_without_credentials(url: &str) -> String {
+    let uri: Uri = match url.parse() {
+        Ok(uri) => uri,
+        Err(_) => return url.to_owned(),
+    };
+    let Some(authority) = uri.authority() else {
+        return url.to_owned();
+    };
+    if !authority.as_str().contains('@') {
+        return url.to_owned();
+    }
+    let scheme = uri.scheme_str().unwrap_or("https");
+    let host = authority.host();
+    let port = authority
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    let path = uri.path();
+    let query = uri
+        .query()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+    format!("{scheme}://{host}{port}{path}{query}")
 }
 
 fn classify_ureq(error: ureq::Error) -> HttpError {

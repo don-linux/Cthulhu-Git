@@ -58,7 +58,8 @@ pub struct ShellArgv {
 ///
 /// macOS is a login shell (`-l`) so `/etc/zprofile` and `~/.zprofile` run.
 /// Linux stays non-login, so an interactive bash still reads `~/.bashrc`.
-/// An empty or non-Unicode `SHELL` uses `passwd_shell`, then `/bin/sh`.
+/// A relative, empty, or non-Unicode `SHELL` uses an absolute `passwd_shell`,
+/// then `/bin/sh`.
 /// `unset` is applied with `/usr/bin/env -u`, which can remove names.
 /// `Options.env` can only add them.
 pub fn shell_argv(
@@ -115,13 +116,26 @@ fn chosen_unix_shell(shell: Option<&OsStr>, passwd_shell: Option<&str>) -> Strin
     if let Some(value) = shell
         && !value.is_empty()
         && let Some(text) = value.to_str()
+        && unix_shell_is_absolute(text)
     {
         return text.to_owned();
     }
     passwd_shell
-        .filter(|shell| !shell.is_empty())
+        .filter(|shell| !shell.is_empty() && unix_shell_is_absolute(shell))
         .unwrap_or("/bin/sh")
         .to_owned()
+}
+
+/// Absolute Unix path. On Unix this is [`Path::is_absolute`].
+///
+/// The Linux shell choice is also unit-tested on Windows, where `Path` does
+/// not treat `/bin/sh` as absolute.
+fn unix_shell_is_absolute(text: &str) -> bool {
+    if cfg!(unix) {
+        Path::new(text).is_absolute()
+    } else {
+        text.starts_with('/')
+    }
 }
 
 fn env_name_is_safe(name: &str) -> bool {
@@ -352,11 +366,15 @@ impl Drop for ShellSession {
     fn drop(&mut self) {
         // Join on a side thread. Waiting here would freeze the window, and a
         // pid that the reader already reaped must not be signaled.
+        // Stop the session before the PTY is closed. Dropping the PTY
+        // SIGHUPs the leader and waits for it, which reparents a `setsid`
+        // child before that child can be reaped.
         let pid = self.pid;
         let join = self.join.take();
-        let _ = self.io.send(Msg::Shutdown);
+        let io = self.io.clone();
         thread::spawn(move || {
             stop_session(pid);
+            let _ = io.send(Msg::Shutdown);
             if let Some(join) = join {
                 let _ = join.join();
             }
@@ -521,9 +539,10 @@ fn should_signal(pid: u32) -> bool {
     rustix::process::test_kill_process(parsed).is_ok()
 }
 
-/// Stop the shell's session. A reaped leader is left alone so the pid cannot
-/// be recycled into an unrelated process. The caller's own session is never
-/// signaled: the PTY child called `setsid`, so its session is not ours.
+/// Stop the shell and its descendants. A reaped leader is left alone so the
+/// pid cannot be recycled into an unrelated process. The caller's own session
+/// is never signaled. Descendants are still reaped when the leader shares
+/// that session, including a child that called `setsid`.
 fn stop_session(leader: u32) {
     #[cfg(unix)]
     {
@@ -531,20 +550,21 @@ fn stop_session(leader: u32) {
             return;
         }
         let mine = session_of(std::process::id());
-        let Some(session) = session_of(leader) else {
-            signal_group(leader, rustix::process::Signal::KILL);
-            return;
+        // Snapshot before anyone is killed. A `setsid` child is absent here
+        // and is reaped from the process tree instead.
+        let members = match session_of(leader) {
+            Some(session) if Some(session) != mine => Some(processes_in_session(session)),
+            _ => None,
         };
-        if mine == Some(session) {
-            return;
-        }
-        let members = processes_in_session(session);
-        for pid in &members {
-            signal_pid(*pid, rustix::process::Signal::HUP);
-        }
-        thread::sleep(Duration::from_millis(50));
-        for pid in members {
-            signal_pid(pid, rustix::process::Signal::KILL);
+        cthulhu_git::git::reap_process_tree(leader);
+        if let Some(members) = members {
+            for pid in &members {
+                signal_pid(*pid, rustix::process::Signal::HUP);
+            }
+            thread::sleep(Duration::from_millis(50));
+            for pid in members {
+                signal_pid(pid, rustix::process::Signal::KILL);
+            }
         }
     }
     #[cfg(windows)]
@@ -560,17 +580,6 @@ fn signal_pid(pid: u32, signal: rustix::process::Signal) {
         return;
     };
     let _ = rustix::process::kill_process(pid, signal);
-}
-
-#[cfg(unix)]
-fn signal_group(pid: u32, signal: rustix::process::Signal) {
-    let Some(pid) = rustix::process::Pid::from_raw(pid as i32) else {
-        return;
-    };
-    if pid == rustix::process::getpid() || pid == rustix::process::getpgrp() {
-        return;
-    }
-    let _ = rustix::process::kill_process_group(pid, signal);
 }
 
 /// Session id from a `/proc/<pid>/stat` line. `comm` may contain spaces and
@@ -1562,6 +1571,75 @@ mod tests {
         assert_eq!(argv.args, ["-u", "GH_TOKEN", "--", "/bin/sh"]);
     }
 
+    #[test]
+    fn shell_argv_rejects_a_relative_shell() {
+        for relative in ["./sh", "bash", "bin/zsh", "../sh"] {
+            let argv =
+                shell_argv(HostOs::Linux, Some(OsStr::new(relative)), None, &[]).expect("relative");
+            assert_eq!(argv.program, "/bin/sh", "{relative}");
+            assert!(argv.args.iter().all(|arg| arg != relative), "{relative}");
+
+            let wrapped = shell_argv(
+                HostOs::Linux,
+                Some(OsStr::new(relative)),
+                None,
+                &["GIT_DIR"],
+            )
+            .expect("wrapped");
+            assert_eq!(wrapped.program, "/usr/bin/env", "{relative}");
+            let rendered = format!("{} {}", wrapped.program, wrapped.args.join(" "));
+            assert!(
+                !rendered.contains(relative),
+                "{relative} leaked into {rendered}"
+            );
+            assert_eq!(
+                wrapped.args,
+                ["-u", "GIT_DIR", "--", "/bin/sh"],
+                "{relative}"
+            );
+        }
+
+        let zsh = shell_argv(HostOs::Linux, Some(OsStr::new("/bin/zsh")), None, &[]).expect("zsh");
+        assert_eq!(zsh.program, "/bin/zsh");
+        let wrapped_zsh = shell_argv(
+            HostOs::Linux,
+            Some(OsStr::new("/bin/zsh")),
+            None,
+            &["GIT_DIR"],
+        )
+        .expect("wrapped zsh");
+        assert_eq!(wrapped_zsh.program, "/usr/bin/env");
+        assert_eq!(wrapped_zsh.args, ["-u", "GIT_DIR", "--", "/bin/zsh"]);
+
+        let passwd = shell_argv(
+            HostOs::Linux,
+            Some(OsStr::new("./sh")),
+            Some("/bin/bash"),
+            &[],
+        )
+        .expect("passwd");
+        assert_eq!(passwd.program, "/bin/bash");
+
+        let relative_passwd = shell_argv(
+            HostOs::Linux,
+            Some(OsStr::new("bash")),
+            Some("bin/zsh"),
+            &[],
+        )
+        .expect("relative passwd");
+        assert_eq!(relative_passwd.program, "/bin/sh");
+
+        let windows = shell_argv(
+            HostOs::Windows,
+            Some(OsStr::new("./sh")),
+            None,
+            &["GIT_DIR"],
+        )
+        .expect("windows");
+        assert_eq!(windows.program, "powershell.exe");
+        assert!(windows.args.is_empty());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn session_from_stat_uses_the_last_paren() {
@@ -1607,6 +1685,242 @@ mod tests {
         assert!(!process_is_running(sleep_pid), "background sleep survived");
         assert!(!process_is_running(leader), "session leader survived");
         let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_shell_does_not_execute_a_planted_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let shell_before = std::env::var_os("SHELL");
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let marker = dir.path().join("marker");
+        let planted = dir.path().join("sh");
+        let script = format!("#!/bin/sh\ntouch '{}'\n", marker.display());
+        std::fs::write(&planted, script).expect("write planted shell");
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod planted shell");
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "ui::terminal::tests::child_relative_shell_does_not_execute_a_planted_binary",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("SHELL", "./sh")
+            .env("CTHULHU_TERMINAL_RELATIVE_SHELL_DIR", dir.path())
+            .output()
+            .expect("spawn child test");
+
+        assert_eq!(std::env::var_os("SHELL"), shell_before);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "child failed:\n{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("1 passed"),
+            "child did not run:\n{stdout}\n{stderr}"
+        );
+    }
+
+    /// Re-exec target for [`relative_shell_does_not_execute_a_planted_binary`].
+    /// `SHELL=./sh` is set on this process only.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "helper run by relative_shell_does_not_execute_a_planted_binary"]
+    fn child_relative_shell_does_not_execute_a_planted_binary() {
+        let Some(dir) = std::env::var_os("CTHULHU_TERMINAL_RELATIVE_SHELL_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let marker = dir.join("marker");
+        let ctx = egui::Context::default();
+        let metrics = test_metrics();
+        let session = match ShellSession::spawn(&dir, &ctx, &metrics) {
+            Ok(session) => session,
+            Err(error) => panic!("{error}"),
+        };
+        thread::sleep(Duration::from_millis(400));
+        assert!(
+            !marker.exists(),
+            "relative SHELL executed the planted binary"
+        );
+        drop(session);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropped_shell_kills_a_job_that_left_the_session() {
+        let shell_before = std::env::var_os("SHELL");
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let control = dir.path().join("control");
+        let escaped = dir.path().join("escaped");
+        let ctx = egui::Context::default();
+        let metrics = test_metrics();
+        let session = match ShellSession::spawn(dir.path(), &ctx, &metrics) {
+            Ok(session) => session,
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(std::env::var_os("SHELL"), shell_before);
+
+        wait_for_shell_output(&session);
+        // Fork before setsid. An interactive shell makes a background job the
+        // process-group leader, and setsid then returns EPERM. The parent
+        // perl waits so both sleeps stay descendants of the session leader.
+        let program = LEAVE_SESSION
+            .replace("@@CONTROL@@", &control.display().to_string())
+            .replace("@@ESCAPED@@", &escaped.display().to_string());
+        session.write(program.as_bytes());
+
+        let control_pid = wait_for_shell_pid(&control, &session);
+        let escaped_pid = wait_for_shell_pid(&escaped, &session);
+        assert!(
+            process_is_running(control_pid),
+            "control sleep was not alive"
+        );
+        assert!(
+            process_is_running(escaped_pid),
+            "setsid sleep was not alive"
+        );
+        assert_eq!(
+            session_of(control_pid),
+            session_of(session.pid),
+            "control sleep left the shell session"
+        );
+        assert_ne!(
+            session_of(escaped_pid),
+            session_of(session.pid),
+            "setsid did not leave the shell session"
+        );
+        assert!(
+            is_descendant(escaped_pid, session.pid),
+            "setsid sleep is not a descendant of the shell"
+        );
+        drop(session);
+
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(2)
+            && (process_is_running(control_pid) || process_is_running(escaped_pid))
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_is_running(escaped_pid),
+            "setsid sleep survived dropping the shell"
+        );
+        assert!(
+            !process_is_running(control_pid),
+            "same-session sleep survived dropping the shell"
+        );
+    }
+
+    #[cfg(unix)]
+    fn test_metrics() -> Metrics {
+        Metrics {
+            cols: 80,
+            rows: 24,
+            cell_w: 8.0,
+            cell_h: 16.0,
+            font: egui::FontId::monospace(14.0),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    const LEAVE_SESSION: &str = r#"/usr/bin/perl <<'END'
+use POSIX;
+my $control_path = "@@CONTROL@@";
+my $escaped_path = "@@ESCAPED@@";
+my $control = fork();
+die "fork control: $!" unless defined $control;
+if ($control == 0) {
+    open my $fh, ">", $control_path or die $!;
+    print $fh $$;
+    close $fh;
+    exec "/bin/sleep", "30" or die $!;
+}
+my $escaped = fork();
+die "fork escaped: $!" unless defined $escaped;
+if ($escaped == 0) {
+    defined POSIX::setsid() or die "setsid: $!";
+    open my $fh, ">", $escaped_path or die $!;
+    print $fh $$;
+    close $fh;
+    exec "/bin/sleep", "30" or die $!;
+}
+wait();
+wait();
+END
+"#;
+
+    #[cfg(target_os = "linux")]
+    fn screen_text(session: &ShellSession) -> String {
+        let term = session.term.lock();
+        let mut text = String::new();
+        for index in 0..24i32 {
+            for column in 0..80 {
+                text.push(term.grid()[Line(index)][Column(column)].c);
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_shell_output(session: &ShellSession) {
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(2) {
+            if screen_text(session).chars().any(|ch| !ch.is_whitespace()) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_shell_pid(path: &Path, session: &ShellSession) -> u32 {
+        let started = std::time::Instant::now();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse::<u32>()
+                && pid > 1
+            {
+                return pid;
+            }
+            if started.elapsed() > Duration::from_secs(2) {
+                panic!(
+                    "pid file {} was not written\n{}",
+                    path.display(),
+                    screen_text(session)
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parent_pid(pid: u32) -> Option<u32> {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        let line = text.lines().find(|line| line.starts_with("PPid:"))?;
+        line["PPid:".len()..].trim().parse().ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_descendant(pid: u32, ancestor: u32) -> bool {
+        let mut current = pid;
+        for _ in 0..16 {
+            if current == ancestor {
+                return true;
+            }
+            let Some(parent) = parent_pid(current) else {
+                return false;
+            };
+            if parent <= 1 {
+                return false;
+            }
+            current = parent;
+        }
+        false
     }
 
     #[cfg(target_os = "linux")]

@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime};
 
 use cthulhu_git::git::{
     DiscoverInputs, Git, GitError, Head, OVERRIDE_VAR, discover_with, fetch, history, inspect,
+    pull_ff_only,
 };
 use tempfile::TempDir;
 
@@ -202,6 +203,195 @@ fn poke_script(dir: &Path, file_name: &str, marker: &Path) -> PathBuf {
     let path = dir.join(file_name);
     write_executable(&path, &format!("#!/bin/sh\ntouch {}\n", marker.display()));
     path
+}
+
+fn editor_trap_script(dir: &Path, marker: &Path) -> PathBuf {
+    let path = dir.join("editor-trap.sh");
+    write_executable(
+        &path,
+        &format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display()),
+    );
+    path
+}
+
+/// Runs git in `root` with the same isolation as [`Fixture::git`].
+fn repo_git(git: &Git, scratch: &Path, root: &Path, args: &[&str]) -> String {
+    let mut command = Command::new(&git.path);
+    command
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .env("GIT_AUTHOR_NAME", "cthulhu")
+        .env("GIT_AUTHOR_EMAIL", "cthulhu@example.invalid")
+        .env("GIT_COMMITTER_NAME", "cthulhu")
+        .env("GIT_COMMITTER_EMAIL", "cthulhu@example.invalid")
+        .args([
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "core.fsmonitor=false",
+            "--no-pager",
+        ]);
+    for var in CLEARED_ENV {
+        command.env_remove(var);
+    }
+    let hooks = scratch.join("empty-hooks");
+    let global = scratch.join("empty.gitconfig");
+    let system = scratch.join("empty.system.gitconfig");
+    let _ = fs::create_dir_all(&hooks);
+    let _ = fs::write(&global, "");
+    let _ = fs::write(&system, "");
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .env("GIT_CONFIG_SYSTEM", &system)
+        .arg("-c")
+        .arg(format!("core.hooksPath={}", hooks.display()))
+        .args(args);
+    let output = command.output().expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf8")
+        .trim()
+        .to_owned()
+}
+
+struct DivergedPullSetup {
+    _origin: Fixture,
+    local_root: PathBuf,
+    _local_tmp: TempDir,
+    git: Git,
+    head_before: String,
+    editor_marker: PathBuf,
+}
+
+/// Origin and a clone with diverged histories, upstream tracking, editor traps, and HEAD recorded.
+fn diverged_pull_setup(configure: impl Fn(&Path, &Path, &Git)) -> DivergedPullSetup {
+    let origin = Fixture::init();
+    origin.write("tracked.txt", "base\n");
+    origin.git(&["add", "tracked.txt"]);
+    origin.git(&["commit", "-m", "base"]);
+
+    let local_tmp = TempDir::with_prefix("cthulhu-adv-pull-").expect("local temp");
+    let local_root = local_tmp.path().join("clone");
+    let origin_path = fs::canonicalize(&origin.root).expect("origin path");
+    repo_git(
+        &origin.git,
+        origin.tmp.path(),
+        origin.tmp.path(),
+        &[
+            "clone",
+            "--",
+            origin_path.to_str().expect("utf8"),
+            local_root.to_str().expect("utf8"),
+        ],
+    );
+
+    origin.write("tracked.txt", "origin only\n");
+    origin.git(&["add", "tracked.txt"]);
+    origin.git(&["commit", "-m", "origin"]);
+
+    fs::write(local_root.join("tracked.txt"), "local only\n").expect("local write");
+    repo_git(
+        &origin.git,
+        local_tmp.path(),
+        &local_root,
+        &["add", "tracked.txt"],
+    );
+    repo_git(
+        &origin.git,
+        local_tmp.path(),
+        &local_root,
+        &["commit", "-m", "local"],
+    );
+
+    let editor_marker = local_tmp.path().join("editor-ran");
+    let editor = editor_trap_script(local_tmp.path(), &editor_marker);
+    let editor_path = fs::canonicalize(&editor).expect("editor script path");
+    repo_git(
+        &origin.git,
+        local_tmp.path(),
+        &local_root,
+        &[
+            "config",
+            "--local",
+            "sequence.editor",
+            editor_path.to_str().expect("utf8"),
+        ],
+    );
+    repo_git(
+        &origin.git,
+        local_tmp.path(),
+        &local_root,
+        &[
+            "config",
+            "--local",
+            "core.editor",
+            editor_path.to_str().expect("utf8"),
+        ],
+    );
+
+    configure(local_tmp.path(), &local_root, &origin.git);
+
+    let head_before = repo_git(
+        &origin.git,
+        local_tmp.path(),
+        &local_root,
+        &["rev-parse", "HEAD"],
+    );
+
+    let git = origin.git.clone();
+    DivergedPullSetup {
+        _origin: origin,
+        local_root,
+        _local_tmp: local_tmp,
+        git,
+        head_before,
+        editor_marker,
+    }
+}
+
+fn assert_no_rebase_or_merge_state(root: &Path) {
+    let git_dir = root.join(".git");
+    assert!(
+        !git_dir.join("rebase-merge").exists(),
+        "rebase-merge should not exist under {}",
+        git_dir.display()
+    );
+    assert!(
+        !git_dir.join("rebase-apply").exists(),
+        "rebase-apply should not exist under {}",
+        git_dir.display()
+    );
+    assert!(
+        !git_dir.join("MERGE_HEAD").exists(),
+        "MERGE_HEAD should not exist under {}",
+        git_dir.display()
+    );
+}
+
+fn assert_pull_ff_only_rejects_rebase(setup: &DivergedPullSetup) {
+    let result = pull_ff_only(&setup.git, &setup.local_root);
+    assert!(
+        result.is_err(),
+        "divergent pull with rebase config must fail, got {:?}",
+        result
+    );
+    let head_after = repo_git(
+        &setup.git,
+        setup._local_tmp.path(),
+        &setup.local_root,
+        &["rev-parse", "HEAD"],
+    );
+    assert_eq!(head_after, setup.head_before, "HEAD must not move");
+    assert_did_not_run(
+        &setup.editor_marker,
+        "pull must not invoke sequence.editor or core.editor",
+    );
+    assert_no_rebase_or_merge_state(&setup.local_root);
 }
 
 fn make_stat_dirty(path: &Path) {
@@ -1234,6 +1424,119 @@ fn inherited_git_config_count_cannot_set_ssh_command_on_fetch() {
         config_value: Some(&command),
         extra_env: &extra,
     });
+}
+
+fn set_local_config(scratch: &Path, root: &Path, git: &Git, key: &str, value: &str) {
+    repo_git(git, scratch, root, &["config", "--local", key, value]);
+}
+
+#[test]
+fn pull_ff_only_does_not_rebase_when_pull_rebase_is_true() {
+    let setup = diverged_pull_setup(|scratch, root, git| {
+        set_local_config(scratch, root, git, "pull.rebase", "true");
+    });
+    assert_pull_ff_only_rejects_rebase(&setup);
+}
+
+#[test]
+fn pull_ff_only_does_not_rebase_when_pull_rebase_is_merges() {
+    let setup = diverged_pull_setup(|scratch, root, git| {
+        set_local_config(scratch, root, git, "pull.rebase", "merges");
+    });
+    assert_pull_ff_only_rejects_rebase(&setup);
+}
+
+#[test]
+fn pull_ff_only_does_not_rebase_when_pull_rebase_is_m() {
+    let setup = diverged_pull_setup(|scratch, root, git| {
+        set_local_config(scratch, root, git, "pull.rebase", "m");
+    });
+    assert_pull_ff_only_rejects_rebase(&setup);
+}
+
+#[test]
+fn pull_ff_only_does_not_rebase_when_pull_rebase_is_interactive() {
+    let setup = diverged_pull_setup(|scratch, root, git| {
+        set_local_config(scratch, root, git, "pull.rebase", "interactive");
+    });
+    assert_pull_ff_only_rejects_rebase(&setup);
+}
+
+#[test]
+fn pull_ff_only_does_not_rebase_when_pull_rebase_is_i() {
+    let setup = diverged_pull_setup(|scratch, root, git| {
+        set_local_config(scratch, root, git, "pull.rebase", "i");
+    });
+    assert_pull_ff_only_rejects_rebase(&setup);
+}
+
+#[test]
+fn pull_ff_only_does_not_rebase_when_pull_rebase_is_preserve() {
+    let setup = diverged_pull_setup(|scratch, root, git| {
+        set_local_config(scratch, root, git, "pull.rebase", "preserve");
+    });
+    assert_pull_ff_only_rejects_rebase(&setup);
+}
+
+#[test]
+fn pull_ff_only_does_not_rebase_when_branch_main_rebase_is_interactive() {
+    let setup = diverged_pull_setup(|scratch, root, git| {
+        set_local_config(scratch, root, git, "branch.main.rebase", "interactive");
+    });
+    assert_pull_ff_only_rejects_rebase(&setup);
+}
+
+#[test]
+fn pull_ff_only_fast_forwards_when_pull_rebase_is_false_and_behind_upstream() {
+    let origin = Fixture::init();
+    origin.write("tracked.txt", "base\n");
+    origin.git(&["add", "tracked.txt"]);
+    origin.git(&["commit", "-m", "base"]);
+
+    let local_tmp = TempDir::with_prefix("cthulhu-adv-pull-ff-").expect("local temp");
+    let local_root = local_tmp.path().join("clone");
+    let origin_path = fs::canonicalize(&origin.root).expect("origin path");
+    repo_git(
+        &origin.git,
+        origin.tmp.path(),
+        origin.tmp.path(),
+        &[
+            "clone",
+            "--",
+            origin_path.to_str().expect("utf8"),
+            local_root.to_str().expect("utf8"),
+        ],
+    );
+
+    origin.write("tracked.txt", "origin ahead\n");
+    origin.git(&["add", "tracked.txt"]);
+    origin.git(&["commit", "-m", "origin ahead"]);
+
+    set_local_config(
+        local_tmp.path(),
+        &local_root,
+        &origin.git,
+        "pull.rebase",
+        "false",
+    );
+
+    let upstream_tip = origin.git(&["rev-parse", "main"]);
+
+    pull_ff_only(&origin.git, &local_root).expect("fast-forward pull");
+    let head = repo_git(
+        &origin.git,
+        local_tmp.path(),
+        &local_root,
+        &["rev-parse", "HEAD"],
+    );
+    let upstream = repo_git(
+        &origin.git,
+        local_tmp.path(),
+        &local_root,
+        &["rev-parse", "origin/main"],
+    );
+    assert_eq!(head, upstream_tip);
+    assert_eq!(head, upstream);
 }
 
 #[test]
