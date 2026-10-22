@@ -111,8 +111,7 @@ jobs:
         run: |
           sha256sum -- * > checksums.txt
           cat checksums.txt
-      # zizmor: ignore[superfluous-actions]
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # zizmor: ignore[superfluous-actions] v2.6.2
         with:
           files: dist/*
           name: Cthulhu Git ${{ github.ref_name }}
