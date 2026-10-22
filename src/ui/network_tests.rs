@@ -879,6 +879,7 @@ fn history_hover_card_names_the_author_and_coauthor() {
             );
         });
 
+    let author_label = format!("{HOVER_AUTHOR}, {HOVER_COAUTHOR}");
     {
         let cells: Vec<_> = harness.query_all_by_label(HOVER_SUMMARY).collect();
         assert!(
@@ -890,6 +891,27 @@ fn history_hover_card_names_the_author_and_coauthor() {
             .into_iter()
             .min_by(|left, right| left.rect().left().total_cmp(&right.rect().left()))
             .expect("message cell");
+        cell.hover();
+    }
+    harness.run_steps(60);
+
+    let message_hover = label_dump(&harness);
+    assert!(
+        !message_hover.contains("Co-author") && !message_hover.contains("Loading…"),
+        "message hover opened the card\n{message_hover}"
+    );
+
+    {
+        let cells: Vec<_> = harness.query_all_by_label(&author_label).collect();
+        assert!(
+            !cells.is_empty(),
+            "author cell missing\n{}",
+            label_dump(&harness)
+        );
+        let cell = cells
+            .into_iter()
+            .min_by(|left, right| left.rect().left().total_cmp(&right.rect().left()))
+            .expect("author cell");
         cell.hover();
     }
     harness.run_steps(60);
