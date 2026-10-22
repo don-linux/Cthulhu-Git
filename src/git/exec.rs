@@ -485,7 +485,8 @@ fn finish_both(
         (Some(stdout), Some(stderr)) => (stdout, stderr),
         (stdout, stderr) => {
             // The direct child has exited, but a grandchild still holds a pipe.
-            signal_group(pid, GroupSignal::Kill);
+            // `setsid` may have moved that grandchild out of the child's group.
+            super::reap::reap_process_tree(pid);
             let stdout = stdout.unwrap_or_else(|| {
                 recv_reader(&stdout_pending, READER_BUDGET).unwrap_or_else(reader_abandoned)
             });
@@ -533,42 +534,14 @@ fn reader_abandoned() -> CappedRead {
     }
 }
 
-enum GroupSignal {
-    #[cfg(unix)]
-    Term,
-    Kill,
-}
-
-fn signal_group(pid: u32, signal: GroupSignal) {
-    #[cfg(unix)]
-    {
-        let Some(pid) = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap_or(0)) else {
-            return;
-        };
-        if pid == rustix::process::getpid() || pid == rustix::process::getpgrp() {
-            return;
-        }
-        let signal = match signal {
-            GroupSignal::Term => rustix::process::Signal::TERM,
-            GroupSignal::Kill => rustix::process::Signal::KILL,
-        };
-        let _ = rustix::process::kill_process_group(pid, signal);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (pid, signal);
-    }
-}
-
-/// `SIGTERM`, a short grace, then `SIGKILL` of the child's process group.
-/// `wait` is not used: a process stuck in uninterruptible I/O would pin the
-/// caller, which is the stall this timeout exists to bound.
+/// Kill the child's process group, including a `setsid` grandchild, then
+/// briefly `try_wait` the direct child. `wait` is not used: a process stuck
+/// in uninterruptible I/O would pin the caller, which is the stall this
+/// timeout exists to bound.
 fn stop_group(pid: u32, child: &mut Child) {
     #[cfg(unix)]
     {
-        signal_group(pid, GroupSignal::Term);
-        reap(child, Duration::from_millis(50));
-        signal_group(pid, GroupSignal::Kill);
+        super::reap::reap_process_tree(pid);
     }
     #[cfg(not(unix))]
     {

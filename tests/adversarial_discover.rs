@@ -13,10 +13,12 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(not(target_os = "linux"))]
+use std::process::Stdio;
 use std::sync::{OnceLock, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cthulhu_git::git::{DiscoverInputs, GitError, GitVersion, OVERRIDE_VAR, discover_with};
 use tempfile::TempDir;
@@ -29,6 +31,10 @@ if [ "$version" = sleep ]; then
   echo $! > "$0.sleeper"
   wait
   printf 'git version 2.43.0\n'
+  exit 0
+fi
+if [ "$version" = setsid ]; then
+  perl -MPOSIX -e 'defined(my $pid = fork()) or die; if ($pid == 0) { POSIX::setsid() or die $!; open my $fh, ">", $ARGV[0] or die $!; print $fh $$; close $fh; exec "sleep", "30" or die $!; } wait;' "$0.setsid"
   exit 0
 fi
 if [ "$version" = garbage ]; then
@@ -62,8 +68,9 @@ fn shared_script() -> &'static Path {
 /// Creates `dir/name` answering `git version <version>`.
 ///
 /// `"broken"` exits 1. `"sleep"` backgrounds `sleep 30` (pid in `git.sleeper`)
-/// then waits. `"garbage"`
-/// prints non-version stdout (including a non-UTF-8 byte) and exits 0.
+/// then waits. `"setsid"` runs perl, which forks a grandchild that calls
+/// `POSIX::setsid` and `sleep 30` (pid in `git.setsid`) while perl waits.
+/// `"garbage"` prints non-version stdout (including a non-UTF-8 byte) and exits 0.
 /// A version string may itself contain a trailing `\r`.
 fn fake(dir: &Path, name: &str, version: &str) -> PathBuf {
     fs::create_dir_all(dir).expect("fake dir");
@@ -262,17 +269,47 @@ fn assert_recorded_pid_is_dead(path: &Path) {
         .parse()
         .unwrap_or_else(|_| panic!("pid in {}: {text:?}", path.display()));
     assert!(pid > 1, "refusing to treat pid {pid} as the grandchild");
-    let status = Command::new("kill")
+
+    let started = Instant::now();
+    while pid_is_alive(pid) {
+        if started.elapsed() >= Duration::from_millis(500) {
+            panic!("grandchild pid {pid} is still alive after the git that spawned it was stopped");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A zombie still answers `kill -0`. On Linux the `/proc/<pid>/stat` state
+/// decides: missing, or anything other than `R`, `S`, `D`, or `T`, is dead.
+#[cfg(target_os = "linux")]
+fn pid_is_alive(pid: u32) -> bool {
+    let text = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    linux_stat_state_is_alive(&text)
+}
+
+/// State is the field after the last `)`. `comm` may itself contain `)`.
+#[cfg(target_os = "linux")]
+fn linux_stat_state_is_alive(text: &str) -> bool {
+    let Some((_, rest)) = text.rsplit_once(')') else {
+        return false;
+    };
+    matches!(rest.split_whitespace().next(), Some("R" | "S" | "D" | "T"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_is_alive(pid: u32) -> bool {
+    Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .expect("kill -0");
-    assert!(
-        !status.success(),
-        "grandchild pid {pid} is still alive after the git that spawned it was stopped"
-    );
+        .expect("kill -0")
+        .success()
 }
 
 #[test]
@@ -305,6 +342,38 @@ fn sleeping_override_is_bounded_to_about_one_second() {
         }
     }
     assert_recorded_pid_is_dead(&sleeper);
+}
+
+#[test]
+fn setsid_grandchild_of_a_timed_out_git_is_dead() {
+    let tmp = temp();
+    let pinned = fake(tmp.path(), "git", "setsid");
+    let recorded = sidecar(&pinned, ".setsid");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let inputs = DiscoverInputs {
+            override_path: Some(pinned.into()),
+            path_var: None,
+            exe_name: "git",
+            fallbacks: Vec::new(),
+        };
+        let _ = tx.send(discover_with(&inputs));
+    });
+
+    match rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(Err(_)) => {}
+        Ok(Ok(git)) => panic!(
+            "FINDING: CTHULHU_GIT whose --version calls setsid returned a version within 1s ({}); discovery must fail",
+            git.version.raw
+        ),
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+            "FINDING: setsid grandchild kept discovery running after 1s; the probe timeout is 250ms and discovery must return an error within 1s"
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("discovery thread ended without a result");
+        }
+    }
+    assert_recorded_pid_is_dead(&recorded);
 }
 
 #[test]

@@ -17,6 +17,7 @@ env:
 
 jobs:
   verify:
+    name: release checks
     runs-on: ubuntu-24.04
     env:
       TAG: ${{ github.ref_name }}
@@ -61,6 +62,25 @@ jobs:
             exit 1
           fi
 
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: zizmor@1.30.1
+      - name: actionlint and zizmor
+        shell: bash
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RUNNER_TEMP/tools"
+          cd "$RUNNER_TEMP/tools"
+          curl -fsSL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz" | sha256sum -c
+          tar xzf actionlint.tar.gz actionlint
+          chmod +x actionlint
+          cd "$GITHUB_WORKSPACE"
+          "$RUNNER_TEMP/tools/actionlint" -color
+          zizmor --persona auditor .github/workflows
       - run: rustup toolchain install
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -77,7 +97,7 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
+      contents: write # release assets; tag push is the publish gate (F1/F2)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -91,7 +111,7 @@ jobs:
         run: |
           sha256sum -- * > checksums.txt
           cat checksums.txt
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # zizmor: ignore[superfluous-actions] v2.6.2
         with:
           files: dist/*
           name: Cthulhu Git ${{ github.ref_name }}

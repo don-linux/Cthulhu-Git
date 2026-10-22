@@ -10,6 +10,7 @@ mod discover;
 mod exec;
 mod graph;
 mod log;
+mod reap;
 mod remotes;
 mod repo;
 mod sync;
@@ -32,6 +33,7 @@ pub use log::{
     Commit, CommitDetail, CommitHover, CommitStats, History, Person, SHORT_OID_LEN, commit_hover,
     email_key, fold_co_authors, history, latest_commit, parse_co_authors, short_oid,
 };
+pub use reap::reap_process_tree;
 pub use remotes::{Remote, remotes};
 pub use repo::{Head, RepoInfo, inspect};
 pub use sync::{fetch, fetch_request, pull_ff_only};
