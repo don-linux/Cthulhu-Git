@@ -18,7 +18,7 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use cthulhu_git::git::{
-    DiscoverInputs, Git, GitError, Head, OVERRIDE_VAR, discover_with, history, inspect,
+    DiscoverInputs, Git, GitError, Head, OVERRIDE_VAR, discover_with, fetch, history, inspect,
 };
 use tempfile::TempDir;
 
@@ -79,7 +79,9 @@ case "$mode" in
     ;;
   slow-version)
     if [ "$1" = "--version" ]; then
-      sleep 3
+      sleep 30 &
+      echo $! > "$0.sleeper"
+      wait
     fi
     echo "git version 2.43.0"
     exit 0
@@ -96,13 +98,25 @@ case "$mode" in
       fi
       if [ "$arg" = "--show-toplevel" ]; then
         # 32 MiB of ASCII. Do not raise this; the bound under test is ~32 MiB.
-        dd if=/dev/zero bs=1048576 count=32 2>/dev/null | tr '\0' 'A'
+        dd if=/dev/zero bs=1048576 count=32 2>/dev/null | tr '\0' 'A' &
+        echo $! > "$0.producer"
+        wait
         echo
         exit 0
       fi
     done
     echo "unexpected fake git arguments: $*" >&2
     exit 1
+    ;;
+  detach-writer)
+    if [ "$1" = "--version" ]; then
+      echo "git version 2.43.0"
+      exit 0
+    fi
+    # Exit 0 while a grandchild keeps stdout open. The caller must still return.
+    sleep 30 >&1 &
+    echo $! > "$0.writer"
+    exit 0
     ;;
   fail-stderr)
     if [ "$1" = "--version" ]; then
@@ -204,6 +218,27 @@ fn assert_did_not_run(marker: &Path, what: &str) {
     );
 }
 
+fn assert_recorded_pid_is_dead(path: &Path) {
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("missing pid file {}: {error}", path.display()));
+    let pid: u32 = text
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("pid in {}: {text:?}", path.display()));
+    assert!(pid > 1, "refusing to treat pid {pid} as the grandchild");
+    let status = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("kill -0");
+    assert!(
+        !status.success(),
+        "grandchild pid {pid} is still alive after the git that spawned it was stopped"
+    );
+}
+
 fn brief_error(error: &GitError) -> String {
     let rendered = format!("{error:?}");
     if rendered.len() > 600 {
@@ -279,11 +314,23 @@ impl Fixture {
                 "-c",
                 "core.fsmonitor=false",
                 "--no-pager",
-            ])
-            .args(args);
+            ]);
         for var in CLEARED_ENV {
             command.env_remove(var);
         }
+        let hooks = self.tmp.path().join("empty-hooks");
+        let global = self.tmp.path().join("empty.gitconfig");
+        let system = self.tmp.path().join("empty.system.gitconfig");
+        let _ = fs::create_dir_all(&hooks);
+        let _ = fs::write(&global, "");
+        let _ = fs::write(&system, "");
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_SYSTEM", &system)
+            .arg("-c")
+            .arg(format!("core.hooksPath={}", hooks.display()))
+            .args(args);
         let output = command.output().expect("run git");
         assert!(
             output.status.success(),
@@ -973,7 +1020,7 @@ fn not_a_repository_substring_inside_a_different_fatal_is_not_that_error() {
             "a fatal whose primary message is not \"not a git repository\" was classified as NotARepository: {}",
             brief_error(&error)
         ),
-        GitError::Failed {
+        GitError::Command {
             stderr, command, ..
         } => {
             assert!(
@@ -1067,16 +1114,19 @@ fn slow_version_probe_does_not_block_discovery() {
     let fast_path = fast.clone();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let _keep = tmp;
         let found = discover_with(&inputs).map(|git| git.path);
         let _ = tx.send(found);
     });
+    // `tmp` stays here so the sleeper pid file is not deleted before the assert.
 
     match rx.recv_timeout(Duration::from_secs(1)) {
-        Ok(Ok(path)) => assert_eq!(
-            path, fast_path,
-            "discover_with should use the later git that answers --version promptly"
-        ),
+        Ok(Ok(path)) => {
+            assert_eq!(
+                path, fast_path,
+                "discover_with should use the later git that answers --version promptly"
+            );
+            assert_recorded_pid_is_dead(&sidecar(&slow, ".sleeper"));
+        }
         Ok(Err(error)) => panic!("discover_with failed: {error}"),
         Err(mpsc::RecvTimeoutError::Timeout) => panic!(
             "discover_with still running after 1s while probing a git --version that sleeps; a later candidate is good"
@@ -1085,6 +1135,7 @@ fn slow_version_probe_does_not_block_discovery() {
             panic!("discover thread exited without a result");
         }
     }
+    drop(tmp);
 }
 
 #[test]
@@ -1101,7 +1152,9 @@ fn rev_parse_output_bomb_is_refused() {
             "inspect accepted unbounded rev-parse stdout as a repository root ({} bytes)",
             info.root.as_os_str().len()
         ),
-        Err(GitError::Failed { stderr, .. }) if stderr_refuses_unbounded_output(&stderr) => {}
+        Err(GitError::OutputLimit { .. }) => {
+            assert_recorded_pid_is_dead(&sidecar(&fake, ".producer"));
+        }
         Err(error) => panic!(
             "32MiB rev-parse stdout must be refused with a typed output-limit error before it is used as a path; got {}",
             brief_error(&error)
@@ -1109,11 +1162,78 @@ fn rev_parse_output_bomb_is_refused() {
     }
 }
 
-fn stderr_refuses_unbounded_output(stderr: &str) -> bool {
-    let lower = stderr.to_ascii_lowercase();
-    ["limit", "too large", "too long", "exceed", "unbounded"]
-        .iter()
-        .any(|needle| lower.contains(needle))
+#[test]
+fn background_writer_does_not_pin_a_finished_git() {
+    let tmp = TempDir::with_prefix("cthulhu-adv-a-writer-").expect("temp dir");
+    let fake = link_fake(tmp.path(), "git");
+    write_mode(&fake, "detach-writer");
+    let git = probe_fake(&fake);
+    let writer = sidecar(&fake, ".writer");
+    let (tx, rx) = mpsc::channel();
+    let cwd = tmp.path().to_path_buf();
+    thread::spawn(move || {
+        let _ = tx.send(git.run(&cwd, &["status"]).map(|_| ()));
+    });
+    // `tmp` stays here so the grandchild pid file is not deleted before the assert.
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(result) => {
+            result.expect("a git that already exited must return, not wait on its grandchild");
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+            "git exited 0 while a grandchild held stdout, and the caller was still blocked after 2s"
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("git thread ended without a result");
+        }
+    }
+    assert_recorded_pid_is_dead(&writer);
+    drop(tmp);
+}
+
+#[test]
+fn inherited_git_exec_path_cannot_run_remote_helper_on_fetch() {
+    let fixture = Fixture::with_tracked_commit();
+    fixture.git(&["remote", "add", "origin", "https://127.0.0.1:1/cthulhu.git"]);
+    let marker = fixture.marker("remote-helper");
+    let exec_dir = fixture.tmp.path().join("exec-path");
+    write_executable(
+        &exec_dir.join("git-remote-https"),
+        &format!("#!/bin/sh\ntouch {}\n", marker.display()),
+    );
+    let extra = [("GIT_EXEC_PATH", exec_dir.display().to_string())];
+    assert_child_opens(&ChildCheck {
+        target: &fixture.root,
+        branch: "main",
+        action: "fetch",
+        history: None,
+        marker: Some(&marker),
+        required_var: "GIT_EXEC_PATH",
+        config_key: None,
+        config_value: None,
+        extra_env: &extra,
+    });
+}
+
+#[test]
+fn inherited_git_config_count_cannot_set_ssh_command_on_fetch() {
+    let fixture = Fixture::with_tracked_commit();
+    fixture.git(&["remote", "add", "origin", "ssh://127.0.0.1:1/cthulhu.git"]);
+    let marker = fixture.marker("ssh-command");
+    let poke = poke_script(fixture.tmp.path(), "ssh-command.sh", &marker);
+    let command = poke.display().to_string();
+    let pairs = [("core.sshCommand", command.as_str())];
+    let extra = config_count(&pairs);
+    assert_child_opens(&ChildCheck {
+        target: &fixture.root,
+        branch: "main",
+        action: "fetch",
+        history: None,
+        marker: Some(&marker),
+        required_var: "GIT_CONFIG_COUNT",
+        config_key: Some("core.sshCommand"),
+        config_value: Some(&command),
+        extra_env: &extra,
+    });
 }
 
 #[test]
@@ -1129,6 +1249,7 @@ fn child_opens_repo_despite_hostile_environment() {
     );
 
     let git = Git::discover().expect("system git");
+    let action = env::var(CHILD_ACTION).expect("action");
     if let Ok(key) = env::var(CHILD_CONFIG_KEY) {
         let expected = env::var(CHILD_CONFIG_VALUE).expect("expected config value");
         let output = Command::new(&git.path)
@@ -1148,6 +1269,20 @@ fn child_opens_repo_despite_hostile_environment() {
         );
     }
 
+    if action == "fetch" {
+        // Network failure is fine. The marker is the assertion that matters.
+        let _ = fetch(&git, Path::new(&target), "origin/main");
+        if let Ok(marker) = env::var(CHILD_MARKER) {
+            assert!(
+                !Path::new(&marker).exists(),
+                "hostile inherited environment executed a command or wrote {marker}"
+            );
+        }
+        let sentinel = env::var(CHILD_SENTINEL).expect("sentinel path");
+        fs::write(sentinel, "checked\n").expect("write sentinel");
+        return;
+    }
+
     let info = inspect(&git, Path::new(&target)).expect("inspect target");
     assert_eq!(
         info.root,
@@ -1158,7 +1293,7 @@ fn child_opens_repo_despite_hostile_environment() {
         Head::Branch(env::var(CHILD_BRANCH).expect("expected branch"))
     );
 
-    if env::var(CHILD_ACTION).expect("action") == "history" {
+    if action == "history" {
         let history = history(&git, &info.root, &info.head, 10).expect("history");
         let got = history
             .commits

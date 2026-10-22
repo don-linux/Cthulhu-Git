@@ -108,6 +108,15 @@ pub struct FontService {
     installed: bool,
     /// `set_fonts` was queued this pass. The named family is bound on the next one.
     activate_next_pass: bool,
+    /// The font file is read off the UI thread.
+    pending: Option<PendingFace>,
+}
+
+struct PendingFace {
+    name: String,
+    index: u32,
+    monospace: bool,
+    rx: Receiver<Result<Vec<u8>, String>>,
 }
 
 impl Default for FontService {
@@ -117,6 +126,7 @@ impl Default for FontService {
             applied: Applied::Builtin,
             installed: false,
             activate_next_pass: false,
+            pending: None,
         }
     }
 }
@@ -226,7 +236,8 @@ impl FontService {
                 message,
             } if applied == name => FacePhase::Unreadable(message.clone()),
             _ => FacePhase::Builtin {
-                pending: matches!(self.slot, Slot::Idle | Slot::Loading(_)),
+                pending: matches!(self.slot, Slot::Idle | Slot::Loading(_))
+                    || self.pending.is_some(),
             },
         }
     }
@@ -249,14 +260,48 @@ impl FontService {
     }
 
     fn install_face(&mut self, ctx: &egui::Context, name: &str, face: ChosenFace) {
-        let monospace = face.monospace;
-        match std::fs::read(&face.path) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.name != name)
+        {
+            self.pending = None;
+        }
+        if self.pending.is_none() {
+            let path = face.path.clone();
+            let (sender, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let result = std::fs::read(&path)
+                    .map_err(|error| format!("Could not read {}: {error}", path.display()));
+                let _ = sender.send(result);
+            });
+            self.pending = Some(PendingFace {
+                name: name.to_owned(),
+                index: face.index,
+                monospace: face.monospace,
+                rx,
+            });
+        }
+        let ready = {
+            let Some(pending) = &self.pending else {
+                return;
+            };
+            match pending.rx.try_recv() {
+                Ok(bytes) => bytes,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => Err("Font read stopped.".to_owned()),
+            }
+        };
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        match ready {
             Ok(bytes) => {
-                register(ctx, bytes, face.index);
+                register(ctx, bytes, pending.index);
                 self.installed = true;
                 self.applied = Applied::Loaded {
-                    name: name.to_owned(),
-                    monospace,
+                    name: pending.name,
+                    monospace: pending.monospace,
                 };
                 // A replacement is already bound this pass. The first install
                 // is not, so the named family stays off until the next one.
@@ -264,11 +309,11 @@ impl FontService {
                     self.activate_next_pass = true;
                 }
             }
-            Err(error) => {
+            Err(message) => {
                 self.clear_installed(ctx);
                 self.applied = Applied::Unreadable {
-                    name: name.to_owned(),
-                    message: format!("Could not read {}: {error}", face.path.display()),
+                    name: pending.name,
+                    message,
                 };
             }
         }
@@ -556,7 +601,11 @@ mod tests {
         };
 
         ctx.begin_pass(egui::RawInput::default());
-        service.sync(&ctx, Some("Test Mono"));
+        let started = std::time::Instant::now();
+        while !service.activate_next_pass && started.elapsed() < std::time::Duration::from_secs(2) {
+            service.sync(&ctx, Some("Test Mono"));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(!family_active(&ctx));
         assert!(service.activate_next_pass);
         finish_pass(&ctx);

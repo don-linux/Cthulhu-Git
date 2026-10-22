@@ -524,7 +524,7 @@ fn history_row(
     text_cell(
         ui,
         content(layout.cell(rect, Column::Hash)),
-        &row.oid[..row.oid.len().min(cthulhu_git::git::SHORT_OID_LEN)],
+        cthulhu_git::git::short_oid(&row.oid),
         cx.mono_font.clone(),
         palette.hash,
         row_id.with("hash"),

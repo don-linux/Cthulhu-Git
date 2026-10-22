@@ -28,9 +28,9 @@ pub fn remotes(git: &Git, root: &Path) -> Result<Vec<Remote>, GitError> {
         return Ok(Vec::new());
     }
     if !output.status.success() {
-        return Err(GitError::Failed {
+        return Err(GitError::Command {
             command: format!("git {}", args.join(" ")),
-            status: output.status.to_string(),
+            status: output.status,
             stderr: output.stderr,
         });
     }

@@ -1,19 +1,21 @@
 //! Interactive shell for the open repository.
 //!
-//! The PTY is `alacritty_terminal`, not `Git::run`: the parent environment is
-//! left alone, and the process is not killed after 60 seconds. The child is
-//! given `TERM` and `COLORTERM` so `clear` and Ctrl+L erase the screen. It
-//! starts the first time the strip is shown and dies with the
-//! [`OpenedRepo`](super::OpenedRepo).
+//! The PTY is `alacritty_terminal`, not `Git::run`. The child is not killed
+//! after 60 seconds. It does not inherit `GIT_*` (except ssh and askpass) or
+//! `GH_TOKEN` / `GITHUB_TOKEN`. It is given `TERM` and `COLORTERM` so `clear`
+//! and Ctrl+L erase the screen. It starts the first time the strip is shown
+//! and dies with the [`OpenedRepo`](super::OpenedRepo).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
+#[cfg(unix)]
+use std::time::Duration;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
@@ -37,32 +39,161 @@ const TERMINAL_MIN_HEIGHT: f32 = 80.0;
 const SPLITTER_HEIGHT: f32 = 6.0;
 const INITIAL_FRACTION: f32 = 0.40;
 
-/// Which OS the shell choice is for. Tests pass both; the app passes its own.
+/// Which OS the shell choice is for. Tests pass each; the app passes its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostOs {
-    Unix,
+    Linux,
+    Macos,
     Windows,
 }
 
-/// Program to launch. `shell` is the Unix `SHELL` variable.
+/// Program and arguments for the PTY child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellArgv {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+/// Argv for the embedded shell.
 ///
-/// Windows always uses `powershell.exe`. An empty or non-Unicode `SHELL`
-/// falls back to `/bin/sh` because the PTY shell path is a `String`.
-pub fn shell_program(host: HostOs, shell: Option<&OsStr>) -> OsString {
-    match host {
-        HostOs::Windows => OsString::from("powershell.exe"),
-        HostOs::Unix => match shell {
-            Some(value) if !value.is_empty() && value.to_str().is_some() => value.to_os_string(),
-            _ => OsString::from("/bin/sh"),
-        },
+/// macOS is a login shell (`-l`) so `/etc/zprofile` and `~/.zprofile` run.
+/// Linux stays non-login, so an interactive bash still reads `~/.bashrc`.
+/// An empty or non-Unicode `SHELL` uses `passwd_shell`, then `/bin/sh`.
+/// `unset` is applied with `/usr/bin/env -u`, which can remove names.
+/// `Options.env` can only add them.
+pub fn shell_argv(
+    host: HostOs,
+    shell: Option<&OsStr>,
+    passwd_shell: Option<&str>,
+    unset: &[&str],
+) -> Result<ShellArgv, String> {
+    let argv = bare_shell(host, shell, passwd_shell)?;
+    if host == HostOs::Windows || unset.is_empty() {
+        return Ok(argv);
     }
+    let mut args = Vec::with_capacity(unset.len() * 2 + 2 + argv.args.len());
+    for name in unset {
+        if !env_name_is_safe(name) {
+            continue;
+        }
+        args.push("-u".to_owned());
+        args.push((*name).to_owned());
+    }
+    if args.is_empty() {
+        return Ok(argv);
+    }
+    args.push("--".to_owned());
+    args.push(argv.program);
+    args.extend(argv.args);
+    Ok(ShellArgv {
+        program: "/usr/bin/env".to_owned(),
+        args,
+    })
+}
+
+fn bare_shell(
+    host: HostOs,
+    shell: Option<&OsStr>,
+    passwd_shell: Option<&str>,
+) -> Result<ShellArgv, String> {
+    if host == HostOs::Windows {
+        return Ok(ShellArgv {
+            program: "powershell.exe".to_owned(),
+            args: Vec::new(),
+        });
+    }
+    let program = chosen_unix_shell(shell, passwd_shell);
+    let args = if host == HostOs::Macos {
+        vec!["-l".to_owned()]
+    } else {
+        Vec::new()
+    };
+    Ok(ShellArgv { program, args })
+}
+
+fn chosen_unix_shell(shell: Option<&OsStr>, passwd_shell: Option<&str>) -> String {
+    if let Some(value) = shell
+        && !value.is_empty()
+        && let Some(text) = value.to_str()
+    {
+        return text.to_owned();
+    }
+    passwd_shell
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or("/bin/sh")
+        .to_owned()
+}
+
+fn env_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn this_host() -> HostOs {
     if cfg!(windows) {
         HostOs::Windows
+    } else if cfg!(target_os = "macos") {
+        HostOs::Macos
     } else {
-        HostOs::Unix
+        HostOs::Linux
+    }
+}
+
+fn vars_to_unset() -> Vec<String> {
+    let mut names: Vec<String> = std::env::vars()
+        .map(|(name, _)| name)
+        .filter(|name| cthulhu_git::git::inherited_git_var_is_cleared(name))
+        .collect();
+    for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        if std::env::var_os(name).is_some() {
+            names.push(name.to_owned());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+#[cfg(unix)]
+fn passwd_shell() -> Option<String> {
+    let uid = rustix::process::getuid().as_raw().to_string();
+    let text = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in text.lines() {
+        let mut parts = line.splitn(7, ':');
+        let _name = parts.next()?;
+        let _password = parts.next()?;
+        let id = parts.next()?;
+        let _gid = parts.next()?;
+        let _gecos = parts.next()?;
+        let _home = parts.next()?;
+        let shell = parts.next()?;
+        if id == uid && !shell.is_empty() {
+            return Some(shell.to_owned());
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn passwd_shell() -> Option<String> {
+    None
+}
+
+fn ensure_cwd(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        rustix::fs::access(path, rustix::fs::Access::EXEC_OK)
+            .map_err(|error| format!("Cannot enter {}: {error}", path.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        if path.is_dir() {
+            Ok(())
+        } else {
+            Err(format!("Cannot enter {}.", path.display()))
+        }
     }
 }
 
@@ -130,8 +261,16 @@ fn terminfo_installed(name: &str) -> bool {
 
 /// One shell for the open repository, or the message left after it exits.
 pub enum Terminal {
+    /// `tty::new` is running off the egui thread. A second frame must not start another.
+    Starting(StartingShell),
     Live(ShellSession),
-    Exited { message: String },
+    Exited {
+        message: String,
+    },
+}
+
+pub(crate) struct StartingShell {
+    rx: Receiver<Result<ShellSession, String>>,
 }
 
 pub struct ShellSession {
@@ -163,6 +302,7 @@ impl Dimensions for GridSize {
     }
 }
 
+#[derive(Clone)]
 struct Metrics {
     cols: usize,
     rows: usize,
@@ -210,14 +350,17 @@ impl EventListener for Bridge {
 
 impl Drop for ShellSession {
     fn drop(&mut self) {
-        // The PTY child called `setsid`, so its pid is the process group.
-        // Alacritty only SIGHUPs that leader; kill the group first so children
-        // such as `claude` do not survive the repository closing.
-        kill_shell(self.pid);
+        // Join on a side thread. Waiting here would freeze the window, and a
+        // pid that the reader already reaped must not be signaled.
+        let pid = self.pid;
+        let join = self.join.take();
         let _ = self.io.send(Msg::Shutdown);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+        thread::spawn(move || {
+            stop_session(pid);
+            if let Some(join) = join {
+                let _ = join.join();
+            }
+        });
     }
 }
 
@@ -237,13 +380,16 @@ impl ShellSession {
             &grid,
             bridge.clone(),
         )));
-        let program = shell_program(this_host(), std::env::var_os("SHELL").as_deref());
-        let program = program
-            .to_str()
-            .ok_or_else(|| "The shell path is not Unicode.".to_owned())?
-            .to_owned();
+        let unset = vars_to_unset();
+        let unset_refs: Vec<&str> = unset.iter().map(String::as_str).collect();
+        let argv = shell_argv(
+            this_host(),
+            std::env::var_os("SHELL").as_deref(),
+            passwd_shell().as_deref(),
+            &unset_refs,
+        )?;
         let options = tty::Options {
-            shell: Some(tty::Shell::new(program, Vec::new())),
+            shell: Some(tty::Shell::new(argv.program, argv.args)),
             working_directory: Some(cwd.to_path_buf()),
             env: shell_env(),
             ..tty::Options::default()
@@ -359,25 +505,163 @@ fn pty_pid(pty: &Pty) -> u32 {
     }
 }
 
-fn kill_shell(pid: u32) {
+/// `true` when `pid` is a live process we are allowed to signal.
+/// A reaped pid, pid 1, and this process are not.
+#[cfg(unix)]
+fn should_signal(pid: u32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    let Some(parsed) = rustix::process::Pid::from_raw(pid as i32) else {
+        return false;
+    };
+    if parsed == rustix::process::getpid() || parsed == rustix::process::getpgrp() {
+        return false;
+    }
+    rustix::process::test_kill_process(parsed).is_ok()
+}
+
+/// Stop the shell's session. A reaped leader is left alone so the pid cannot
+/// be recycled into an unrelated process. The caller's own session is never
+/// signaled: the PTY child called `setsid`, so its session is not ours.
+fn stop_session(leader: u32) {
     #[cfg(unix)]
-    kill_process_group(pid);
+    {
+        if !should_signal(leader) {
+            return;
+        }
+        let mine = session_of(std::process::id());
+        let Some(session) = session_of(leader) else {
+            signal_group(leader, rustix::process::Signal::KILL);
+            return;
+        };
+        if mine == Some(session) {
+            return;
+        }
+        let members = processes_in_session(session);
+        for pid in &members {
+            signal_pid(*pid, rustix::process::Signal::HUP);
+        }
+        thread::sleep(Duration::from_millis(50));
+        for pid in members {
+            signal_pid(pid, rustix::process::Signal::KILL);
+        }
+    }
     #[cfg(windows)]
-    kill_process_tree(pid);
+    kill_process_tree(leader);
 }
 
 #[cfg(unix)]
-fn kill_process_group(pid: u32) {
-    if pid <= 1 {
+fn signal_pid(pid: u32, signal: rustix::process::Signal) {
+    if !should_signal(pid) {
         return;
     }
+    let Some(pid) = rustix::process::Pid::from_raw(pid as i32) else {
+        return;
+    };
+    let _ = rustix::process::kill_process(pid, signal);
+}
+
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: rustix::process::Signal) {
     let Some(pid) = rustix::process::Pid::from_raw(pid as i32) else {
         return;
     };
     if pid == rustix::process::getpid() || pid == rustix::process::getpgrp() {
         return;
     }
-    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    let _ = rustix::process::kill_process_group(pid, signal);
+}
+
+/// Session id from a `/proc/<pid>/stat` line. `comm` may contain spaces and
+/// parentheses, so the split is the last `)`.
+#[cfg(target_os = "linux")]
+fn session_from_stat(text: &str) -> Option<i32> {
+    let rest = text.rsplit_once(')')?.1;
+    let mut fields = rest.split_whitespace();
+    let _state = fields.next()?;
+    let _ppid = fields.next()?;
+    let _pgrp = fields.next()?;
+    fields.next()?.parse().ok()
+}
+
+#[cfg(unix)]
+fn session_of(pid: u32) -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        session_from_stat(&text)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        session_of_ps(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn session_of_ps(pid: u32) -> Option<i32> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "sess=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn processes_in_session(session: i32) -> Vec<u32> {
+    let mut pids = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return pids;
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        if session_of(pid) == Some(session) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+#[cfg(target_os = "macos")]
+fn processes_in_session(session: i32) -> Vec<u32> {
+    let Ok(output) = std::process::Command::new("/bin/ps")
+        .args(["-ax", "-o", "pid=,sess="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let Ok(text) = String::from_utf8(output.stdout) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid = parts.next()?.parse::<u32>().ok()?;
+            let sess = parts.next()?.parse::<i32>().ok()?;
+            (sess == session).then_some(pid)
+        })
+        .collect()
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn processes_in_session(_session: i32) -> Vec<u32> {
+    Vec::new()
 }
 
 #[cfg(windows)]
@@ -404,6 +688,7 @@ pub fn surrender_focus(ctx: &egui::Context, view_id: Id) {
 
 /// Apply PTY replies and notice a shell that exited on its own.
 pub fn service(ctx: &egui::Context, terminal: &mut Option<Terminal>) {
+    adopt_starting(terminal);
     let Some(Terminal::Live(session)) = terminal else {
         return;
     };
@@ -411,6 +696,22 @@ pub fn service(ctx: &egui::Context, terminal: &mut Option<Terminal>) {
         *terminal = Some(Terminal::Exited {
             message: "The shell exited.".to_owned(),
         });
+    }
+}
+
+fn adopt_starting(terminal: &mut Option<Terminal>) {
+    let Some(Terminal::Starting(starting)) = terminal else {
+        return;
+    };
+    match starting.rx.try_recv() {
+        Ok(Ok(session)) => *terminal = Some(Terminal::Live(session)),
+        Ok(Err(message)) => *terminal = Some(Terminal::Exited { message }),
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            *terminal = Some(Terminal::Exited {
+                message: "Could not start the shell.".to_owned(),
+            });
+        }
     }
 }
 
@@ -444,8 +745,20 @@ pub fn show(
     let painter = ui.painter().with_clip_rect(visible);
     painter.rect_filled(visible, 0.0, palette.background);
 
+    adopt_starting(terminal);
     if terminal.is_none() {
-        *terminal = start_shell(ui.ctx(), cwd, &metrics);
+        *terminal = Some(begin_shell(ui.ctx(), cwd, &metrics));
+        adopt_starting(terminal);
+    }
+    if matches!(terminal, Some(Terminal::Starting(_))) {
+        ui.ctx().request_repaint();
+        painter.text(
+            visible.center(),
+            Align2::CENTER_CENTER,
+            "Starting shell…",
+            metrics.font.clone(),
+            palette.text_muted,
+        );
     }
 
     if !interactive {
@@ -475,18 +788,28 @@ pub fn show(
             }
             paint(&painter, session, visible, &metrics, palette);
         }
-        None => {}
+        Some(Terminal::Starting(_)) | None => {}
     }
     if restart {
-        *terminal = start_shell(ui.ctx(), cwd, &metrics);
+        *terminal = Some(begin_shell(ui.ctx(), cwd, &metrics));
     }
 }
 
-fn start_shell(ctx: &egui::Context, cwd: &Path, metrics: &Metrics) -> Option<Terminal> {
-    match ShellSession::spawn(cwd, ctx, metrics) {
-        Ok(session) => Some(Terminal::Live(session)),
-        Err(message) => Some(Terminal::Exited { message }),
+fn begin_shell(ctx: &egui::Context, cwd: &Path, metrics: &Metrics) -> Terminal {
+    if let Err(message) = ensure_cwd(cwd) {
+        return Terminal::Exited { message };
     }
+    let (tx, rx) = mpsc::channel();
+    let ctx = ctx.clone();
+    let cwd = cwd.to_path_buf();
+    let metrics = metrics.clone();
+    thread::spawn(move || {
+        let result = ShellSession::spawn(&cwd, &ctx, &metrics);
+        // A dropped receiver means the repository closed first. Drop the
+        // session on this worker, not on the egui thread.
+        let _ = tx.send(result);
+    });
+    Terminal::Starting(StartingShell { rx })
 }
 
 fn exited_prompt(
@@ -1184,28 +1507,142 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shell_program_follows_shell_and_uses_powershell_on_windows() {
+    fn shell_argv_follows_shell_login_and_unset() {
+        let zsh = shell_argv(HostOs::Linux, Some(OsStr::new("/bin/zsh")), None, &[]).expect("zsh");
+        assert_eq!(zsh.program, "/bin/zsh");
+        assert!(zsh.args.is_empty());
+
+        let login =
+            shell_argv(HostOs::Macos, Some(OsStr::new("/bin/zsh")), None, &[]).expect("login");
+        assert_eq!(login.program, "/bin/zsh");
+        assert_eq!(login.args, ["-l"]);
+
+        let scrubbed = shell_argv(
+            HostOs::Macos,
+            Some(OsStr::new("/bin/zsh")),
+            None,
+            &["GIT_DIR", "GH_TOKEN"],
+        )
+        .expect("scrubbed");
+        assert_eq!(scrubbed.program, "/usr/bin/env");
         assert_eq!(
-            shell_program(HostOs::Unix, Some(OsStr::new("/bin/zsh"))),
-            OsString::from("/bin/zsh")
+            scrubbed.args,
+            ["-u", "GIT_DIR", "-u", "GH_TOKEN", "--", "/bin/zsh", "-l"]
         );
-        assert_eq!(
-            shell_program(HostOs::Unix, Some(OsStr::new(""))),
-            OsString::from("/bin/sh")
+
+        let passwd =
+            shell_argv(HostOs::Linux, None, Some("/bin/bash"), &["GIT_EXEC_PATH"]).expect("passwd");
+        assert_eq!(passwd.program, "/usr/bin/env");
+        assert_eq!(passwd.args, ["-u", "GIT_EXEC_PATH", "--", "/bin/bash"]);
+
+        let fallback =
+            shell_argv(HostOs::Linux, Some(OsStr::new("")), None, &[]).expect("fallback");
+        assert_eq!(fallback.program, "/bin/sh");
+
+        let windows = shell_argv(
+            HostOs::Windows,
+            Some(OsStr::new("/bin/zsh")),
+            None,
+            &["GIT_DIR"],
+        )
+        .expect("windows");
+        assert_eq!(windows.program, "powershell.exe");
+        assert!(windows.args.is_empty());
+    }
+
+    #[test]
+    fn shell_argv_skips_an_unsafe_unset_name() {
+        let argv = shell_argv(
+            HostOs::Linux,
+            Some(OsStr::new("/bin/sh")),
+            None,
+            &["GIT_DIR;touch /tmp/x", "GH_TOKEN"],
+        )
+        .expect("argv");
+        assert_eq!(argv.args, ["-u", "GH_TOKEN", "--", "/bin/sh"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_from_stat_uses_the_last_paren() {
+        assert_eq!(session_from_stat("12 (bash) S 1 12 99 0"), Some(99));
+        assert_eq!(session_from_stat("12 (weir)d) S 1 12 42 0"), Some(42));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_signal_refuses_init_and_this_process() {
+        assert!(!should_signal(0));
+        assert!(!should_signal(1));
+        assert!(!should_signal(std::process::id()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_session_kills_a_background_job_that_ignores_hup() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sleeper = dir.path().join("sleeper");
+        let leader_file = dir.path().join("leader");
+        let script = format!(
+            "trap '' HUP; sleep 30 & echo $! > '{}'; echo $$ > '{}'; wait",
+            sleeper.display(),
+            leader_file.display()
         );
-        assert_eq!(shell_program(HostOs::Unix, None), OsString::from("/bin/sh"));
-        assert_eq!(
-            shell_program(HostOs::Windows, Some(OsStr::new("/bin/zsh"))),
-            OsString::from("powershell.exe")
-        );
-        assert_eq!(
-            shell_program(HostOs::Windows, Some(OsStr::new(""))),
-            OsString::from("powershell.exe")
-        );
-        assert_eq!(
-            shell_program(HostOs::Windows, None),
-            OsString::from("powershell.exe")
-        );
+        let mut child = std::process::Command::new("setsid")
+            .args(["/bin/sh", "-c", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("setsid");
+        let leader = wait_for_pid(&leader_file);
+        let sleep_pid = wait_for_pid(&sleeper);
+        stop_session(leader);
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(1)
+            && (process_is_running(sleep_pid) || process_is_running(leader))
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!process_is_running(sleep_pid), "background sleep survived");
+        assert!(!process_is_running(leader), "session leader survived");
+        let _ = child.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_is_running(pid: u32) -> bool {
+        let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some((_, rest)) = text.rsplit_once(')') else {
+            return false;
+        };
+        let state = rest.split_whitespace().next().unwrap_or("");
+        matches!(state, "R" | "S" | "D" | "T")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_pid(path: &Path) -> u32 {
+        let started = std::time::Instant::now();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse::<u32>()
+                && pid > 1
+            {
+                return pid;
+            }
+            if started.elapsed() > Duration::from_secs(2) {
+                panic!("pid file {} was not written", path.display());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn missing_cwd_is_not_a_usable_shell_directory() {
+        let missing = std::env::temp_dir().join("cthulhu-missing-cwd-does-not-exist");
+        let error = ensure_cwd(&missing).expect_err("missing");
+        assert!(error.contains("Cannot enter"), "{error}");
     }
 
     #[test]
@@ -1231,11 +1668,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shell_program_ignores_non_unicode_shell() {
+        use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
         let raw = OsString::from_vec(vec![0xff]);
         assert_eq!(
-            shell_program(HostOs::Unix, Some(raw.as_os_str())),
-            OsString::from("/bin/sh")
+            shell_argv(HostOs::Linux, Some(raw.as_os_str()), None, &[])
+                .expect("argv")
+                .program,
+            "/bin/sh"
         );
     }
 }

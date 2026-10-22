@@ -112,7 +112,7 @@ fn broken_override_reports_the_failure() {
     inputs.override_path = Some(pinned.into());
 
     let error = discover_with(&inputs).expect_err("broken");
-    assert!(matches!(&error, GitError::Failed { .. }), "{error:?}");
+    assert!(matches!(&error, GitError::Command { .. }), "{error:?}");
 }
 
 #[test]

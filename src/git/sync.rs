@@ -1,19 +1,24 @@
 //! Fetch the current branch's upstream, and fast-forward pull.
 //!
 //! Fetch names one remote-tracking ref. It does not pass `--all` or `--prune`.
-//! Pull is `git pull --ff-only`, so a non-fast-forward leaves the work tree
-//! untouched.
+//! Pull is `git pull --ff-only --no-rebase`. `--no-rebase` is required:
+//! Git 2.15 through 2.33 rebase anyway when `pull.rebase` or
+//! `branch.<name>.rebase` is set, and `--ff-only` alone does not stop them.
+//! A non-fast-forward leaves the work tree untouched.
 
 use std::path::Path;
 use std::time::Duration;
 
-use super::exec::{Git, GitError};
+use super::exec::{Git, GitError, rejected};
 
 /// Fetch and pull talk to a network. A local read stays on the shorter limit.
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 
-/// `git pull --ff-only`, with no remote and no branch: git uses the upstream.
-const PULL_FF_ONLY_ARGS: &[&str] = &["pull", "--ff-only"];
+/// `git pull --ff-only --no-rebase`, with no remote and no branch: git uses
+/// the upstream. `--no-rebase` skips `pull.rebase` and `branch.<name>.rebase`
+/// on every Git this app accepts. An explicit `--ff-only` still wins on 2.34+,
+/// so a divergence is an error and not a merge commit.
+const PULL_FF_ONLY_ARGS: &[&str] = &["pull", "--ff-only", "--no-rebase"];
 
 /// One `git fetch -- <remote> <refspec>` for the current branch's upstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,11 +76,8 @@ fn refspec_forbidden(ch: char) -> bool {
 
 /// Fetches the upstream named by `upstream_short` into its remote-tracking ref.
 pub fn fetch(git: &Git, root: &Path, upstream_short: &str) -> Result<(), GitError> {
-    let request = fetch_request(upstream_short).ok_or_else(|| GitError::Failed {
-        command: "git fetch".to_owned(),
-        status: "rejected".to_owned(),
-        stderr: "the upstream name cannot be fetched".to_owned(),
-    })?;
+    let request = fetch_request(upstream_short)
+        .ok_or_else(|| rejected("git fetch", "the upstream name cannot be fetched"))?;
     let args = request.args();
     git.require_ok_for(root, &args, NETWORK_TIMEOUT)?;
     Ok(())
@@ -146,6 +148,6 @@ mod tests {
 
     #[test]
     fn pull_is_fast_forward_only() {
-        assert_eq!(PULL_FF_ONLY_ARGS, ["pull", "--ff-only"]);
+        assert_eq!(PULL_FF_ONLY_ARGS, ["pull", "--ff-only", "--no-rebase"]);
     }
 }

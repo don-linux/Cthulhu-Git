@@ -237,17 +237,24 @@ impl GitHubAuth {
             }
             Outcome::Removed(result) => {
                 self.token = None;
-                self.stored = Stored::None;
                 self.user = None;
                 self.rate = None;
                 changes.push(Change::Token(None));
-                changes.push(Change::InKeychain(false));
-                self.notice = Some(match result {
-                    Ok(()) => Notice::Info("The token was removed.".to_owned()),
-                    Err(error) => Notice::Error(format!(
-                        "The token is no longer used, but the keychain could not delete it. {error}"
-                    )),
-                });
+                match result {
+                    Ok(()) => {
+                        self.stored = Stored::None;
+                        changes.push(Change::InKeychain(false));
+                        self.notice = Some(Notice::Info("The token was removed.".to_owned()));
+                    }
+                    // The secret is still in the keychain. Clearing the flag
+                    // would make the next launch skip it.
+                    Err(error) => {
+                        self.stored = Stored::Keychain;
+                        self.notice = Some(Notice::Error(format!(
+                            "The token is no longer used, but the keychain could not delete it. {error}"
+                        )));
+                    }
+                }
             }
             Outcome::Verified(Ok((user, rate))) => {
                 self.notice = None;
@@ -274,5 +281,41 @@ impl GitHubAuth {
             }
         }
         changes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui::Context;
+
+    #[test]
+    fn a_failed_delete_does_not_clear_the_keychain_flag() {
+        let ctx = Context::default();
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Outcome::Removed(Err(TokenStoreError::Locked(
+                "locked".to_owned(),
+            ))))
+            .expect("send");
+        let mut auth = GitHubAuth {
+            token: Some(Token::new("ghp_abcdefghijklmnopqrstuvwxyz")),
+            stored: Stored::Keychain,
+            task: Some(receiver),
+            ..GitHubAuth::default()
+        };
+        let changes = auth.poll(&ctx);
+        assert!(
+            changes
+                .iter()
+                .any(|change| matches!(change, Change::Token(None)))
+        );
+        assert!(
+            !changes
+                .iter()
+                .any(|change| matches!(change, Change::InKeychain(false))),
+            "a failed delete must leave github_token_in_keyring set, got {changes:?}"
+        );
+        assert!(matches!(auth.notice, Some(Notice::Error(_))));
     }
 }

@@ -13,7 +13,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{OnceLock, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -25,7 +25,9 @@ const SCRIPT: &str = r#"#!/bin/sh
 version=$(cat "$0.version")
 [ "$version" = broken ] && exit 1
 if [ "$version" = sleep ]; then
-  sleep 3
+  sleep 30 &
+  echo $! > "$0.sleeper"
+  wait
   printf 'git version 2.43.0\n'
   exit 0
 fi
@@ -59,7 +61,8 @@ fn shared_script() -> &'static Path {
 
 /// Creates `dir/name` answering `git version <version>`.
 ///
-/// `"broken"` exits 1. `"sleep"` sleeps 3s then prints 2.43.0. `"garbage"`
+/// `"broken"` exits 1. `"sleep"` backgrounds `sleep 30` (pid in `git.sleeper`)
+/// then waits. `"garbage"`
 /// prints non-version stdout (including a non-UTF-8 byte) and exits 0.
 /// A version string may itself contain a trailing `\r`.
 fn fake(dir: &Path, name: &str, version: &str) -> PathBuf {
@@ -245,10 +248,38 @@ fn override_symlink_to_directory_is_bad_override() {
     );
 }
 
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().expect("file name").to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+fn assert_recorded_pid_is_dead(path: &Path) {
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("missing pid file {}: {error}", path.display()));
+    let pid: u32 = text
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("pid in {}: {text:?}", path.display()));
+    assert!(pid > 1, "refusing to treat pid {pid} as the grandchild");
+    let status = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("kill -0");
+    assert!(
+        !status.success(),
+        "grandchild pid {pid} is still alive after the git that spawned it was stopped"
+    );
+}
+
 #[test]
 fn sleeping_override_is_bounded_to_about_one_second() {
     let tmp = temp();
     let pinned = fake(tmp.path(), "git", "sleep");
+    let sleeper = sidecar(&pinned, ".sleeper");
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let inputs = DiscoverInputs {
@@ -262,17 +293,18 @@ fn sleeping_override_is_bounded_to_about_one_second() {
 
     match rx.recv_timeout(Duration::from_secs(1)) {
         Ok(Ok(git)) => panic!(
-            "FINDING: CTHULHU_GIT whose --version sleeps 3s returned a version within 1s ({}); discovery must fail or still be bounded",
+            "FINDING: CTHULHU_GIT whose --version sleeps returned a version within 1s ({}); discovery must fail or still be bounded",
             git.version.raw
         ),
         Ok(Err(_)) => {}
         Err(mpsc::RecvTimeoutError::Timeout) => panic!(
-            "FINDING: CTHULHU_GIT --version that sleeps 3s was still running after 1s; discovery must fail or return within about 1s and must not wait out a hung git"
+            "FINDING: CTHULHU_GIT --version that sleeps was still running after 1s; discovery must fail or return within about 1s and must not wait out a hung git"
         ),
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             panic!("discovery thread ended without a result");
         }
     }
+    assert_recorded_pid_is_dead(&sleeper);
 }
 
 #[test]
@@ -304,7 +336,6 @@ fn release_candidate_2_15_0_rc0_override_does_not_meet_the_floor() {
             assert!(!version.is_supported(), "{version:?}");
             assert!(version.raw.contains("rc"), "{version:?}");
         }
-        Err(GitError::Failed { .. }) => {}
         Err(error) => panic!("expected 2.15.0-rc0 to be rejected, got {error:?}"),
     }
 }
@@ -358,8 +389,8 @@ fn garbage_stdout_is_an_error_not_a_panic() {
     inputs.override_path = Some(pinned.into());
     let error = discover_with(&inputs).expect_err("garbage stdout must be an error");
     assert!(
-        matches!(error, GitError::Failed { .. }),
-        "garbage stdout must be Failed, not a panic or another variant: {error:?}"
+        matches!(error, GitError::Rejected { .. }),
+        "garbage stdout must be Rejected, not a panic or another variant: {error:?}"
     );
 }
 

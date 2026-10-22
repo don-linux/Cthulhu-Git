@@ -13,7 +13,6 @@ use std::path::Path;
 use super::exec::{Git, GitError};
 use super::log::{Person, author_and_co_authors};
 
-const FIELD_SEPARATOR: u8 = 0x1f;
 /// Between the subject and the trailer block: a different byte from the
 /// field separator, so a unit separator in either one stays put.
 const TRAILERS_START: u8 = 0x1e;
@@ -25,8 +24,8 @@ const GRAPH_FORMAT: &str =
     "--format=%H%x1f%P%x1f%aN%x1f%aE%x1f%an%x1f%ae%x1f%s%x1e%(trailers:only,unfold)";
 
 /// How many lane colors the history view cycles. Principal is always `0`.
-/// The same count lives in the theme palette.
-const LANE_COLORS: usize = 8;
+/// The theme paints `color % LANE_COLORS`, so this is the palette length too.
+pub const LANE_COLORS: usize = 8;
 
 /// A branch tip to include in the graph. `color` comes from the sidebar index
 /// so a branch keeps its color when a different one is switched off. The
@@ -107,13 +106,31 @@ pub struct GraphTrace {
     pub color: usize,
 }
 
+/// A lane is either holding the principal column open, or waiting for one commit.
+/// Both at once used to be representable.
 #[derive(Clone)]
-struct Lane {
-    /// Commit this lane is waiting to draw. `None` holds the principal column
-    /// open until that branch's tip appears.
-    next: Option<String>,
-    color: usize,
-    placeholder: bool,
+enum Lane {
+    Placeholder { color: usize },
+    Waiting { next: String, color: usize },
+}
+
+impl Lane {
+    fn color(&self) -> usize {
+        match self {
+            Self::Placeholder { color } | Self::Waiting { color, .. } => *color,
+        }
+    }
+
+    fn next(&self) -> Option<&str> {
+        match self {
+            Self::Waiting { next, .. } => Some(next.as_str()),
+            Self::Placeholder { .. } => None,
+        }
+    }
+
+    fn is_placeholder(&self) -> bool {
+        matches!(self, Self::Placeholder { .. })
+    }
 }
 
 struct BottomLane {
@@ -135,10 +152,11 @@ struct ExtraParent {
 pub fn head_commit_oid(git: &Git, root: &Path) -> Result<String, GitError> {
     let args = ["rev-parse", "--verify", "HEAD"];
     let output = git.require_ok(root, &args)?;
-    parse_oid(&output.stdout).ok_or_else(|| GitError::Failed {
-        command: format!("git {}", args.join(" ")),
-        status: output.status.to_string(),
-        stderr: "unrecognized rev-parse output".to_owned(),
+    parse_oid(&output.stdout).ok_or_else(|| {
+        super::exec::rejected(
+            &format!("git {}", args.join(" ")),
+            "unrecognized rev-parse output",
+        )
     })
 }
 
@@ -236,16 +254,21 @@ fn newest_principal(branches: &[GraphCandidate<'_>]) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
+/// Painted slot for a sidebar row. Principal is always 0. Other rows use
+/// slots 1 through 7, and the eighth non-principal row repeats slot 1.
+/// `sidebar_index.max(1)` made index 0 and index 1 the same slot.
 fn lane_color(sidebar_index: usize, principal: bool) -> usize {
     if principal {
-        return 0;
-    }
-    let color = sidebar_index.max(1);
-    if color.is_multiple_of(LANE_COLORS) {
-        color + 1
+        0
     } else {
-        color
+        1 + sidebar_index % (LANE_COLORS - 1)
     }
+}
+
+/// The palette slot a stored color paints. Kept next to [`lane_color`] so the
+/// theme's modulo cannot drift from the assignment.
+pub fn painted_lane_color(color: usize) -> usize {
+    color % LANE_COLORS
 }
 
 /// Commits reachable from `tips`, newest first, laid out into lanes.
@@ -264,11 +287,10 @@ pub fn branch_graph(
 
     for tip in tips {
         if !is_oid(&tip.oid) {
-            return Err(GitError::Failed {
-                command: "git log".to_owned(),
-                status: "invalid tip".to_owned(),
-                stderr: format!("{} does not point at a commit hash", tip.name),
-            });
+            return Err(super::exec::rejected(
+                "git log",
+                format!("{} does not point at a commit hash", tip.name),
+            ));
         }
     }
 
@@ -295,10 +317,11 @@ pub fn branch_graph(
     let args: Vec<&str> = owned.iter().map(String::as_str).collect();
 
     let output = git.require_ok(root, &args)?;
-    let mut commits = parse_graph_log(&output.stdout).ok_or_else(|| GitError::Failed {
-        command: format!("git {}", args.join(" ")),
-        status: output.status.to_string(),
-        stderr: "unrecognized log output".to_owned(),
+    let mut commits = parse_graph_log(&output.stdout).ok_or_else(|| {
+        super::exec::rejected(
+            &format!("git {}", args.join(" ")),
+            "unrecognized log output",
+        )
     })?;
     let truncated = commits.len() > limit;
     commits.truncate(limit);
@@ -326,11 +349,11 @@ pub(crate) fn parse_graph_log(stdout: &[u8]) -> Option<Vec<GraphCommit>> {
 }
 
 fn parse_graph_record(record: &[u8]) -> Option<GraphCommit> {
-    let mut parts = record.splitn(7, |byte| *byte == FIELD_SEPARATOR);
-    let oid = parts.next()?;
-    let parents = parts.next()?;
-    let identity = [parts.next()?, parts.next()?, parts.next()?, parts.next()?];
-    let rest = parts.next()?;
+    let parts = super::log::split_fields(record, 7)?;
+    let oid = parts[0];
+    let parents = parts[1];
+    let identity = [parts[2], parts[3], parts[4], parts[5]];
+    let rest = parts[6];
     let split = rest.iter().rposition(|byte| *byte == TRAILERS_START)?;
     let (summary, trailers) = (&rest[..split], &rest[split + 1..]);
     if !is_oid(&String::from_utf8_lossy(oid)) {
@@ -388,11 +411,7 @@ pub fn layout_graph(commits: &[GraphCommit], tips: &[GraphTip]) -> HistoryGraph 
         remaining.remove(&commit.oid);
         let on_trunk = trunk.contains(&commit.oid);
         if !on_trunk && !trunk.is_empty() && lanes.is_empty() {
-            lanes.push(Lane {
-                next: None,
-                color: spine_color,
-                placeholder: true,
-            });
+            lanes.push(Lane::Placeholder { color: spine_color });
         }
         rows.push(layout_row(
             commit,
@@ -470,18 +489,18 @@ fn occupy(
 ) -> (usize, bool) {
     if on_trunk {
         if let Some(lane) = lanes.first_mut() {
-            if lane.placeholder || lane.next.as_deref() == Some(commit_oid) {
-                let spawned = lane.next.as_deref() != Some(commit_oid);
-                lane.placeholder = false;
-                lane.next = Some(commit_oid.to_owned());
-                lane.color = spine_color;
+            if lane.is_placeholder() || lane.next() == Some(commit_oid) {
+                let spawned = lane.next() != Some(commit_oid);
+                *lane = Lane::Waiting {
+                    next: commit_oid.to_owned(),
+                    color: spine_color,
+                };
                 return (0, spawned);
             }
         } else {
-            lanes.push(Lane {
-                next: Some(commit_oid.to_owned()),
+            lanes.push(Lane::Waiting {
+                next: commit_oid.to_owned(),
                 color: spine_color,
-                placeholder: false,
             });
             return (0, true);
         }
@@ -489,15 +508,14 @@ fn occupy(
 
     if let Some(index) = lanes
         .iter()
-        .position(|lane| lane.next.as_deref() == Some(commit_oid))
+        .position(|lane| lane.next() == Some(commit_oid))
     {
         return (index, false);
     }
 
-    lanes.push(Lane {
-        next: Some(commit_oid.to_owned()),
+    lanes.push(Lane::Waiting {
+        next: commit_oid.to_owned(),
         color: commit_color,
-        placeholder: false,
     });
     (lanes.len() - 1, true)
 }
@@ -515,7 +533,7 @@ struct RowCtx<'a> {
 fn lane_waiting_for(lanes: &[Lane], oid: &str, trunk: &HashSet<String>) -> Option<usize> {
     let index = lanes
         .iter()
-        .position(|lane| !lane.placeholder && lane.next.as_deref() == Some(oid))?;
+        .position(|lane| !lane.is_placeholder() && lane.next() == Some(oid))?;
     if trunk.contains(oid) && index != 0 {
         None
     } else {
@@ -595,20 +613,20 @@ fn layout_row(commit: &GraphCommit, lanes: &mut Vec<Lane>, ctx: &RowCtx<'_>) -> 
                     });
                 }
             }
-        } else if lane.placeholder {
+        } else if lane.is_placeholder() {
             bottom.push(BottomLane {
                 next: None,
-                color: lane.color,
+                color: lane.color(),
                 from: None,
                 continues_commit: false,
                 placeholder: true,
             });
-        } else if lane.next.as_deref() == Some(commit.oid.as_str()) {
+        } else if lane.next() == Some(commit.oid.as_str()) {
             merging_from.push(index);
         } else {
             bottom.push(BottomLane {
-                next: lane.next.clone(),
-                color: lane.color,
+                next: lane.next().map(str::to_owned),
+                color: lane.color(),
                 from: Some(index),
                 continues_commit: false,
                 placeholder: false,
@@ -677,16 +695,18 @@ fn layout_row(commit: &GraphCommit, lanes: &mut Vec<Lane>, ctx: &RowCtx<'_>) -> 
         traces.push(GraphTrace {
             from_lane: Some(from_index),
             to_lane: None,
-            color: top[from_index].color,
+            color: top[from_index].color(),
         });
     }
 
     *lanes = bottom
         .into_iter()
-        .map(|lane| Lane {
-            next: lane.next,
-            color: lane.color,
-            placeholder: lane.placeholder,
+        .map(|lane| match lane.next {
+            Some(next) if !lane.placeholder => Lane::Waiting {
+                next,
+                color: lane.color,
+            },
+            _ => Lane::Placeholder { color: lane.color },
         })
         .collect();
 
@@ -806,6 +826,7 @@ fn commit_colors(
 mod tests {
     use std::collections::BTreeSet;
 
+    use super::super::log::FIELD_SEPARATOR;
     use super::*;
 
     const OID_A: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -990,6 +1011,57 @@ mod tests {
             commit.co_authors,
             [Person::new("Tag\u{1f}ged", "tag@example.invalid")]
         );
+    }
+
+    #[test]
+    fn a_record_separator_inside_the_subject_stays_in_the_summary() {
+        let stdout = record_with(
+            OID_A,
+            "",
+            ("Ada", "ada@example.invalid"),
+            b"subject\x1ewith a separator",
+            b"",
+        );
+        let commits = parse_graph_log(&stdout).expect("parsable");
+        assert_eq!(commits[0].summary, "subject\u{1e}with a separator");
+    }
+
+    #[test]
+    fn every_small_linear_history_keeps_the_principal_on_lane_zero() {
+        for length in 1..=8 {
+            let commits: Vec<GraphCommit> = (0..length)
+                .map(|index| {
+                    let oid = format!("{:040x}", length - index);
+                    let parents = if index + 1 == length {
+                        Vec::new()
+                    } else {
+                        vec![format!("{:040x}", length - index - 1)]
+                    };
+                    commit(
+                        &oid,
+                        "step",
+                        &parents.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            let graph = layout_graph(&commits, &[spine("main", &commits[0].oid, 0)]);
+            assert!(connected(&graph.rows), "length {length}");
+            assert!(graph.columns >= 1, "length {length}");
+            assert!(
+                graph.rows.iter().all(|row| {
+                    row.commit_lane < graph.columns
+                        && row.traces.iter().all(|trace| {
+                            trace.from_lane.is_none_or(|lane| lane < graph.columns)
+                                && trace.to_lane.is_none_or(|lane| lane < graph.columns)
+                        })
+                }),
+                "length {length}"
+            );
+            assert!(
+                graph.rows.iter().all(|row| row.commit_lane == 0),
+                "length {length}"
+            );
+        }
     }
 
     #[test]
@@ -1424,7 +1496,7 @@ mod tests {
         assert_eq!(feature.color, 1);
         assert_eq!(
             tips.iter().find(|tip| tip.name == "topic").unwrap().color,
-            2
+            3
         );
     }
 
@@ -1537,7 +1609,7 @@ mod tests {
         let head = tips.iter().find(|tip| tip.name == "HEAD").expect("head");
         assert!(!head.principal);
         assert!(head.current);
-        assert_eq!(head.color, 1);
+        assert_eq!(head.color, 2);
         assert_eq!(head.oid, OID_B);
     }
 
@@ -1571,36 +1643,68 @@ mod tests {
     }
 
     #[test]
-    fn a_late_sidebar_row_does_not_reuse_the_principal_color() {
-        let names = ["b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8"];
-        let oids = [
-            OID_A,
-            OID_B,
-            OID_C,
-            "1111111111111111111111111111111111111111",
-            "2222222222222222222222222222222222222222",
-            "3333333333333333333333333333333333333333",
-            "4444444444444444444444444444444444444444",
-            "5555555555555555555555555555555555555555",
-            "6666666666666666666666666666666666666666",
-        ];
-        let branches: Vec<GraphCandidate<'_>> = names
-            .iter()
-            .zip(oids)
-            .enumerate()
-            .map(|(index, (name, oid))| {
-                choice(
-                    name,
-                    oid,
-                    index == 0,
-                    Some((names.len() - index) as i64),
-                    index == 0 || index == 8,
-                )
-            })
-            .collect();
+    fn a_late_sidebar_row_repeats_a_slot_without_taking_the_principal_color() {
+        let mut branches = Vec::new();
+        for index in 0..8 {
+            branches.push(choice(
+                match index {
+                    0 => "b0",
+                    1 => "b1",
+                    2 => "b2",
+                    3 => "b3",
+                    4 => "b4",
+                    5 => "b5",
+                    6 => "b6",
+                    _ => "b7",
+                },
+                match index {
+                    0 => OID_A,
+                    1 => OID_B,
+                    _ => OID_C,
+                },
+                false,
+                Some(1),
+                true,
+            ));
+        }
+        branches.push(choice("main", OID_A, true, Some(9), true));
         let tips = graph_tips(&branches, None);
-        let late = tips.iter().find(|tip| tip.name == "b8").unwrap();
-        assert!(!late.color.is_multiple_of(LANE_COLORS));
+        let painted = |name: &str| {
+            painted_lane_color(tips.iter().find(|tip| tip.name == name).unwrap().color)
+        };
+        assert_eq!(painted("main"), 0);
+        assert_eq!(painted("b0"), painted("b7"));
+        assert_ne!(painted("b0"), painted("b1"));
+        assert_ne!(painted("b0"), 0);
+    }
+
+    #[test]
+    fn neighboring_sidebar_rows_paint_different_slots_from_the_principal() {
+        let branches = [
+            choice("feature", OID_A, true, Some(5), true),
+            choice("bugfix", OID_B, false, Some(4), true),
+            choice("main", OID_C, false, Some(1), true),
+        ];
+        let tips = graph_tips(&branches, None);
+        let painted = |name: &str| {
+            painted_lane_color(tips.iter().find(|tip| tip.name == name).unwrap().color)
+        };
+        assert_eq!(painted("main"), 0);
+        assert_ne!(painted("feature"), painted("bugfix"));
+        assert_ne!(painted("feature"), 0);
+        assert_ne!(painted("bugfix"), 0);
+
+        let with_head = graph_tips(&branches, Some("7777777777777777777777777777777777777777"));
+        let head = painted_lane_color(
+            with_head
+                .iter()
+                .find(|tip| tip.name == "HEAD")
+                .unwrap()
+                .color,
+        );
+        assert_ne!(head, 0);
+        assert_ne!(head, painted("feature"));
+        assert_ne!(head, painted("bugfix"));
     }
 
     fn principal_name(tips: &[GraphTip]) -> &str {

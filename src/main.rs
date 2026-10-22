@@ -48,6 +48,13 @@ fn window_icon() -> egui::IconData {
         .expect("icon-256.png rendered by build.rs")
 }
 
+/// On macOS an empty icon keeps eframe away from the Dock, so it shows
+/// `AppIcon.icns` from the app bundle, drawn on Apple's icon grid.
+#[cfg(target_os = "macos")]
+fn window_icon() -> egui::IconData {
+    egui::IconData::default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,11 +65,4 @@ mod tests {
         assert!(startup_folder(Some("-psn_0_12345".into())).is_none());
         assert!(startup_folder(Some("--help".into())).is_none());
     }
-}
-
-/// On macOS an empty icon keeps eframe away from the Dock, so it shows
-/// `AppIcon.icns` from the app bundle, drawn on Apple's icon grid.
-#[cfg(target_os = "macos")]
-fn window_icon() -> egui::IconData {
-    egui::IconData::default()
 }

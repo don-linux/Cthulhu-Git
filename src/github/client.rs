@@ -214,15 +214,19 @@ pub fn authenticated_user(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchError {
-    /// 404 or 410: there is no avatar at that URL.
+    /// 404, 410, a refused URL, or a body over the cap. Try the next URL.
     Missing,
+    /// Timeout, connect, or TLS. Try the next URL, and do not remember a miss
+    /// when every URL failed this way.
+    Unavailable,
     Failed(String),
 }
 
 /// Downloads an image. Never sends the token.
 pub fn fetch_image(transport: &dyn Transport, url: &str) -> Result<Vec<u8>, FetchError> {
     let response = http::get(transport, url, None).map_err(|error| match error {
-        HttpError::NotAllowed(_) => FetchError::Missing,
+        HttpError::NotAllowed(_) | HttpError::TooLarge => FetchError::Missing,
+        HttpError::TimedOut | HttpError::Connect | HttpError::Tls(_) => FetchError::Unavailable,
         other => FetchError::Failed(other.to_string()),
     })?;
     match response.status {
