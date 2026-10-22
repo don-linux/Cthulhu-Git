@@ -546,28 +546,10 @@ fn history_row(
         row_id.with("author"),
     );
 
-    // One card per row, hung from the cell under the pointer: a row is wider
-    // than the window, and a card at its left edge would be far from the
-    // pointer. Off the row (on the way into the card) it keeps its cell.
-    let column_id = row_id.with("card-column");
-    let pointer = ui.ctx().pointer_hover_pos();
-    let column = match Column::ALL
-        .into_iter()
-        .find(|column| pointer.is_some_and(|at| layout.cell(rect, *column).contains(at)))
-    {
-        Some(column) => {
-            ui.ctx()
-                .data_mut(|data| data.insert_temp(column_id, column.index()));
-            column
-        }
-        None => ui
-            .ctx()
-            .data(|data| data.get_temp::<usize>(column_id))
-            .and_then(|index| Column::ALL.get(index).copied())
-            .unwrap_or(Column::Message),
-    };
+    // The card opens from Author only. A row is wide, and a card on every
+    // column would follow the pointer across the whole commit.
     ui.interact(
-        layout.cell(rect, column),
+        layout.cell(rect, Column::Author),
         row_id.with("card"),
         Sense::hover(),
     )
@@ -609,7 +591,8 @@ fn elided(ui: &Ui, text: &str, font: FontId, color: Color32, max_width: f32) -> 
 }
 
 /// Painted text with an accessibility node carrying the full text. Painted
-/// instead of a `Label` so the row, not each cell, owns the hover card.
+/// instead of a `Label` so a cell does not open its own card. The card
+/// belongs to the Author column.
 fn text_cell(ui: &mut Ui, rect: Rect, text: &str, font: FontId, color: Color32, id: Id) {
     if rect.width() <= 0.0 {
         return;
