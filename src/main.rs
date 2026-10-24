@@ -20,7 +20,8 @@ fn main() -> eframe::Result {
             .with_app_id("cthulhu-git")
             .with_icon(window_icon())
             .with_inner_size([860.0, 620.0])
-            .with_min_inner_size([520.0, 400.0]),
+            .with_min_inner_size([520.0, 400.0])
+            .with_maximized(true),
         ..Default::default()
     };
 

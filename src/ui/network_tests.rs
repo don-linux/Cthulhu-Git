@@ -874,6 +874,7 @@ fn history_hover_card_names_the_author_and_coauthor() {
                     terminal_open: false,
                     syncing: None,
                     columns: HistoryColumns::default(),
+                    history_loading: false,
                 },
                 &mut AvatarService::disabled(),
             );

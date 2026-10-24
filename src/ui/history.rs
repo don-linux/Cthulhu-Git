@@ -183,14 +183,24 @@ fn default_per_mille(column: Column) -> u16 {
 
 /// Draws the history and returns new column widths when a divider was released
 /// or double-clicked, for the app to save.
+///
+/// When `loading` is set and there are no rows yet, the muted line says the
+/// history is still opening. A finished load with no commits keeps
+/// "No commits yet."
 pub fn show(
     ui: &mut Ui,
     repo: &mut OpenedRepo,
     palette: &Palette,
     saved: HistoryColumns,
     avatars: &mut AvatarService,
+    loading: bool,
 ) -> Option<HistoryColumns> {
-    let empty = empty_history(&repo.branches, repo.detached_oid.is_some());
+    // While this view's log is still running, an empty table is not "no commits".
+    let empty = if loading {
+        "Opening history…"
+    } else {
+        empty_history(&repo.branches, repo.detached_oid.is_some())
+    };
     repo.hover.poll(ui.ctx(), &repo.info.root);
     let OpenedRepo {
         graph,
@@ -215,7 +225,9 @@ pub fn show(
     );
     ui.add_space(6.0);
     if rows.is_empty() {
-        ui.label(RichText::new(empty).color(palette.text_muted));
+        // The column between the sidebars can be narrower than these sentences.
+        // Wrap inside it; truncating would drop the line the loading state shows.
+        wrapped_line(ui, empty, palette.text_muted);
         return None;
     }
     if graph.truncated {
@@ -349,6 +361,32 @@ fn scaled(ui: &Ui, style: TextStyle) -> FontId {
     let mut font = style.resolve(ui.style());
     font.size *= TEXT_SCALE;
     font
+}
+
+/// The full sentence, broken so every row stays inside `ui`'s width.
+///
+/// Word wrap alone lets one token paint past the history column into the
+/// detail sidebar. Breaking anywhere keeps the galley in the column without
+/// eliding it.
+fn wrapped_line(ui: &mut Ui, text: &str, color: Color32) {
+    let width = ui.available_width().max(0.0);
+    let mut job = LayoutJob::single_section(
+        text.to_owned(),
+        TextFormat {
+            font_id: TextStyle::Body.resolve(ui.style()),
+            color,
+            valign: ui.text_valign(),
+            ..TextFormat::default()
+        },
+    );
+    job.wrap = TextWrapping {
+        max_width: width,
+        max_rows: usize::MAX,
+        break_anywhere: true,
+        overflow_character: None,
+    };
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    ui.add(Label::new(galley));
 }
 
 fn empty_history(branches: &[ListedBranch], detached: bool) -> &'static str {

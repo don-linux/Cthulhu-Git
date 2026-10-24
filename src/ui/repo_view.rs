@@ -9,8 +9,8 @@ use cthulhu_git::git::{Branch, Head, Person, Upstream};
 use cthulhu_git::github::RepoContext;
 use cthulhu_git::settings::HistoryColumns;
 use eframe::egui::{
-    self, Align, Color32, CursorIcon, Frame, Label, Layout, Margin, Pos2, Rect, RichText,
-    ScrollArea, Sense, Stroke, Ui, Vec2,
+    self, Align, Color32, CursorIcon, FontSelection, Frame, Label, Layout, Margin, Pos2, Rect,
+    RichText, ScrollArea, Sense, Stroke, Ui, Vec2, WidgetText,
 };
 
 use super::avatars::{self, AvatarService};
@@ -37,6 +37,8 @@ pub struct ViewState<'a> {
     pub terminal_open: bool,
     pub syncing: Option<SyncKind>,
     pub columns: HistoryColumns,
+    /// This repository's history graph is still being read.
+    pub history_loading: bool,
 }
 
 pub fn show(
@@ -178,7 +180,14 @@ pub fn show(
                 widgets::error_banner(ui, error);
                 ui.add_space(12.0);
             }
-            if let Some(columns) = history::show(ui, repo, &palette, state.columns, avatars) {
+            if let Some(columns) = history::show(
+                ui,
+                repo,
+                &palette,
+                state.columns,
+                avatars,
+                state.history_loading,
+            ) {
                 actions.push(Action::SetHistoryColumns(columns));
             }
         });
@@ -478,7 +487,7 @@ fn detail_panel(ui: &mut Ui, repo: &OpenedRepo, palette: &Palette, avatars: &mut
             if commit.message.is_empty() {
                 ui.label(RichText::new("No message.").color(palette.text_muted));
             } else {
-                ui.label(RichText::new(&commit.message).color(palette.text));
+                sidebar_text(ui, RichText::new(&commit.message).color(palette.text));
             }
         });
 }
@@ -504,17 +513,38 @@ fn person_line(
             palette,
             None,
         );
-        ui.add(Label::new(
+        sidebar_text(
+            ui,
             RichText::new(format!("{} <{}>", person.name, person.email)).color(palette.text),
-        ));
+        );
     });
 }
 
 fn detail_field(ui: &mut Ui, palette: &Palette, label: &str, value: RichText) {
     ui.label(RichText::new(label).small().color(palette.text_muted));
     ui.add_space(2.0);
-    ui.add(Label::new(value));
+    sidebar_text(ui, value);
     ui.add_space(10.0);
+}
+
+/// Draws `text` inside the width this sidebar was given.
+///
+/// A commit hash and a name with an address are single tokens. Letting either extend
+/// grows the sidebar up to the remaining window and leaves the history column
+/// with no room. Breaking inside the token keeps the whole string visible.
+fn sidebar_text(ui: &mut Ui, text: impl Into<WidgetText>) {
+    let width = ui.available_width().max(0.0);
+    let mut job = std::sync::Arc::unwrap_or_clone(text.into().into_layout_job(
+        ui.style(),
+        FontSelection::Default,
+        ui.text_valign(),
+    ));
+    job.wrap.max_width = width;
+    job.wrap.break_anywhere = true;
+    job.wrap.max_rows = usize::MAX;
+    job.wrap.overflow_character = None;
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    ui.add(Label::new(galley));
 }
 
 struct SyncOffer {
@@ -584,14 +614,7 @@ fn sync_offer(head: &Head, branches: &[ListedBranch]) -> SyncOffer {
 
 /// Width of an icon-and-word control, so the branch name stops before it.
 fn sync_control_width(ui: &Ui, text: &str) -> f32 {
-    let font = eframe::egui::TextStyle::Button.resolve(ui.style());
-    let text_width = ui.fonts_mut(|fonts| {
-        fonts
-            .layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER)
-            .rect
-            .width()
-    });
-    text_width + 18.0 + ui.spacing().icon_spacing + ui.spacing().button_padding.x * 2.0
+    icons::icon_text_button_width(ui, text)
 }
 
 /// Icon and word, one click. Dimmed, and not clickable, when the action cannot run.

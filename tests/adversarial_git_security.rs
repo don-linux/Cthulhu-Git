@@ -2,9 +2,10 @@
 //!
 //! Opening a repository must not execute commands planted in that repository
 //! or in the inherited environment, must not hide the real history, and must
-//! reject unbounded or ambiguous git output. Tests do not change this process's
-//! environment or working directory. Inherited variables are applied only to a
-//! child re-exec of this binary.
+//! reject unbounded or ambiguous git output. The history graph is a later
+//! `branch_graph` log (`--max-count`, not `log -1`) and is held to the same
+//! rules. Tests do not change this process's environment or working directory.
+//! Inherited variables are applied only to a child re-exec of this binary.
 
 #![cfg(unix)]
 
@@ -15,11 +16,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{OnceLock, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use cthulhu_git::git::{
-    DiscoverInputs, Git, GitError, Head, OVERRIDE_VAR, discover_with, fetch, history, inspect,
-    pull_ff_only,
+    DiscoverInputs, Git, GitError, GraphTip, Head, OVERRIDE_VAR, branch_graph, discover_with,
+    fetch, history, inspect, pull_ff_only,
 };
 use tempfile::TempDir;
 
@@ -29,12 +30,17 @@ const CHILD_ROOT: &str = "CTHULHU_ADV_A_ROOT";
 const CHILD_BRANCH: &str = "CTHULHU_ADV_A_BRANCH";
 const CHILD_ACTION: &str = "CTHULHU_ADV_A_ACTION";
 const CHILD_HISTORY: &str = "CTHULHU_ADV_A_HISTORY";
+const CHILD_TIP: &str = "CTHULHU_ADV_A_TIP";
 const CHILD_MARKER: &str = "CTHULHU_ADV_A_MARKER";
 const CHILD_REQUIRED: &str = "CTHULHU_ADV_A_REQUIRED";
 const CHILD_SENTINEL: &str = "CTHULHU_ADV_A_SENTINEL";
 const CHILD_CONFIG_KEY: &str = "CTHULHU_ADV_A_CONFIG_KEY";
 const CHILD_CONFIG_VALUE: &str = "CTHULHU_ADV_A_CONFIG_VALUE";
 const SUGGESTION_MARK: &str = "If you trust it, run: ";
+
+/// Any positive limit runs the same `--max-count` log the window asks for.
+/// The window's own limit only changes how many commits come back.
+const GRAPH_LOG_LIMIT: usize = 10;
 
 /// Cleared on every setup `git` and on the child before the hostile variables
 /// are applied, so one test cannot leak into another through the inherited
@@ -72,6 +78,28 @@ if [ -n "${CTHULHU_ADV_A_ARGV_LOG-}" ]; then
   printf '%s\0' "$@" > "$CTHULHU_ADV_A_ARGV_LOG"
   exit 0
 fi
+# The deferred history log is `git log --max-count=…`, not `log -1`.
+history_log_argv() {
+  is_log=0
+  has_max=0
+  for arg in "$@"; do
+    if [ "$arg" = "log" ]; then
+      is_log=1
+    fi
+    if [ "$arg" = "-1" ]; then
+      echo "refusing log -1; this fake is the history log" >&2
+      exit 1
+    fi
+    case "$arg" in
+      --max-count=*) has_max=1 ;;
+    esac
+  done
+  if [ "$is_log" != 1 ] || [ "$has_max" != 1 ]; then
+    echo "unexpected fake git arguments: $*" >&2
+    exit 1
+  fi
+}
+
 mode=$(cat "$0.mode" 2>/dev/null || echo version)
 case "$mode" in
   version)
@@ -139,6 +167,30 @@ case "$mode" in
     fi
     log=$(cat "$0.log")
     printf '%s\0' "$@" > "$log"
+    exit 0
+    ;;
+  slow-log)
+    if [ "$1" = "--version" ]; then
+      echo "git version 2.43.0"
+      exit 0
+    fi
+    history_log_argv "$@"
+    # Outlives the 60s command timeout so the caller must kill the group and return.
+    sleep 120 &
+    echo $! > "$0.sleeper"
+    wait
+    exit 0
+    ;;
+  bomb-log)
+    if [ "$1" = "--version" ]; then
+      echo "git version 2.43.0"
+      exit 0
+    fi
+    history_log_argv "$@"
+    # 9 MiB is over the 8 MiB cap. Do not shrink this below that cap.
+    dd if=/dev/zero bs=1048576 count=9 2>/dev/null | tr '\0' 'A' &
+    echo $! > "$0.producer"
+    wait
     exit 0
     ;;
   *)
@@ -1200,6 +1252,249 @@ fn inherited_git_trace_does_not_write_a_trace_file() {
     });
 }
 
+fn graph_tip(name: &str, oid: impl Into<String>) -> GraphTip {
+    GraphTip {
+        name: name.to_owned(),
+        oid: oid.into(),
+        color: 0,
+        principal: true,
+        current: true,
+    }
+}
+
+/// The worker calls `branch_graph`. A one-commit repository must come back whole,
+/// and `marker` must not have been created by that log.
+fn assert_branch_graph_keeps_commit(fixture: &Fixture, marker: &Path, what: &str) {
+    let oid = fixture.git(&["rev-parse", "HEAD"]);
+    let loaded = branch_graph(
+        &fixture.git,
+        &fixture.canonical_root(),
+        &[graph_tip("main", oid)],
+        GRAPH_LOG_LIMIT,
+    );
+    assert_did_not_run(marker, what);
+    let graph = loaded
+        .unwrap_or_else(|error| panic!("{what} failed while reading the history graph: {error}"));
+    assert_eq!(
+        graph
+            .rows
+            .iter()
+            .map(|row| row.summary.as_str())
+            .collect::<Vec<_>>(),
+        ["first"],
+        "{what} did not keep the real commit"
+    );
+    assert!(!graph.truncated, "{what} truncated a one-commit history");
+}
+
+fn assert_history_log_command(command: &str) {
+    let args: Vec<&str> = command.split_whitespace().collect();
+    assert!(args.contains(&"log"), "not the history log: {command}");
+    assert!(
+        args.iter().any(|arg| arg.starts_with("--max-count=")),
+        "not the --max-count history log: {command}"
+    );
+    assert!(
+        !args.contains(&"-1"),
+        "log -1 is not the deferred history log: {command}"
+    );
+}
+
+fn assert_git_honors_trace_var(git: &Git, var: &str, dir: &Path) {
+    let proof = dir.join(format!("{var}.proof"));
+    let _ = fs::remove_file(&proof);
+    let output = Command::new(&git.path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .env_remove("GIT_TRACE")
+        .env_remove("GIT_TRACE2")
+        .env_remove("GIT_TRACE2_EVENT")
+        .env(var, &proof)
+        .output()
+        .unwrap_or_else(|error| panic!("git {var} proof: {error}"));
+    assert!(
+        output.status.success(),
+        "git {var} proof failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = fs::metadata(&proof).map(|meta| meta.len()).unwrap_or(0);
+    let _ = fs::remove_file(&proof);
+    assert!(
+        bytes > 0,
+        "git did not write {var}; branch_graph could pass without the app clearing it"
+    );
+}
+
+#[test]
+fn stat_dirty_clean_filter_is_not_executed_on_branch_graph() {
+    let fixture = Fixture::with_tracked_commit();
+    let marker = fixture.marker("graph-clean-filter");
+    let poke = poke_script(fixture.tmp.path(), "graph-clean-poke.sh", &marker);
+    fixture.write(".gitattributes", "* filter=evil\n");
+    fixture.git(&[
+        "config",
+        "--local",
+        "filter.evil.clean",
+        &poke.display().to_string(),
+    ]);
+    make_stat_dirty(&fixture.root.join("tracked.txt"));
+    assert_branch_graph_keeps_commit(
+        &fixture,
+        &marker,
+        "branch_graph ran filter.evil.clean from the repository while reading the history log",
+    );
+}
+
+#[test]
+fn stat_dirty_process_filter_is_not_executed_on_branch_graph() {
+    let fixture = Fixture::with_tracked_commit();
+    let marker = fixture.marker("graph-process-filter");
+    let poke = poke_script(fixture.tmp.path(), "graph-process-poke.sh", &marker);
+    fixture.write(".gitattributes", "* filter=evil\n");
+    fixture.git(&[
+        "config",
+        "--local",
+        "filter.evil.process",
+        &poke.display().to_string(),
+    ]);
+    make_stat_dirty(&fixture.root.join("tracked.txt"));
+    assert_branch_graph_keeps_commit(
+        &fixture,
+        &marker,
+        "branch_graph ran filter.evil.process from the repository while reading the history log",
+    );
+}
+
+#[test]
+fn repo_alias_log_is_not_executed_on_branch_graph() {
+    let fixture = Fixture::with_tracked_commit();
+    let marker = fixture.marker("graph-alias-log");
+    let poke = poke_script(fixture.tmp.path(), "graph-alias-log.sh", &marker);
+    fixture.git(&[
+        "config",
+        "--local",
+        "alias.log",
+        &format!("!{}", poke.display()),
+    ]);
+    assert_branch_graph_keeps_commit(&fixture, &marker, "alias.log during branch_graph");
+}
+
+#[test]
+fn inherited_git_trace_variables_do_not_write_during_branch_graph() {
+    let fixture = Fixture::with_tracked_commit();
+    for var in ["GIT_TRACE", "GIT_TRACE2", "GIT_TRACE2_EVENT"] {
+        assert_git_honors_trace_var(&fixture.git, var, fixture.tmp.path());
+    }
+    let oid = fixture.git(&["rev-parse", "HEAD"]);
+    let trace = fixture.marker("graph.git.trace");
+    let trace2 = fixture.marker("graph.git.trace2");
+    let trace2_event = fixture.marker("graph.git.trace2.event");
+    let extra = [
+        ("GIT_TRACE", trace.display().to_string()),
+        ("GIT_TRACE2", trace2.display().to_string()),
+        ("GIT_TRACE2_EVENT", trace2_event.display().to_string()),
+        (CHILD_TIP, oid),
+    ];
+    assert_child_opens(&ChildCheck {
+        target: &fixture.root,
+        branch: "main",
+        action: "graph",
+        // The graph action reads this as the commit summary, not the full log text.
+        history: Some("first"),
+        marker: Some(&trace),
+        required_var: "GIT_TRACE",
+        config_key: None,
+        config_value: None,
+        extra_env: &extra,
+    });
+    assert_did_not_run(&trace2, "GIT_TRACE2 during branch_graph");
+    assert_did_not_run(&trace2_event, "GIT_TRACE2_EVENT during branch_graph");
+}
+
+#[test]
+fn slow_branch_graph_log_times_out_and_returns() {
+    let tmp = TempDir::with_prefix("cthulhu-adv-a-slow-log-").expect("temp dir");
+    let fake = link_fake(tmp.path(), "git");
+    write_mode(&fake, "slow-log");
+    let git = probe_fake(&fake);
+    let workdir = tmp.path().join("workdir");
+    fs::create_dir(&workdir).expect("workdir");
+    let sleeper = sidecar(&fake, ".sleeper");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let tip = graph_tip("main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let _ = tx.send(branch_graph(&git, &workdir, &[tip], GRAPH_LOG_LIMIT));
+    });
+    // `tmp` stays here so the sleeper pid file is not deleted before the assert.
+    // The fake sleeps 120s. The command timeout is 60s. Do not join the worker.
+    let started = Instant::now();
+    match rx.recv_timeout(Duration::from_secs(90)) {
+        Ok(Err(GitError::TimedOut { command, limit })) => {
+            assert_history_log_command(&command);
+            assert_eq!(limit, Duration::from_secs(60));
+            assert!(
+                started.elapsed() >= Duration::from_secs(50),
+                "history log returned in {:?}, before the command timeout",
+                started.elapsed()
+            );
+            assert_recorded_pid_is_dead(&sleeper);
+        }
+        Ok(Ok(graph)) => panic!(
+            "a log that sleeps past the command timeout returned a graph ({} rows)",
+            graph.rows.len()
+        ),
+        Ok(Err(error)) => panic!(
+            "a log that sleeps past the command timeout must return TimedOut; got {}",
+            brief_error(&error)
+        ),
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+            "branch_graph still running after 90s; a slow history log must hit the command timeout and return"
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("branch_graph thread exited without a result");
+        }
+    }
+    drop(tmp);
+}
+
+#[test]
+fn branch_graph_log_output_bomb_is_capped() {
+    let tmp = TempDir::with_prefix("cthulhu-adv-a-log-bomb-").expect("temp dir");
+    let fake = link_fake(tmp.path(), "git");
+    write_mode(&fake, "bomb-log");
+    let git = probe_fake(&fake);
+    let workdir = tmp.path().join("workdir");
+    fs::create_dir(&workdir).expect("workdir");
+    let producer = sidecar(&fake, ".producer");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let tip = graph_tip("main", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let _ = tx.send(branch_graph(&git, &workdir, &[tip], GRAPH_LOG_LIMIT));
+    });
+    // `tmp` stays here so the producer pid file is not deleted before the assert.
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Err(GitError::OutputLimit { command })) => {
+            assert_history_log_command(&command);
+            assert_recorded_pid_is_dead(&producer);
+        }
+        Ok(Ok(graph)) => panic!(
+            "branch_graph accepted unbounded log stdout ({} rows)",
+            graph.rows.len()
+        ),
+        Ok(Err(error)) => panic!(
+            "log stdout over 8 MiB must be refused with a typed output-limit error; got {}",
+            brief_error(&error)
+        ),
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+            "branch_graph still running after 5s while the history log wrote past the output cap"
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("branch_graph thread exited without a result");
+        }
+    }
+    drop(tmp);
+}
+
 #[test]
 fn not_a_repository_substring_inside_a_different_fatal_is_not_that_error() {
     let fixture = Fixture::with_tracked_commit();
@@ -1586,29 +1881,66 @@ fn child_opens_repo_despite_hostile_environment() {
         return;
     }
 
-    let info = inspect(&git, Path::new(&target)).expect("inspect target");
-    assert_eq!(
-        info.root,
-        PathBuf::from(env::var(CHILD_ROOT).expect("expected root"))
-    );
-    assert_eq!(
-        info.head,
-        Head::Branch(env::var(CHILD_BRANCH).expect("expected branch"))
-    );
-
-    if action == "history" {
-        let history = history(&git, &info.root, &info.head, 10).expect("history");
-        let got = history
-            .commits
-            .iter()
-            .map(|commit| format!("{} {}", commit.oid, commit.summary))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(
-            got,
-            env::var(CHILD_HISTORY).expect("expected history"),
-            "history did not match the real commits"
+    if action == "graph" {
+        let oid = env::var(CHILD_TIP).expect("parent sets the tip oid");
+        let branch = env::var(CHILD_BRANCH).expect("expected branch");
+        // `CHILD_HISTORY` is the commit summary for this action.
+        let expected = env::var(CHILD_HISTORY).expect("expected summary");
+        let loaded = branch_graph(
+            &git,
+            Path::new(&target),
+            &[graph_tip(&branch, oid)],
+            GRAPH_LOG_LIMIT,
         );
+        for var in ["GIT_TRACE", "GIT_TRACE2", "GIT_TRACE2_EVENT"] {
+            let path = env::var(var).unwrap_or_else(|_| panic!("parent did not export {var}"));
+            assert!(!path.is_empty(), "parent exported an empty {var}");
+            assert!(
+                !Path::new(&path).exists(),
+                "hostile {var} wrote {path} during branch_graph"
+            );
+        }
+        let graph = loaded.unwrap_or_else(|error| {
+            panic!("branch_graph failed under the hostile environment: {error}")
+        });
+        assert_eq!(
+            graph
+                .rows
+                .iter()
+                .map(|row| row.summary.as_str())
+                .collect::<Vec<_>>(),
+            [expected.as_str()],
+            "branch_graph did not return the real commit"
+        );
+        assert!(
+            !graph.truncated,
+            "branch_graph truncated a one-commit history"
+        );
+    } else {
+        let info = inspect(&git, Path::new(&target)).expect("inspect target");
+        assert_eq!(
+            info.root,
+            PathBuf::from(env::var(CHILD_ROOT).expect("expected root"))
+        );
+        assert_eq!(
+            info.head,
+            Head::Branch(env::var(CHILD_BRANCH).expect("expected branch"))
+        );
+
+        if action == "history" {
+            let history = history(&git, &info.root, &info.head, 10).expect("history");
+            let got = history
+                .commits
+                .iter()
+                .map(|commit| format!("{} {}", commit.oid, commit.summary))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                got,
+                env::var(CHILD_HISTORY).expect("expected history"),
+                "history did not match the real commits"
+            );
+        }
     }
 
     if let Ok(marker) = env::var(CHILD_MARKER) {
