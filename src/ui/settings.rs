@@ -43,6 +43,7 @@ enum Page {
     Terminal,
     History,
     GitHubAuth,
+    About,
 }
 
 #[derive(Clone, Default)]
@@ -51,10 +52,56 @@ struct FontPicker {
     query: String,
 }
 
-/// What the History and GitHub Auth pages read.
+/// What the History, GitHub Auth, and About pages read.
 pub struct SettingsView {
     pub author_avatars: bool,
     pub api_status: ApiStatus,
+    /// A folder dialog or a repository open is already in progress.
+    pub busy: bool,
+    pub about: AboutInfo,
+}
+
+/// Identity shown on the About page. Tests pass fixed strings; the app fills
+/// them from the build and from `git --version`.
+pub struct AboutInfo {
+    pub version: String,
+    pub version_date: String,
+    pub commit: String,
+    pub license: String,
+    pub description: String,
+    pub repository: String,
+    pub git_version: String,
+}
+
+impl AboutInfo {
+    pub fn current(git_version: &str) -> Self {
+        Self {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            version_date: env!("CTHULHU_GIT_COMMIT_DATE").to_owned(),
+            commit: env!("CTHULHU_GIT_COMMIT").to_owned(),
+            license: env!("CARGO_PKG_LICENSE").to_owned(),
+            description: env!("CARGO_PKG_DESCRIPTION").to_owned(),
+            repository: env!("CARGO_PKG_REPOSITORY").to_owned(),
+            git_version: git_version.to_owned(),
+        }
+    }
+
+    /// One block for a bug report. The repository URL is included as stored.
+    pub fn copy_text(&self) -> String {
+        format!(
+            "Cthulhu-Git {version}\nVersion date: {date}\nCommit: {commit}\nLicense: {license}\nGit: {git}\n{repository}",
+            version = self.version,
+            date = self.version_date,
+            commit = self.commit,
+            license = self.license,
+            git = self.git_version,
+            repository = self.repository,
+        )
+    }
+
+    fn releases_url(&self) -> String {
+        format!("{}/releases", self.repository.trim_end_matches('/'))
+    }
 }
 
 pub fn show(
@@ -95,6 +142,22 @@ pub fn show(
                 {
                     actions.push(Action::Home);
                 }
+                let folder_tint = if view_state.busy {
+                    palette.text_muted
+                } else {
+                    palette.text
+                };
+                if icons::icon_button_enabled(
+                    ui,
+                    Icon::Folder,
+                    folder_tint,
+                    "Open a folder",
+                    !view_state.busy,
+                )
+                .clicked()
+                {
+                    actions.push(Action::Browse);
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
                         RichText::new("Settings")
@@ -130,6 +193,9 @@ pub fn show(
                     {
                         page = Page::GitHubAuth;
                     }
+                    if nav_button(ui, "About", Icon::Info, page == Page::About).clicked() {
+                        page = Page::About;
+                    }
                 });
         });
 
@@ -164,6 +230,7 @@ pub fn show(
                     Page::GitHubAuth => {
                         github_page(ui, &palette, github, &view_state.api_status);
                     }
+                    Page::About => about_page(ui, &palette, &view_state.about),
                 }
             });
     });
@@ -217,6 +284,52 @@ fn terminal_page(
     }
     ui.add_space(8.0);
     font_hint(ui, palette, view);
+}
+
+fn about_page(ui: &mut Ui, palette: &Palette, about: &AboutInfo) {
+    page_title(ui, palette, "Cthulhu-Git", &about.description);
+    about_row(ui, palette, "Version", &about.version, false);
+    about_row(ui, palette, "Version date", &about.version_date, false);
+    about_row(ui, palette, "Commit", &about.commit, true);
+    about_row(ui, palette, "License", &about.license, false);
+    about_row(ui, palette, "Git", &about.git_version, false);
+    ui.add_space(8.0);
+
+    ui.horizontal(|ui| {
+        icons::icon(ui, Icon::GitHub, palette.text);
+        ui.hyperlink_to(
+            RichText::new(&about.repository).color(palette.accent),
+            &about.repository,
+        );
+    });
+    let releases = about.releases_url();
+    ui.hyperlink_to(RichText::new(&releases).color(palette.accent), &releases);
+    ui.add_space(12.0);
+
+    if ui
+        .add(Button::new("Copy version info"))
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .clicked()
+    {
+        ui.ctx().copy_text(about.copy_text());
+    }
+    ui.add_space(16.0);
+    muted(ui, palette, "Copyright 2026 Fernando Diaz");
+}
+
+fn about_row(ui: &mut Ui, palette: &Palette, label: &str, value: &str, monospace: bool) {
+    ui.label(RichText::new(label).small().color(palette.text_muted));
+    ui.add_space(2.0);
+    let mut text = RichText::new(value).color(if monospace {
+        palette.hash
+    } else {
+        palette.text
+    });
+    if monospace {
+        text = text.monospace();
+    }
+    ui.label(text);
+    ui.add_space(10.0);
 }
 
 fn page_title(ui: &mut Ui, palette: &Palette, title: &str, subtitle: &str) {

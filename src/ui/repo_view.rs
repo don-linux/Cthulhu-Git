@@ -1,16 +1,16 @@
 //! Repository screen. A top bar with the branch and detail toggles and the
 //! repository name, a sidebar of local branches, the commit history in the
 //! middle ([`super::history`]), the latest commit on the right with the
-//! terminal beneath it, and a bottom bar with the Home and Settings buttons,
-//! the current branch with fetch and pull, and the terminal toggle at the
-//! right end.
+//! terminal beneath it, and a bottom bar with Home, a folder shortcut and
+//! Settings, the current branch (a menu that checks out another local branch),
+//! fetch and pull, and the terminal toggle at the right end.
 
 use cthulhu_git::git::{Branch, Head, Person, Upstream};
 use cthulhu_git::github::RepoContext;
 use cthulhu_git::settings::HistoryColumns;
 use eframe::egui::{
-    self, Align, Color32, CursorIcon, Frame, Label, Layout, Margin, Pos2, Rect, RichText,
-    ScrollArea, Sense, Stroke, Ui, Vec2,
+    self, Align, Button, Color32, CursorIcon, Frame, Label, Layout, Margin, Pos2, Rect, RichText,
+    ScrollArea, Sense, Stroke, Ui, Vec2, containers::menu::MenuButton,
 };
 
 use super::avatars::{self, AvatarService};
@@ -37,6 +37,8 @@ pub struct ViewState<'a> {
     pub terminal_open: bool,
     pub syncing: Option<SyncKind>,
     pub columns: HistoryColumns,
+    /// A folder dialog or a repository open is already in progress.
+    pub busy: bool,
 }
 
 pub fn show(
@@ -77,23 +79,53 @@ pub fn show(
                 {
                     actions.push(Action::Home);
                 }
+                let folder_tint = if state.busy {
+                    palette.text_muted
+                } else {
+                    palette.text
+                };
+                if icons::icon_button_enabled(
+                    ui,
+                    Icon::Folder,
+                    folder_tint,
+                    "Open a folder",
+                    !state.busy,
+                )
+                .clicked()
+                {
+                    actions.push(Action::Browse);
+                }
                 if icons::icon_button(ui, Icon::Settings, palette.text, "Settings").clicked() {
                     actions.push(Action::OpenSettings);
                 }
                 ui.separator();
-                let (branch, color) = branch_text(&repo.info.head, &palette);
-                icons::icon(ui, Icon::GitBranch, color).on_hover_text("Current branch");
+                let (branch_label, branch_color) = branch_text(&repo.info.head, &palette);
                 let offer = sync_offer(&repo.info.head, &repo.branches);
-                let (fetch_on, pull_on, fetch_hover, pull_hover) = match syncing {
-                    Some(SyncKind::Fetch) => (false, false, "Fetching…", "Fetching…"),
-                    Some(SyncKind::Pull) => (false, false, "Pulling…", "Pulling…"),
-                    None => (
-                        offer.fetch_upstream.is_some(),
-                        offer.pull,
-                        offer.fetch_hover,
-                        offer.pull_hover,
-                    ),
-                };
+                let (fetch_on, pull_on, fetch_hover, pull_hover, branch_on, branch_hover) =
+                    match syncing {
+                        Some(SyncKind::Fetch) => {
+                            (false, false, "Fetching…", "Fetching…", false, "Fetching…")
+                        }
+                        Some(SyncKind::Pull) => {
+                            (false, false, "Pulling…", "Pulling…", false, "Pulling…")
+                        }
+                        Some(SyncKind::Checkout) => (
+                            false,
+                            false,
+                            "Switching…",
+                            "Switching…",
+                            false,
+                            "Switching…",
+                        ),
+                        None => (
+                            offer.fetch_upstream.is_some(),
+                            offer.pull,
+                            offer.fetch_hover,
+                            offer.pull_hover,
+                            true,
+                            "Switch branch",
+                        ),
+                    };
                 let (terminal_tint, terminal_hover) = if terminal_open {
                     (palette.accent, "Hide terminal")
                 } else {
@@ -113,7 +145,16 @@ pub fn show(
                             let max_name = (ui.available_width() - reserve).max(0.0);
                             ui.scope(|ui| {
                                 ui.set_max_width(max_name);
-                                ui.add(Label::new(branch).truncate());
+                                if let Some(name) = branch_menu(
+                                    ui,
+                                    repo,
+                                    branch_label,
+                                    branch_color,
+                                    branch_on,
+                                    branch_hover,
+                                ) {
+                                    actions.push(Action::Checkout(name));
+                                }
                             });
                             if sync_labeled(
                                 ui,
@@ -606,6 +647,49 @@ fn sync_labeled(
 ) -> bool {
     let color = if enabled { tint } else { muted };
     icons::icon_text_button(ui, icon, word, color, hover, enabled).clicked()
+}
+
+/// Icon and branch name. Click opens the local branches; choosing another one
+/// checks it out. The current row is marked and does not emit a checkout.
+fn branch_menu(
+    ui: &mut Ui,
+    repo: &OpenedRepo,
+    label: RichText,
+    color: Color32,
+    enabled: bool,
+    hover: &str,
+) -> Option<String> {
+    let button = Button::image_and_text(icons::tinted(ui, Icon::GitBranch, color), label)
+        .frame_when_inactive(false)
+        .truncate();
+    let (response, picked) = if enabled {
+        let (response, inner) = MenuButton::from_button(button).ui(ui, |ui| pick_branch(ui, repo));
+        (response, inner.and_then(|inner| inner.inner))
+    } else {
+        (ui.add_enabled(false, button), None)
+    };
+    let response = response.on_hover_text(hover);
+    if enabled {
+        response.on_hover_cursor(CursorIcon::PointingHand);
+    }
+    picked
+}
+
+fn pick_branch(ui: &mut Ui, repo: &OpenedRepo) -> Option<String> {
+    if repo.branches.is_empty() {
+        ui.label("No branches.");
+        return None;
+    }
+    ui.set_min_width(160.0);
+    let mut chosen = None;
+    for listed in &repo.branches {
+        let current = listed.branch.current;
+        if ui.selectable_label(current, &listed.branch.name).clicked() && !current {
+            ui.close();
+            chosen = Some(listed.branch.name.clone());
+        }
+    }
+    chosen
 }
 
 /// The branch name, and the color its icon shares with it.

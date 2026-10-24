@@ -86,15 +86,18 @@ pub enum Action {
     /// `upstream` is `%(upstream:short)`, for example `origin/main`.
     Fetch(String),
     Pull,
+    /// Local branch to check out. The name is the short ref, unchanged.
+    Checkout(String),
     SetHistoryColumns(HistoryColumns),
     SetAuthorAvatars(bool),
 }
 
-/// A fetch or pull running against the open repository.
+/// A fetch, pull, or branch switch running against the open repository.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SyncKind {
     Fetch,
     Pull,
+    Checkout,
 }
 
 enum Screen {
@@ -140,6 +143,9 @@ pub struct CthulhuApp {
     sync_job: Option<SyncJob>,
     avatars: AvatarService,
     github: GitHubAuth,
+    /// `git --version` for the About page. `None` until Settings has asked.
+    git_version: Option<String>,
+    git_probe: Option<Receiver<String>>,
 }
 
 /// Downloaded avatars, beside the settings in the per-user cache folder.
@@ -193,11 +199,44 @@ impl CthulhuApp {
             sync_job: None,
             avatars,
             github,
+            git_version: None,
+            git_probe: None,
         };
         if let Some(path) = startup {
             app.open(ctx, path);
         }
         app
+    }
+
+    /// One `git --version` the first time Settings opens. Later visits reuse it.
+    fn ensure_git_version(&mut self, ctx: &egui::Context) {
+        if self.git_version.is_some() || self.git_probe.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let text = match Git::discover() {
+                Ok(git) => git.version.to_string(),
+                Err(_) => "Not found".to_owned(),
+            };
+            let _ = sender.send(text);
+            ctx.request_repaint();
+        });
+        self.git_probe = Some(receiver);
+    }
+
+    fn poll_git_version(&mut self) {
+        let Some(probe) = &self.git_probe else {
+            return;
+        };
+        let text = match probe.try_recv() {
+            Ok(text) => text,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => "Not found".to_owned(),
+        };
+        self.git_version = Some(text);
+        self.git_probe = None;
     }
 
     fn poll_github(&mut self, ctx: &egui::Context) {
@@ -324,6 +363,10 @@ impl eframe::App for CthulhuApp {
         self.avatars.poll(ui.ctx());
         self.fonts
             .sync(ui.ctx(), self.settings.terminal_font.as_deref());
+        if self.settings_open {
+            self.ensure_git_version(ui.ctx());
+        }
+        self.poll_git_version();
 
         let syncing = self.sync_for_open_repo();
         let actions = if self.settings_open {
@@ -338,9 +381,19 @@ impl eframe::App for CthulhuApp {
                 Screen::Home => None,
             };
             terminal::service(ui.ctx(), &mut self.font_preview);
+            let git_label = self
+                .git_version
+                .as_deref()
+                .unwrap_or(if self.git_probe.is_some() {
+                    "Checking…"
+                } else {
+                    "Not found"
+                });
             let view = settings::SettingsView {
                 author_avatars: self.settings.author_avatars,
                 api_status: self.avatars.api_status(),
+                busy: self.opening.is_some() || self.picker.is_some(),
+                about: settings::AboutInfo::current(git_label),
             };
             settings::show(
                 ui,
@@ -374,6 +427,7 @@ impl eframe::App for CthulhuApp {
                         terminal_open: !self.settings.terminal_hidden,
                         syncing,
                         columns: self.settings.history_columns,
+                        busy: self.opening.is_some() || self.picker.is_some(),
                     },
                     &mut self.avatars,
                 ),
@@ -383,8 +437,11 @@ impl eframe::App for CthulhuApp {
         for action in actions {
             match action {
                 Action::Browse => {
-                    self.error = None;
-                    self.picker = Some(FolderPicker::open(ui.ctx(), frame, self.browse_start()));
+                    if self.picker.is_none() && self.opening.is_none() {
+                        self.error = None;
+                        self.picker =
+                            Some(FolderPicker::open(ui.ctx(), frame, self.browse_start()));
+                    }
                 }
                 Action::Open(path) => {
                     self.error = None;
@@ -430,6 +487,9 @@ impl eframe::App for CthulhuApp {
                 }
                 Action::Pull => {
                     self.start_sync(ui.ctx(), SyncCommand::Pull);
+                }
+                Action::Checkout(name) => {
+                    self.start_sync(ui.ctx(), SyncCommand::Checkout(name));
                 }
                 Action::SetHistoryColumns(columns) => {
                     let columns = columns.normalized();
@@ -511,6 +571,7 @@ fn reload_repo(git: &Git, path: &Path) -> Result<Refreshed, String> {
 enum SyncCommand {
     Fetch(String),
     Pull,
+    Checkout(String),
 }
 
 struct SyncJob {
@@ -527,6 +588,9 @@ fn run_sync(root: &Path, command: SyncCommand) -> Result<Refreshed, String> {
         }
         SyncCommand::Pull => {
             git::pull_ff_only(&git, root).map_err(|error| error.to_string())?;
+        }
+        SyncCommand::Checkout(name) => {
+            git::switch_branch(&git, root, name).map_err(|error| error.to_string())?;
         }
     }
     reload_repo(&git, root)
@@ -613,6 +677,7 @@ impl CthulhuApp {
         let kind = match &command {
             SyncCommand::Fetch(_) => SyncKind::Fetch,
             SyncCommand::Pull => SyncKind::Pull,
+            SyncCommand::Checkout(_) => SyncKind::Checkout,
         };
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
@@ -653,7 +718,15 @@ impl CthulhuApp {
         }
         match result {
             Ok(refreshed) => {
+                let switched = job.kind == SyncKind::Checkout;
                 apply_refresh(repo, refreshed);
+                if switched {
+                    for listed in &mut repo.branches {
+                        if listed.branch.current {
+                            listed.checked = true;
+                        }
+                    }
+                }
                 self.error = None;
             }
             Err(message) => self.error = Some(message),

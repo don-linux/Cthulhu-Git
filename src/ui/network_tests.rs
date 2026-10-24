@@ -19,6 +19,7 @@ use cthulhu_git::git::{
 use cthulhu_git::github::ApiStatus;
 use cthulhu_git::settings::HistoryColumns;
 use eframe::egui::accesskit::{Role, Toggled};
+use eframe::egui::output::OutputCommand;
 use eframe::egui::{self, ColorImage};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
@@ -32,7 +33,7 @@ use super::fonts::FontService;
 use super::github_auth::{GitHubAuth, Stored};
 use super::hover::{self, HoverCache, Segment};
 use super::repo_view;
-use super::settings::{self, SettingsView};
+use super::settings::{self, AboutInfo, SettingsView};
 use super::theme;
 use super::{Action, ListedBranch, OpenedRepo};
 
@@ -657,6 +658,7 @@ fn action_label(action: &Action) -> String {
         Action::EnsureFontCatalog => "EnsureFontCatalog".to_owned(),
         Action::Fetch(upstream) => format!("Fetch({upstream})"),
         Action::Pull => "Pull".to_owned(),
+        Action::Checkout(name) => format!("Checkout({name})"),
         Action::SetHistoryColumns(_) => "SetHistoryColumns".to_owned(),
         Action::SetAuthorAvatars(on) => format!("SetAuthorAvatars({on})"),
     }
@@ -669,7 +671,7 @@ type SettingsHarness = (
     Rc<RefCell<Vec<Action>>>,
 );
 
-fn open_settings() -> SettingsHarness {
+fn open_settings_with(about: AboutInfo) -> SettingsHarness {
     let github = Rc::new(RefCell::new(GitHubAuth::default()));
     let github_ui = Rc::clone(&github);
     let actions = Rc::new(RefCell::new(Vec::new()));
@@ -679,6 +681,8 @@ fn open_settings() -> SettingsHarness {
     let view = SettingsView {
         author_avatars: true,
         api_status: ApiStatus::default(),
+        busy: false,
+        about,
     };
     let harness = Harness::builder()
         .with_size(egui::Vec2::new(1100.0, 1600.0))
@@ -697,6 +701,33 @@ fn open_settings() -> SettingsHarness {
             *actions_ui.borrow_mut() = produced;
         });
     (harness, github, actions)
+}
+
+fn open_settings() -> SettingsHarness {
+    open_settings_with(AboutInfo::current("2.43.0"))
+}
+
+/// egui appends [`OutputCommand`]s across passes. A click is the suffix when
+/// the previous commands are still in front; otherwise the frame replaced them.
+fn commands_since<'a>(
+    previous: &[OutputCommand],
+    harness: &'a Harness<'_, ()>,
+) -> &'a [OutputCommand] {
+    let commands = &harness.output().platform_output.commands;
+    commands.strip_prefix(previous).unwrap_or(commands)
+}
+
+fn opened_url<'a>(commands: &'a [OutputCommand], url: &str) -> Option<&'a str> {
+    commands.iter().find_map(|command| match command {
+        OutputCommand::OpenUrl(open) if open.url == url => Some(open.url.as_str()),
+        _ => None,
+    })
+}
+
+fn assert_no_token_material(text: &str) {
+    for needle in ["?", "@", "ghp_", "github_pat_", FAKE_TOKEN] {
+        assert!(!text.contains(needle), "{text:?} contains {needle}");
+    }
 }
 
 #[test]
@@ -784,6 +815,147 @@ fn settings_hides_the_token_and_history_toggles_avatars() {
     harness.step();
     let got: Vec<_> = actions.borrow().iter().map(action_label).collect();
     assert_eq!(got, vec!["SetAuthorAvatars(false)".to_owned()], "{got:?}");
+}
+
+#[test]
+fn about_shows_the_commit_and_a_repository_url_without_a_token() {
+    // Fixed strings. AboutInfo::current would embed the real build commit.
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    let version = env!("CARGO_PKG_VERSION");
+    let version_date = "2026-10-24";
+    let license = env!("CARGO_PKG_LICENSE");
+    let git_version = "2.43.0";
+    let repository = env!("CARGO_PKG_REPOSITORY");
+    let releases = format!("{repository}/releases");
+    assert_eq!(repository, "https://github.com/don-linux/Cthulhu-Git");
+    assert_eq!(
+        releases,
+        "https://github.com/don-linux/Cthulhu-Git/releases"
+    );
+    assert_no_token_material(repository);
+    assert_no_token_material(&releases);
+
+    let (mut harness, github, _actions) = open_settings_with(AboutInfo {
+        version: version.to_owned(),
+        version_date: version_date.to_owned(),
+        commit: COMMIT.to_owned(),
+        license: license.to_owned(),
+        description: env!("CARGO_PKG_DESCRIPTION").to_owned(),
+        repository: repository.to_owned(),
+        git_version: git_version.to_owned(),
+    });
+
+    click_label(&mut harness, "GitHub Auth");
+    assert!(
+        harness.query_by_label_contains("Paste it here").is_some(),
+        "GitHub Auth did not open\n{}",
+        label_dump(&harness)
+    );
+    {
+        password_field(&harness).click();
+    }
+    harness.step();
+    {
+        password_field(&harness).type_text(FAKE_TOKEN);
+    }
+    harness.step();
+    {
+        let auth = github.borrow();
+        assert_eq!(auth.draft, FAKE_TOKEN, "the field did not take the token");
+        assert!(!auth.busy(), "typing started a keychain or network task");
+        assert!(!auth.has_token(), "typing stored a token");
+        assert_eq!(auth.stored(), Stored::None);
+        assert!(auth.notice().is_none(), "typing produced a notice");
+    }
+
+    click_label(&mut harness, "About");
+    assert_eq!(
+        github.borrow().draft,
+        FAKE_TOKEN,
+        "leaving GitHub Auth dropped the typed token"
+    );
+
+    let mut tops = Vec::new();
+    for label in ["Terminal", "History", "GitHub Auth", "About"] {
+        tops.push(harness.get_by_label(label).rect().top());
+    }
+    let about_top = tops[3];
+    assert!(
+        tops[..3].iter().all(|top| about_top > *top),
+        "About top {about_top}, nav tops {tops:?}"
+    );
+
+    for label in [
+        version,
+        version_date,
+        COMMIT,
+        license,
+        git_version,
+        repository,
+    ] {
+        harness.get_by_label(label);
+    }
+
+    // node_strings reads access.url() while walking every node. A link target
+    // that shows up there has to be the repository or the releases page.
+    let mut urls = Vec::new();
+    for_each_node(&harness, |node| {
+        if let Some(url) = node.accesskit_node().url() {
+            urls.push(url.to_owned());
+        }
+    });
+    for url in &urls {
+        assert!(
+            url == repository || url == &releases,
+            "access url {url:?} is not the repository or the releases page\n{urls:?}"
+        );
+        assert_no_token_material(url);
+    }
+
+    let previous = harness.output().platform_output.commands.clone();
+    click_label(&mut harness, repository);
+    let fresh = commands_since(&previous, &harness);
+    let opened = opened_url(fresh, repository).unwrap_or_else(|| {
+        panic!(
+            "no OpenUrl for the repository\nfresh: {fresh:?}\nall: {:?}",
+            harness.output().platform_output.commands
+        )
+    });
+    assert_no_token_material(opened);
+
+    let previous = harness.output().platform_output.commands.clone();
+    click_label(&mut harness, &releases);
+    let fresh = commands_since(&previous, &harness);
+    let opened = opened_url(fresh, &releases).unwrap_or_else(|| {
+        panic!(
+            "no new OpenUrl for releases\nfresh: {fresh:?}\nall: {:?}",
+            harness.output().platform_output.commands
+        )
+    });
+    assert_no_token_material(opened);
+
+    assert!(
+        !tree_contains(&harness, FAKE_TOKEN),
+        "token leaked on the About page\n{}",
+        label_dump(&harness)
+    );
+
+    let previous = harness.output().platform_output.commands.clone();
+    click_label(&mut harness, "Copy version info");
+    let fresh = commands_since(&previous, &harness);
+    let copied = fresh.iter().find_map(|command| match command {
+        OutputCommand::CopyText(text)
+            if text.contains(version)
+                && text.contains(COMMIT)
+                && text.contains("https://github.com/don-linux/Cthulhu-Git") =>
+        {
+            Some(text.as_str())
+        }
+        _ => None,
+    });
+    let copied = copied
+        .unwrap_or_else(|| panic!("CopyText missing version, commit, or repository\n{fresh:?}"));
+    assert_no_token_material(copied);
 }
 
 fn hover_repo() -> OpenedRepo {
@@ -874,6 +1046,7 @@ fn history_hover_card_names_the_author_and_coauthor() {
                     terminal_open: false,
                     syncing: None,
                     columns: HistoryColumns::default(),
+                    busy: false,
                 },
                 &mut AvatarService::disabled(),
             );

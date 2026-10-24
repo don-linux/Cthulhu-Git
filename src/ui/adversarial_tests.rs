@@ -9,12 +9,15 @@
 //! [`Harness::run`](egui_kittest::Harness::run) is not used; settle with
 //! [`Harness::step`](egui_kittest::Harness::step) instead.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(unix)]
 use std::process::Output;
+use std::rc::Rc;
 use std::thread;
 use std::time::Duration;
 
@@ -22,18 +25,23 @@ use cthulhu_git::git::{
     Branch, Commit, CommitDetail, GraphCommit, GraphTip, Head, Person, RepoInfo, Upstream,
     layout_graph,
 };
+use cthulhu_git::github::ApiStatus;
 use cthulhu_git::settings::{HistoryColumns, Settings};
 use eframe::egui::{self, accesskit::Role};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use tempfile::TempDir;
 
 use super::avatars::AvatarService;
+use super::fonts::FontService;
+use super::github_auth::GitHubAuth;
 use super::home::{self, HomeState};
 use super::hover::HoverCache;
 use super::repo_view;
+use super::settings::{self, AboutInfo, SettingsView};
+use super::terminal::Terminal;
 use super::theme;
-use super::{CthulhuApp, ListedBranch, OpenedRepo, Screen};
+use super::{Action, CthulhuApp, ListedBranch, OpenedRepo, Screen, SyncKind};
 
 const CHILD_ENV: &str = "CTHULHU_ADVERSARIAL_UI_CHILD";
 const WINDOW_SIZE: egui::Vec2 = egui::Vec2::new(520.0, 400.0);
@@ -307,42 +315,29 @@ fn click_extreme_button<State>(harness: &Harness<'_, State>, top: bool) {
     buttons[chosen].click();
 }
 
-fn bottom_bar_buttons<State>(harness: &Harness<'_, State>) -> Vec<egui::Rect> {
+fn bar_buttons<State>(harness: &Harness<'_, State>, top: bool) -> Vec<egui::Rect> {
     let buttons: Vec<_> = harness
         .query_all_by_role(Role::Button)
         .map(|button| button.rect())
         .collect();
-    let bottom_y = buttons
-        .iter()
-        .map(|rect| rect.center().y)
-        .fold(f32::MIN, f32::max);
+    let edge = buttons.iter().map(|rect| rect.center().y).fold(
+        if top { f32::MAX } else { f32::MIN },
+        if top { f32::min } else { f32::max },
+    );
     let mut row: Vec<_> = buttons
         .into_iter()
-        .filter(|rect| (rect.center().y - bottom_y).abs() < 8.0)
+        .filter(|rect| (rect.center().y - edge).abs() < 8.0)
         .collect();
     row.sort_by(|left, right| left.left().total_cmp(&right.left()));
     row
 }
 
-fn bottom_bar_label<State>(harness: &Harness<'_, State>, buttons: &[egui::Rect]) -> egui::Rect {
-    let y = buttons[0].center().y;
-    let mut labels: Vec<_> = harness
-        .query_all_by_role(Role::Label)
-        .filter(|label| {
-            let value = label.value();
-            value.as_deref() != Some("Fetch")
-                && value.as_deref() != Some("Pull")
-                && (label.rect().center().y - y).abs() < 8.0
-        })
-        .map(|label| label.rect())
-        .collect();
-    labels.sort_by(|left, right| left.left().total_cmp(&right.left()));
-    assert_eq!(
-        labels.len(),
-        1,
-        "expected the branch name as the only bottom-bar label besides Fetch and Pull"
-    );
-    labels[0]
+fn bottom_bar_buttons<State>(harness: &Harness<'_, State>) -> Vec<egui::Rect> {
+    bar_buttons(harness, false)
+}
+
+fn top_bar_buttons<State>(harness: &Harness<'_, State>) -> Vec<egui::Rect> {
+    bar_buttons(harness, true)
 }
 
 fn click_leftmost_top_button<State>(harness: &Harness<'_, State>) {
@@ -430,9 +425,422 @@ fn show_repo(
             terminal_open,
             syncing: None,
             columns: HistoryColumns::default(),
+            busy: false,
         },
         &mut AvatarService::disabled(),
     )
+}
+
+fn listed_branch(name: &str, current: bool) -> ListedBranch {
+    ListedBranch {
+        branch: Branch {
+            name: name.to_owned(),
+            oid: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            committer_time: Some(1_700_000_000),
+            commit_count: 1,
+            upstream: Upstream::None,
+            current,
+        },
+        checked: current,
+    }
+}
+
+fn repo_at(name: &str, head: Head, branches: Vec<ListedBranch>) -> OpenedRepo {
+    let mut repo = opened(name, vec![commit("one")], false);
+    repo.info.head = head;
+    repo.branches = branches;
+    repo
+}
+
+struct RepoDrive {
+    repo: OpenedRepo,
+    branches_open: bool,
+    detail_open: bool,
+    terminal_open: bool,
+    syncing: Option<SyncKind>,
+    busy: bool,
+}
+
+fn closed_repo(repo: OpenedRepo) -> RepoDrive {
+    RepoDrive {
+        repo,
+        branches_open: false,
+        detail_open: false,
+        terminal_open: false,
+        syncing: None,
+        busy: false,
+    }
+}
+
+type ActionLog = Rc<RefCell<Vec<Action>>>;
+
+/// `show_repo` drops its actions. This keeps the latest frame's list.
+fn drive_repo(drive: RepoDrive) -> (Harness<'static, ()>, Rc<RefCell<RepoDrive>>, ActionLog) {
+    let state = Rc::new(RefCell::new(drive));
+    let state_ui = Rc::clone(&state);
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let actions_ui = Rc::clone(&actions);
+    let mut avatars = AvatarService::disabled();
+    let harness = Harness::builder()
+        .with_size(WINDOW_SIZE)
+        .with_pixels_per_point(PIXELS_PER_POINT)
+        .build_ui(move |ui| {
+            let mut drive = state_ui.borrow_mut();
+            let branches_open = drive.branches_open;
+            let detail_open = drive.detail_open;
+            let terminal_open = drive.terminal_open;
+            let syncing = drive.syncing;
+            let busy = drive.busy;
+            let produced = repo_view::show(
+                ui,
+                &mut drive.repo,
+                &repo_view::ViewState {
+                    error: None,
+                    branches_open,
+                    detail_open,
+                    terminal_open,
+                    syncing,
+                    columns: HistoryColumns::default(),
+                    busy,
+                },
+                &mut avatars,
+            );
+            *actions_ui.borrow_mut() = produced;
+        });
+    (harness, state, actions)
+}
+
+fn about_info() -> AboutInfo {
+    AboutInfo {
+        version: "0.0.0-test".to_owned(),
+        version_date: "2026-01-01".to_owned(),
+        commit: "test".to_owned(),
+        license: "MIT".to_owned(),
+        description: "Adversarial settings harness".to_owned(),
+        repository: "https://example.invalid/cthulhu-git".to_owned(),
+        git_version: "git version 2.43.0".to_owned(),
+    }
+}
+
+fn drive_settings(busy: Rc<RefCell<bool>>) -> (Harness<'static, ()>, ActionLog) {
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let actions_ui = Rc::clone(&actions);
+    let busy_ui = Rc::clone(&busy);
+    let fonts = FontService::default();
+    let mut preview: Option<Terminal> = None;
+    let mut github = GitHubAuth::default();
+    let harness = Harness::builder()
+        .with_size(WINDOW_SIZE)
+        .with_pixels_per_point(PIXELS_PER_POINT)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), theme::DEFAULT_THEME);
+            let view = SettingsView {
+                author_avatars: true,
+                api_status: ApiStatus::default(),
+                busy: *busy_ui.borrow(),
+                about: about_info(),
+            };
+            let produced = settings::show(ui, None, &fonts, &mut preview, None, &view, &mut github);
+            *actions_ui.borrow_mut() = produced;
+        });
+    (harness, actions)
+}
+
+fn button_label(node: &egui_kittest::Node<'_>) -> String {
+    node.accesskit_node().label().unwrap_or_default()
+}
+
+fn bottom_row_nodes<'a, State>(harness: &'a Harness<'_, State>) -> Vec<egui_kittest::Node<'a>> {
+    let nodes: Vec<_> = harness.query_all_by_role(Role::Button).collect();
+    let bottom_y = nodes
+        .iter()
+        .map(|node| node.rect().center().y)
+        .fold(f32::MIN, f32::max);
+    let mut row: Vec<_> = nodes
+        .into_iter()
+        .filter(|node| (node.rect().center().y - bottom_y).abs() < 8.0)
+        .collect();
+    row.sort_by(|left, right| left.rect().left().total_cmp(&right.rect().left()));
+    row
+}
+
+fn buttons_labeled<'a, State>(
+    harness: &'a Harness<'_, State>,
+    name: &str,
+) -> Vec<egui_kittest::Node<'a>> {
+    harness
+        .query_all_by_role(Role::Button)
+        .filter(|node| button_label(node) == name)
+        .collect()
+}
+
+fn button_covering<'a, State>(
+    harness: &'a Harness<'_, State>,
+    rect: egui::Rect,
+) -> egui_kittest::Node<'a> {
+    harness
+        .query_all_by_role(Role::Button)
+        .find(|node| node.rect().contains(rect.center()))
+        .unwrap_or_else(|| panic!("no button contains {rect:?}\n{}", button_dump(harness)))
+}
+
+fn button_dump<State>(harness: &Harness<'_, State>) -> String {
+    harness
+        .query_all_by_role(Role::Button)
+        .map(|node| {
+            format!(
+                "{:?} disabled={} label={:?}",
+                node.rect(),
+                node.accesskit_node().is_disabled(),
+                button_label(&node)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn label_values<State>(harness: &Harness<'_, State>) -> BTreeSet<String> {
+    harness
+        .query_all_by_role(Role::Label)
+        .filter_map(|node| node.value())
+        .collect()
+}
+
+/// Hover `rect` and wait out egui's 0.5s tooltip delay. Default `step_dt` is 0.25s.
+fn hover_tooltip<State>(harness: &mut Harness<'_, State>, rect: egui::Rect) -> String {
+    let before = label_values(harness);
+    harness.hover_at(rect.center());
+    let mut appeared = Vec::new();
+    for _ in 0..8 {
+        harness.step();
+        appeared = label_values(harness)
+            .into_iter()
+            .filter(|label| !before.contains(label))
+            .collect();
+        if !appeared.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        appeared.len(),
+        1,
+        "tooltip at {rect:?} appeared as {appeared:?}\n{}",
+        visible_text(harness)
+    );
+    appeared.remove(0)
+}
+
+fn click_bottom_index<State>(harness: &Harness<'_, State>, index: usize) {
+    let nodes = bottom_row_nodes(harness);
+    assert!(
+        nodes.len() > index,
+        "bottom row has {} buttons\n{}",
+        nodes.len(),
+        button_dump(harness)
+    );
+    nodes[index].click();
+}
+
+fn assert_in_window(rect: egui::Rect, what: &str) {
+    assert!(rect.width() > 1.0, "{what} width {:.2}", rect.width());
+    assert!(rect.height() > 1.0, "{what} height {:.2}", rect.height());
+    assert!(rect.left() >= -1.0, "{what} left {:.2}", rect.left());
+    assert!(
+        rect.right() <= WINDOW_SIZE.x + 1.0,
+        "{what} right {:.2} past {}",
+        rect.right(),
+        WINDOW_SIZE.x
+    );
+}
+
+fn describe_action(action: &Action) -> String {
+    match action {
+        Action::Browse => "Browse".to_owned(),
+        Action::Open(path) => format!("Open({})", path.display()),
+        Action::Home => "Home".to_owned(),
+        Action::OpenSettings => "OpenSettings".to_owned(),
+        Action::CloseSettings => "CloseSettings".to_owned(),
+        Action::ToggleBranchesSidebar => "ToggleBranchesSidebar".to_owned(),
+        Action::ToggleDetailSidebar => "ToggleDetailSidebar".to_owned(),
+        Action::ToggleTerminal => "ToggleTerminal".to_owned(),
+        Action::SetTerminalFont(name) => format!("SetTerminalFont({name:?})"),
+        Action::EnsureFontCatalog => "EnsureFontCatalog".to_owned(),
+        Action::Fetch(upstream) => format!("Fetch({upstream})"),
+        Action::Pull => "Pull".to_owned(),
+        Action::Checkout(name) => format!("Checkout({name})"),
+        Action::SetHistoryColumns(_) => "SetHistoryColumns".to_owned(),
+        Action::SetAuthorAvatars(on) => format!("SetAuthorAvatars({on})"),
+    }
+}
+
+fn describe_actions(actions: &[Action]) -> String {
+    if actions.is_empty() {
+        return "[]".to_owned();
+    }
+    actions
+        .iter()
+        .map(describe_action)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn assert_exact(actions: &[Action], expected: &[&str]) {
+    let got: Vec<String> = actions.iter().map(describe_action).collect();
+    let expected: Vec<String> = expected.iter().copied().map(str::to_owned).collect();
+    assert_eq!(got, expected, "actions");
+}
+
+fn assert_no_checkout(actions: &[Action]) {
+    assert!(
+        actions
+            .iter()
+            .all(|action| !matches!(action, Action::Checkout(_))),
+        "unexpected checkout: {}",
+        describe_actions(actions)
+    );
+}
+
+fn assert_only_checkout(actions: &[Action], name: &str) {
+    assert_eq!(
+        actions.len(),
+        1,
+        "expected one Checkout, got {}",
+        describe_actions(actions)
+    );
+    let Action::Checkout(got) = &actions[0] else {
+        panic!("expected Checkout, got {}", describe_actions(actions));
+    };
+    assert_eq!(got.as_bytes(), name.as_bytes(), "checkout payload bytes");
+}
+
+fn selected_or_disabled(node: &egui_kittest::Node<'_>) -> bool {
+    let access = node.accesskit_node();
+    access.toggled() == Some(egui::accesskit::Toggled::True) || access.is_disabled()
+}
+
+fn on_screen(rect: egui::Rect) -> bool {
+    rect.width() > 1.0
+        && rect.height() > 1.0
+        && rect.center().x >= -1.0
+        && rect.center().x <= WINDOW_SIZE.x + 1.0
+        && rect.center().y >= -1.0
+        && rect.center().y <= WINDOW_SIZE.y + 1.0
+}
+
+/// The opening frame is a sizing pass: rows sit at the origin and are disabled.
+/// A row is ready once it is on screen, off the bottom bar, and can take a click.
+fn menu_row_ready<State>(harness: &Harness<'_, State>, name: &str) -> bool {
+    let bottom_y = bottom_bar_buttons(harness)
+        .first()
+        .map(|rect| rect.center().y)
+        .unwrap_or(f32::MAX);
+    buttons_labeled(harness, name).iter().any(|node| {
+        let rect = node.rect();
+        on_screen(rect)
+            && (rect.center().y - bottom_y).abs() > 8.0
+            && !node.accesskit_node().is_disabled()
+    })
+}
+
+/// The menu popup measures on the opening frame. One extra step places it.
+fn open_branch_menu(harness: &mut Harness<'static, ()>, marker: &str) {
+    if !menu_row_ready(harness, marker) {
+        click_bottom_index(harness, 3);
+        harness.step();
+    }
+    if !menu_row_ready(harness, marker) {
+        harness.step();
+    }
+    assert!(
+        menu_row_ready(harness, marker),
+        "menu did not list {marker}\n{}",
+        button_dump(harness)
+    );
+}
+
+fn click_off_bar(harness: &mut Harness<'static, ()>, name: &str) {
+    off_bar(harness, name).click();
+    harness.step();
+}
+
+/// The selected row's center ignores a pointer click that jumps in from the bar.
+/// A press near the top of the row, then one a few points lower, is taken.
+fn click_selected_row(harness: &mut Harness<'static, ()>, name: &str) {
+    let rect = off_bar(harness, name).rect();
+    let x = rect.center().x;
+    for y in [rect.top() + 2.0, rect.top() + 6.0] {
+        let pos = egui::pos2(x, y);
+        harness.hover_at(pos);
+        harness.step();
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            });
+            harness.step();
+        }
+    }
+}
+
+fn off_bar<'a>(harness: &'a Harness<'_, ()>, name: &str) -> egui_kittest::Node<'a> {
+    let bottom_y = bottom_bar_buttons(harness)[0].center().y;
+    let matches: Vec<_> = buttons_labeled(harness, name)
+        .into_iter()
+        .filter(|node| (node.rect().center().y - bottom_y).abs() > 8.0)
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "off-bar buttons named {name:?}\n{}",
+        button_dump(harness)
+    );
+    matches.into_iter().next().expect("menu row")
+}
+
+struct PaintedText {
+    rect: egui::Rect,
+    elided: bool,
+    text: String,
+}
+
+fn painted_texts<State>(harness: &Harness<'_, State>) -> Vec<PaintedText> {
+    let mut found = Vec::new();
+    for clipped in &harness.output().shapes {
+        collect_text(clipped.clip_rect, &clipped.shape, &mut found);
+    }
+    found
+}
+
+fn collect_text(clip: egui::Rect, shape: &egui::Shape, found: &mut Vec<PaintedText>) {
+    match shape {
+        egui::Shape::Vec(shapes) => {
+            for shape in shapes {
+                collect_text(clip, shape, found);
+            }
+        }
+        egui::Shape::Text(text) => {
+            let painted = text.visual_bounding_rect().intersect(clip);
+            if painted.width() <= 0.0 || painted.height() <= 0.0 {
+                return;
+            }
+            found.push(PaintedText {
+                rect: painted,
+                elided: text.galley.elided,
+                text: text.galley.job.text.clone(),
+            });
+        }
+        _ => {}
+    }
+}
+
+fn sync_name(kind: SyncKind) -> &'static str {
+    match kind {
+        SyncKind::Fetch => "fetch",
+        SyncKind::Pull => "pull",
+        SyncKind::Checkout => "checkout",
+    }
 }
 
 /// One lane, each commit the parent of the one above it, `main` on the newest.
@@ -841,7 +1249,7 @@ fn fetch_and_pull_sit_beside_the_branch_name() {
         ahead: 1,
         behind: 0,
     };
-    let harness = ui_harness(|ui| {
+    let mut harness = ui_harness(|ui| {
         let _ = show_repo(ui, &mut repo, true, true, false);
     });
     assert_text(&harness, "Fetch");
@@ -849,27 +1257,53 @@ fn fetch_and_pull_sit_beside_the_branch_name() {
     let row = bottom_bar_buttons(&harness);
     assert_eq!(
         row.len(),
-        5,
-        "expected home, settings, fetch, pull and terminal on the bottom bar"
+        7,
+        "expected home, folder, settings, branch, fetch, pull and terminal\n{}",
+        button_dump(&harness)
     );
-    let branch = bottom_bar_label(&harness, &row);
-    let name_to_fetch = row[2].left() - branch.right();
-    let pull_to_terminal = row[4].left() - row[3].right();
-    assert!(
-        row[2].left() + 1.0 >= branch.right(),
-        "fetch overlaps the branch name"
+    assert_eq!(
+        hover_tooltip(&mut harness, row[0]),
+        "Open another repository"
     );
-    assert!(row[3].left() + 1.0 >= row[2].right());
+    assert_eq!(hover_tooltip(&mut harness, row[1]), "Open a folder");
+    assert_eq!(hover_tooltip(&mut harness, row[2]), "Settings");
+    let row = bottom_bar_buttons(&harness);
     assert!(
-        pull_to_terminal + 1.0 >= name_to_fetch,
-        "spare width should sit before the terminal, not between the name and fetch \
-         (name gap {name_to_fetch}, pull-to-terminal {pull_to_terminal})"
+        row[0].right() <= row[1].left() + 1.0,
+        "folder overlaps home ({:?} then {:?})",
+        row[0],
+        row[1]
+    );
+    assert!(
+        row[1].right() <= row[2].left() + 1.0,
+        "settings overlaps folder ({:?} then {:?})",
+        row[1],
+        row[2]
+    );
+    assert!(
+        row[3].right() <= row[4].left() + 1.0,
+        "fetch overlaps the branch button ({:?} then {:?})",
+        row[3],
+        row[4]
+    );
+    assert!(
+        row[4].right() <= row[5].left() + 1.0,
+        "pull overlaps fetch ({:?} then {:?})",
+        row[4],
+        row[5]
+    );
+    let branch_to_fetch = row[4].left() - row[3].right();
+    let pull_to_terminal = row[6].left() - row[5].right();
+    assert!(
+        pull_to_terminal + 1.0 >= branch_to_fetch,
+        "spare width should sit before the terminal, not between the branch and fetch \
+         (branch gap {branch_to_fetch}, pull-to-terminal {pull_to_terminal})"
     );
 
     let long = "b".repeat(240);
     let mut repo = opened("beside-long", vec![commit("one")], false);
     repo.info.head = Head::Branch(long.clone());
-    repo.branches[0].branch.name = long;
+    repo.branches[0].branch.name = long.clone();
     repo.branches[0].branch.upstream = Upstream::Tracking {
         name: "origin/main".to_owned(),
         ahead: 0,
@@ -879,11 +1313,407 @@ fn fetch_and_pull_sit_beside_the_branch_name() {
         let _ = show_repo(ui, &mut repo, true, true, false);
     });
     let row = bottom_bar_buttons(&harness);
-    assert_eq!(row.len(), 5);
-    assert!(
-        row[3].right() <= row[4].left() + 1.0,
-        "pull is pushed past the terminal"
+    assert_eq!(
+        row.len(),
+        7,
+        "long branch bottom row\n{}",
+        button_dump(&harness)
     );
+    assert!(
+        row[5].right() <= row[6].left() + 1.0,
+        "pull is pushed past the terminal ({:?} then {:?})",
+        row[5],
+        row[6]
+    );
+    assert!(
+        row[6].right() <= WINDOW_SIZE.x + 1.0,
+        "terminal right {:.2} leaves the window",
+        row[6].right()
+    );
+    let branch = row[3];
+    let fetch_left = row[4].left();
+    let on_bar: Vec<_> = painted_texts(&harness)
+        .into_iter()
+        .filter(|painted| {
+            painted.text == long
+                && painted.rect.center().y >= branch.top() - 2.0
+                && painted.rect.center().y <= branch.bottom() + 2.0
+                && painted.rect.left() >= branch.left() - 4.0
+                && painted.rect.left() <= branch.right() + 4.0
+        })
+        .collect();
+    assert!(
+        !on_bar.is_empty(),
+        "no galley of the 240-character branch name on the branch button\n{}",
+        painted_texts(&harness)
+            .iter()
+            .filter(|painted| painted.text.chars().filter(|ch| *ch == 'b').count() > 40)
+            .map(|painted| {
+                format!(
+                    "elided={} rect={:?} len={}",
+                    painted.elided,
+                    painted.rect,
+                    painted.text.chars().count()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    for painted in &on_bar {
+        assert!(
+            painted.rect.right() <= fetch_left + 1.0,
+            "branch galley right {:.2} crosses Fetch at {fetch_left:.2}",
+            painted.rect.right()
+        );
+    }
+    if on_bar.iter().any(|painted| painted.elided) {
+        assert!(
+            on_bar.iter().all(|painted| painted.elided),
+            "the long branch galley was not elided"
+        );
+    } else {
+        println!(
+            "\nFINDING egui did not set elided on the 240-character branch galley; painted text stays left of Fetch"
+        );
+    }
+}
+
+#[test]
+fn a_bidi_branch_name_stays_inside_the_bottom_bar() {
+    let name = "topic\u{202E}evil";
+    let mut repo = opened("bidi-branch", vec![commit("one")], false);
+    repo.info.head = Head::Branch(name.to_owned());
+    repo.branches[0].branch.name = name.to_owned();
+    let harness = ui_harness(|ui| {
+        let _ = show_repo(ui, &mut repo, false, false, false);
+    });
+    let nodes = bottom_row_nodes(&harness);
+    assert_eq!(nodes.len(), 7, "bottom row\n{}", button_dump(&harness));
+    let index = nodes
+        .iter()
+        .position(|node| button_label(node).contains('\u{202E}'))
+        .unwrap_or_else(|| {
+            panic!(
+                "no bottom-row button contains U+202E\n{}",
+                button_dump(&harness)
+            )
+        });
+    assert_eq!(index, 3, "U+202E button is not the branch control");
+    assert_in_window(nodes[3].rect(), "bidi branch");
+    assert!(
+        nodes[4].rect().left() < nodes[5].rect().left(),
+        "Fetch is not left of Pull"
+    );
+    assert_eq!(button_label(&nodes[4]), "Fetch");
+    assert_eq!(button_label(&nodes[5]), "Pull");
+}
+
+#[test]
+fn the_minimum_window_keeps_folder_branch_fetch_and_pull_reachable() {
+    let mut repo = opened("minimum", vec![commit("one")], false);
+    let harness = ui_harness(|ui| {
+        let _ = show_repo(ui, &mut repo, true, true, false);
+    });
+    let row = bottom_bar_buttons(&harness);
+    assert_eq!(row.len(), 7, "bottom row\n{}", button_dump(&harness));
+    assert_eq!(button_label(&bottom_row_nodes(&harness)[3]), "main");
+    assert_eq!(button_label(&bottom_row_nodes(&harness)[4]), "Fetch");
+    assert_eq!(button_label(&bottom_row_nodes(&harness)[5]), "Pull");
+    assert_in_window(row[1], "folder");
+    assert_in_window(row[3], "branch");
+    assert_in_window(row[4], "fetch");
+    assert_in_window(row[5], "pull");
+}
+
+#[test]
+fn the_folder_button_browses_once_and_ignores_a_second_click_while_busy() {
+    let (mut harness, drive, actions) =
+        drive_repo(closed_repo(opened("browse", vec![commit("one")], false)));
+    let row = bottom_bar_buttons(&harness);
+    assert!(row.len() >= 2, "bottom row\n{}", button_dump(&harness));
+    let home_index = (0..row.len())
+        .find(|&index| hover_tooltip(&mut harness, row[index]) == "Open another repository")
+        .expect("home tooltip");
+    let row = bottom_bar_buttons(&harness);
+    assert!(
+        home_index + 1 < row.len(),
+        "nothing sits right of home\n{}",
+        button_dump(&harness)
+    );
+    assert_eq!(
+        hover_tooltip(&mut harness, row[home_index + 1]),
+        "Open a folder"
+    );
+    {
+        let row = bottom_bar_buttons(&harness);
+        button_covering(&harness, row[home_index + 1]).click();
+    }
+    harness.step();
+    assert_exact(&actions.borrow(), &["Browse"]);
+
+    drive.borrow_mut().busy = true;
+    harness.step();
+    {
+        let row = bottom_bar_buttons(&harness);
+        let folder = button_covering(&harness, row[home_index + 1]);
+        assert!(folder.accesskit_node().is_disabled());
+        folder.click();
+    }
+    harness.step();
+    assert!(
+        actions.borrow().is_empty(),
+        "busy folder click emitted {}",
+        describe_actions(&actions.borrow())
+    );
+    let row = bottom_bar_buttons(&harness);
+    assert!(
+        button_covering(&harness, row[home_index + 1])
+            .accesskit_node()
+            .is_disabled()
+    );
+}
+
+#[test]
+fn the_settings_folder_button_sits_right_of_home_and_browses() {
+    let busy = Rc::new(RefCell::new(false));
+    let (mut harness, actions) = drive_settings(Rc::clone(&busy));
+    let row = top_bar_buttons(&harness);
+    assert!(
+        row.len() >= 3,
+        "settings top row has {} buttons\n{}",
+        row.len(),
+        button_dump(&harness)
+    );
+    assert_eq!(hover_tooltip(&mut harness, row[0]), "Back");
+    assert_eq!(
+        hover_tooltip(&mut harness, row[1]),
+        "Open another repository"
+    );
+    assert_eq!(hover_tooltip(&mut harness, row[2]), "Open a folder");
+    let row = top_bar_buttons(&harness);
+    assert!(
+        row[1].right() <= row[2].left() + 1.0,
+        "folder is not immediately right of home: {:?} then {:?}",
+        row[1],
+        row[2]
+    );
+    assert!(row[2].width() > 1.0, "folder width {:.2}", row[2].width());
+    assert!(
+        row[2].right() <= WINDOW_SIZE.x + 1.0,
+        "folder right {:.2}",
+        row[2].right()
+    );
+    button_covering(&harness, row[2]).click();
+    harness.step();
+    assert_exact(&actions.borrow(), &["Browse"]);
+
+    *busy.borrow_mut() = true;
+    harness.step();
+    {
+        let row = top_bar_buttons(&harness);
+        let folder = button_covering(&harness, row[2]);
+        assert!(folder.accesskit_node().is_disabled());
+        folder.click();
+    }
+    harness.step();
+    assert!(
+        actions.borrow().is_empty(),
+        "busy settings folder click emitted {}",
+        describe_actions(&actions.borrow())
+    );
+    let row = top_bar_buttons(&harness);
+    assert!(
+        button_covering(&harness, row[2])
+            .accesskit_node()
+            .is_disabled()
+    );
+}
+
+fn branch_menu_repo(name: &str, head: Head, branches: Vec<ListedBranch>) -> OpenedRepo {
+    repo_at(name, head, branches)
+}
+
+#[test]
+fn the_branch_menu_checks_out_another_branch_and_not_the_current_one() {
+    let (mut harness, _drive, actions) = drive_repo(closed_repo(branch_menu_repo(
+        "checkout-feature",
+        Head::Branch("main".to_owned()),
+        vec![listed_branch("main", true), listed_branch("feature", false)],
+    )));
+    assert_eq!(
+        button_label(&bottom_row_nodes(&harness)[3]),
+        "main",
+        "bottom row\n{}",
+        button_dump(&harness)
+    );
+    open_branch_menu(&mut harness, "feature");
+    assert_no_checkout(&actions.borrow());
+    {
+        let current = off_bar(&harness, "main");
+        assert!(
+            selected_or_disabled(&current),
+            "current row toggled={:?} disabled={}",
+            current.accesskit_node().toggled(),
+            current.accesskit_node().is_disabled()
+        );
+        click_off_bar(&mut harness, "feature");
+    }
+    assert_only_checkout(&actions.borrow(), "feature");
+
+    // The selected row is its own open. A second click in the same harness
+    // does not land on a menu row.
+    let (mut harness, _drive, actions) = drive_repo(closed_repo(branch_menu_repo(
+        "checkout-current",
+        Head::Branch("main".to_owned()),
+        vec![listed_branch("main", true), listed_branch("feature", false)],
+    )));
+    open_branch_menu(&mut harness, "feature");
+    click_selected_row(&mut harness, "main");
+    assert!(
+        actions.borrow().is_empty(),
+        "clicking the current branch emitted {}",
+        describe_actions(&actions.borrow())
+    );
+    assert!(
+        buttons_labeled(&harness, "feature").is_empty(),
+        "clicking the current row left the menu open\n{}",
+        button_dump(&harness)
+    );
+}
+
+#[test]
+fn a_branch_named_like_an_option_is_passed_through_unchanged() {
+    let repo = repo_at(
+        "switch",
+        Head::Branch("main".to_owned()),
+        vec![listed_branch("main", true), listed_branch("-switch", false)],
+    );
+    let (mut harness, _drive, actions) = drive_repo(closed_repo(repo));
+    open_branch_menu(&mut harness, "-switch");
+    assert_no_checkout(&actions.borrow());
+    click_off_bar(&mut harness, "-switch");
+    {
+        let borrowed = actions.borrow();
+        assert_only_checkout(&borrowed, "-switch");
+        let Action::Checkout(payload) = &borrowed[0] else {
+            unreachable!("assert_only_checkout");
+        };
+        assert_ne!(payload.as_bytes(), b"switch");
+        assert_ne!(payload.as_bytes(), b"--switch");
+    }
+}
+
+#[test]
+fn detached_and_unborn_heads_still_list_other_branches() {
+    let detached = repo_at(
+        "detached",
+        Head::Detached {
+            short_oid: "abc1234def56".to_owned(),
+        },
+        vec![listed_branch("feature", false)],
+    );
+    let (mut harness, _drive, actions) = drive_repo(closed_repo(detached));
+    let label = button_label(&bottom_row_nodes(&harness)[3]);
+    assert!(
+        label.contains("Detached HEAD at abc1234def56"),
+        "branch button is {label:?}"
+    );
+    click_bottom_index(&harness, 3);
+    harness.step();
+    assert_no_checkout(&actions.borrow());
+    if !menu_row_ready(&harness, "feature") {
+        harness.step();
+    }
+    assert!(
+        menu_row_ready(&harness, "feature"),
+        "detached menu did not list feature\n{}",
+        button_dump(&harness)
+    );
+    click_off_bar(&mut harness, "feature");
+    assert_only_checkout(&actions.borrow(), "feature");
+
+    let unborn = repo_at(
+        "unborn",
+        Head::Unborn("new".to_owned()),
+        vec![listed_branch("new", true), listed_branch("feature", false)],
+    );
+    let (mut harness, _drive, actions) = drive_repo(closed_repo(unborn));
+    let label = button_label(&bottom_row_nodes(&harness)[3]);
+    assert!(
+        label.contains("new (no commits yet)"),
+        "unborn button is {label:?}"
+    );
+    open_branch_menu(&mut harness, "feature");
+    assert_no_checkout(&actions.borrow());
+    {
+        let current = off_bar(&harness, "new");
+        assert!(
+            selected_or_disabled(&current),
+            "unborn row toggled={:?} disabled={}",
+            current.accesskit_node().toggled(),
+            current.accesskit_node().is_disabled()
+        );
+        click_off_bar(&mut harness, "feature");
+    }
+    assert_only_checkout(&actions.borrow(), "feature");
+
+    let (mut harness, _drive, actions) = drive_repo(closed_repo(repo_at(
+        "unborn-current",
+        Head::Unborn("new".to_owned()),
+        vec![listed_branch("new", true), listed_branch("feature", false)],
+    )));
+    open_branch_menu(&mut harness, "feature");
+    click_selected_row(&mut harness, "new");
+    assert!(
+        actions
+            .borrow()
+            .iter()
+            .all(|action| !matches!(action, Action::Checkout(_))),
+        "clicking the unborn row emitted {}",
+        describe_actions(&actions.borrow())
+    );
+    assert!(
+        buttons_labeled(&harness, "feature").is_empty(),
+        "clicking the unborn row left the menu open\n{}",
+        button_dump(&harness)
+    );
+}
+
+#[test]
+fn the_branch_menu_stays_closed_while_fetch_pull_or_checkout_runs() {
+    for kind in [SyncKind::Fetch, SyncKind::Pull, SyncKind::Checkout] {
+        let repo = repo_at(
+            "syncing",
+            Head::Branch("main".to_owned()),
+            vec![listed_branch("main", true), listed_branch("feature", false)],
+        );
+        let mut drive = closed_repo(repo);
+        drive.syncing = Some(kind);
+        let (mut harness, _drive, actions) = drive_repo(drive);
+        assert!(
+            buttons_labeled(&harness, "feature").is_empty(),
+            "{} listed feature before a click\n{}",
+            sync_name(kind),
+            button_dump(&harness)
+        );
+        {
+            let nodes = bottom_row_nodes(&harness);
+            assert!(
+                nodes[3].accesskit_node().is_disabled(),
+                "{} branch button is enabled",
+                sync_name(kind)
+            );
+            nodes[3].click();
+        }
+        harness.step();
+        assert_no_checkout(&actions.borrow());
+        assert!(
+            buttons_labeled(&harness, "feature").is_empty(),
+            "{} opened the menu\n{}",
+            sync_name(kind),
+            button_dump(&harness)
+        );
+    }
 }
 
 #[test]

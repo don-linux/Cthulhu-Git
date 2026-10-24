@@ -301,7 +301,7 @@ asks for, so nothing is scaled from a bitmap:
 
 To change the icon, edit `assets/icon.svg` and rebuild.
 
-The interface icons (`panel-left`, `house`, `git-branch`, `key-round`, …) are unmodified
+The interface icons (`panel-left`, `house`, `folder`, `git-branch`, `github`, `info`, `key-round`, …) are unmodified
 [Lucide](https://lucide.dev) SVGs in [`assets/icons/`](assets/icons), under
 the license in [`assets/icons/LICENSE`](assets/icons/LICENSE). `build.rs`
 renders them white at 64 px and the app tints them with the theme's colors.
@@ -323,7 +323,7 @@ to write those notes and cut a release is in
 
 ## Limits of this version
 
-- No commit, push, stage, diff or file list. Fetch and fast-forward pull are the writes.
+- No commit, push, stage, diff or file list. Fetch, fast-forward pull, and switching the current local branch are the writes. Switching uses `git switch --no-guess` on Git 2.23 and newer, so HEAD stays attached to that branch and a remote of the same name is not turned into a new local branch. Git 2.15 through 2.22 use `git checkout` after the local ref is confirmed, and a branch name that starts with `-` is refused. There is no `--force`: a dirty file that would be overwritten, or a branch checked out in another worktree, leaves the repository unchanged. The switch updates the work tree, so smudge filters and the `post-checkout` hook run, as they do in a terminal.
 - The history stops at the latest 1000 commits. Dates and file stats are in
   the hover card, not in a column.
 - A co-author is not looked up on the GitHub API by a commit of their own

@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 
 use cthulhu_git::git::{
     DiscoverInputs, Git, GitError, Head, OVERRIDE_VAR, discover_with, fetch, history, inspect,
-    pull_ff_only,
+    pull_ff_only, switch_branch,
 };
 use tempfile::TempDir;
 
@@ -140,6 +140,28 @@ case "$mode" in
     log=$(cat "$0.log")
     printf '%s\0' "$@" > "$log"
     exit 0
+    ;;
+  record-command)
+    if [ "$1" = "--version" ]; then
+      echo "git version 2.43.0"
+      exit 0
+    fi
+    if [ ! -f "$0.log" ]; then
+      echo "missing argv log sidecar" >&2
+      exit 1
+    fi
+    log=$(cat "$0.log")
+    printf '%s\0' "$@" > "$log"
+    exit 0
+    ;;
+  slow-command)
+    if [ "$1" = "--version" ]; then
+      echo "git version 2.43.0"
+      exit 0
+    fi
+    sleep 120 &
+    echo $! > "$0.sleeper"
+    wait
     ;;
   *)
     echo "unknown fake git mode: $mode" >&2
@@ -1620,4 +1642,534 @@ fn child_opens_repo_despite_hostile_environment() {
 
     let sentinel = env::var(CHILD_SENTINEL).expect("sentinel path");
     fs::write(sentinel, "checked\n").expect("write sentinel");
+}
+
+fn recorded_argv(path: &Path) -> Vec<String> {
+    let recorded = fs::read(path).unwrap_or_else(|error| {
+        panic!("missing argv log {}: {error}", path.display());
+    });
+    recorded
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8(part.to_vec()).expect("argv is utf-8"))
+        .collect()
+}
+
+fn point_argv_log(fake: &Path, log: &Path) {
+    fs::write(sidecar(fake, ".log"), log.display().to_string()).expect("argv sidecar");
+}
+
+/// `Git::run_for` puts these in front of every command, including switch.
+const SWITCH_EXEC_PREFIX: &[&str] = &[
+    "--no-optional-locks",
+    "--no-pager",
+    "--no-replace-objects",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "log.showSignature=false",
+];
+
+fn assert_switch_command_argv(args: &[String], name: &str) {
+    assert!(
+        args.len() >= SWITCH_EXEC_PREFIX.len() + 4,
+        "{name} argv is shorter than the exec prefix plus switch: {args:?}"
+    );
+    let boundary = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or_else(|| panic!("{name} was not one argument after --: {args:?}"));
+    assert!(
+        args[..boundary].iter().all(|arg| arg != name),
+        "{name} appeared before -- as a bare flag: {args:?}"
+    );
+    assert!(
+        args.iter().all(|arg| arg != "--all" && arg != "--prune"),
+        "{name} argv includes --all or --prune: {args:?}"
+    );
+    let head: Vec<&str> = args[..SWITCH_EXEC_PREFIX.len()]
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(head, SWITCH_EXEC_PREFIX, "{name} exec prefixes: {args:?}");
+    let tail: Vec<&str> = args[args.len() - 4..].iter().map(String::as_str).collect();
+    assert_eq!(tail, ["switch", "--no-guess", "--", name], "{name}");
+    assert_eq!(
+        args.len(),
+        SWITCH_EXEC_PREFIX.len() + 4,
+        "{name} argv has extra elements: {args:?}"
+    );
+}
+
+fn assert_attached_to(fixture: &Fixture, name: &str) {
+    switch_branch(&fixture.git, &fixture.root, name).unwrap_or_else(|error| {
+        panic!("switch to {name} failed: {error}");
+    });
+    let info = inspect(&fixture.git, &fixture.root).unwrap_or_else(|error| {
+        panic!("inspect after switching to {name} failed: {error}");
+    });
+    assert_eq!(
+        info.head,
+        Head::Branch(name.to_owned()),
+        "detached HEAD after switching to {name}"
+    );
+    assert_eq!(
+        fixture.git(&["symbolic-ref", "--quiet", "HEAD"]),
+        format!("refs/heads/{name}")
+    );
+}
+
+fn remove_artifact(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove {}: {error}", path.display()),
+    }
+}
+
+fn write_passthrough_filter(path: &Path, marker: &Path, label: &str) {
+    let body = format!(
+        "#!/bin/sh\ncat\nprintf '%s\\n' '{}' >> '{}'\n",
+        label,
+        marker.display()
+    );
+    write_executable(path, &body);
+}
+
+fn write_post_checkout(dir: &Path, log: &Path, marker: &Path) {
+    fs::create_dir_all(dir).expect("hooks directory");
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ntouch '{}'\n",
+        log.display(),
+        marker.display()
+    );
+    write_executable(&dir.join("post-checkout"), &body);
+}
+
+fn assert_filter_appended(path: &Path, label: &str) {
+    let text = fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!("{label} filter did not append a marker: {error}");
+    });
+    assert!(
+        text.lines().any(|line| line == label),
+        "{label} filter marker was {text:?}"
+    );
+}
+
+fn assert_post_checkout_was_a_branch_switch(log: &Path, marker: &Path) {
+    assert!(
+        marker.is_file(),
+        "post-checkout did not run (marker {} is absent)",
+        marker.display()
+    );
+    let text = fs::read_to_string(log)
+        .unwrap_or_else(|error| panic!("post-checkout did not record $*: {error}"));
+    let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+    assert!(
+        !lines.is_empty(),
+        "post-checkout touched a marker but recorded no arguments"
+    );
+    for line in lines {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(
+            fields.get(2).copied(),
+            Some("1"),
+            "post-checkout third field must be 1, recorded {line:?}"
+        );
+    }
+}
+
+fn ref_names(fixture: &Fixture, pattern: &str) -> String {
+    fixture.git(&["for-each-ref", "--format=%(refname)", pattern])
+}
+
+#[test]
+fn checkout_option_shaped_names_are_one_ref_argument() {
+    let tmp = TempDir::with_prefix("cthulhu-adv-a-switch-argv-").expect("temp dir");
+    let fake = link_fake(tmp.path(), "git");
+    write_mode(&fake, "record-command");
+    let argv_log = tmp.path().join("argv.log");
+    point_argv_log(&fake, &argv_log);
+    let git = probe_fake(&fake);
+    let workdir = tmp.path().join("workdir");
+    fs::create_dir(&workdir).expect("workdir");
+
+    for name in [
+        "-switch",
+        "--upload-pack=evil",
+        "--force",
+        "-f",
+        "--detach",
+        "--orphan",
+        "--guess",
+        "-B",
+    ] {
+        remove_artifact(&argv_log);
+        switch_branch(&git, &workdir, name).unwrap_or_else(|error| {
+            panic!("switch_branch {name} failed: {}", brief_error(&error));
+        });
+        assert!(
+            argv_log.is_file(),
+            "{name} did not spawn git; argv log was not written"
+        );
+        assert_switch_command_argv(&recorded_argv(&argv_log), name);
+    }
+}
+
+#[test]
+fn checkout_keeps_head_attached_to_the_named_branch() {
+    let fixture = Fixture::with_two_commits();
+    fixture.git(&["branch", "other", "HEAD~1"]);
+    let parent = fixture.git(&["rev-parse", "other"]);
+    assert_attached_to(&fixture, "other");
+
+    fixture.git(&["update-ref", "refs/heads/-switch", &parent]);
+    assert_attached_to(&fixture, "-switch");
+
+    fixture.git(&["update-ref", "refs/heads/--upload-pack=evil", &parent]);
+    assert_attached_to(&fixture, "--upload-pack=evil");
+}
+
+#[test]
+fn checkout_rejects_dotdot_newline_space_and_ref_escape_before_git_runs() {
+    let tmp = TempDir::with_prefix("cthulhu-adv-a-switch-reject-").expect("temp dir");
+    let fake = link_fake(tmp.path(), "git");
+    write_mode(&fake, "record-command");
+    let git = probe_fake(&fake);
+    let workdir = tmp.path().join("workdir");
+    fs::create_dir(&workdir).expect("workdir");
+
+    for (index, name) in ["", " ", "ma\nin", "..", "../../.git", "foo/../../.git"]
+        .into_iter()
+        .enumerate()
+    {
+        let argv_log = tmp.path().join(format!("argv-{index}.log"));
+        point_argv_log(&fake, &argv_log);
+        let result = switch_branch(&git, &workdir, name);
+        assert!(
+            matches!(result, Err(GitError::Rejected { .. })),
+            "{name:?} must be rejected before git runs, got {}",
+            match &result {
+                Ok(()) => "Ok(())".to_owned(),
+                Err(error) => brief_error(error),
+            }
+        );
+        assert!(
+            !argv_log.exists(),
+            "{name:?} spawned git; argv log was created at {}",
+            argv_log.display()
+        );
+    }
+}
+
+#[test]
+fn checkout_does_not_force_overwrite_of_a_dirty_worktree() {
+    let fixture = Fixture::with_two_commits();
+    fixture.git(&["branch", "other", "HEAD~1"]);
+    fixture.write("tracked.txt", "DIRTY\n");
+    let marker = fixture.marker("dirty-post-checkout");
+    poke_script(&fixture.root.join(".git/hooks"), "post-checkout", &marker);
+
+    let result = switch_branch(&fixture.git, &fixture.root, "other");
+    let Err(error) = result else {
+        panic!("dirty worktree was checked out");
+    };
+    match &error {
+        GitError::Command {
+            command, stderr, ..
+        } => {
+            assert!(
+                stderr.contains("would be overwritten"),
+                "stderr lost the overwrite refusal: {stderr}"
+            );
+            assert!(
+                !command.contains("--force"),
+                "switch forced the checkout: {command}"
+            );
+        }
+        other => panic!(
+            "dirty switch must be a git command failure, got {}",
+            brief_error(other)
+        ),
+    }
+    assert_eq!(
+        fs::read(fixture.root.join("tracked.txt")).expect("tracked.txt"),
+        b"DIRTY\n"
+    );
+    let info = inspect(&fixture.git, &fixture.root).unwrap_or_else(|error| {
+        panic!("inspect after a refused switch failed: {error}");
+    });
+    assert_eq!(info.head, Head::Branch("main".to_owned()));
+    assert_did_not_run(&marker, "post-checkout ran after a refused switch");
+}
+
+#[test]
+fn repo_alias_checkout_is_not_executed() {
+    let fixture = Fixture::with_two_commits();
+    let target = fixture.git(&["rev-parse", "HEAD~1"]);
+    fixture.git(&["branch", "other", "HEAD~1"]);
+    let marker = fixture.marker("alias-checkout");
+    let poke = poke_script(fixture.tmp.path(), "alias-checkout.sh", &marker);
+    fixture.git(&[
+        "config",
+        "--local",
+        "alias.checkout",
+        &format!("!{}", poke.display()),
+    ]);
+
+    switch_branch(&fixture.git, &fixture.root, "other").unwrap_or_else(|error| {
+        panic!("switch to other failed: {error}");
+    });
+    assert_did_not_run(&marker, "alias.checkout");
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), target);
+}
+
+#[test]
+fn include_path_alias_checkout_is_not_executed() {
+    let fixture = Fixture::with_two_commits();
+    let target = fixture.git(&["rev-parse", "HEAD~1"]);
+    fixture.git(&["branch", "other", "HEAD~1"]);
+    let marker = fixture.marker("include-alias-checkout");
+    let poke = poke_script(fixture.tmp.path(), "include-alias-checkout.sh", &marker);
+    let included = fixture.tmp.path().join("alias.gitconfig");
+    fs::write(
+        &included,
+        format!("[alias]\n\tcheckout = !{}\n", poke.display()),
+    )
+    .expect("included config");
+    fixture.git(&[
+        "config",
+        "--local",
+        "include.path",
+        &included.display().to_string(),
+    ]);
+
+    switch_branch(&fixture.git, &fixture.root, "other").unwrap_or_else(|error| {
+        panic!("switch to other failed: {error}");
+    });
+    assert_did_not_run(&marker, "include.path alias.checkout");
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), target);
+}
+
+#[test]
+fn include_path_checkout_default_remote_does_not_create_a_branch() {
+    let local = Fixture::init();
+    local.write("tracked.txt", "local\n");
+    local.git(&["add", "tracked.txt"]);
+    local.git(&["commit", "-m", "local"]);
+    let main_oid = local.git(&["rev-parse", "HEAD"]);
+
+    let origin = Fixture::init();
+    origin.write("tracked.txt", "origin shared\n");
+    origin.git(&["add", "tracked.txt"]);
+    origin.git(&["commit", "-m", "origin"]);
+    origin.git(&["branch", "shared"]);
+
+    let evil = Fixture::init();
+    evil.write("tracked.txt", "evil shared\n");
+    evil.git(&["add", "tracked.txt"]);
+    evil.git(&["commit", "-m", "evil"]);
+    evil.git(&["branch", "shared"]);
+
+    let origin_tip = origin.git(&["rev-parse", "refs/heads/shared"]);
+    let evil_tip = evil.git(&["rev-parse", "refs/heads/shared"]);
+    assert_ne!(
+        origin_tip, evil_tip,
+        "origin and evil must publish different shared commits"
+    );
+
+    let origin_path = fs::canonicalize(&origin.root).expect("origin path");
+    let evil_path = fs::canonicalize(&evil.root).expect("evil path");
+    local.git(&[
+        "remote",
+        "add",
+        "origin",
+        origin_path.to_str().expect("utf8 origin"),
+    ]);
+    local.git(&[
+        "remote",
+        "add",
+        "evil",
+        evil_path.to_str().expect("utf8 evil"),
+    ]);
+    local.git(&["fetch", "origin"]);
+    local.git(&["fetch", "evil"]);
+    assert_eq!(
+        local.git(&["rev-parse", "refs/remotes/origin/shared"]),
+        origin_tip
+    );
+    assert_eq!(
+        local.git(&["rev-parse", "refs/remotes/evil/shared"]),
+        evil_tip
+    );
+    assert!(
+        ref_names(&local, "refs/heads/shared").is_empty(),
+        "fixture already had a local shared branch"
+    );
+
+    let included = local.tmp.path().join("checkout.gitconfig");
+    fs::write(
+        &included,
+        "[checkout]\n\tguess = true\n\tdefaultRemote = evil\n",
+    )
+    .expect("included checkout config");
+    local.git(&[
+        "config",
+        "--local",
+        "include.path",
+        &included.display().to_string(),
+    ]);
+    assert_eq!(
+        local.git(&["config", "--get", "checkout.defaultRemote"]),
+        "evil"
+    );
+    assert_eq!(
+        local.git(&["config", "--bool", "--get", "checkout.guess"]),
+        "true"
+    );
+
+    let result = switch_branch(&local.git, &local.root, "shared");
+    assert!(
+        result.is_err(),
+        "switch to a remote-only branch must fail, got {result:?}"
+    );
+    assert!(
+        ref_names(&local, "refs/heads/shared").is_empty(),
+        "switch created refs/heads/shared from checkout.defaultRemote"
+    );
+    let info = inspect(&local.git, &local.root).unwrap_or_else(|error| {
+        panic!("inspect after refusing shared failed: {error}");
+    });
+    assert_eq!(info.head, Head::Branch("main".to_owned()));
+    assert_eq!(local.git(&["rev-parse", "HEAD"]), main_oid);
+}
+
+#[test]
+fn checkout_runs_post_checkout_and_smudge_like_the_terminal() {
+    // Terminal `git switch` runs post-checkout with third field 1. Leaving a
+    // commit that assigns filter=evil runs clean; coming back runs smudge.
+    let fixture = Fixture::with_two_commits();
+    let clean_marker = fixture.marker("clean-filter");
+    let smudge_marker = fixture.marker("smudge-filter");
+    let hook_log = fixture.marker("post-checkout-args");
+    let hook_marker = fixture.marker("post-checkout");
+    write_passthrough_filter(&fixture.tmp.path().join("clean.sh"), &clean_marker, "clean");
+    write_passthrough_filter(
+        &fixture.tmp.path().join("smudge.sh"),
+        &smudge_marker,
+        "smudge",
+    );
+    let hooks = fixture.tmp.path().join("checkout-hooks");
+    write_post_checkout(&hooks, &hook_log, &hook_marker);
+    fixture.git(&[
+        "config",
+        "--local",
+        "filter.evil.clean",
+        &fixture.tmp.path().join("clean.sh").display().to_string(),
+    ]);
+    fixture.git(&[
+        "config",
+        "--local",
+        "filter.evil.smudge",
+        &fixture.tmp.path().join("smudge.sh").display().to_string(),
+    ]);
+    fixture.git(&[
+        "config",
+        "--local",
+        "core.hooksPath",
+        &hooks.display().to_string(),
+    ]);
+    fixture.write(".gitattributes", "* filter=evil\n");
+    fixture.git(&["add", ".gitattributes"]);
+    fixture.git(&["commit", "-m", "attributes"]);
+    fixture.git(&["branch", "other", "HEAD~1"]);
+
+    for path in [&clean_marker, &smudge_marker, &hook_log, &hook_marker] {
+        remove_artifact(path);
+    }
+    switch_branch(&fixture.git, &fixture.root, "other").unwrap_or_else(|error| {
+        panic!("switch to other failed: {error}");
+    });
+    assert_post_checkout_was_a_branch_switch(&hook_log, &hook_marker);
+    assert_filter_appended(&clean_marker, "clean");
+    assert_did_not_run(&smudge_marker, "smudge while leaving the filter commit");
+    assert_eq!(
+        fs::read(fixture.root.join("tracked.txt")).expect("tracked.txt"),
+        b"two\n"
+    );
+    assert!(!fixture.root.join(".gitattributes").exists());
+
+    for path in [&clean_marker, &smudge_marker, &hook_log, &hook_marker] {
+        remove_artifact(path);
+    }
+    switch_branch(&fixture.git, &fixture.root, "main").unwrap_or_else(|error| {
+        panic!("switch back to main failed: {error}");
+    });
+    assert_post_checkout_was_a_branch_switch(&hook_log, &hook_marker);
+    assert_filter_appended(&smudge_marker, "smudge");
+    assert_did_not_run(&clean_marker, "clean while returning to the filter commit");
+    assert_eq!(
+        fs::read(fixture.root.join("tracked.txt")).expect("tracked.txt"),
+        b"two\n"
+    );
+    assert_eq!(
+        fs::read(fixture.root.join(".gitattributes")).expect(".gitattributes"),
+        b"* filter=evil\n"
+    );
+}
+
+#[test]
+fn checkout_does_not_run_core_fsmonitor() {
+    let fixture = Fixture::with_two_commits();
+    fixture.git(&["branch", "other", "HEAD~1"]);
+    let marker = fixture.marker("fsmonitor-checkout");
+    let poke = poke_script(fixture.tmp.path(), "fsmonitor-checkout.sh", &marker);
+    fixture.git(&[
+        "config",
+        "--local",
+        "core.fsmonitor",
+        &poke.display().to_string(),
+    ]);
+
+    switch_branch(&fixture.git, &fixture.root, "other").unwrap_or_else(|error| {
+        panic!("switch failed: {error}");
+    });
+    assert_did_not_run(&marker, "core.fsmonitor");
+}
+
+#[test]
+fn slow_checkout_times_out_at_sixty_seconds() {
+    // The fake sleeps for 120s. switch_branch must return at its 60s limit and
+    // kill that sleeper. Do not join the worker: a git that ignores the limit
+    // would pin this test on the join instead of the 90s receive.
+    let tmp = TempDir::with_prefix("cthulhu-adv-a-slow-switch-").expect("temp dir");
+    let fake = link_fake(tmp.path(), "git");
+    write_mode(&fake, "slow-command");
+    let sleeper = sidecar(&fake, ".sleeper");
+    let git = probe_fake(&fake);
+    let workdir = tmp.path().join("workdir");
+    fs::create_dir(&workdir).expect("workdir");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(switch_branch(&git, &workdir, "main"));
+    });
+
+    match rx.recv_timeout(Duration::from_secs(90)) {
+        Ok(Err(GitError::TimedOut { limit, .. })) => {
+            assert_eq!(limit, Duration::from_secs(60));
+            assert_recorded_pid_is_dead(&sleeper);
+        }
+        Ok(Ok(())) => panic!("slow switch_branch returned successfully"),
+        Ok(Err(error)) => panic!(
+            "slow switch_branch must time out at 60s, got {}",
+            brief_error(&error)
+        ),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("switch_branch still running after 90s; the command limit is 60 seconds")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("switch thread exited without a result");
+        }
+    }
+    drop(tmp);
 }

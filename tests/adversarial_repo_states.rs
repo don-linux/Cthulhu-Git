@@ -1,4 +1,4 @@
-//! Adversarial repository states for `inspect` and `history`.
+//! Adversarial repository states for `inspect`, `history`, and `switch_branch`.
 //!
 //! Fixtures shell out to the system git. Author identity is set on those
 //! commands only, so the test process environment stays untouched.
@@ -8,7 +8,10 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use cthulhu_git::git::{Git, GitError, Head, History, RepoInfo, SHORT_OID_LEN, history, inspect};
+use cthulhu_git::git::{
+    Branch, Git, GitError, Head, History, RepoInfo, SHORT_OID_LEN, branches, history, inspect,
+    latest_commit, switch_branch,
+};
 use tempfile::TempDir;
 
 struct Repo {
@@ -798,4 +801,463 @@ fn merge_commit_is_listed_once_newest_first() {
             .count(),
         1
     );
+}
+
+/// `main` has `a.txt=base` and `keep.txt=same`. `other` has `a.txt=other`
+/// and the same `keep.txt`. HEAD is back on `main`.
+fn repo_with_diverged_a_txt() -> Repo {
+    let repo = Repo::init_named("diverge");
+    repo.write("a.txt", "base");
+    repo.write("keep.txt", "same");
+    repo.add("a.txt");
+    repo.add("keep.txt");
+    repo.commit("base");
+    repo.git(&["branch", "other"]);
+    repo.git(&["switch", "other"]);
+    repo.write("a.txt", "other");
+    repo.add("a.txt");
+    repo.commit("other tip");
+    repo.git(&["switch", "main"]);
+    repo
+}
+
+/// After `switch_branch`, HEAD is attached to `name`, that row is the only
+/// current branch and sorts first, and the latest commit is that branch tip.
+fn assert_switched_to(repo: &Repo, name: &str) -> Vec<Branch> {
+    let expected_ref = format!("refs/heads/{name}");
+    assert_eq!(
+        repo.git(&["symbolic-ref", "--quiet", "HEAD"]),
+        expected_ref,
+        "HEAD must be attached to {name}"
+    );
+
+    let info = repo.info();
+    assert_eq!(info.head, Head::Branch(name.to_owned()));
+
+    let rows = branches(&repo.git, &repo.root, &info.head)
+        .unwrap_or_else(|error| panic!("branches after switching to {name}: {error}"));
+    assert!(
+        rows.first()
+            .is_some_and(|row| row.current && row.name == name),
+        "current branch {name} must sort first, got {rows:?}"
+    );
+    assert_eq!(
+        rows.iter().filter(|row| row.current).count(),
+        1,
+        "one current branch, got {rows:?}"
+    );
+
+    let tip = repo.git(&["rev-parse", &expected_ref]);
+    let detail = latest_commit(&repo.git, &repo.root, &info.head)
+        .unwrap_or_else(|error| panic!("latest commit on {name}: {error}"))
+        .unwrap_or_else(|| panic!("latest commit on {name} must be Some"));
+    assert_eq!(detail.oid, tip);
+    rows
+}
+
+/// A refused switch is git's own failure: [`GitError::Command`], not
+/// `Rejected` or `NotARepository`. The command line includes `name` and
+/// never `--force`. Stderr stays English because the library sets `LC_ALL=C`.
+fn assert_command_failure(error: GitError, name: &str) -> String {
+    let display = error.to_string();
+    match error {
+        GitError::Command {
+            command, stderr, ..
+        } => {
+            assert!(
+                display.contains(name) || command.contains(name),
+                "branch name {name} missing from `{display}` / `{command}`"
+            );
+            assert!(!command.contains("--force"), "{command}");
+            assert!(!display.contains("--force"), "{display}");
+            stderr
+        }
+        GitError::Rejected { .. } => panic!("expected Command, got Rejected: {display}"),
+        GitError::NotARepository(path) => {
+            panic!(
+                "expected Command, got NotARepository({}): {display}",
+                path.display()
+            )
+        }
+        other => panic!("expected Command, got {other:?}: {display}"),
+    }
+}
+
+fn relative_paths(root: &Path) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries =
+            fs::read_dir(&dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
+        let mut children = Vec::new();
+        for entry in entries {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("path under root")
+                .to_string_lossy()
+                .into_owned();
+            if entry.file_type().expect("file type").is_dir() {
+                children.push(path);
+            }
+            paths.push(relative);
+        }
+        stack.extend(children);
+    }
+    paths.sort();
+    paths
+}
+
+fn paths_named<'a>(paths: &'a [String], name: &str) -> Vec<&'a str> {
+    paths
+        .iter()
+        .filter(|path| Path::new(path).file_name().and_then(|item| item.to_str()) == Some(name))
+        .map(String::as_str)
+        .collect()
+}
+
+/// Every `index` and `filename` under the temp dir belongs to the source
+/// worktree. The bare clone must not gain either.
+fn assert_checkout_files_stay_in_source(paths: &[String], filename: &str) {
+    let tracked = paths_named(paths, filename);
+    assert!(
+        tracked
+            .iter()
+            .any(|path| Path::new(path) == Path::new("source").join(filename)),
+        "committed {filename} missing from the source worktree: {tracked:?}"
+    );
+    assert!(
+        tracked
+            .iter()
+            .all(|path| Path::new(path).starts_with("source")),
+        "{filename} appeared outside the source worktree: {tracked:?}"
+    );
+    let indexes = paths_named(paths, "index");
+    assert!(
+        indexes
+            .iter()
+            .all(|path| Path::new(path).starts_with("source")),
+        "index appeared outside the source worktree: {indexes:?}"
+    );
+}
+
+fn switch_ok(repo: &Repo, name: &str) {
+    switch_branch(&repo.git, &repo.root, name)
+        .unwrap_or_else(|error| panic!("switch to {name} must succeed, got {error}"));
+}
+
+#[test]
+fn checkout_nested_branch_attaches_symbolic_head() {
+    let repo = Repo::with_commit();
+    repo.git(&["branch", "feature/foo"]);
+    switch_ok(&repo, "feature/foo");
+
+    let rows = assert_switched_to(&repo, "feature/foo");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].name, "feature/foo");
+    assert!(rows[0].current, "{rows:?}");
+    assert_eq!(rows[1].name, "main");
+    assert!(!rows[1].current, "{rows:?}");
+}
+
+#[test]
+fn checkout_refuses_overlapping_dirty_file() {
+    let repo = repo_with_diverged_a_txt();
+    repo.write("a.txt", "dirty");
+
+    let error = switch_branch(&repo.git, &repo.root, "other").expect_err("overlapping dirty file");
+    let stderr = assert_command_failure(error, "other");
+    assert!(
+        stderr.contains("would be overwritten"),
+        "english overwrite refusal, got {stderr}"
+    );
+
+    assert_eq!(fs::read(repo.root.join("a.txt")).expect("a.txt"), b"dirty");
+    // `Repo::git` trims, which would hide the leading space in porcelain.
+    // An empty index diff and a worktree diff keep the edit unstaged.
+    assert_eq!(repo.git(&["diff", "--cached", "--", "a.txt"]), "");
+    let diff = repo.git(&["diff", "--", "a.txt"]);
+    assert!(diff.contains("-base"), "{diff}");
+    assert!(diff.contains("+dirty"), "{diff}");
+    assert_eq!(
+        repo.git(&["symbolic-ref", "--quiet", "HEAD"]),
+        "refs/heads/main"
+    );
+}
+
+#[test]
+fn checkout_keeps_uncommitted_edit_when_paths_differ_elsewhere() {
+    let repo = repo_with_diverged_a_txt();
+    let other_tip = repo.git(&["rev-parse", "refs/heads/other"]);
+    repo.write("keep.txt", "edited");
+
+    switch_ok(&repo, "other");
+    assert_switched_to(&repo, "other");
+    assert_eq!(
+        fs::read(repo.root.join("keep.txt")).expect("keep.txt"),
+        b"edited"
+    );
+    assert_eq!(repo.git(&["diff", "--cached", "--", "keep.txt"]), "");
+    let diff = repo.git(&["diff", "--", "keep.txt"]);
+    assert!(diff.contains("-same"), "{diff}");
+    assert!(diff.contains("+edited"), "{diff}");
+    assert_eq!(fs::read(repo.root.join("a.txt")).expect("a.txt"), b"other");
+
+    let info = repo.info();
+    let detail = latest_commit(&repo.git, &repo.root, &info.head)
+        .expect("latest commit")
+        .expect("other has a commit");
+    assert_eq!(detail.oid, other_tip);
+}
+
+#[test]
+fn checkout_refuses_branch_checked_out_in_linked_worktree() {
+    let repo = Repo::with_commit();
+    repo.git(&["branch", "topic"]);
+    let linked = repo.tmp.path().join("linked");
+    let linked_arg = linked.to_str().expect("utf8").to_owned();
+    repo.git(&["worktree", "add", &linked_arg, "topic"]);
+
+    let error = switch_branch(&repo.git, &repo.root, "topic").expect_err("worktree lock");
+    let stderr = assert_command_failure(error, "topic");
+    assert!(
+        stderr.contains("already used by worktree"),
+        "english worktree refusal, got {stderr}"
+    );
+    assert_eq!(
+        repo.git(&["symbolic-ref", "--quiet", "HEAD"]),
+        "refs/heads/main"
+    );
+    assert_eq!(
+        repo.git_at(&linked, &["symbolic-ref", "--quiet", "HEAD"]),
+        "refs/heads/topic"
+    );
+}
+
+#[test]
+fn checkout_of_dash_switch_attaches_head() {
+    // `git branch -- -switch` is rejected. `refs/heads/-switch` is still a real branch.
+    let repo = Repo::with_commit();
+    repo.git(&["update-ref", "refs/heads/-switch", "HEAD"]);
+    switch_ok(&repo, "-switch");
+
+    assert_eq!(
+        repo.git(&["symbolic-ref", "--quiet", "HEAD"]),
+        "refs/heads/-switch"
+    );
+    assert_eq!(repo.info().head, Head::Branch("-switch".to_owned()));
+    assert_switched_to(&repo, "-switch");
+}
+
+#[test]
+fn checkout_from_orphan_unborn_attaches_main() {
+    let repo = Repo::init_named("orphan");
+    repo.write("a.txt", "kept");
+    repo.add("a.txt");
+    repo.commit("initial");
+    repo.git(&["checkout", "--orphan", "unborn"]);
+
+    assert_eq!(
+        repo.git(&["symbolic-ref", "--quiet", "HEAD"]),
+        "refs/heads/unborn"
+    );
+    assert_eq!(repo.info().head, Head::Unborn("unborn".to_owned()));
+    let bytes = fs::read(repo.root.join("a.txt")).expect("a.txt");
+
+    switch_ok(&repo, "main");
+    let rows = assert_switched_to(&repo, "main");
+    assert!(
+        rows.iter().any(|row| row.name == "main" && row.current),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().all(|row| row.name != "unborn"),
+        "synthetic unborn row remained: {rows:?}"
+    );
+    assert_eq!(fs::read(repo.root.join("a.txt")).expect("a.txt"), bytes);
+}
+
+#[test]
+fn checkout_from_detached_head_attaches_main() {
+    let repo = Repo::with_commit();
+    repo.git(&["checkout", "--detach", "HEAD"]);
+    let detached = repo.info();
+    assert!(
+        matches!(detached.head, Head::Detached { .. }),
+        "expected a detached HEAD, got {:?}",
+        detached.head
+    );
+
+    switch_ok(&repo, "main");
+    assert_switched_to(&repo, "main");
+    assert_eq!(repo.info().head, Head::Branch("main".to_owned()));
+    assert!(
+        latest_commit(&repo.git, &repo.root, &repo.info().head)
+            .expect("latest commit")
+            .is_some()
+    );
+}
+
+#[test]
+fn sha256_checkout_attaches_head() {
+    let repo = Repo::init_sha256();
+    repo.commit("hashed");
+    repo.git(&["branch", "other"]);
+    switch_ok(&repo, "other");
+    assert_switched_to(&repo, "other");
+
+    assert_eq!(repo.git(&["rev-parse", "--show-object-format"]), "sha256");
+    let tip = repo.git(&["rev-parse", "refs/heads/other"]);
+    assert_eq!(tip.len(), 64, "{tip}");
+    assert!(tip.chars().all(|ch| ch.is_ascii_hexdigit()), "{tip}");
+
+    let detail = latest_commit(&repo.git, &repo.root, &repo.info().head)
+        .expect("latest commit")
+        .expect("sha256 branch has a commit");
+    assert_eq!(detail.oid.len(), 64, "{}", detail.oid);
+    assert!(
+        detail.oid.chars().all(|ch| ch.is_ascii_hexdigit()),
+        "{}",
+        detail.oid
+    );
+    assert_eq!(detail.oid, tip);
+}
+
+#[test]
+fn packed_ref_checkout_attaches_destination() {
+    let repo = Repo::with_commit();
+    repo.git(&["branch", "topic"]);
+    let tip = repo.git(&["rev-parse", "refs/heads/topic"]);
+    repo.git(&["pack-refs", "--all"]);
+    let loose = repo.root.join(".git/refs/heads/topic");
+    if loose.exists() {
+        fs::remove_file(&loose).expect("remove loose ref");
+    }
+    assert!(!loose.exists(), "loose ref must be gone");
+    let packed = fs::read_to_string(repo.root.join(".git/packed-refs")).expect("packed-refs");
+    assert!(packed.contains(&tip), "{packed}");
+
+    switch_ok(&repo, "topic");
+    assert_switched_to(&repo, "topic");
+    assert_eq!(
+        repo.git(&["symbolic-ref", "--quiet", "HEAD"]),
+        "refs/heads/topic"
+    );
+}
+
+#[test]
+fn bare_checkout_fails_cleanly_inside_the_temp_dir() {
+    let repo = Repo::init_named("source");
+    repo.write("tracked.txt", "tracked");
+    repo.add("tracked.txt");
+    repo.commit("track a file");
+    repo.git(&["branch", "feature"]);
+
+    let bare = repo.tmp.path().join("demo.git");
+    let bare_arg = bare.to_str().expect("utf8").to_owned();
+    let src = repo.root.to_str().expect("utf8").to_owned();
+    let cwd = repo.tmp.path().to_path_buf();
+    repo.git_at(&cwd, &["clone", "--bare", &src, &bare_arg]);
+    assert_eq!(
+        repo.git_at(&bare, &["rev-parse", "--is-bare-repository"]),
+        "true"
+    );
+    repo.git_at(&bare, &["rev-parse", "--verify", "refs/heads/feature"]);
+
+    let before = relative_paths(repo.tmp.path());
+    assert_checkout_files_stay_in_source(&before, "tracked.txt");
+
+    let error = switch_branch(&repo.git, &bare, "feature").expect_err("bare switch");
+    let stderr = assert_command_failure(error, "feature");
+    assert!(
+        stderr.contains("work tree")
+            || stderr.contains("this operation must be run in a work tree"),
+        "english bare-repo refusal, got {stderr}"
+    );
+
+    assert_eq!(
+        repo.git_at(&bare, &["symbolic-ref", "--quiet", "HEAD"]),
+        "refs/heads/main"
+    );
+    let after = relative_paths(repo.tmp.path());
+    assert_eq!(
+        after, before,
+        "switch must not create files in the temp dir"
+    );
+    assert_checkout_files_stay_in_source(&after, "tracked.txt");
+}
+
+#[test]
+fn checkout_does_not_wipe_superproject_or_submodule() {
+    let super_repo = Repo::init_named("super");
+    super_repo.commit("super initial");
+
+    let origin = super_repo.tmp.path().join("origin");
+    fs::create_dir(&origin).expect("origin dir");
+    super_repo.run(&origin, &["init", "-b", "main"]);
+    fs::write(origin.join("mod.txt"), "from-module\n").expect("mod.txt");
+    super_repo.git_at(&origin, &["add", "--", "mod.txt"]);
+    super_repo.commit_in(&origin, "module initial");
+
+    let url = format!(
+        "file://{}",
+        dunce::canonicalize(&origin)
+            .expect("canonical origin")
+            .display()
+    );
+    super_repo.git_at(
+        &super_repo.root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &url,
+            "module",
+        ],
+    );
+    super_repo.commit("add module");
+
+    super_repo.write("README", "main-readme");
+    super_repo.add("README");
+    super_repo.commit("readme on main");
+    let gitlink = super_repo.git(&["rev-parse", "HEAD:module"]);
+
+    super_repo.git(&["switch", "-c", "other"]);
+    let other_readme = "other-readme";
+    super_repo.write("README", other_readme);
+    super_repo.add("README");
+    super_repo.commit("readme on other");
+    assert_eq!(super_repo.git(&["rev-parse", "HEAD:module"]), gitlink);
+    super_repo.git(&["switch", "main"]);
+    assert_eq!(
+        fs::read_to_string(super_repo.root.join("README")).expect("README"),
+        "main-readme"
+    );
+    assert_eq!(super_repo.git(&["rev-parse", "HEAD:module"]), gitlink);
+
+    let module = super_repo.root.join("module");
+    let module_head = super_repo.git_at(&module, &["rev-parse", "HEAD"]);
+    let mod_txt = fs::read(module.join("mod.txt")).expect("mod.txt");
+
+    switch_branch(&super_repo.git, &super_repo.root, "other").unwrap_or_else(|error| {
+        panic!("switch other must keep the superproject and submodule, got {error}")
+    });
+    assert_switched_to(&super_repo, "other");
+    assert_eq!(
+        fs::read_to_string(super_repo.root.join("README")).expect("README"),
+        other_readme
+    );
+    assert_eq!(super_repo.git(&["rev-parse", "HEAD:module"]), gitlink);
+    assert!(
+        super_repo.root.join(".git").is_dir(),
+        "superproject .git must stay a directory"
+    );
+    assert!(module.join(".git").exists(), "submodule .git disappeared");
+    assert_eq!(
+        super_repo.git_at(&module, &["rev-parse", "HEAD"]),
+        module_head
+    );
+    assert_eq!(fs::read(module.join("mod.txt")).expect("mod.txt"), mod_txt);
 }
