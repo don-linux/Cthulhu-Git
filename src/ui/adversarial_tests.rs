@@ -2376,13 +2376,13 @@ fn adversarial_inflight_graph_shows_opening_history() {
     assert_child_ok(&output, "CHILD_OK inflight_graph");
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "child of adversarial_inflight_graph_shows_opening_history; isolated config"]
 fn child_inflight_graph_shows_opening_history() {
     if !spawned() {
         return;
     }
-    #[cfg(unix)]
     inflight_graph_shows_opening_history();
 }
 
@@ -2426,13 +2426,13 @@ fn adversarial_graph_failure_keeps_repository() {
     assert_child_ok(&output, "CHILD_OK graph_failure");
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "child of adversarial_graph_failure_keeps_repository; isolated config"]
 fn child_graph_failure_keeps_repository() {
     if !spawned() {
         return;
     }
-    #[cfg(unix)]
     graph_failure_keeps_repository();
 }
 
@@ -2480,13 +2480,13 @@ fn adversarial_home_during_graph_load_keeps_settings() {
     assert_child_ok(&output, "CHILD_OK home_during_graph_load");
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "child of adversarial_home_during_graph_load_keeps_settings; isolated config"]
 fn child_home_during_graph_load_keeps_settings() {
     if !spawned() {
         return;
     }
-    #[cfg(unix)]
     home_during_graph_load_keeps_settings();
 }
 
@@ -2543,13 +2543,13 @@ fn adversarial_second_open_supersedes_inflight_graph() {
     assert_child_ok(&output, "CHILD_OK second_open_supersedes");
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "child of adversarial_second_open_supersedes_inflight_graph; isolated config"]
 fn child_second_open_supersedes_inflight_graph() {
     if !spawned() {
         return;
     }
-    #[cfg(unix)]
     second_open_supersedes_inflight_graph();
 }
 
