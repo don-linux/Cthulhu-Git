@@ -814,9 +814,28 @@ fn hash_block(ui: &mut Ui, palette: &Palette, oid: &str, github: Option<&GitHubR
     }
     if let Some(github) = github {
         ui.add_space(4.0);
-        ui.hyperlink_to("Open on GitHub", github.commit_url(oid));
+        open_on_github(ui, palette, &github.commit_url(oid));
     }
     ui.add_space(10.0);
+}
+
+/// GitHub mark beside the commit link. The mark opens the same page.
+fn open_on_github(ui: &mut Ui, palette: &Palette, url: &str) {
+    ui.horizontal(|ui| {
+        let gap = ui.spacing().icon_spacing;
+        ui.spacing_mut().item_spacing.x = gap;
+        let mark = ui
+            .add(icons::tinted(ui, Icon::GitHub, palette.accent).sense(Sense::click()))
+            .on_hover_cursor(CursorIcon::PointingHand);
+        ui.hyperlink_to("Open on GitHub", url);
+        let new_tab = mark.clicked_with_open_in_background();
+        if new_tab || mark.clicked() {
+            ui.open_url(egui::OpenUrl {
+                url: url.to_owned(),
+                new_tab,
+            });
+        }
+    });
 }
 
 /// Avatar, then the name and the address. The address is a mail link when it
