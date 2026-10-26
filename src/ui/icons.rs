@@ -30,6 +30,9 @@ pub enum Icon {
     ArrowDownToLine,
     CircleUserRound,
     KeyRound,
+    Folder,
+    GitHub,
+    Info,
 }
 
 impl Icon {
@@ -47,6 +50,9 @@ impl Icon {
             Self::ArrowDownToLine => "arrow-down-to-line",
             Self::CircleUserRound => "circle-user-round",
             Self::KeyRound => "key-round",
+            Self::Folder => "folder",
+            Self::GitHub => "github",
+            Self::Info => "info",
         }
     }
 
@@ -69,6 +75,9 @@ impl Icon {
                 include_bytes!(concat!(env!("OUT_DIR"), "/icons/circle-user-round.rgba"))
             }
             Self::KeyRound => include_bytes!(concat!(env!("OUT_DIR"), "/icons/key-round.rgba")),
+            Self::Folder => include_bytes!(concat!(env!("OUT_DIR"), "/icons/folder.rgba")),
+            Self::GitHub => include_bytes!(concat!(env!("OUT_DIR"), "/icons/github.rgba")),
+            Self::Info => include_bytes!(concat!(env!("OUT_DIR"), "/icons/info.rgba")),
         }
     }
 
@@ -100,13 +109,33 @@ impl Icon {
 /// The rect is the hovered size from the first frame, so the bar around it
 /// does not grow when the pointer arrives.
 pub fn icon_button(ui: &mut Ui, icon: Icon, tint: Color32, hover_text: &str) -> Response {
-    let response = ui.add(
+    icon_button_enabled(ui, icon, tint, hover_text, true)
+}
+
+/// Same as [`icon_button`]. A disabled control keeps the icon and does not take the click.
+pub fn icon_button_enabled(
+    ui: &mut Ui,
+    icon: Icon,
+    tint: Color32,
+    hover_text: &str,
+    enabled: bool,
+) -> Response {
+    let mut response = ui.add_enabled(
+        enabled,
         Button::image(icon.image(ui.ctx(), tint))
             .frame_when_inactive(false)
             .min_size(icon_button_min_size(ui)),
     );
     show_hover_tip(ui, &response, hover_text);
-    response.on_hover_cursor(CursorIcon::PointingHand)
+    if enabled {
+        response = response.on_hover_cursor(CursorIcon::PointingHand);
+    }
+    response
+}
+
+/// The tinted icon image, for a button built outside this module.
+pub fn tinted(ui: &Ui, icon: Icon, tint: Color32) -> Image<'static> {
+    icon.image(ui.ctx(), tint)
 }
 
 pub fn icon(ui: &mut Ui, icon: Icon, tint: Color32) -> Response {
@@ -221,6 +250,9 @@ mod tests {
             Icon::ArrowDownToLine,
             Icon::CircleUserRound,
             Icon::KeyRound,
+            Icon::Folder,
+            Icon::GitHub,
+            Icon::Info,
         ] {
             assert_eq!(
                 icon.rgba().len(),

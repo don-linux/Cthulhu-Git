@@ -86,6 +86,7 @@ fn harness(size: egui::Vec2, screen: Screen) -> Harness<'static, Screen> {
                         syncing: None,
                         columns: screen.columns,
                         history_loading: screen.history_loading,
+                        busy: false,
                     },
                     &mut avatars,
                 );
@@ -575,6 +576,7 @@ fn action_name(action: &Action) -> String {
         Action::EnsureFontCatalog => "EnsureFontCatalog".to_owned(),
         Action::Fetch(upstream) => format!("Fetch({upstream})"),
         Action::Pull => "Pull".to_owned(),
+        Action::Checkout(name) => format!("Checkout({name})"),
         Action::SetHistoryColumns(columns) => format!("SetHistoryColumns({columns:?})"),
         Action::SetAuthorAvatars(on) => format!("SetAuthorAvatars({on})"),
     }

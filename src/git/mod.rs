@@ -1,9 +1,9 @@
 //! Access to repositories through the system `git` executable.
 //!
 //! Reads do not write. Fetch updates the remote-tracking ref of the current
-//! branch, and pull fast-forwards that branch. No libgit2 or gitoxide: the app
-//! uses whatever git the user already has, so behavior (config, credentials,
-//! hooks) matches their terminal.
+//! branch, pull fast-forwards that branch, and switch checks out another local
+//! branch. No libgit2 or gitoxide: the app uses whatever git the user already
+//! has, so behavior (config, credentials, hooks) matches their terminal.
 
 mod branches;
 mod discover;
@@ -36,4 +36,4 @@ pub use log::{
 pub use reap::reap_process_tree;
 pub use remotes::{Remote, remotes};
 pub use repo::{Head, RepoInfo, inspect};
-pub use sync::{fetch, fetch_request, pull_ff_only};
+pub use sync::{fetch, fetch_request, pull_ff_only, switch_branch, switch_request};

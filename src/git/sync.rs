@@ -90,6 +90,122 @@ pub fn pull_ff_only(git: &Git, root: &Path) -> Result<(), GitError> {
     Ok(())
 }
 
+/// `git switch` arrived in 2.23. Older Git uses `git checkout`.
+const SWITCH_SINCE: (u32, u32, u32) = (2, 23, 0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchKind {
+    /// `git switch --no-guess -- <name>`.
+    Switch,
+    /// `git checkout <name> --`, only for Git 2.15 through 2.22.
+    Checkout,
+}
+
+/// A local branch switch that leaves `HEAD` attached to that branch.
+///
+/// On Git 2.53, `git checkout refs/heads/<name> --` detaches and skips the
+/// worktree lock. `git switch --no-guess -- <name>` stays attached, refuses a
+/// branch checked out elsewhere, and does not create a branch from
+/// `checkout.defaultRemote`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchRequest {
+    name: String,
+    kind: SwitchKind,
+}
+
+impl SwitchRequest {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Argv after `git`. The branch is one argument after `--` on Git 2.23+,
+    /// so a name such as `-switch` is not an option.
+    pub fn args(&self) -> Vec<&str> {
+        match self.kind {
+            SwitchKind::Switch => vec!["switch", "--no-guess", "--", self.name.as_str()],
+            SwitchKind::Checkout => vec!["checkout", self.name.as_str(), "--"],
+        }
+    }
+}
+
+/// Builds the switch for a local branch name.
+///
+/// `None` when the name cannot be a ref under `refs/heads/`, and, on Git older
+/// than 2.23, when the name starts with `-` (checkout would read it as an option).
+pub fn switch_request(version: (u32, u32, u32), name: &str) -> Option<SwitchRequest> {
+    if !branch_name_is_switchable(name) {
+        return None;
+    }
+    let kind = if version >= SWITCH_SINCE {
+        SwitchKind::Switch
+    } else if name.starts_with('-') {
+        return None;
+    } else {
+        SwitchKind::Checkout
+    };
+    Some(SwitchRequest {
+        name: name.to_owned(),
+        kind,
+    })
+}
+
+/// Checks out a local branch and leaves `HEAD` attached to it.
+///
+/// No `--force`. A dirty file that would be overwritten, or a branch checked
+/// out in another worktree, is an error and the repository stays as it was.
+/// This uses the local command limit (60s), not the fetch/pull network limit.
+pub fn switch_branch(git: &Git, root: &Path, name: &str) -> Result<(), GitError> {
+    let Some(request) = switch_request(git.version.numbers(), name) else {
+        return Err(rejected(
+            "git switch",
+            "the branch name cannot be checked out",
+        ));
+    };
+    // Git 2.15 has no `--no-guess`. Confirm the local ref first so checkout
+    // cannot invent a branch from a remote.
+    if request.kind == SwitchKind::Checkout {
+        let spec = format!("refs/heads/{}", request.name);
+        let verified = git.run(root, &["rev-parse", "--verify", "--quiet", spec.as_str()])?;
+        if !verified.status.success() {
+            return Err(rejected("git switch", "the branch does not exist"));
+        }
+    }
+    let args = request.args();
+    git.require_ok(root, &args)?;
+    Ok(())
+}
+
+/// `git check-ref-format` rules for `refs/heads/<name>`, except a leading `-`.
+///
+/// `check-ref-format --branch` rejects that dash. A name such as `-switch` is
+/// still a legal ref, and `git switch --` can take it.
+fn branch_name_is_switchable(name: &str) -> bool {
+    if name.is_empty() || name == "@" {
+        return false;
+    }
+    if name.starts_with('/')
+        || name.ends_with('/')
+        || name.ends_with('.')
+        || name.contains("//")
+        || name.contains("..")
+        || name.contains("@{")
+    {
+        return false;
+    }
+    if name.chars().any(ref_char_forbidden) {
+        return false;
+    }
+    name.split('/').all(|component| {
+        !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
+    })
+}
+
+fn ref_char_forbidden(ch: char) -> bool {
+    ch.is_ascii_control()
+        || ch.is_whitespace()
+        || matches!(ch, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +265,71 @@ mod tests {
     #[test]
     fn pull_is_fast_forward_only() {
         assert_eq!(PULL_FF_ONLY_ARGS, ["pull", "--ff-only", "--no-rebase"]);
+    }
+
+    fn assert_switch_args(version: (u32, u32, u32), name: &str, expected: &[&str]) {
+        let request = switch_request(version, name).unwrap_or_else(|| panic!("request for {name}"));
+        let args = request.args();
+        assert_eq!(args, expected, "{name}");
+        let flags = &args[..args.len() - 1];
+        for forbidden in [
+            "-f", "--force", "--detach", "--orphan", "--guess", "--all", "--prune",
+        ] {
+            assert!(
+                !flags.contains(&forbidden),
+                "{name} flags include {forbidden}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checkout_args_prefix_the_branch_after_end_of_options() {
+        let modern = (2, 23, 0);
+        for name in [
+            "main",
+            "feature/necronomicon",
+            "-switch",
+            "--upload-pack=evil",
+            "--force",
+        ] {
+            assert_switch_args(modern, name, &["switch", "--no-guess", "--", name]);
+        }
+    }
+
+    #[test]
+    fn checkout_args_on_git_2_15_use_checkout_and_refuse_a_leading_dash() {
+        let old = (2, 15, 0);
+        assert_switch_args(old, "main", &["checkout", "main", "--"]);
+        assert_switch_args(old, "feature/foo", &["checkout", "feature/foo", "--"]);
+        assert!(switch_request(old, "-switch").is_none());
+        assert!(switch_request(old, "--upload-pack=evil").is_none());
+    }
+
+    #[test]
+    fn checkout_args_reject_dotdot_newline_and_check_ref_format() {
+        let versions = [(2, 15, 0), (2, 23, 0), (2, 53, 0)];
+        let rejected = [
+            "",
+            " ",
+            "ma\nin",
+            "..",
+            "../../.git",
+            "foo/../../.git",
+            "foo.lock",
+            ".hidden",
+            "a@{1}",
+            "star*",
+            "foo/",
+            "@",
+        ];
+        for version in versions {
+            for name in rejected {
+                assert!(
+                    switch_request(version, name).is_none(),
+                    "{name:?} on {version:?}"
+                );
+            }
+            assert!(switch_request(version, "HEAD").is_some());
+        }
     }
 }

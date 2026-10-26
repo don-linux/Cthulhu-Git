@@ -10,6 +10,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use resvg::{tiny_skia, usvg};
 
@@ -22,7 +23,7 @@ const WINDOWS_ICON_SIZES: [u32; 8] = [16, 20, 24, 32, 40, 48, 64, 256];
 const UI_ICONS_DIR: &str = "assets/icons";
 
 /// Interface icons, by file name without `.svg`. Must match `src/ui/icons.rs`.
-const UI_ICONS: [&str; 11] = [
+const UI_ICONS: [&str; 14] = [
     "panel-left",
     "panel-right",
     "house",
@@ -34,6 +35,9 @@ const UI_ICONS: [&str; 11] = [
     "arrow-down-to-line",
     "circle-user-round",
     "key-round",
+    "folder",
+    "github",
+    "info",
 ];
 
 /// Side of the rendered interface icons. Drawn at about 18 points, this stays
@@ -54,6 +58,7 @@ fn main() {
     fs::write(out_dir.join("icon-256.png"), png).expect("write icon-256.png");
 
     render_ui_icons(&out_dir);
+    embed_source_revision();
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         embed_windows_resources(&tree, &out_dir);
@@ -174,4 +179,72 @@ BEGIN
 END
 "#
     )
+}
+
+/// Commit and commit date of the source tree, for the About page.
+///
+/// A build without a checkout (a packaged tarball) still compiles. Both values
+/// are then `unknown`.
+fn embed_source_revision() {
+    let head = Path::new(".git/HEAD");
+    if head.is_file() {
+        println!("cargo:rerun-if-changed=.git/HEAD");
+        if let Ok(contents) = fs::read_to_string(head)
+            && let Some(reference) = contents.trim().strip_prefix("ref: ")
+        {
+            let ref_path = Path::new(".git").join(reference.trim());
+            if ref_path.is_file() {
+                println!("cargo:rerun-if-changed={}", ref_path.display());
+            }
+        }
+    }
+    let commit = git_line(&["rev-parse", "HEAD"]);
+    let date = git_line(&["log", "-1", "--format=%cs"]);
+    println!(
+        "cargo:rustc-env=CTHULHU_GIT_COMMIT={}",
+        commit.map_or_else(|| "unknown".to_owned(), |value| sanitize_commit(&value))
+    );
+    println!(
+        "cargo:rustc-env=CTHULHU_GIT_COMMIT_DATE={}",
+        date.map_or_else(|| "unknown".to_owned(), |value| sanitize_date(&value))
+    );
+}
+
+fn git_line(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let line = text.trim();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line.to_owned())
+    }
+}
+
+fn sanitize_commit(raw: &str) -> String {
+    if raw.len() >= 7 && raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        raw.to_owned()
+    } else {
+        "unknown".to_owned()
+    }
+}
+
+/// `git log --format=%cs` prints `YYYY-MM-DD`.
+fn sanitize_date(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let shaped = bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit());
+    if shaped {
+        raw.to_owned()
+    } else {
+        "unknown".to_owned()
+    }
 }
