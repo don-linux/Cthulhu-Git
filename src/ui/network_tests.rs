@@ -958,6 +958,74 @@ fn about_shows_the_commit_and_a_repository_url_without_a_token() {
     assert_no_token_material(copied);
 }
 
+#[test]
+fn terminal_font_field_is_half_the_column_and_centered_beside_browse() {
+    let (harness, _github, _actions) = open_settings();
+    let title = harness.get_by_label("Terminal Font").rect();
+    let field = harness.get_by_role(Role::TextInput).rect();
+    let browse = harness.get_by_label("Browse fonts").rect();
+    assert!(
+        (field.width() - 390.0).abs() < 2.0,
+        "font field width {:.1}\n{}",
+        field.width(),
+        label_dump(&harness)
+    );
+    let gap = browse.left() - field.right();
+    assert!(
+        (0.0..16.0).contains(&gap),
+        "browse gap {gap:.1} (field {field:?}, browse {browse:?})"
+    );
+    let pair_center = (field.left() + browse.right()) / 2.0;
+    assert!(
+        (pair_center - title.center().x).abs() < 4.0,
+        "pair center {pair_center:.1}, title center {:.1}",
+        title.center().x
+    );
+}
+
+#[test]
+fn about_puts_the_copyright_opposite_copy_version_info() {
+    let (mut harness, _github, _actions) = open_settings();
+    click_label(&mut harness, "About");
+    let title = harness.get_by_label("Cthulhu-Git").rect();
+    let logo = harness.get_by_label("Cthulhu-Git logo").rect();
+    let subtitle = harness.get_by_label(env!("CARGO_PKG_DESCRIPTION")).rect();
+    assert!(
+        logo.top() > title.bottom() && subtitle.top() > logo.bottom(),
+        "logo should sit between the title and the description ({title:?}, {logo:?}, {subtitle:?})"
+    );
+    assert!(
+        (logo.width() - 128.0).abs() < 2.0 && (logo.center().x - title.center().x).abs() < 4.0,
+        "logo {logo:?} title {title:?}"
+    );
+    let notice = harness.get_by_label("© 2026 Don Linux").rect();
+    let copy = harness.get_by_label("Copy version info").rect();
+    let version = harness.get_by_label("Version").rect();
+    let releases = format!("{}/releases", env!("CARGO_PKG_REPOSITORY"));
+    let releases_link = harness.get_by_label(&releases).rect();
+    let below_links = notice.top() - releases_link.bottom();
+    assert!(
+        (0.0..48.0).contains(&below_links),
+        "copyright sits {below_links:.1}px under the releases link ({notice:?}, {releases_link:?})"
+    );
+    assert!(
+        (notice.left() - version.left()).abs() < 2.0,
+        "copyright {:?} version {:?}",
+        notice,
+        version
+    );
+    assert!(
+        copy.left() > notice.right() + 100.0,
+        "copy {:?} should sit across from {:?}",
+        copy,
+        notice
+    );
+    assert!(
+        (copy.center().y - notice.center().y).abs() < 16.0,
+        "copy and copyright are not on the same row ({copy:?}, {notice:?})"
+    );
+}
+
 fn hover_repo() -> OpenedRepo {
     let oid = "ab".repeat(20);
     let author = Person::new(HOVER_AUTHOR, "ada@miskatonic.test");

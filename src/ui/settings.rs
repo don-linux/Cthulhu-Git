@@ -1,7 +1,7 @@
 //! Settings screen. It replaces the whole window, including the repository
 //! bottom bar. Back and Home sit at the left of the top bar, and the title
-//! at the right. Pages are listed on the left; the chosen page is drawn on
-//! the right. Both columns scroll.
+//! at the right. Pages are listed on the left; the chosen page is a centered
+//! column on the right. Both columns scroll.
 //!
 //! The font browser is a modal drawn after the panels, so its veil covers the
 //! bar, the navigation, and the page.
@@ -18,8 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cthulhu_git::github::{ApiStatus, TOKEN_TEMPLATE_URL};
 use cthulhu_git::settings::HistoryColumns;
 use eframe::egui::{
-    self, Align, Button, Color32, CursorIcon, Frame, Id, Key, Layout, Margin, RichText, ScrollArea,
-    Sense, Stroke, TextEdit, Ui, UiBuilder, Vec2,
+    self, Align, Button, Color32, CursorIcon, FontId, Frame, Id, Key, Label, Layout, Margin,
+    RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, Vec2,
 };
 
 use super::Action;
@@ -30,13 +30,34 @@ use super::terminal::{self, Terminal};
 use super::theme::{self, Palette};
 use super::widgets;
 
-const NAV_WIDTH: f32 = 200.0;
-const FORM_WIDTH: f32 = 560.0;
-const MODAL_WIDTH: f32 = 440.0;
+const NAV_WIDTH: f32 = 260.0;
+const PAGE_WIDTH: f32 = 780.0;
+/// Half the settings column. The family field stays this wide, with Browse fonts beside it.
+const FONT_FIELD_WIDTH: f32 = PAGE_WIDTH / 2.0;
+const BROWSE_FONTS: &str = "Browse fonts";
+const MODAL_WIDTH: f32 = 520.0;
 const MODAL_FADE_SECS: f32 = 0.15;
 const MODAL_BACKDROP_ALPHA: u8 = 160;
 /// Space above and below the prompt, inside the preview border.
 const PREVIEW_PAD: f32 = 8.0;
+/// Scales the one-line preview so the prompt is not flush with the border.
+const PREVIEW_HEIGHT_SCALE: f32 = 1.05;
+const PAGE_TOP: f32 = 40.0;
+/// Added under the last block. The column already keeps `COLUMN_SPACING` in the cursor.
+const PAGE_END: f32 = 32.0;
+/// Line and control spacing inside a page. Replaces egui's 3px default on this screen.
+const COLUMN_SPACING: f32 = 8.0;
+/// Extra gap before a section or the About card, on top of `COLUMN_SPACING`.
+const BETWEEN_CARDS: f32 = 12.0;
+const TITLE_SIZE: f32 = 24.0;
+const SUBTITLE_SIZE: f32 = 16.0;
+const SECTION_SIZE: f32 = 18.0;
+const BODY_SIZE: f32 = 16.0;
+const HELP_SIZE: f32 = 15.0;
+const NAV_LABEL_SIZE: f32 = 16.0;
+const BAR_TITLE_SIZE: f32 = 18.0;
+const BUTTON_MIN: Vec2 = Vec2::new(0.0, 36.0);
+const NAV_ITEM_GAP: f32 = 6.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -161,7 +182,7 @@ pub fn show(
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
                         RichText::new("Settings")
-                            .size(15.0)
+                            .size(BAR_TITLE_SIZE)
                             .strong()
                             .color(palette.text),
                     );
@@ -179,6 +200,7 @@ pub fn show(
                 .auto_shrink(false)
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = NAV_ITEM_GAP;
                     if nav_button(ui, "Terminal", Icon::Terminal, page == Page::Terminal).clicked()
                     {
                         page = Page::Terminal;
@@ -205,10 +227,7 @@ pub fn show(
             .id_salt("settings-page")
             .auto_shrink(false)
             .show(ui, |ui| {
-                let width = ui.available_width().min(FORM_WIDTH);
-                ui.set_min_width(width);
-                ui.set_max_width(width);
-                match page {
+                page_column(ui, |ui| match page {
                     Page::Terminal => {
                         terminal_page(
                             ui,
@@ -220,8 +239,15 @@ pub fn show(
                             &mut actions,
                         );
                         if let Some(cwd) = cwd {
-                            ui.add_space(8.0);
-                            shell_preview(ui, &palette, preview, cwd);
+                            section(ui, |ui| {
+                                centered_text(
+                                    ui,
+                                    RichText::new("Terminal Live Preview")
+                                        .size(SUBTITLE_SIZE)
+                                        .color(palette.text_muted),
+                                );
+                                shell_preview(ui, &palette, preview, cwd);
+                            });
                         }
                     }
                     Page::History => {
@@ -231,7 +257,7 @@ pub fn show(
                         github_page(ui, &palette, github, &view_state.api_status);
                     }
                     Page::About => about_page(ui, &palette, &view_state.about),
-                }
+                });
             });
     });
 
@@ -263,133 +289,165 @@ fn terminal_page(
     modal_visible: bool,
     actions: &mut Vec<Action>,
 ) {
-    ui.add_space(8.0);
-    ui.label(
-        RichText::new("Terminal Font")
-            .size(16.0)
-            .strong()
-            .color(palette.text),
+    page_header(
+        ui,
+        palette,
+        "Terminal Font",
+        "Family used by the terminal. Leave this empty to keep the built-in monospace.",
     );
-    ui.label(
-        RichText::new(
-            "Family used by the terminal. Leave this empty to keep the built-in monospace.",
-        )
-        .small()
-        .color(palette.text_muted),
-    );
-    ui.add_space(12.0);
-
-    if let Some(name) = font_name_row(ui, saved, picker, modal_visible, actions) {
-        actions.push(Action::SetTerminalFont(name));
-    }
-    ui.add_space(8.0);
-    font_hint(ui, palette, view);
+    section(ui, |ui| {
+        if let Some(name) = font_name_row(ui, saved, picker, modal_visible, actions) {
+            actions.push(Action::SetTerminalFont(name));
+        }
+        font_hint(ui, palette, view);
+    });
 }
 
 fn about_page(ui: &mut Ui, palette: &Palette, about: &AboutInfo) {
-    page_title(ui, palette, "Cthulhu-Git", &about.description);
-    about_row(ui, palette, "Version", &about.version, false);
-    about_row(ui, palette, "Version date", &about.version_date, false);
-    about_row(ui, palette, "Commit", &about.commit, true);
-    about_row(ui, palette, "License", &about.license, false);
-    about_row(ui, palette, "Git", &about.git_version, false);
-    ui.add_space(8.0);
+    ui.add_space(PAGE_TOP);
+    centered_text(
+        ui,
+        RichText::new("Cthulhu-Git")
+            .size(TITLE_SIZE)
+            .strong()
+            .color(palette.text),
+    );
+    about_logo(ui);
+    centered_text(
+        ui,
+        RichText::new(&about.description)
+            .size(SUBTITLE_SIZE)
+            .color(palette.text_muted),
+    );
+    card(ui, palette, |ui| {
+        about_row(ui, palette, "Version", &about.version, false);
+        about_row(ui, palette, "Version date", &about.version_date, false);
+        about_row(ui, palette, "Commit", &about.commit, true);
+        about_row(ui, palette, "License", &about.license, false);
+        about_row(ui, palette, "Git", &about.git_version, false);
+        ui.horizontal(|ui| {
+            icons::icon(ui, Icon::GitHub, palette.text);
+            link(ui, palette, &about.repository, &about.repository);
+        });
+        let releases = about.releases_url();
+        ui.horizontal(|ui| {
+            icons::icon(ui, Icon::GitHub, palette.text);
+            link(ui, palette, &releases, &releases);
+        });
+        // `horizontal` keeps this row at the button's height. A bare right-to-left
+        // layout would claim the rest of the page and stretch the card.
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let copy = text_button(ui, "Copy version info", true);
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_min_width(ui.available_width());
+                    help(ui, palette, "© 2026 Don Linux");
+                });
+                if copy.clicked() {
+                    ui.ctx().copy_text(about.copy_text());
+                }
+            });
+        });
+    });
+}
 
-    ui.horizontal(|ui| {
-        icons::icon(ui, Icon::GitHub, palette.text);
-        ui.hyperlink_to(
-            RichText::new(&about.repository).color(palette.accent),
-            &about.repository,
+/// Side of the application icon under the About title. The source is 256 px.
+const ABOUT_LOGO: f32 = 128.0;
+
+fn about_logo(ui: &mut Ui) {
+    let texture = logo_texture(ui.ctx());
+    ui.vertical_centered(|ui| {
+        ui.add(
+            egui::Image::new(&texture)
+                .fit_to_exact_size(Vec2::splat(ABOUT_LOGO))
+                .alt_text("Cthulhu-Git logo"),
         );
     });
-    let releases = about.releases_url();
-    ui.hyperlink_to(RichText::new(&releases).color(palette.accent), &releases);
-    ui.add_space(12.0);
+}
 
-    if ui
-        .add(Button::new("Copy version info"))
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .clicked()
-    {
-        ui.ctx().copy_text(about.copy_text());
+/// Uploaded once and kept for the life of the context, same as the interface icons.
+fn logo_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let id = Id::new("cthulhu-git-about-logo");
+    if let Some(texture) = ctx.data(|data| data.get_temp(id)) {
+        return texture;
     }
-    ui.add_space(16.0);
-    muted(ui, palette, "Copyright 2026 Fernando Diaz");
+    let rgba = image::load_from_memory(include_bytes!(concat!(env!("OUT_DIR"), "/icon-256.png")))
+        .expect("icon-256.png rendered by build.rs")
+        .into_rgba8();
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    );
+    let texture = ctx.load_texture(
+        "cthulhu-git-about-logo",
+        image,
+        egui::TextureOptions::LINEAR,
+    );
+    ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+    texture
 }
 
 fn about_row(ui: &mut Ui, palette: &Palette, label: &str, value: &str, monospace: bool) {
-    ui.label(RichText::new(label).small().color(palette.text_muted));
-    ui.add_space(2.0);
-    let mut text = RichText::new(value).color(if monospace {
-        palette.hash
-    } else {
-        palette.text
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.label(
+            RichText::new(label)
+                .size(HELP_SIZE)
+                .color(palette.text_muted),
+        );
+        let mut text = RichText::new(value).size(BODY_SIZE).color(if monospace {
+            palette.hash
+        } else {
+            palette.text
+        });
+        if monospace {
+            text = text.monospace();
+        }
+        ui.label(text);
     });
-    if monospace {
-        text = text.monospace();
-    }
-    ui.label(text);
-    ui.add_space(10.0);
-}
-
-fn page_title(ui: &mut Ui, palette: &Palette, title: &str, subtitle: &str) {
-    ui.add_space(8.0);
-    ui.label(RichText::new(title).size(16.0).strong().color(palette.text));
-    ui.label(RichText::new(subtitle).small().color(palette.text_muted));
-    ui.add_space(12.0);
-}
-
-fn paragraph(ui: &mut Ui, palette: &Palette, text: &str) {
-    ui.label(RichText::new(text).color(palette.text));
-    ui.add_space(6.0);
-}
-
-fn muted(ui: &mut Ui, palette: &Palette, text: &str) {
-    ui.label(RichText::new(text).small().color(palette.text_muted));
 }
 
 fn history_page(ui: &mut Ui, palette: &Palette, avatars_on: bool, actions: &mut Vec<Action>) {
-    page_title(
+    page_header(
         ui,
         palette,
         "Commit History",
         "Author pictures and the width of the history columns.",
     );
-    let mut on = avatars_on;
-    if ui
-        .checkbox(
-            &mut on,
-            RichText::new("Show author avatars").color(palette.text),
-        )
-        .changed()
-    {
-        actions.push(Action::SetAuthorAvatars(on));
-    }
-    ui.add_space(4.0);
-    muted(
-        ui,
-        palette,
-        "Pictures come from GitHub (no-reply addresses, and the GitHub API for repositories \
-         hosted there) and from Gravatar, which receives a SHA-256 hash of the address, never \
-         the address itself. They are kept for a week in the user cache folder. Off draws \
-         initials and sends nothing.",
-    );
-    ui.add_space(16.0);
-    ui.label(RichText::new("Columns").strong().color(palette.text));
-    muted(
-        ui,
-        palette,
-        "Drag a divider in the history header to resize that column only. Double-click a \
-         divider to restore that column. Widths follow the window and the open sidebars.",
-    );
-    ui.add_space(6.0);
-    if ui
-        .button("Reset all column widths")
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .clicked()
-    {
-        actions.push(Action::SetHistoryColumns(HistoryColumns::default()));
-    }
+    section(ui, |ui| {
+        let mut on = avatars_on;
+        if ui
+            .checkbox(
+                &mut on,
+                RichText::new("Show author avatars")
+                    .size(BODY_SIZE)
+                    .color(palette.text),
+            )
+            .changed()
+        {
+            actions.push(Action::SetAuthorAvatars(on));
+        }
+        help(
+            ui,
+            palette,
+            "Pictures come from GitHub (no-reply addresses, and the GitHub API for repositories \
+             hosted there) and from Gravatar, which receives a SHA-256 hash of the address, never \
+             the address itself. They are kept for a week in the user cache folder. Off draws \
+             initials and sends nothing.",
+        );
+    });
+    section(ui, |ui| {
+        section_title(ui, palette, "Columns");
+        help(
+            ui,
+            palette,
+            "Drag a divider in the history header to resize that column only. Double-click a \
+             divider to restore that column. Widths follow the window and the open sidebars.",
+        );
+        if text_button(ui, "Reset all column widths", true).clicked() {
+            actions.push(Action::SetHistoryColumns(HistoryColumns::default()));
+        }
+    });
 }
 
 /// Read-only uses the token has today, and what it could add later with the
@@ -415,175 +473,170 @@ const POSSIBLE_LATER: [(&str, &str); 5] = [
 ];
 
 fn github_page(ui: &mut Ui, palette: &Palette, github: &mut GitHubAuth, api: &ApiStatus) {
-    page_title(
+    page_header(
         ui,
         palette,
         "GitHub Auth",
         "Optional. Without a token, public repositories still show avatars.",
     );
-    paragraph(
-        ui,
-        palette,
-        "A GitHub token lets Cthulhu Git read the authors and avatars of your private \
-         repositories, and raises GitHub's limit from 60 to 5,000 requests an hour. It is only \
-         used to read: Cthulhu Git never writes to GitHub with it.",
-    );
+    section(ui, |ui| {
+        body(
+            ui,
+            palette,
+            "A GitHub token lets Cthulhu Git read the authors and avatars of your private \
+             repositories, and raises GitHub's limit from 60 to 5,000 requests an hour. It is only \
+             used to read: Cthulhu Git never writes to GitHub with it.",
+        );
+    });
+    section(ui, |ui| {
+        section_title(ui, palette, "1. Create a read-only token");
+        link(
+            ui,
+            palette,
+            "Open GitHub's token form, already set to read-only",
+            TOKEN_TEMPLATE_URL,
+        );
+        help(
+            ui,
+            palette,
+            "The form asks for Contents: read-only and Metadata: read-only. For an organization's \
+             private repositories, choose that organization as the Resource owner.",
+        );
+    });
 
-    ui.label(
-        RichText::new("1. Create a read-only token")
-            .strong()
-            .color(palette.text),
-    );
-    ui.hyperlink_to(
-        RichText::new("Open GitHub's token form, already set to read-only").color(palette.accent),
-        TOKEN_TEMPLATE_URL,
-    );
-    muted(
-        ui,
-        palette,
-        "The form asks for Contents: read-only and Metadata: read-only. For an organization's \
-         private repositories, choose that organization as the Resource owner.",
-    );
-    ui.add_space(10.0);
-
-    ui.label(
-        RichText::new("2. Paste it here")
-            .strong()
-            .color(palette.text),
-    );
     let busy = github.busy();
-    ui.horizontal(|ui| {
-        let field = ui.add_enabled(
-            !busy,
-            TextEdit::singleline(&mut github.draft)
-                .id(token_field_id())
-                .password(true)
-                .hint_text("github_pat_…")
-                .desired_width(FORM_WIDTH - 90.0),
-        );
-        let enter = field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
-        let save = ui
-            .add_enabled(
-                !busy && !github.draft.trim().is_empty(),
-                Button::new("Save"),
-            )
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .clicked();
-        if (save || enter) && !github.draft.trim().is_empty() {
-            github.save_draft(ui.ctx());
-        }
-    });
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(!busy, Button::new("Import from GitHub CLI"))
-            .on_hover_text("Runs `gh auth token` and fills the field. Nothing is saved yet.")
-            .clicked()
-        {
-            github.import_gh(ui.ctx());
-        }
-        if cthulhu_git::github::token_from_env().is_some()
-            && ui
-                .add_enabled(!busy, Button::new("Use GH_TOKEN"))
-                .on_hover_text("Fills the field from GH_TOKEN or GITHUB_TOKEN.")
-                .clicked()
-        {
-            github.use_env();
-        }
-    });
-    ui.add_space(10.0);
-
-    ui.label(RichText::new("Status").strong().color(palette.text));
-    let stored = match github.stored() {
-        Stored::None => "No token. Public repositories only.",
-        Stored::Keychain => "Token saved in the system keychain.",
-        Stored::Session => "Token used for this session only; it is not saved.",
-    };
-    ui.label(RichText::new(stored).color(palette.text));
-    if let Some(login) = github.user() {
-        let limit = github
-            .rate()
-            .and_then(|rate| Some((rate.remaining?, rate.limit?)))
-            .map(|(remaining, limit)| format!(" · {remaining}/{limit} requests left this hour"))
-            .unwrap_or_default();
-        ui.label(RichText::new(format!("Connected as {login}{limit}")).color(palette.diff_added));
-    }
-    if api.token_rejected {
-        ui.label(
-            RichText::new("GitHub rejected the token; requests continue without it.")
-                .color(palette.warning),
-        );
-    }
-    if let Some(until) = api.paused_until {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs())
-            .unwrap_or(0);
-        if until > now {
-            let minutes = (until - now).div_ceil(60);
-            ui.label(
-                RichText::new(format!(
-                    "GitHub's rate limit was reached. The API is asked again in {minutes} min."
-                ))
-                .color(palette.warning),
-            );
-        }
-    }
-    match github.notice() {
-        Some(Notice::Info(text)) => muted(ui, palette, text),
-        Some(Notice::Error(text)) => {
-            ui.label(RichText::new(text).color(palette.error));
-        }
-        None => {}
-    }
-    if busy {
-        ui.spinner();
-    }
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(!busy && github.has_token(), Button::new("Verify"))
-            .on_hover_text("Asks GitHub who the token belongs to.")
-            .clicked()
-        {
-            github.verify(ui.ctx());
-        }
-        if ui
-            .add_enabled(!busy && github.has_token(), Button::new("Remove token"))
-            .clicked()
-        {
-            github.remove(ui.ctx());
-        }
-    });
-    muted(
-        ui,
-        palette,
-        "Stored in Keychain on macOS, Credential Manager on Windows, or the Secret Service \
-         (GNOME Keyring, KWallet) on Linux. Never in settings.json. It is sent only to \
-         api.github.com, never to avatar hosts.",
-    );
-    ui.add_space(16.0);
-
-    ui.label(
-        RichText::new("Possible later with this token")
-            .strong()
-            .color(palette.text),
-    );
-    for (feature, permission) in POSSIBLE_LATER {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(format!("• {feature}")).color(palette.text));
-            ui.label(
-                RichText::new(format!("({permission})"))
-                    .small()
-                    .color(palette.text_muted),
-            );
+    section(ui, |ui| {
+        section_title(ui, palette, "2. Paste it here");
+        ui.horizontal(|ui| {
+            // The button is placed first so the field takes whatever width remains.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let save = text_button(ui, "Save", !busy && !github.draft.trim().is_empty());
+                let field = ui.add_enabled(
+                    !busy,
+                    TextEdit::singleline(&mut github.draft)
+                        .id(token_field_id())
+                        .password(true)
+                        .hint_text("github_pat_…")
+                        .font(field_font())
+                        .desired_width(ui.available_width()),
+                );
+                let enter = field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+                if (save.clicked() || enter) && !github.draft.trim().is_empty() {
+                    github.save_draft(ui.ctx());
+                }
+            });
         });
-    }
-    ui.add_space(4.0);
-    muted(
-        ui,
-        palette,
-        "Writing to GitHub (pushing over HTTPS, opening pull requests) would need a different \
-         token with write access, and is not part of this page.",
-    );
+        ui.horizontal(|ui| {
+            if text_button(ui, "Import from GitHub CLI", !busy)
+                .on_hover_text("Runs `gh auth token` and fills the field. Nothing is saved yet.")
+                .clicked()
+            {
+                github.import_gh(ui.ctx());
+            }
+            if cthulhu_git::github::token_from_env().is_some()
+                && text_button(ui, "Use GH_TOKEN", !busy)
+                    .on_hover_text("Fills the field from GH_TOKEN or GITHUB_TOKEN.")
+                    .clicked()
+            {
+                github.use_env();
+            }
+        });
+    });
+
+    section(ui, |ui| {
+        section_title(ui, palette, "Status");
+        let stored = match github.stored() {
+            Stored::None => "No token. Public repositories only.",
+            Stored::Keychain => "Token saved in the system keychain.",
+            Stored::Session => "Token used for this session only; it is not saved.",
+        };
+        body(ui, palette, stored);
+        if let Some(login) = github.user() {
+            let limit = github
+                .rate()
+                .and_then(|rate| Some((rate.remaining?, rate.limit?)))
+                .map(|(remaining, limit)| format!(" · {remaining}/{limit} requests left this hour"))
+                .unwrap_or_default();
+            colored(
+                ui,
+                &format!("Connected as {login}{limit}"),
+                palette.diff_added,
+            );
+        }
+        if api.token_rejected {
+            colored(
+                ui,
+                "GitHub rejected the token; requests continue without it.",
+                palette.warning,
+            );
+        }
+        if let Some(until) = api.paused_until {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0);
+            if until > now {
+                let minutes = (until - now).div_ceil(60);
+                colored(
+                    ui,
+                    &format!(
+                        "GitHub's rate limit was reached. The API is asked again in {minutes} min."
+                    ),
+                    palette.warning,
+                );
+            }
+        }
+        match github.notice() {
+            Some(Notice::Info(text)) => help(ui, palette, text),
+            Some(Notice::Error(text)) => colored(ui, text, palette.error),
+            None => {}
+        }
+        if busy {
+            ui.spinner();
+        }
+        ui.horizontal(|ui| {
+            if text_button(ui, "Verify", !busy && github.has_token())
+                .on_hover_text("Asks GitHub who the token belongs to.")
+                .clicked()
+            {
+                github.verify(ui.ctx());
+            }
+            if text_button(ui, "Remove token", !busy && github.has_token()).clicked() {
+                github.remove(ui.ctx());
+            }
+        });
+        help(
+            ui,
+            palette,
+            "Stored in Keychain on macOS, Credential Manager on Windows, or the Secret Service \
+             (GNOME Keyring, KWallet) on Linux. Never in settings.json. It is sent only to \
+             api.github.com, never to avatar hosts.",
+        );
+    });
+
+    section(ui, |ui| {
+        section_title(ui, palette, "Possible later with this token");
+        for (feature, permission) in POSSIBLE_LATER {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("• {feature}"))
+                        .size(BODY_SIZE)
+                        .color(palette.text),
+                );
+                ui.label(
+                    RichText::new(format!("({permission})"))
+                        .size(HELP_SIZE)
+                        .color(palette.text_muted),
+                );
+            });
+        }
+        help(
+            ui,
+            palette,
+            "Writing to GitHub (pushing over HTTPS, opening pull requests) would need a different \
+             token with write access, and is not part of this page.",
+        );
+    });
 }
 
 /// One prompt line, clipped out of a normal-sized shell. A one-row PTY scrolls
@@ -592,7 +645,10 @@ fn github_page(ui: &mut Ui, palette: &Palette, github: &mut GitHubAuth, api: &Ap
 /// keyboard are ignored.
 fn shell_preview(ui: &mut Ui, palette: &Palette, preview: &mut Option<Terminal>, cwd: &Path) {
     let row = terminal_row_height(ui);
-    let size = Vec2::new(ui.available_width(), row + PREVIEW_PAD * 2.0);
+    let size = Vec2::new(
+        ui.available_width(),
+        (row + PREVIEW_PAD * 2.0) * PREVIEW_HEIGHT_SCALE,
+    );
     let drawn = ui.allocate_ui(size, |ui| {
         ui.set_min_size(size);
         let outer = ui.max_rect();
@@ -639,26 +695,31 @@ fn font_name_row(
     modal_visible: bool,
     actions: &mut Vec<Action>,
 ) -> Option<Option<String>> {
-    ui.horizontal(|ui| {
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui
-                .add(Button::new("Browse fonts"))
-                .on_hover_cursor(CursorIcon::PointingHand)
-                .clicked()
-            {
+    let width = font_row_width(ui);
+    let indent = ((ui.available_width() - width) / 2.0).max(0.0);
+    // Right-to-left keeps the button ahead of the field, so a click this frame
+    // already counts as the modal being up and Escape does not revert the draft.
+    with_width_at(
+        ui,
+        indent,
+        width,
+        Layout::right_to_left(Align::Center),
+        |ui| {
+            if text_button(ui, BROWSE_FONTS, true).clicked() {
                 picker.open = true;
                 actions.push(Action::EnsureFontCatalog);
             }
-            // The button runs first (`right_to_left`), so a click this frame
-            // already counts as the modal being up.
-            font_editor(ui, saved, modal_visible || picker.open)
-        })
-        .inner
-    })
-    .inner
+            font_editor(ui, saved, modal_visible || picker.open, FONT_FIELD_WIDTH)
+        },
+    )
 }
 
-fn font_editor(ui: &mut Ui, saved: Option<&str>, modal_visible: bool) -> Option<Option<String>> {
+fn font_editor(
+    ui: &mut Ui,
+    saved: Option<&str>,
+    modal_visible: bool,
+    width: f32,
+) -> Option<Option<String>> {
     let saved_text = saved.unwrap_or("");
     let escape = !modal_visible && ui.input(|input| input.key_pressed(Key::Escape));
     let mut draft = if escape {
@@ -668,11 +729,11 @@ fn font_editor(ui: &mut Ui, saved: Option<&str>, modal_visible: bool) -> Option<
             .data(|data| data.get_temp(draft_id()))
             .unwrap_or_else(|| saved_text.to_owned())
     };
-    let width = ui.available_width();
     let response = ui.add(
         TextEdit::singleline(&mut draft)
             .id(font_field_id())
             .hint_text("Monospace")
+            .font(field_font())
             .desired_width(width),
     );
     if response.has_focus() {
@@ -691,29 +752,72 @@ fn font_editor(ui: &mut Ui, saved: Option<&str>, modal_visible: bool) -> Option<
 }
 
 fn font_hint(ui: &mut Ui, palette: &Palette, view: &fonts::FontView<'_>) {
-    match &view.face {
-        FacePhase::Builtin { pending: true } => {
-            note(ui, "Looking up installed fonts…", palette.text_muted);
+    let (text, error) = match &view.face {
+        FacePhase::Builtin { pending: true } => ("Looking up installed fonts…", false),
+        FacePhase::Missing => (
+            "Font not found. The terminal is using the built-in monospace.",
+            false,
+        ),
+        FacePhase::Ready { monospace: false } => (
+            "This font is not monospace. The terminal grid expects a fixed width.",
+            false,
+        ),
+        FacePhase::Unreadable(message) | FacePhase::ScanFailed(message) => (message.as_str(), true),
+        FacePhase::Builtin { pending: false } | FacePhase::Ready { monospace: true } => return,
+    };
+    let indent = ((ui.available_width() - font_row_width(ui)) / 2.0).max(0.0);
+    with_width_at(
+        ui,
+        indent,
+        FONT_FIELD_WIDTH,
+        Layout::top_down(Align::Min),
+        |ui| {
+            if error {
+                colored(ui, text, palette.error);
+            } else {
+                note(ui, text, palette.text_muted);
+            }
+        },
+    );
+}
+
+/// Width of Browse fonts, so the family field can stay `FONT_FIELD_WIDTH`
+/// and the pair can be centered without laying the button out twice.
+fn browse_button_width(ui: &Ui) -> f32 {
+    let text = ui
+        .painter()
+        .layout_no_wrap(
+            BROWSE_FONTS.to_owned(),
+            FontId::proportional(BODY_SIZE),
+            Color32::PLACEHOLDER,
+        )
+        .rect
+        .width();
+    text + ui.spacing().button_padding.x * 2.0
+}
+
+fn font_row_width(ui: &Ui) -> f32 {
+    FONT_FIELD_WIDTH + ui.spacing().item_spacing.x + browse_button_width(ui)
+}
+
+/// A strip `width` wide, starting `indent` from the left of this row.
+fn with_width_at<R>(
+    ui: &mut Ui,
+    indent: f32,
+    width: f32,
+    layout: Layout,
+    add: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    ui.horizontal(|ui| {
+        if indent > 0.0 {
+            ui.add_space(indent);
         }
-        FacePhase::Missing => {
-            note(
-                ui,
-                "Font not found. The terminal is using the built-in monospace.",
-                palette.text_muted,
-            );
-        }
-        FacePhase::Ready { monospace: false } => {
-            note(
-                ui,
-                "This font is not monospace. The terminal grid expects a fixed width.",
-                palette.text_muted,
-            );
-        }
-        FacePhase::Unreadable(message) | FacePhase::ScanFailed(message) => {
-            note(ui, message, palette.error);
-        }
-        FacePhase::Builtin { pending: false } | FacePhase::Ready { monospace: true } => {}
-    }
+        let mut rect = ui.available_rect_before_wrap();
+        rect.max.x = rect.min.x + width;
+        ui.scope_builder(UiBuilder::new().max_rect(rect).layout(layout), add)
+            .inner
+    })
+    .inner
 }
 
 fn font_modal(
@@ -737,17 +841,17 @@ fn font_modal(
                 .fill(palette.surface)
                 .stroke(Stroke::new(1.0, palette.border))
                 .corner_radius(widgets::CORNER_RADIUS)
-                .inner_margin(Margin::same(16))
+                .inner_margin(Margin::same(20))
                 .show(ui, |ui| {
                     ui.set_min_width(MODAL_WIDTH);
                     ui.set_max_width(MODAL_WIDTH);
+                    ui.spacing_mut().item_spacing.y = COLUMN_SPACING;
                     ui.label(
                         RichText::new("Terminal Font")
-                            .size(16.0)
+                            .size(TITLE_SIZE)
                             .strong()
                             .color(palette.text),
                     );
-                    ui.add_space(12.0);
                     font_browser(ui, palette, saved, view, picker, actions);
                 });
         });
@@ -768,20 +872,20 @@ fn font_browser(
         CatalogPhase::Idle | CatalogPhase::Loading => {
             note(ui, "Looking up installed fonts…", palette.text_muted);
         }
-        CatalogPhase::Failed(message) => note(ui, message, palette.error),
+        CatalogPhase::Failed(message) => colored(ui, message, palette.error),
         CatalogPhase::Ready(catalog) => {
             let mut query = picker.query.clone();
             ui.add(
                 TextEdit::singleline(&mut query)
                     .id_salt("font-search")
                     .hint_text("Search fonts")
+                    .font(field_font())
                     .desired_width(f32::INFINITY),
             );
             let query_changed = query != picker.query;
             if query_changed {
                 picker.query = query;
             }
-            ui.add_space(8.0);
 
             if catalog.names().is_empty() {
                 note(ui, "No installed fonts were found.", palette.text_muted);
@@ -836,11 +940,11 @@ fn font_row(ui: &mut Ui, palette: &Palette, name: &str, selected: bool) -> egui:
             Frame::new()
                 .fill(fill)
                 .corner_radius(widgets::CORNER_RADIUS)
-                .inner_margin(Margin::symmetric(10, 6))
+                .inner_margin(Margin::symmetric(12, 10))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.add(
-                        egui::Label::new(RichText::new(name).color(palette.text))
+                        egui::Label::new(RichText::new(name).size(BODY_SIZE).color(palette.text))
                             .selectable(false)
                             .truncate(),
                     );
@@ -871,7 +975,7 @@ fn nav_button(ui: &mut Ui, label: &str, icon: Icon, selected: bool) -> egui::Res
                 Frame::new()
                     .fill(fill)
                     .corner_radius(widgets::CORNER_RADIUS)
-                    .inner_margin(Margin::symmetric(8, 6))
+                    .inner_margin(Margin::symmetric(14, 12))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
@@ -882,9 +986,13 @@ fn nav_button(ui: &mut Ui, label: &str, icon: Icon, selected: bool) -> egui::Res
                             };
                             icons::icon(ui, icon, tint);
                             ui.add(
-                                egui::Label::new(RichText::new(label).color(palette.text))
-                                    .selectable(false)
-                                    .truncate(),
+                                egui::Label::new(
+                                    RichText::new(label)
+                                        .size(NAV_LABEL_SIZE)
+                                        .color(palette.text),
+                                )
+                                .selectable(false)
+                                .truncate(),
                             );
                         });
                     });
@@ -895,7 +1003,7 @@ fn nav_button(ui: &mut Ui, label: &str, icon: Icon, selected: bool) -> egui::Res
 }
 
 fn note(ui: &mut Ui, text: &str, color: Color32) {
-    ui.label(RichText::new(text).color(color));
+    ui.label(RichText::new(text).size(HELP_SIZE).color(color));
 }
 
 fn normalize_draft(draft: &str) -> Option<String> {
@@ -942,5 +1050,101 @@ fn bar_frame(palette: &Palette) -> Frame {
 fn nav_frame(palette: &Palette) -> Frame {
     Frame::new()
         .fill(palette.surface)
-        .inner_margin(Margin::symmetric(8, 8))
+        .inner_margin(Margin::symmetric(10, 12))
+}
+
+fn page_column(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    widgets::centered_column(ui, PAGE_WIDTH, |ui| {
+        ui.spacing_mut().item_spacing.y = COLUMN_SPACING;
+        add(ui);
+        ui.add_space(PAGE_END);
+    });
+}
+
+fn page_header(ui: &mut Ui, palette: &Palette, title: &str, subtitle: &str) {
+    ui.add_space(PAGE_TOP);
+    centered_text(
+        ui,
+        RichText::new(title)
+            .size(TITLE_SIZE)
+            .strong()
+            .color(palette.text),
+    );
+    centered_text(
+        ui,
+        RichText::new(subtitle)
+            .size(SUBTITLE_SIZE)
+            .color(palette.text_muted),
+    );
+}
+
+/// Centers each line in the column, including a subtitle that wraps.
+fn centered_text(ui: &mut Ui, text: RichText) {
+    ui.vertical_centered(|ui| {
+        ui.add(Label::new(text).halign(Align::Center).selectable(false));
+    });
+}
+
+fn section_title(ui: &mut Ui, palette: &Palette, title: &str) {
+    ui.label(
+        RichText::new(title)
+            .size(SECTION_SIZE)
+            .strong()
+            .color(palette.text),
+    );
+}
+
+fn body(ui: &mut Ui, palette: &Palette, text: &str) {
+    colored(ui, text, palette.text);
+}
+
+fn help(ui: &mut Ui, palette: &Palette, text: &str) {
+    note(ui, text, palette.text_muted);
+}
+
+fn colored(ui: &mut Ui, text: &str, color: Color32) {
+    ui.label(RichText::new(text).size(BODY_SIZE).color(color));
+}
+
+fn link(ui: &mut Ui, palette: &Palette, label: &str, url: &str) {
+    ui.hyperlink_to(
+        RichText::new(label).size(BODY_SIZE).color(palette.accent),
+        url,
+    );
+}
+
+fn text_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        Button::new(RichText::new(label).size(BODY_SIZE)).min_size(BUTTON_MIN),
+    )
+    .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn field_font() -> FontId {
+    FontId::proportional(BODY_SIZE)
+}
+
+/// A block of the page with the gap of a card, and no fill or border.
+fn section(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    ui.add_space(BETWEEN_CARDS);
+    ui.vertical(|ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = COLUMN_SPACING;
+        add(ui);
+    });
+}
+
+fn card(ui: &mut Ui, palette: &Palette, add: impl FnOnce(&mut Ui)) {
+    ui.add_space(BETWEEN_CARDS);
+    Frame::new()
+        .fill(palette.surface)
+        .stroke(Stroke::new(1.0, palette.border))
+        .corner_radius(widgets::CORNER_RADIUS)
+        .inner_margin(Margin::same(20))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = COLUMN_SPACING;
+            add(ui);
+        });
 }
