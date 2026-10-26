@@ -1,6 +1,7 @@
 //! Kittest coverage for the commit-history table: title order and alignment,
-//! horizontal scroll, divider drag, double-click reset, virtualization, and
-//! cells that must stay inside their columns.
+//! horizontal scroll, divider drag, double-click reset, virtualization,
+//! cells that must stay inside their columns, and the opening line while
+//! history is still loading.
 
 use cthulhu_git::git::{
     Branch, Commit, CommitDetail, GraphBranch, GraphCommit, GraphRow, GraphTip, Head, HistoryGraph,
@@ -20,6 +21,8 @@ use super::{Action, ListedBranch, OpenedRepo};
 
 const PIXELS_PER_POINT: f32 = 1.0;
 const HEIGHT: f32 = 640.0;
+/// The app's minimum inner size, and the window the narrow-history kittest uses.
+const MIN_WINDOW: egui::Vec2 = egui::Vec2::new(520.0, 400.0);
 /// Titles and cells are aligned when their left edges differ by at most a point.
 const TOL: f32 = 1.0;
 const TITLES: [&str; 5] = ["Branch", "Graph", "Commit Hash", "Commit Message", "Author"];
@@ -29,6 +32,8 @@ struct Screen {
     columns: HistoryColumns,
     branches_open: bool,
     detail_open: bool,
+    /// This repository's history graph is still being read.
+    history_loading: bool,
     actions: Vec<Action>,
 }
 
@@ -56,6 +61,7 @@ fn screen(
         columns,
         branches_open,
         detail_open,
+        history_loading: false,
         actions: Vec::new(),
     }
 }
@@ -79,6 +85,7 @@ fn harness(size: egui::Vec2, screen: Screen) -> Harness<'static, Screen> {
                         terminal_open: false,
                         syncing: None,
                         columns: screen.columns,
+                        history_loading: screen.history_loading,
                         busy: false,
                     },
                     &mut avatars,
@@ -201,6 +208,25 @@ fn linear_graph(commits: &[Commit], author: &Person) -> HistoryGraph {
         .into_iter()
         .collect::<Vec<_>>();
     layout_graph(&inputs, &tips)
+}
+
+/// Branch list and latest commit are already known; the graph has no rows.
+///
+/// Opening a repository installs the current branch, which already has
+/// commits, before the history worker fills the table. With
+/// `history_loading` the empty table is still opening. Without it, the same
+/// empty table is "No commits yet."
+fn opened_while_history_loads(name: &str) -> OpenedRepo {
+    let mut repo = opened(
+        name,
+        &[Commit {
+            oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            summary: "field notes from the estuary".to_owned(),
+        }],
+        false,
+    );
+    repo.graph = HistoryGraph::default();
+    repo
 }
 
 fn one_commit(summary: &str) -> OpenedRepo {
@@ -1140,4 +1166,290 @@ fn long_cells_stay_inside_their_columns() {
         "the long summary was not elided (accessibility width {:.1})",
         message_cell.width()
     );
+}
+
+struct PaintedText {
+    clip: egui::Rect,
+    bounds: egui::Rect,
+    elided: bool,
+}
+
+fn painted_text(harness: &Harness<'_, Screen>, exact: &str) -> Vec<PaintedText> {
+    let mut found = Vec::new();
+    for clipped in &harness.output().shapes {
+        collect_painted_text(&clipped.shape, clipped.clip_rect, exact, &mut found);
+    }
+    found
+}
+
+fn collect_painted_text(
+    shape: &egui::Shape,
+    clip: egui::Rect,
+    exact: &str,
+    found: &mut Vec<PaintedText>,
+) {
+    match shape {
+        egui::Shape::Text(text) if text.galley.text() == exact => {
+            found.push(PaintedText {
+                clip,
+                bounds: text.galley.rect.translate(text.pos.to_vec2()),
+                elided: text.galley.elided,
+            });
+        }
+        egui::Shape::Vec(shapes) => {
+            for shape in shapes {
+                collect_painted_text(shape, clip, exact, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn assert_inside_panel(what: &str, rect: egui::Rect, panel: egui::Rect, window: egui::Vec2) {
+    assert!(
+        rect.width() > 1.0 && rect.height() > 1.0,
+        "{what} has no extent ({rect:?})"
+    );
+    assert!(
+        rect.left() >= panel.left() - TOL
+            && rect.right() <= panel.right() + TOL
+            && rect.top() >= panel.top() - TOL
+            && rect.bottom() <= panel.bottom() + TOL,
+        "{what} is clipped or drawn past the panel (rect {rect:?}, panel {panel:?})"
+    );
+    assert!(
+        rect.left() >= -TOL && rect.right() <= window.x + TOL,
+        "{what} overflows the minimum window width {:.0} (rect {rect:?})",
+        window.x
+    );
+}
+
+fn sole_clip(harness: &Harness<'_, Screen>, exact: &str) -> egui::Rect {
+    let painted = painted_text(harness, exact);
+    assert_eq!(
+        painted.len(),
+        1,
+        "expected one painted {exact:?}, found {}\n{}",
+        painted.len(),
+        labels(harness)
+    );
+    painted[0].clip
+}
+
+/// The history panel is the gap between the branch sidebar and the detail
+/// sidebar. An empty graph returns before any column is drawn, so those
+/// clips are the panel.
+fn history_panel(harness: &Harness<'_, Screen>) -> egui::Rect {
+    let branches = sole_clip(harness, "Branches (1)");
+    let detail = sole_clip(harness, "Latest commit");
+    egui::Rect::from_min_max(
+        egui::pos2(branches.right(), branches.top()),
+        egui::pos2(detail.left(), branches.bottom()),
+    )
+}
+
+/// The opening line has to be fully inside the history panel at the minimum
+/// window, and actually painted there.
+fn assert_opening_line_inside_panel(harness: &Harness<'_, Screen>, window: egui::Vec2) {
+    let exact = "Opening history…";
+    let line = harness.get_by_label(exact).rect();
+    let panel = history_panel(harness);
+    assert_inside_panel(exact, line, panel, window);
+
+    let painted = painted_text(harness, exact);
+    match painted.as_slice() {
+        [painted] => {
+            assert!(
+                !painted.elided,
+                "{exact} is truncated (line {line:?}, clip {:?})",
+                painted.clip
+            );
+            assert_inside_panel(exact, painted.bounds, panel, window);
+        }
+        [] => panic!(
+            "{exact} is clipped away: laid out at {line:?}, history panel is {panel:?}\n{}",
+            labels(harness)
+        ),
+        _ => panic!(
+            "expected one painted {exact:?}, found {}\n{}",
+            painted.len(),
+            labels(harness)
+        ),
+    }
+}
+
+fn assert_titles_do_not_move(
+    loading: &[(&'static str, egui::Rect)],
+    idle: &[(&'static str, egui::Rect)],
+) {
+    let loading_names: Vec<_> = loading.iter().map(|(name, _)| *name).collect();
+    let idle_names: Vec<_> = idle.iter().map(|(name, _)| *name).collect();
+    assert_eq!(
+        loading_names,
+        idle_names,
+        "column titles changed while history was opening: loading {}, idle {}",
+        header_names(loading),
+        header_names(idle)
+    );
+    let mut previous = -1isize;
+    for name in &loading_names {
+        let index = TITLES
+            .iter()
+            .position(|title| title == name)
+            .unwrap_or_else(|| panic!("unexpected title {name}")) as isize;
+        assert!(
+            index > previous,
+            "titles out of left-to-right order: {}",
+            header_names(loading)
+        );
+        previous = index;
+    }
+    for pair in loading.windows(2) {
+        assert!(
+            pair[0].1.left() < pair[1].1.left(),
+            "{} is not left of {}",
+            pair[0].0,
+            pair[1].0
+        );
+        let idle_gap = title_left(idle, pair[1].0) - title_left(idle, pair[0].0);
+        let loading_gap = pair[1].1.left() - pair[0].1.left();
+        assert!(
+            (loading_gap - idle_gap).abs() <= TOL,
+            "{} to {} gap changed from {idle_gap:.2} to {loading_gap:.2}",
+            pair[0].0,
+            pair[1].0
+        );
+    }
+}
+
+#[test]
+fn opening_history_stays_inside_the_minimum_window() {
+    // Same 520×400 window as the narrow-history kittest, with both sidebars
+    // open. An empty graph draws no columns, so the opening line itself has
+    // to stay inside the history panel.
+    let mut loading_screen = screen(
+        opened_while_history_loads("opening"),
+        HistoryColumns::default(),
+        true,
+        true,
+    );
+    loading_screen.history_loading = true;
+    let loading = harness(MIN_WINDOW, loading_screen);
+    let idle = harness(
+        MIN_WINDOW,
+        screen(
+            opened_while_history_loads("settled"),
+            HistoryColumns::default(),
+            true,
+            true,
+        ),
+    );
+
+    assert!(
+        loading.query_by_label("Commit history (0)").is_some(),
+        "header should stay Commit history (0) while the graph is empty\n{}",
+        labels(&loading)
+    );
+    assert!(
+        loading.query_by_label("Opening history…").is_some(),
+        "missing opening line\n{}",
+        labels(&loading)
+    );
+    assert!(
+        loading.query_by_label("No commits yet.").is_none(),
+        "a loading history is not an empty repository\n{}",
+        labels(&loading)
+    );
+    assert!(
+        idle.query_by_label("No commits yet.").is_some(),
+        "the same empty repo should say there are no commits once loading is finished\n{}",
+        labels(&idle)
+    );
+    assert!(
+        idle.query_by_label("Opening history…").is_none(),
+        "a finished history should not stay on the opening line\n{}",
+        labels(&idle)
+    );
+
+    assert_opening_line_inside_panel(&loading, MIN_WINDOW);
+
+    let loading_titles = header_row(&loading);
+    let idle_titles = header_row(&idle);
+    if !loading_titles.is_empty() || !idle_titles.is_empty() {
+        assert_titles_do_not_move(&loading_titles, &idle_titles);
+    }
+}
+
+#[test]
+fn hovering_a_panel_toggle_does_not_grow_the_top_bar() {
+    // Branches open, detail closed: the two top-bar icons say different things,
+    // so each hover has to surface its own label.
+    let mut harness = harness(
+        egui::Vec2::new(1100.0, HEIGHT),
+        screen(
+            one_commit("still bar"),
+            HistoryColumns::default(),
+            true,
+            false,
+        ),
+    );
+    let header = "Commit history (1)";
+    let header_y = label_rects(&harness, header)
+        .first()
+        .unwrap_or_else(|| panic!("missing {header}\n{}", labels(&harness)))
+        .top();
+    let mut toggles = panel_toggle_rects(&harness);
+    toggles.sort_by(|left, right| left.center().x.total_cmp(&right.center().x));
+    assert_eq!(
+        toggles.len(),
+        2,
+        "expected the two panel icons\n{}",
+        labels(&harness)
+    );
+
+    // Longer than egui's 0.5s tooltip delay at the harness step of 1/60s.
+    let steps_until_tip = 45;
+    let tips = ["Hide branches", "Show commit details"];
+    for (before, tip) in toggles.iter().zip(tips) {
+        let height = before.height();
+        harness.hover_at(before.center());
+        harness.run_steps(steps_until_tip);
+
+        let header_after = label_rects(&harness, header);
+        assert!(
+            (header_after[0].top() - header_y).abs() <= TOL,
+            "{tip} moved the history header from {header_y:.2} to {:.2}",
+            header_after[0].top()
+        );
+        let after = panel_toggle_rects(&harness)
+            .into_iter()
+            .find(|rect| (rect.center().x - before.center().x).abs() < 8.0)
+            .unwrap_or_else(|| panic!("lost the {tip} toggle\n{}", labels(&harness)));
+        assert!(
+            (after.height() - height).abs() <= TOL,
+            "{tip} changed the button height from {height:.2} to {:.2}",
+            after.height()
+        );
+        assert!(
+            harness.query_by_label(tip).is_some(),
+            "missing hover label {tip:?}\n{}",
+            labels(&harness)
+        );
+    }
+}
+
+/// The two icon buttons in the top bar, not the ones in the bottom bar.
+fn panel_toggle_rects(harness: &Harness<'_, Screen>) -> Vec<egui::Rect> {
+    let buttons: Vec<_> = harness
+        .query_all_by_role(Role::Button)
+        .map(|node| node.rect())
+        .collect();
+    let top = buttons
+        .iter()
+        .map(|rect| rect.top())
+        .fold(f32::MAX, f32::min);
+    buttons
+        .into_iter()
+        .filter(|rect| rect.top() < top + 4.0)
+        .collect()
 }

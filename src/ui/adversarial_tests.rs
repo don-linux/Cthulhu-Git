@@ -8,16 +8,27 @@
 //! Opening a repository shows a spinner, which repaints forever.
 //! [`Harness::run`](egui_kittest::Harness::run) is not used; settle with
 //! [`Harness::step`](egui_kittest::Harness::step) instead.
+//!
+//! `settle_open` waits until the repository chrome is installed. The history
+//! graph is a second worker and is not part of that wait; a load still in
+//! flight keeps repainting, so the graph cases wait on that separately.
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::ffi::OsStr;
 use std::fs;
+use std::io::ErrorKind;
+#[cfg(unix)]
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(unix)]
 use std::process::Output;
 use std::rc::Rc;
+#[cfg(unix)]
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
@@ -52,11 +63,59 @@ fn spawned() -> bool {
     std::env::var_os(CHILD_ENV).is_some()
 }
 
+/// `true` when creating a temp directory failed because the quota is exhausted.
+fn is_quota(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::QuotaExceeded
+        || error.raw_os_error() == Some(122)
+        || error.to_string().to_ascii_lowercase().contains("quota")
+}
+
+fn quota_temp_root() -> PathBuf {
+    let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"),
+        PathBuf::from,
+    );
+    target.join("cthulhu-adv-ui-tmp")
+}
+
+/// A temp directory. A `QuotaExceeded` from the default temp location retries
+/// under `target/cthulhu-adv-ui-tmp`, unique per call. This does not change
+/// the process environment.
+fn temp_dir(prefix: &str) -> TempDir {
+    match TempDir::with_prefix(prefix) {
+        Ok(dir) => dir,
+        Err(error) if is_quota(&error) => {
+            let root = quota_temp_root();
+            fs::create_dir_all(&root).unwrap_or_else(|create| {
+                panic!(
+                    "quota fallback {}: {create} (original: {error})",
+                    root.display()
+                )
+            });
+            TempDir::with_prefix_in(prefix, &root).unwrap_or_else(|again| {
+                panic!(
+                    "temp dir under {}: {again} (original quota: {error})",
+                    root.display()
+                )
+            })
+        }
+        Err(error) => panic!("temp dir: {error}"),
+    }
+}
+
 #[cfg(unix)]
 fn reexec(test_name: &str) -> Output {
-    let config = TempDir::with_prefix("cthulhu-adv-ui-config-").expect("temp config dir");
-    let home = TempDir::with_prefix("cthulhu-adv-ui-home-").expect("temp home dir");
-    Command::new(std::env::current_exe().expect("test executable"))
+    reexec_env(test_name, &[], false)
+}
+
+/// `clear_git_override` drops `CTHULHU_GIT` so a fake on `PATH` is the one
+/// that gets probed. Existing cases leave the override alone.
+#[cfg(unix)]
+fn reexec_env(test_name: &str, extra: &[(&str, &OsStr)], clear_git_override: bool) -> Output {
+    let config = temp_dir("cthulhu-adv-ui-config-");
+    let home = temp_dir("cthulhu-adv-ui-home-");
+    let mut command = Command::new(std::env::current_exe().expect("test executable"));
+    command
         .args([
             "--exact",
             test_name,
@@ -70,9 +129,14 @@ fn reexec(test_name: &str) -> Output {
         .env("XDG_DATA_HOME", home.path().join("data"))
         .env("XDG_CACHE_HOME", home.path().join("cache"))
         .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
-        .expect("spawn child test")
+        .env_remove("GIT_WORK_TREE");
+    if clear_git_override {
+        command.env_remove("CTHULHU_GIT");
+    }
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    command.output().expect("spawn child test")
 }
 
 #[cfg(unix)]
@@ -189,7 +253,7 @@ struct GitRepo {
 
 impl GitRepo {
     fn init(name: &str) -> Self {
-        let tmp = TempDir::with_prefix("cthulhu-adv-ui-repo-").expect("temp dir");
+        let tmp = temp_dir("cthulhu-adv-ui-repo-");
         let root = tmp.path().join(name);
         fs::create_dir(&root).expect("repo dir");
         run_git(&root, &["init", "-b", "main"]);
@@ -202,7 +266,7 @@ impl GitRepo {
 }
 
 fn plain_dir(name: &str) -> (TempDir, PathBuf) {
-    let tmp = TempDir::with_prefix("cthulhu-adv-ui-plain-").expect("temp dir");
+    let tmp = temp_dir("cthulhu-adv-ui-plain-");
     let path = tmp.path().join(name);
     fs::create_dir(&path).expect("plain dir");
     (tmp, path)
@@ -425,6 +489,7 @@ fn show_repo(
             terminal_open,
             syncing: None,
             columns: HistoryColumns::default(),
+            history_loading: false,
             busy: false,
         },
         &mut AvatarService::disabled(),
@@ -501,6 +566,7 @@ fn drive_repo(drive: RepoDrive) -> (Harness<'static, ()>, Rc<RefCell<RepoDrive>>
                     terminal_open,
                     syncing,
                     columns: HistoryColumns::default(),
+                    history_loading: false,
                     busy,
                 },
                 &mut avatars,
@@ -924,7 +990,7 @@ fn child_missing_cli_path() {
     if !spawned() {
         return;
     }
-    let tmp = TempDir::with_prefix("cthulhu-adv-ui-missing-").expect("temp dir");
+    let tmp = temp_dir("cthulhu-adv-ui-missing-");
     let missing = tmp.path().join("does-not-exist");
     let mut harness = app_harness(Some(missing));
     settle_open(&mut harness);
@@ -946,7 +1012,7 @@ fn child_file_cli_path() {
     if !spawned() {
         return;
     }
-    let tmp = TempDir::with_prefix("cthulhu-adv-ui-file-").expect("temp dir");
+    let tmp = temp_dir("cthulhu-adv-ui-file-");
     let file = tmp.path().join("notes.txt");
     fs::write(&file, "not a repository\n").expect("write file");
     let mut harness = app_harness(Some(file));
@@ -1016,7 +1082,7 @@ fn child_missing_recent() {
     if !spawned() {
         return;
     }
-    let tmp = TempDir::with_prefix("cthulhu-adv-ui-gone-").expect("temp dir");
+    let tmp = temp_dir("cthulhu-adv-ui-gone-");
     let gone = tmp.path().join("gone-recent-rlyeh");
     fs::create_dir(&gone).expect("recent dir");
     let mut settings = Settings::default();
@@ -1737,4 +1803,826 @@ fn adversarial_thousand_commits_are_virtualized() {
         "expected a virtualized history, rendered {rendered} commit rows"
     );
     assert_eq!(count_text(&harness, "commit-0800"), 0);
+}
+
+/// Stderr the fake git writes when the history log is told to fail.
+/// Not a "not a git repository" line, so the open is not reclassified.
+#[cfg(unix)]
+const GRAPH_FAIL_TEXT: &str = "fatal: adversarial graph log failed";
+
+/// Seconds the fake sleeps inside the history log. Long enough that the first
+/// settled paint still shows the in-flight line, short enough for [`OPEN_ATTEMPTS`].
+#[cfg(unix)]
+const GRAPH_LOG_SLEEP_SECS: &str = "2";
+
+/// One shared script. Each case symlinks `git` at it and writes its own sidecars,
+/// so parallel tests do not rewrite an executable that another child is running.
+#[cfg(unix)]
+const FAKE_GIT_SCRIPT: &str = r#"#!/bin/sh
+# Metadata commands return immediately. Only `log` with `--max-count` sleeps or fails.
+# `log -1` is the latest-commit read and must not take either path.
+# Sidecars, next to the invoked symlink: .mode .subject .message .sleep .failtext .paths .hits
+
+if [ "${1-}" = "--version" ]; then
+  echo "git version 2.43.0"
+  exit 0
+fi
+
+saw() {
+  needle=$1
+  shift
+  for arg in "$@"; do
+    if [ "$arg" = "$needle" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+emit_graph() {
+  subject=$1
+  printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\036' \
+    "$OID" "" "cthulhu" "cthulhu@example.invalid" "cthulhu" "cthulhu@example.invalid" "$subject"
+}
+
+emit_detail() {
+  message=$1
+  printf '%s\037%s\037%s\037%s\037%s\037%s\037\036%s\n' \
+    "$OID" "cthulhu" "cthulhu@example.invalid" "cthulhu" "cthulhu@example.invalid" \
+    "2026-01-01 00:00" "$message"
+}
+
+record_start() {
+  hit_root=$0.hits
+  mkdir -p "$hit_root" || exit 1
+  n=0
+  while ! mkdir "$hit_root/$n" 2>/dev/null; do
+    n=$((n + 1))
+    if [ "$n" -gt 200 ]; then
+      echo "fake git: too many history logs" >&2
+      exit 1
+    fi
+  done
+  HIT=$hit_root/$n
+  printf '%s\n' "$1" > "$HIT/path"
+}
+
+record_done() {
+  printf 'done\n' > "$HIT/done"
+}
+
+resolve_rule() {
+  here=$1
+  RULE_ACTION=
+  RULE_SUBJECT=
+  RULE_MESSAGE=
+  if [ -f "$0.paths" ]; then
+    while IFS=$(printf '\t') read -r rule_action rule_subject rule_message rule_path; do
+      if [ -z "$rule_path" ]; then
+        continue
+      fi
+      if [ "$rule_path" = "$here" ]; then
+        RULE_ACTION=$rule_action
+        RULE_SUBJECT=$rule_subject
+        RULE_MESSAGE=$rule_message
+        return 0
+      fi
+    done < "$0.paths"
+    echo "fake git: no history rule for $here" >&2
+    exit 1
+  fi
+  RULE_ACTION=$(cat "$0.mode" 2>/dev/null || echo ok)
+  RULE_SUBJECT=$(cat "$0.subject" 2>/dev/null || echo row-subject)
+  if [ -f "$0.message" ]; then
+    RULE_MESSAGE=$(cat "$0.message")
+  else
+    RULE_MESSAGE=$RULE_SUBJECT
+  fi
+}
+
+history_log() {
+  here=$(pwd -P) || exit 1
+  record_start "$here"
+  resolve_rule "$here"
+  case "$RULE_ACTION" in
+    slow)
+      sleep "$SLEEP_SECS"
+      emit_graph "$RULE_SUBJECT"
+      record_done
+      ;;
+    fail)
+      printf '%s\n' "$FAIL_TEXT" >&2
+      record_done
+      exit 128
+      ;;
+    ok)
+      emit_graph "$RULE_SUBJECT"
+      record_done
+      ;;
+    *)
+      echo "fake git: unknown history action $RULE_ACTION" >&2
+      exit 1
+      ;;
+  esac
+}
+
+detail_log() {
+  here=$(pwd -P) || exit 1
+  resolve_rule "$here"
+  emit_detail "$RULE_MESSAGE"
+}
+
+OID=$(cat "$0.oid" 2>/dev/null || echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
+SLEEP_SECS=$(cat "$0.sleep" 2>/dev/null || echo 2)
+FAIL_TEXT=$(cat "$0.failtext" 2>/dev/null || echo "fatal: adversarial graph log failed")
+
+has_max_count=0
+subcommand=
+prev=
+for arg in "$@"; do
+  if [ "$prev" = "-c" ]; then
+    prev=
+    continue
+  fi
+  case "$arg" in
+    -c)
+      prev=-c
+      ;;
+    --max-count|--max-count=*)
+      has_max_count=1
+      ;;
+    -*)
+      ;;
+    *)
+      if [ -z "$subcommand" ]; then
+        subcommand=$arg
+      fi
+      ;;
+  esac
+done
+
+case "$subcommand" in
+  rev-parse)
+    if saw --is-bare-repository "$@"; then
+      echo false
+      exit 0
+    fi
+    if saw --show-toplevel "$@"; then
+      pwd -P
+      exit 0
+    fi
+    if saw --verify "$@"; then
+      printf '%s\n' "$OID"
+      exit 0
+    fi
+    ;;
+  symbolic-ref)
+    printf '%s\n' refs/heads/main
+    exit 0
+    ;;
+  for-each-ref)
+    printf '%s\037%s\037%s\037%s\037%s\n' main "$OID" "" "" 1700000000
+    exit 0
+    ;;
+  rev-list)
+    echo 1
+    exit 0
+    ;;
+  config)
+    exit 1
+    ;;
+  log)
+    if [ "$has_max_count" -eq 1 ]; then
+      history_log
+      exit 0
+    fi
+    detail_log
+    exit 0
+    ;;
+esac
+echo "unexpected fake git ($subcommand): $*" >&2
+exit 1
+"#;
+
+#[cfg(unix)]
+fn shared_fake_script() -> &'static Path {
+    static SCRIPT: OnceLock<PathBuf> = OnceLock::new();
+    SCRIPT.get_or_init(|| {
+        let path = quota_temp_root().join("cthulhu-adv-ui-fake-git.sh");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("fake git script directory");
+        }
+        fs::write(&path, FAKE_GIT_SCRIPT).expect("write shared fake git");
+        let mut permissions = fs::metadata(&path)
+            .expect("fake git metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod fake git");
+        path
+    })
+}
+
+#[cfg(unix)]
+fn sidecar(link: &Path, suffix: &str) -> PathBuf {
+    let mut name = link.file_name().expect("fake git name").to_os_string();
+    name.push(suffix);
+    link.with_file_name(name)
+}
+
+/// Symlink plus sidecars. The directory stays alive until the child exits.
+#[cfg(unix)]
+struct FakeGit {
+    _dir: TempDir,
+    link: PathBuf,
+}
+
+#[cfg(unix)]
+impl FakeGit {
+    fn install() -> Self {
+        let dir = temp_dir("cthulhu-adv-ui-git-");
+        let link = dir.path().join("git");
+        symlink(shared_fake_script(), &link).expect("symlink fake git");
+        Self { _dir: dir, link }
+    }
+
+    fn dir(&self) -> &Path {
+        self.link.parent().expect("fake git directory")
+    }
+}
+
+#[cfg(unix)]
+fn reexec_with_fake(test_name: &str, fake: &FakeGit) -> Output {
+    let path = std::env::join_paths(std::iter::once(fake.dir().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("join PATH");
+    reexec_env(
+        test_name,
+        &[
+            ("PATH", path.as_os_str()),
+            ("CTHULHU_ADV_UI_GIT", fake.link.as_os_str()),
+        ],
+        true,
+    )
+}
+
+#[cfg(unix)]
+fn fake_from_env() -> PathBuf {
+    PathBuf::from(std::env::var_os("CTHULHU_ADV_UI_GIT").expect("CTHULHU_ADV_UI_GIT"))
+}
+
+#[cfg(unix)]
+fn repo_dir(name: &str) -> (TempDir, PathBuf) {
+    let tmp = temp_dir("cthulhu-adv-ui-fake-repo-");
+    let root = tmp.path().join(name);
+    fs::create_dir(&root).expect("repo dir");
+    (tmp, root)
+}
+
+#[cfg(unix)]
+fn canonical_repo(root: &Path) -> PathBuf {
+    fs::canonicalize(root).expect("canonical repo")
+}
+
+#[cfg(unix)]
+struct GraphCase<'a> {
+    action: &'a str,
+    subject: &'a str,
+    message: &'a str,
+    root: &'a Path,
+}
+
+#[cfg(unix)]
+fn write_sleep_and_failure(link: &Path) {
+    fs::write(sidecar(link, ".sleep"), GRAPH_LOG_SLEEP_SECS).expect("sleep sidecar");
+    fs::write(sidecar(link, ".failtext"), GRAPH_FAIL_TEXT).expect("failure sidecar");
+}
+
+#[cfg(unix)]
+fn write_single_case(link: &Path, action: &str, subject: &str, message: &str) {
+    fs::write(sidecar(link, ".mode"), action).expect("mode sidecar");
+    fs::write(sidecar(link, ".subject"), subject).expect("subject sidecar");
+    fs::write(sidecar(link, ".message"), message).expect("message sidecar");
+    write_sleep_and_failure(link);
+}
+
+#[cfg(unix)]
+fn write_graph_cases(link: &Path, cases: &[GraphCase<'_>]) {
+    let mut body = String::new();
+    for case in cases {
+        let path = canonical_repo(case.root);
+        let path = path.to_str().expect("utf-8 repo path");
+        assert!(
+            !case.action.contains('\t')
+                && !case.subject.contains('\t')
+                && !case.message.contains('\t')
+                && !path.contains('\t'),
+            "a graph case field contains a tab"
+        );
+        body.push_str(case.action);
+        body.push('\t');
+        body.push_str(case.subject);
+        body.push('\t');
+        body.push_str(case.message);
+        body.push('\t');
+        body.push_str(path);
+        body.push('\n');
+    }
+    fs::write(sidecar(link, ".paths"), body).expect("path rules");
+    write_sleep_and_failure(link);
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct HistoryHit {
+    path: String,
+    finished: bool,
+}
+
+#[cfg(unix)]
+fn history_hits(link: &Path) -> Vec<HistoryHit> {
+    let root = sidecar(link, ".hits");
+    let mut hits = Vec::new();
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return hits,
+        Err(error) => panic!("read {}: {error}", root.display()),
+    };
+    for entry in entries {
+        let entry = entry.expect("history hit");
+        let path_file = entry.path().join("path");
+        if !path_file.is_file() {
+            continue;
+        }
+        let path = fs::read_to_string(&path_file)
+            .expect("history hit path")
+            .trim_end()
+            .to_owned();
+        hits.push(HistoryHit {
+            path,
+            finished: entry.path().join("done").is_file(),
+        });
+    }
+    hits
+}
+
+#[cfg(unix)]
+fn assert_one_history_log(link: &Path, root: &Path) {
+    let hits = history_hits(link);
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly one history log (--max-count), saw {} hits: {hits:?}",
+        hits.len()
+    );
+    assert!(
+        hits[0].finished,
+        "the history log was started but has not finished: {hits:?}"
+    );
+    let ran = fs::canonicalize(&hits[0].path)
+        .unwrap_or_else(|error| panic!("history log directory {}: {error}", hits[0].path));
+    assert_eq!(
+        ran,
+        canonical_repo(root),
+        "history log ran in the wrong repository"
+    );
+}
+
+/// Both workers have exited. A hit is recorded when the log starts and marked
+/// done when it is about to exit, so a match means every `--max-count` log
+/// has finished and no new one began during the recheck.
+#[cfg(unix)]
+fn wait_for_history_logs(link: &Path) {
+    for _ in 0..OPEN_ATTEMPTS {
+        let hits = history_hits(link);
+        let started = hits.len();
+        let finished = hits.iter().filter(|hit| hit.finished).count();
+        if started > 0 && started == finished {
+            thread::sleep(Duration::from_millis(200));
+            let again = history_hits(link);
+            if again.len() == started && again.iter().all(|hit| hit.finished) {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("history logs did not finish: {:?}", history_hits(link));
+}
+
+#[cfg(unix)]
+fn has_exact_label<State>(harness: &Harness<'_, State>, text: &str) -> bool {
+    harness
+        .query_all_by_role(Role::Label)
+        .any(|node| node.value().as_deref() == Some(text))
+}
+
+#[cfg(unix)]
+fn assert_exact_label<State>(harness: &Harness<'_, State>, text: &str) {
+    assert!(
+        has_exact_label(harness, text),
+        "layout is missing exact label {text:?}\n{}",
+        visible_text(harness)
+    );
+}
+
+/// The center line while this view's graph worker is running and the table is empty.
+#[cfg(unix)]
+fn assert_opening_history(harness: &Harness<'_, CthulhuApp>, name: &str, row_subject: &str) {
+    assert_repo(harness, name);
+    assert!(
+        !matches!(harness.state().screen, Screen::Home),
+        "the in-flight history painted Home, error={:?}\n{}",
+        harness.state().error,
+        visible_text(harness)
+    );
+    assert_exact_label(harness, "Opening history…");
+    assert_exact_label(harness, "Commit history (0)");
+    assert_eq!(
+        count_text(harness, "No commits yet."),
+        0,
+        "an in-flight history said there were no commits\n{}",
+        visible_text(harness)
+    );
+    assert_eq!(
+        count_text(harness, row_subject),
+        0,
+        "commit subject is visible while the history log is still running\n{}",
+        visible_text(harness)
+    );
+    let Screen::Repo(repo) = &harness.state().screen else {
+        panic!("expected the repository screen");
+    };
+    assert!(
+        repo.graph.rows.is_empty(),
+        "rows arrived before the history log finished"
+    );
+    assert!(
+        repo.graph_selection.is_empty(),
+        "graph_selection filled before the worker reported"
+    );
+    assert!(
+        repo.graph_requested.is_empty(),
+        "graph_requested filled before the worker reported"
+    );
+}
+
+/// Poll until the graph worker has painted `subject`. Does not use [`Harness::run`].
+#[cfg(unix)]
+fn settle_graph(harness: &mut Harness<'_, CthulhuApp>, subject: &str) {
+    for _ in 0..OPEN_ATTEMPTS {
+        if harness.state().opening.is_none()
+            && count_text(harness, "Opening history…") == 0
+            && count_text(harness, subject) >= 1
+            && has_exact_label(harness, "Commit history (1)")
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+        harness.step();
+    }
+    panic!(
+        "graph did not show {subject:?}; error={:?}\n{}",
+        harness.state().error,
+        visible_text(harness)
+    );
+}
+
+#[cfg(unix)]
+fn settle_graph_failure(harness: &mut Harness<'_, CthulhuApp>, needle: &str) {
+    for _ in 0..OPEN_ATTEMPTS {
+        harness.step();
+        if harness.state().opening.is_none()
+            && count_text(harness, needle) >= 1
+            && count_text(harness, "Opening history…") == 0
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "graph failure did not settle; error={:?}\n{}",
+        harness.state().error,
+        visible_text(harness)
+    );
+}
+
+#[cfg(unix)]
+fn assert_last_repository(root: &Path) {
+    assert_eq!(
+        settings_json()["last_repository"]
+            .as_str()
+            .map(PathBuf::from),
+        Some(canonical_repo(root)),
+        "last_repository is not the canonical root"
+    );
+}
+
+/// The frame that handles Open also runs `sync_graph` while the previous
+/// repository is still on screen. Calling both matches that order. The late
+/// worker is not joined.
+#[cfg(unix)]
+fn supersede_open(harness: &mut Harness<'_, CthulhuApp>, path: PathBuf) {
+    let ctx = harness.ctx.clone();
+    let app = harness.state_mut();
+    app.open(&ctx, path);
+    app.sync_graph(&ctx);
+}
+
+#[cfg(unix)]
+fn settle_named_graph(harness: &mut Harness<'_, CthulhuApp>, name: &str, subject: &str) {
+    for _ in 0..OPEN_ATTEMPTS {
+        harness.step();
+        if harness.state().opening.is_none()
+            && matches!(harness.state().screen, Screen::Repo(_))
+            && count_text(harness, name) >= 1
+            && count_text(harness, subject) >= 1
+            && count_text(harness, "Opening history…") == 0
+            && has_exact_label(harness, "Commit history (1)")
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "second repository did not show {subject:?}; error={:?}\n{}",
+        harness.state().error,
+        visible_text(harness)
+    );
+}
+
+#[cfg(unix)]
+fn assert_history_contains(link: &Path, root: &Path) {
+    let expected = canonical_repo(root);
+    let hits = history_hits(link);
+    assert!(
+        hits.iter().any(|hit| {
+            fs::canonicalize(&hit.path)
+                .ok()
+                .is_some_and(|path| path == expected)
+        }),
+        "no history log for {}\n{hits:?}",
+        expected.display()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn adversarial_inflight_graph_shows_opening_history() {
+    let fake = FakeGit::install();
+    let output = reexec_with_fake(
+        &child_name("child_inflight_graph_shows_opening_history"),
+        &fake,
+    );
+    assert_child_ok(&output, "CHILD_OK inflight_graph");
+}
+
+#[test]
+#[ignore = "child of adversarial_inflight_graph_shows_opening_history; isolated config"]
+fn child_inflight_graph_shows_opening_history() {
+    if !spawned() {
+        return;
+    }
+    #[cfg(unix)]
+    inflight_graph_shows_opening_history();
+}
+
+#[cfg(unix)]
+fn inflight_graph_shows_opening_history() {
+    let link = fake_from_env();
+    let (_tmp, root) = repo_dir("lantern-repo");
+    write_single_case(&link, "slow", "row-lantern", "detail-lantern");
+
+    let mut harness = app_harness(Some(root.clone()));
+    settle_open(&mut harness);
+    assert_opening_history(&harness, "lantern-repo", "row-lantern");
+
+    settle_graph(&mut harness, "row-lantern");
+    assert_repo(&harness, "lantern-repo");
+    assert_eq!(
+        count_text(&harness, "Opening history…"),
+        0,
+        "opening line stayed after the history log finished\n{}",
+        visible_text(&harness)
+    );
+    assert_text(&harness, "row-lantern");
+    assert_exact_label(&harness, "Commit history (1)");
+    assert_one_history_log(&link, &root);
+
+    // A follow-up log would record its hit before sleeping. A few frames
+    // later the count is still one.
+    for _ in 0..3 {
+        thread::sleep(Duration::from_millis(50));
+        harness.step();
+    }
+    assert_one_history_log(&link, &root);
+    println!("CHILD_OK inflight_graph");
+}
+
+#[cfg(unix)]
+#[test]
+fn adversarial_graph_failure_keeps_repository() {
+    let fake = FakeGit::install();
+    let output = reexec_with_fake(&child_name("child_graph_failure_keeps_repository"), &fake);
+    assert_child_ok(&output, "CHILD_OK graph_failure");
+}
+
+#[test]
+#[ignore = "child of adversarial_graph_failure_keeps_repository; isolated config"]
+fn child_graph_failure_keeps_repository() {
+    if !spawned() {
+        return;
+    }
+    #[cfg(unix)]
+    graph_failure_keeps_repository();
+}
+
+#[cfg(unix)]
+fn graph_failure_keeps_repository() {
+    let link = fake_from_env();
+    let (_tmp, root) = repo_dir("failure-repo");
+    write_single_case(&link, "fail", "row-failure", "detail-failure");
+
+    let mut harness = app_harness(Some(root.clone()));
+    settle_graph_failure(&mut harness, GRAPH_FAIL_TEXT);
+
+    assert!(
+        !matches!(harness.state().screen, Screen::Home),
+        "graph failure returned to Home, error={:?}\n{}",
+        harness.state().error,
+        visible_text(&harness)
+    );
+    assert_repo(&harness, "failure-repo");
+    assert_eq!(
+        count_text(&harness, "Opening history…"),
+        0,
+        "opening line stayed after the history log failed\n{}",
+        visible_text(&harness)
+    );
+    assert_text(&harness, GRAPH_FAIL_TEXT);
+    let message = harness.state().error.clone().unwrap_or_default();
+    assert!(
+        message.contains(GRAPH_FAIL_TEXT),
+        "error banner text is missing from the app error: {message}"
+    );
+    assert_last_repository(&root);
+    assert_one_history_log(&link, &root);
+    println!("CHILD_OK graph_failure");
+}
+
+#[cfg(unix)]
+#[test]
+fn adversarial_home_during_graph_load_keeps_settings() {
+    let fake = FakeGit::install();
+    let output = reexec_with_fake(
+        &child_name("child_home_during_graph_load_keeps_settings"),
+        &fake,
+    );
+    assert_child_ok(&output, "CHILD_OK home_during_graph_load");
+}
+
+#[test]
+#[ignore = "child of adversarial_home_during_graph_load_keeps_settings; isolated config"]
+fn child_home_during_graph_load_keeps_settings() {
+    if !spawned() {
+        return;
+    }
+    #[cfg(unix)]
+    home_during_graph_load_keeps_settings();
+}
+
+#[cfg(unix)]
+fn home_during_graph_load_keeps_settings() {
+    let link = fake_from_env();
+    let (_tmp, root) = repo_dir("rlyeh-slow");
+    write_single_case(&link, "slow", "row-rlyeh", "detail-rlyeh");
+
+    let mut harness = app_harness(Some(root.clone()));
+    settle_open(&mut harness);
+    assert_opening_history(&harness, "rlyeh-slow", "row-rlyeh");
+    let before_home = settings_bytes();
+
+    // Home is the first button on the bottom row. The click is applied after
+    // the repository view draws, so the release frame still shows the repo.
+    // One more step paints Home.
+    click_extreme_button(&harness, false);
+    harness.step();
+    harness.step();
+
+    assert_home(&harness);
+    assert_eq!(settings_bytes(), before_home, "Going Home rewrote settings");
+    assert_last_repository(&root);
+
+    wait_for_history_logs(&link);
+    for _ in 0..10 {
+        thread::sleep(Duration::from_millis(100));
+        harness.step();
+        assert_home(&harness);
+        assert_eq!(
+            settings_bytes(),
+            before_home,
+            "a late graph result rewrote settings"
+        );
+        assert!(
+            !matches!(harness.state().screen, Screen::Repo(_)),
+            "a late graph result restored the repository\n{}",
+            visible_text(&harness)
+        );
+    }
+    assert_one_history_log(&link, &root);
+    println!("CHILD_OK home_during_graph_load");
+}
+
+#[cfg(unix)]
+#[test]
+fn adversarial_second_open_supersedes_inflight_graph() {
+    let fake = FakeGit::install();
+    let output = reexec_with_fake(
+        &child_name("child_second_open_supersedes_inflight_graph"),
+        &fake,
+    );
+    assert_child_ok(&output, "CHILD_OK second_open_supersedes");
+}
+
+#[test]
+#[ignore = "child of adversarial_second_open_supersedes_inflight_graph; isolated config"]
+fn child_second_open_supersedes_inflight_graph() {
+    if !spawned() {
+        return;
+    }
+    #[cfg(unix)]
+    second_open_supersedes_inflight_graph();
+}
+
+#[cfg(unix)]
+fn second_open_supersedes_inflight_graph() {
+    let link = fake_from_env();
+    let (_first_tmp, first) = repo_dir("alpha-repo");
+    let (_second_tmp, second) = repo_dir("beta-repo");
+    // The same tip hash on both repositories, so a late graph is not discarded
+    // merely because the branch tips differ. The subjects are what show the leak.
+    write_graph_cases(
+        &link,
+        &[
+            GraphCase {
+                action: "slow",
+                subject: "row-alpha",
+                message: "detail-alpha",
+                root: &first,
+            },
+            GraphCase {
+                action: "ok",
+                subject: "row-beta",
+                message: "detail-beta",
+                root: &second,
+            },
+        ],
+    );
+
+    let mut harness = app_harness(Some(first.clone()));
+    settle_open(&mut harness);
+    assert_opening_history(&harness, "alpha-repo", "row-alpha");
+
+    supersede_open(&mut harness, second.clone());
+    settle_named_graph(&mut harness, "beta-repo", "row-beta");
+    assert_second_repo_without_first(&harness);
+
+    wait_for_history_logs(&link);
+    for _ in 0..10 {
+        thread::sleep(Duration::from_millis(100));
+        harness.step();
+        assert_second_repo_without_first(&harness);
+    }
+    assert_history_contains(&link, &first);
+    assert_history_contains(&link, &second);
+    println!("CHILD_OK second_open_supersedes");
+}
+
+#[cfg(unix)]
+fn assert_second_repo_without_first(harness: &Harness<'_, CthulhuApp>) {
+    assert!(
+        matches!(harness.state().screen, Screen::Repo(_)),
+        "the second open left the screen as Home, error={:?}\n{}",
+        harness.state().error,
+        visible_text(harness)
+    );
+    assert_repo(harness, "beta-repo");
+    assert_text(harness, "row-beta");
+    assert_eq!(
+        count_text(harness, "row-alpha"),
+        0,
+        "the first repository's commit appeared on the second\n{}",
+        visible_text(harness)
+    );
+    assert_eq!(
+        count_text(harness, "alpha-repo"),
+        0,
+        "the first repository's name appeared on the second\n{}",
+        visible_text(harness)
+    );
+    assert_eq!(
+        count_text(harness, "Opening history…"),
+        0,
+        "the second repository is still opening history\n{}",
+        visible_text(harness)
+    );
 }

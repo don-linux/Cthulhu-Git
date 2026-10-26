@@ -1,4 +1,4 @@
-//! Adversarial repository states for `inspect`, `history`, and `switch_branch`.
+//! Adversarial repository states for `inspect`, `history`, `branch_graph`, and `switch_branch`.
 //!
 //! Fixtures shell out to the system git. Author identity is set on those
 //! commands only, so the test process environment stays untouched.
@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use cthulhu_git::git::{
-    Branch, Git, GitError, Head, History, RepoInfo, SHORT_OID_LEN, branches, history, inspect,
-    latest_commit, switch_branch,
+    Branch, Git, GitError, GraphTip, Head, History, HistoryGraph, RepoInfo, SHORT_OID_LEN,
+    branch_graph, branches, history, inspect, latest_commit, switch_branch,
 };
 use tempfile::TempDir;
 
@@ -172,6 +172,25 @@ impl Repo {
         history(&self.git, &info.root, &info.head, limit)
     }
 
+    /// Drops one loose object so a later history walk cannot read it.
+    /// `inspect` only verifies `HEAD`, which still exists.
+    fn remove_loose_object(&self, oid: &str) {
+        assert!(
+            oid.len() > 2 && oid.chars().all(|ch| ch.is_ascii_hexdigit()),
+            "commit id {oid}"
+        );
+        let git_dir = self.git(&["rev-parse", "--absolute-git-dir"]);
+        let path = Path::new(&git_dir)
+            .join("objects")
+            .join(&oid[..2])
+            .join(&oid[2..]);
+        assert!(
+            path.is_file(),
+            "object {oid} must be loose so the history walk can be broken"
+        );
+        fs::remove_file(&path).expect("remove loose object");
+    }
+
     /// `git commit` and plain `git hash-object` reject a NUL in the message.
     /// `--literally` stores the bytes anyway.
     fn hash_commit_literally(&self, object: &[u8]) -> String {
@@ -201,6 +220,27 @@ impl Repo {
             .trim()
             .to_owned()
     }
+}
+
+/// A failed history read must not be reported as "this path is not a repository".
+/// The open already returned `RepoInfo`.
+fn assert_history_failure_stays_off_the_open(error: GitError) {
+    assert!(
+        !matches!(
+            error,
+            GitError::NotARepository(_) | GitError::UnsafeRepository(_)
+        ),
+        "history failure must stay off the open, got {error}"
+    );
+    assert!(
+        matches!(error, GitError::Command { .. } | GitError::Rejected { .. }),
+        "typed log error, got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        !message.contains("is not inside a Git repository"),
+        "{message}"
+    );
 }
 
 fn assert_subject_preserved(summary: &str) {
@@ -1260,4 +1300,76 @@ fn checkout_does_not_wipe_superproject_or_submodule() {
         module_head
     );
     assert_eq!(fs::read(module.join("mod.txt")).expect("mod.txt"), mod_txt);
+}
+
+/// Opening is `inspect`. An unborn branch has no tip, so the history graph is
+/// a later read and comes back empty.
+#[test]
+fn unborn_repository_opens_without_a_history_graph() {
+    let repo = Repo::init_named("unborn-open");
+    let info = inspect(&repo.git, &repo.root).expect("unborn repository opens");
+    assert_eq!(info.root, repo.canonical());
+    assert_eq!(info.name, "unborn-open");
+    assert_eq!(info.head, Head::Unborn("main".to_owned()));
+
+    assert_eq!(
+        history(&repo.git, &info.root, &info.head, 10).expect("unborn history is empty"),
+        History::default()
+    );
+    assert_eq!(
+        branch_graph(&repo.git, &info.root, &[], 10).expect("no tip does not run git log"),
+        HistoryGraph::default()
+    );
+}
+
+/// The detached tip still verifies, so `inspect` returns the repository.
+/// The parent object is gone, and that failure belongs to the history calls.
+#[test]
+fn detached_head_opens_when_the_history_walk_fails() {
+    let repo = Repo::init_named("detached-missing-parent");
+    repo.commit("parent");
+    repo.commit("child");
+    let parent = repo.git(&["rev-parse", "HEAD~1"]);
+    repo.git(&["checkout", "--detach", "HEAD"]);
+    let tip = repo.git(&["rev-parse", "HEAD"]);
+    assert!(tip.len() > SHORT_OID_LEN, "{tip}");
+    repo.remove_loose_object(&parent);
+    assert_eq!(
+        repo.git(&["rev-parse", "--verify", "HEAD"]),
+        tip,
+        "HEAD must still resolve after the parent object is removed"
+    );
+
+    let info =
+        inspect(&repo.git, &repo.root).expect("detached repository opens without walking parents");
+    assert_eq!(info.root, repo.canonical());
+    assert_eq!(info.name, "detached-missing-parent");
+    assert_eq!(
+        info.head,
+        Head::Detached {
+            short_oid: tip[..SHORT_OID_LEN].to_owned(),
+        }
+    );
+
+    let logged = history(&repo.git, &info.root, &info.head, 10)
+        .expect_err("history walk fails on its own call");
+    assert_history_failure_stays_off_the_open(logged);
+
+    let tips = [GraphTip {
+        name: "HEAD".to_owned(),
+        oid: tip.clone(),
+        color: 0,
+        principal: true,
+        current: true,
+    }];
+    let graphed = branch_graph(&repo.git, &info.root, &tips, 10)
+        .expect_err("history graph fails independently of inspect");
+    assert_history_failure_stays_off_the_open(graphed);
+    assert_eq!(
+        info.head,
+        Head::Detached {
+            short_oid: tip[..SHORT_OID_LEN].to_owned(),
+        },
+        "open metadata is unchanged after the history graph fails"
+    );
 }

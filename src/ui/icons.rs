@@ -3,8 +3,8 @@
 //! the theme.
 
 use eframe::egui::{
-    Button, Color32, ColorImage, Context, CursorIcon, Id, Image, Painter, Pos2, Rect, Response,
-    RichText, TextureHandle, TextureOptions, Ui, Vec2,
+    Button, Color32, ColorImage, Context, CursorIcon, Frame, Id, Image, Painter, Pos2, Rect,
+    Response, RichText, TextStyle, TextureHandle, TextureOptions, Tooltip, Ui, Vec2,
 };
 
 /// Side of the textures written by `build.rs` (`UI_ICON_SIZE`).
@@ -12,6 +12,10 @@ const TEXTURE_SIZE: usize = 64;
 
 /// Side an icon is drawn at, in points.
 const ICON_SIZE: f32 = 18.0;
+
+/// Space between an icon button and its hover label. egui's own tooltip sits
+/// 4px away, close enough to read as part of the bar it came from.
+const HOVER_TIP_GAP: f32 = 8.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
@@ -101,6 +105,9 @@ impl Icon {
 }
 
 /// An icon that only shows a frame while hovered or pressed.
+///
+/// The rect is the hovered size from the first frame, so the bar around it
+/// does not grow when the pointer arrives.
 pub fn icon_button(ui: &mut Ui, icon: Icon, tint: Color32, hover_text: &str) -> Response {
     icon_button_enabled(ui, icon, tint, hover_text, true)
 }
@@ -113,12 +120,13 @@ pub fn icon_button_enabled(
     hover_text: &str,
     enabled: bool,
 ) -> Response {
-    let mut response = ui
-        .add_enabled(
-            enabled,
-            Button::image(icon.image(ui.ctx(), tint)).frame_when_inactive(false),
-        )
-        .on_hover_text(hover_text);
+    let mut response = ui.add_enabled(
+        enabled,
+        Button::image(icon.image(ui.ctx(), tint))
+            .frame_when_inactive(false)
+            .min_size(icon_button_min_size(ui)),
+    );
+    show_hover_tip(ui, &response, hover_text);
     if enabled {
         response = response.on_hover_cursor(CursorIcon::PointingHand);
     }
@@ -157,17 +165,71 @@ pub fn icon_text_button(
     hover_text: &str,
     enabled: bool,
 ) -> Response {
-    let mut response = ui
-        .add_enabled(
-            enabled,
-            Button::image_and_text(icon.image(ui.ctx(), tint), RichText::new(text).color(tint))
-                .frame_when_inactive(false),
-        )
-        .on_hover_text(hover_text);
+    let mut response = ui.add_enabled(
+        enabled,
+        Button::image_and_text(icon.image(ui.ctx(), tint), RichText::new(text).color(tint))
+            .frame_when_inactive(false)
+            .min_size(icon_text_min_size(ui, text)),
+    );
+    show_hover_tip(ui, &response, hover_text);
     if enabled {
         response = response.on_hover_cursor(CursorIcon::PointingHand);
     }
     response
+}
+
+/// Width [`icon_text_button`] occupies, so a neighbor can stop before it.
+pub fn icon_text_button_width(ui: &Ui, text: &str) -> f32 {
+    icon_text_min_size(ui, text).x
+}
+
+/// Hovered outer size of an icon button.
+///
+/// egui's full frame totals `button_padding` per side. With
+/// `frame_when_inactive(false)` the inactive path drops the stroke after
+/// `button_style` already subtracted it from `inner_margin`. A 1px inactive
+/// stroke then makes the button, and the bar around it, grow on hover.
+fn icon_button_min_size(ui: &Ui) -> Vec2 {
+    Vec2::splat(ICON_SIZE) + ui.spacing().button_padding * 2.0
+}
+
+/// Same floor as [`icon_button_min_size`], plus the label.
+///
+/// The extra inactive stroke on the width is the amount hover would add back
+/// if the measured label is a hair narrower than the button's atoms. Fetch
+/// and Pull then stay put instead of pushing the branch name.
+fn icon_text_min_size(ui: &Ui, text: &str) -> Vec2 {
+    let font = TextStyle::Button.resolve(ui.style());
+    let text_size = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER)
+        .rect
+        .size();
+    let content = Vec2::new(
+        ICON_SIZE + ui.spacing().icon_spacing + text_size.x,
+        ICON_SIZE.max(text_size.y),
+    );
+    let padding = ui.spacing().button_padding;
+    let stroke = ui.visuals().widgets.inactive.bg_stroke.width;
+    Vec2::new(
+        content.x + padding.x * 2.0 + stroke * 2.0,
+        content.y + padding.y * 2.0,
+    )
+}
+
+fn show_hover_tip(ui: &Ui, response: &Response, text: &str) {
+    let mut tip = Tooltip::for_enabled(response).gap(HOVER_TIP_GAP);
+    tip.popup = tip.popup.frame(hover_tip_frame(ui));
+    tip.show(|ui| {
+        ui.set_max_width(ui.spacing().tooltip_width);
+        ui.label(text);
+    });
+}
+
+fn hover_tip_frame(ui: &Ui) -> Frame {
+    // `Frame::popup` fills with `window_fill`, and this theme sets that to the
+    // same surface as the bars. The field background keeps the label separate.
+    Frame::popup(ui.style()).fill(ui.visuals().extreme_bg_color)
 }
 
 #[cfg(test)]

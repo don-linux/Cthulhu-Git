@@ -1,8 +1,11 @@
 //! The window: a home screen, a repository view, and a settings screen.
 //!
 //! On launch, a folder passed on the command line opens first, then the last
-//! repository from the settings, otherwise the home screen shows. Settings
-//! are described in `docs/SETTINGS.md`, themes in `docs/THEMES.md`.
+//! repository from the settings, otherwise the home screen shows. The
+//! repository chrome is ready before the window appears; the history graph
+//! follows on the worker. A later open stays on a worker because the window
+//! is visible then. Settings are described in `docs/SETTINGS.md`, themes in
+//! `docs/THEMES.md`.
 
 #[cfg(test)]
 mod adversarial_tests;
@@ -105,17 +108,7 @@ enum Screen {
     Repo(Box<OpenedRepo>),
 }
 
-struct LoadedRepo {
-    info: RepoInfo,
-    graph: HistoryGraph,
-    tips: Vec<GraphTip>,
-    detached_oid: Option<String>,
-    branches: Vec<Branch>,
-    latest: Option<CommitDetail>,
-    github: Option<GitHubRepo>,
-}
-
-type OpenResult = Result<LoadedRepo, String>;
+type OpenResult = Result<Refreshed, String>;
 
 struct Opening {
     path: PathBuf,
@@ -203,7 +196,16 @@ impl CthulhuApp {
             git_probe: None,
         };
         if let Some(path) = startup {
-            app.open(ctx, path);
+            // The window stays hidden until the first frame is painted.
+            // Finishing this open here means that frame is the repository
+            // chrome, or the home screen with the error. The history graph
+            // follows on the worker and is not part of that wait. A later
+            // open stays on a worker thread: the window is visible then,
+            // and blocking it would freeze the UI.
+            let result = load(&path);
+            if app.finish_open(path, result) {
+                app.start_open_graph(ctx);
+            }
         }
         app
     }
@@ -253,7 +255,9 @@ impl CthulhuApp {
         }
     }
 
-    /// Git runs on a worker thread: blocking the UI thread would freeze the window.
+    /// Chrome runs on a worker thread: blocking the UI thread would freeze the
+    /// window. The history graph is a second worker, started once this open
+    /// has installed the repository.
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
         self.graph_generation = self.graph_generation.wrapping_add(1);
         self.graph_load = None;
@@ -267,7 +271,7 @@ impl CthulhuApp {
         self.opening = Some(Opening { path, receiver });
     }
 
-    fn poll_opening(&mut self) {
+    fn poll_opening(&mut self, ctx: &egui::Context) {
         let Some(opening) = &self.opening else {
             return;
         };
@@ -281,20 +285,33 @@ impl CthulhuApp {
         let Some(opening) = self.opening.take() else {
             return;
         };
+        if self.finish_open(opening.path, result) {
+            self.start_open_graph(ctx);
+        }
+    }
 
+    /// Installs the repository, or Home when opening failed.
+    ///
+    /// The history graph is not part of this result. A later log failure stays
+    /// on the repository screen and keeps `last_repository`.
+    fn finish_open(&mut self, path: PathBuf, result: OpenResult) -> bool {
         match result {
-            Ok(loaded) => {
+            Ok(refreshed) => {
                 self.error = None;
-                self.settings.remember_repository(&loaded.info.root);
+                self.settings.remember_repository(&refreshed.info.root);
                 self.save_settings();
                 self.opened_count += 1;
                 self.screen = Screen::Repo(Box::new(OpenedRepo {
-                    info: loaded.info,
-                    graph: loaded.graph,
-                    graph_selection: loaded.tips.clone(),
-                    graph_requested: loaded.tips,
-                    detached_oid: loaded.detached_oid,
-                    branches: loaded
+                    info: refreshed.info,
+                    // Empty until the history worker reports. Filling
+                    // `graph_selection` would make `sync_graph` treat this
+                    // blank graph as the answer, and filling `graph_requested`
+                    // would latch a failure before the load starts.
+                    graph: HistoryGraph::default(),
+                    graph_selection: Vec::new(),
+                    graph_requested: Vec::new(),
+                    detached_oid: refreshed.detached_oid,
+                    branches: refreshed
                         .branches
                         .into_iter()
                         .map(|branch| ListedBranch {
@@ -302,22 +319,40 @@ impl CthulhuApp {
                             branch,
                         })
                         .collect(),
-                    latest: loaded.latest,
+                    latest: refreshed.latest,
                     view_id: egui::Id::new(("repo-view", self.opened_count)),
                     terminal: None,
-                    github: loaded.github,
+                    github: refreshed.github,
                     hover: hover::HoverCache::default(),
                 }));
+                true
             }
             Err(message) => {
                 self.error = Some(message);
-                if self.settings.last_repository.as_deref() == Some(opening.path.as_path()) {
+                if self.settings.last_repository.as_deref() == Some(path.as_path()) {
                     self.settings.forget_last_repository();
                     self.save_settings();
                 }
                 self.screen = Screen::Home;
+                false
             }
         }
+    }
+
+    /// One history worker for the repository just installed, when it has commits.
+    ///
+    /// No tips means an unborn repository, so the center stays "No commits yet."
+    fn start_open_graph(&mut self, ctx: &egui::Context) {
+        let tips = {
+            let Screen::Repo(repo) = &self.screen else {
+                return;
+            };
+            selected_tips(&repo.branches, repo.detached_oid.as_deref())
+        };
+        if tips.is_empty() {
+            return;
+        }
+        self.start_graph_load(ctx, tips);
     }
 
     fn poll_picker(&mut self, ctx: &egui::Context) {
@@ -355,7 +390,7 @@ impl CthulhuApp {
 
 impl eframe::App for CthulhuApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        self.poll_opening();
+        self.poll_opening(ui.ctx());
         self.poll_graph();
         self.poll_sync();
         self.poll_picker(ui.ctx());
@@ -369,6 +404,7 @@ impl eframe::App for CthulhuApp {
         self.poll_git_version();
 
         let syncing = self.sync_for_open_repo();
+        let history_loading = self.history_loading();
         let actions = if self.settings_open {
             // The repository stays underneath. Keep the shell alive and take
             // keystrokes away from the hidden terminal.
@@ -427,6 +463,7 @@ impl eframe::App for CthulhuApp {
                         terminal_open: !self.settings.terminal_hidden,
                         syncing,
                         columns: self.settings.history_columns,
+                        history_loading,
                         busy: self.opening.is_some() || self.picker.is_some(),
                     },
                     &mut self.avatars,
@@ -517,30 +554,11 @@ struct Refreshed {
     github: Option<GitHubRepo>,
 }
 
+/// Repository chrome. The history graph is not built here, so a log failure
+/// does not reject the open or forget the repository.
 fn load(path: &Path) -> OpenResult {
     let git = Git::discover().map_err(|error| error.to_string())?;
-    let refreshed = reload_repo(&git, path)?;
-    let listed: Vec<ListedBranch> = refreshed
-        .branches
-        .iter()
-        .cloned()
-        .map(|branch| ListedBranch {
-            checked: checked_when_opened(&branch),
-            branch,
-        })
-        .collect();
-    let tips = selected_tips(&listed, refreshed.detached_oid.as_deref());
-    let graph = git::branch_graph(&git, &refreshed.info.root, &tips, HISTORY_LIMIT)
-        .map_err(|error| error.to_string())?;
-    Ok(LoadedRepo {
-        info: refreshed.info,
-        graph,
-        tips,
-        detached_oid: refreshed.detached_oid,
-        branches: refreshed.branches,
-        latest: refreshed.latest,
-        github: refreshed.github,
-    })
+    reload_repo(&git, path)
 }
 
 /// HEAD, branches and the latest commit, without rebuilding the graph.
@@ -652,6 +670,17 @@ struct GraphLoad {
 }
 
 impl CthulhuApp {
+    /// This view's history worker is in flight. A load for another repository
+    /// does not change the line in the center.
+    fn history_loading(&self) -> bool {
+        let Screen::Repo(repo) = &self.screen else {
+            return false;
+        };
+        self.graph_load
+            .as_ref()
+            .is_some_and(|load| load.view_id == repo.view_id)
+    }
+
     fn sync_for_open_repo(&self) -> Option<SyncKind> {
         let Screen::Repo(repo) = &self.screen else {
             return None;
