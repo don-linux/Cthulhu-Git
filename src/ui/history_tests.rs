@@ -3,12 +3,16 @@
 //! cells that must stay inside their columns, and the opening line while
 //! history is still loading.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use cthulhu_git::git::{
-    Branch, Commit, CommitDetail, GraphBranch, GraphCommit, GraphRow, GraphTip, Head, HistoryGraph,
-    Person, RepoInfo, SHORT_OID_LEN, Upstream, layout_graph,
+    Branch, Commit, CommitDetail, CommitHover, CommitStats, GraphBranch, GraphCommit, GraphRow,
+    GraphTip, Head, HistoryGraph, Person, RepoInfo, SHORT_OID_LEN, Upstream, layout_graph,
 };
+use cthulhu_git::github::GitHubRepo;
 use cthulhu_git::settings::HistoryColumns;
 use eframe::egui::accesskit::Role;
+use eframe::egui::output::OutputCommand;
 use eframe::egui::{self, Modifiers, MouseWheelUnit, PointerButton, Pos2, TouchPhase};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
@@ -91,8 +95,12 @@ fn harness(size: egui::Vec2, screen: Screen) -> Harness<'static, Screen> {
                     &mut avatars,
                 );
                 for action in &produced {
-                    if let Action::SetHistoryColumns(columns) = action {
-                        screen.columns = *columns;
+                    match action {
+                        Action::SetHistoryColumns(columns) => screen.columns = *columns,
+                        Action::ToggleDetailSidebar => {
+                            screen.detail_open = !screen.detail_open;
+                        }
+                        _ => {}
                     }
                 }
                 screen.actions.extend(produced);
@@ -560,6 +568,11 @@ fn click_at(harness: &mut Harness<'_, Screen>, at: Pos2) {
     set_button(harness, at, true);
     set_button(harness, at, false);
     harness.step();
+}
+
+fn double_click_at(harness: &mut Harness<'_, Screen>, at: Pos2) {
+    click_at(harness, at);
+    click_at(harness, at);
 }
 
 fn action_name(action: &Action) -> String {
@@ -1589,6 +1602,20 @@ fn near_lane(point: Pos2, marks: &LaneMarks) -> bool {
             .any(|dot| point.distance(*dot) <= HALO_REACH)
 }
 
+/// Glow vertices of `lane` that sit on that lane. The open detail sidebar
+/// paints other meshes, so an empty mesh list is not the signal.
+fn lane_glow_near(harness: &Harness<'_, Screen>, lane: egui::Color32) -> usize {
+    let marks = lane_marks(harness, lane);
+    glow_vertices(harness)
+        .into_iter()
+        .filter(|vertex| {
+            vertex.color.a() > 0
+                && is_lane_glow(vertex.color, lane)
+                && near_lane(vertex.pos, &marks)
+        })
+        .count()
+}
+
 fn assert_no_glow(harness: &Harness<'_, Screen>) {
     assert!(
         glow_vertices(harness).is_empty(),
@@ -1666,6 +1693,480 @@ fn clicking_a_branch_tag_lights_only_that_lanes_halo() {
 
     click_branch(&mut harness, "main");
     assert_glow_is(&harness, main);
+}
+
+fn two_commits() -> (OpenedRepo, String, String) {
+    let newer = "a".repeat(40);
+    let older = "b".repeat(40);
+    let repo = opened(
+        "pick-commit",
+        &[
+            Commit {
+                oid: newer.clone(),
+                summary: "newer estuary note".to_owned(),
+            },
+            Commit {
+                oid: older.clone(),
+                summary: "older estuary note".to_owned(),
+            },
+        ],
+        false,
+    );
+    (repo, newer, older)
+}
+
+fn history_window() -> egui::Vec2 {
+    egui::vec2(1400.0, HEIGHT)
+}
+
+/// One frame later the sidebar and the row fill show the click.
+fn settle(harness: &mut Harness<'_, Screen>) {
+    harness.step();
+}
+
+fn header_title(harness: &Harness<'_, Screen>, name: &str) -> egui::Rect {
+    header_row(harness)
+        .into_iter()
+        .find(|(title, _)| *title == name)
+        .map(|(_, rect)| rect)
+        .unwrap_or_else(|| panic!("missing {name} title\n{}", labels(harness)))
+}
+
+/// Right-hand padding of the hash column, past the glyphs.
+fn hash_padding(harness: &Harness<'_, Screen>, short_oid: &str) -> Pos2 {
+    let hash = header_title(harness, "Commit Hash");
+    let message = header_title(harness, "Commit Message");
+    let text = content_rect(harness, short_oid, hash, None);
+    let column_right = message.left() - super::history::CELL_PAD;
+    let x = column_right - 2.0;
+    assert!(
+        x > text.right() + 1.0,
+        "hash padding click at {x:.1} lands on the glyphs ending at {:.1}",
+        text.right()
+    );
+    Pos2::new(x, text.center().y)
+}
+
+fn graph_point(harness: &Harness<'_, Screen>, row_y: f32) -> Pos2 {
+    let graph = header_title(harness, "Graph");
+    let hash = header_title(harness, "Commit Hash");
+    let left = graph.left() - super::history::CELL_PAD;
+    let right = hash.left() - super::history::CELL_PAD;
+    Pos2::new((left + right) / 2.0, row_y)
+}
+
+fn selection_rows(harness: &Harness<'_, Screen>) -> Vec<egui::Rect> {
+    let color = theme::DEFAULT_THEME.palette.selection;
+    let mut found = Vec::new();
+    for clipped in &harness.output().shapes {
+        collect_selection(&clipped.shape, color, &mut found);
+    }
+    found
+}
+
+fn collect_selection(shape: &egui::Shape, color: egui::Color32, found: &mut Vec<egui::Rect>) {
+    match shape {
+        egui::Shape::Rect(rect)
+            if rect.fill == color && rect.rect.height() >= 30.0 && rect.rect.width() >= 80.0 =>
+        {
+            found.push(rect.rect);
+        }
+        egui::Shape::Vec(shapes) => {
+            for shape in shapes {
+                collect_selection(shape, color, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn assert_selected(harness: &Harness<'_, Screen>, oid: &str) {
+    harness.get_by_label("Selected commit");
+    harness.get_by_label(oid);
+    assert!(
+        !selection_rows(harness).is_empty(),
+        "the chosen row has no selection fill"
+    );
+}
+
+fn assert_latest(harness: &Harness<'_, Screen>) {
+    harness.get_by_label("Latest commit");
+    assert!(
+        harness.query_by_label("Selected commit").is_none(),
+        "the sidebar stayed on the chosen commit"
+    );
+    assert!(
+        selection_rows(harness).is_empty(),
+        "a row stayed filled after the commit was released"
+    );
+}
+
+fn detail_toggles(actions: &[Action]) -> usize {
+    actions
+        .iter()
+        .filter(|action| matches!(action, Action::ToggleDetailSidebar))
+        .count()
+}
+
+/// Clipboard writes from the frame that just ran. A later `step` replaces them.
+fn copied_texts(harness: &Harness<'_, Screen>) -> Vec<String> {
+    harness
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn copied_notice(oid: &str) -> String {
+    format!("Copied {}", short_oid(oid))
+}
+
+#[test]
+fn clicking_hash_padding_selects_that_commit() {
+    let (repo, newer, _) = two_commits();
+    let mut harness = harness(
+        history_window(),
+        screen(repo, HistoryColumns::default(), false, true),
+    );
+    let at = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
+    let before = harness.state().actions.len();
+    click_at(&mut harness, at);
+    assert!(
+        copied_texts(&harness).is_empty(),
+        "a single hash click copied {:?}",
+        copied_texts(&harness)
+    );
+    settle(&mut harness);
+    assert_selected(&harness, &newer);
+    assert_eq!(
+        detail_toggles(&harness.state().actions[before..]),
+        0,
+        "choosing a commit closed or opened a sidebar that was already open"
+    );
+}
+
+#[test]
+fn clicking_another_message_switches_the_selected_commit() {
+    let (repo, newer, older) = two_commits();
+    let mut harness = harness(
+        history_window(),
+        screen(repo, HistoryColumns::default(), false, true),
+    );
+    let at = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
+    click_at(&mut harness, at);
+    settle(&mut harness);
+    let message = harness.get_by_label("older estuary note").rect().center();
+    click_at(&mut harness, message);
+    settle(&mut harness);
+    assert_selected(&harness, &older);
+    assert!(
+        harness.query_by_label(&newer).is_none(),
+        "the sidebar kept the previous commit"
+    );
+    assert!(
+        selection_rows(&harness)
+            .iter()
+            .any(|rect| (rect.center().y - message.y).abs() <= 22.0),
+        "the selection fill is not on the older commit"
+    );
+}
+
+#[test]
+fn clicking_the_selected_cell_again_keeps_the_commit() {
+    let (repo, newer, _) = two_commits();
+    let mut harness = harness(
+        history_window(),
+        screen(repo, HistoryColumns::default(), false, true),
+    );
+    let at = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
+    click_at(&mut harness, at);
+    settle(&mut harness);
+    let before = harness.state().actions.len();
+    click_at(&mut harness, at);
+    settle(&mut harness);
+    assert_selected(&harness, &newer);
+    assert_eq!(detail_toggles(&harness.state().actions[before..]), 0);
+}
+
+#[test]
+fn clicking_the_graph_leaves_the_selected_commit() {
+    let (repo, newer, _) = two_commits();
+    let mut harness = harness(
+        history_window(),
+        screen(repo, HistoryColumns::default(), false, true),
+    );
+    let hash = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
+    click_at(&mut harness, hash);
+    settle(&mut harness);
+    let graph = graph_point(&harness, hash.y);
+    click_at(&mut harness, graph);
+    settle(&mut harness);
+    assert_selected(&harness, &newer);
+    let lane = theme::DEFAULT_THEME.palette.graph_color(0);
+    assert_eq!(
+        lane_glow_near(&harness, lane),
+        0,
+        "clicking the graph lit a branch"
+    );
+}
+
+#[test]
+fn clicking_the_author_returns_to_the_latest_commit() {
+    let (repo, newer, _) = two_commits();
+    let mut harness = harness(
+        history_window(),
+        screen(repo, HistoryColumns::default(), false, true),
+    );
+    let at = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
+    click_at(&mut harness, at);
+    settle(&mut harness);
+    let author = header_title(&harness, "Author");
+    let at = content_rect(&harness, "Ada Lovelace", author, None).center();
+    click_at(&mut harness, at);
+    settle(&mut harness);
+    assert_latest(&harness);
+    // The author card stays open under the pointer and repeats this hash.
+    let shown = harness.query_all_by_label(&newer).count();
+    assert!(
+        (1..=2).contains(&shown),
+        "the latest hash should be on the sidebar, found {shown}"
+    );
+}
+
+#[test]
+fn clicking_the_branch_tag_returns_to_the_latest_commit() {
+    let (repo, newer, older) = two_commits();
+    let mut harness = harness(
+        history_window(),
+        screen(repo, HistoryColumns::default(), false, true),
+    );
+    let message = harness.get_by_label("older estuary note").rect().center();
+    click_at(&mut harness, message);
+    settle(&mut harness);
+    assert_selected(&harness, &older);
+    click_branch(&mut harness, "main");
+    assert_latest(&harness);
+    harness.get_by_label(&newer);
+    let lane = theme::DEFAULT_THEME.palette.graph_color(0);
+    assert!(
+        lane_glow_near(&harness, lane) > 0,
+        "clicking the branch tag did not light its lane"
+    );
+}
+
+#[test]
+fn selecting_a_commit_opens_a_closed_detail_sidebar() {
+    let (repo, newer, _) = two_commits();
+    let mut harness = harness(
+        history_window(),
+        screen(repo, HistoryColumns::default(), false, false),
+    );
+    assert!(harness.query_by_label("Latest commit").is_none());
+    let at = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
+    let before = harness.state().actions.len();
+    click_at(&mut harness, at);
+    assert_eq!(detail_toggles(&harness.state().actions[before..]), 1);
+    settle(&mut harness);
+    assert_selected(&harness, &newer);
+}
+
+#[test]
+fn selected_commit_shows_the_hover_details() {
+    let (mut repo, newer, _) = two_commits();
+    repo.github = Some(GitHubRepo {
+        owner: "ada".to_owned(),
+        name: "notes".to_owned(),
+    });
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    repo.hover.store_ready(CommitHover {
+        oid: newer.clone(),
+        author: person("Ada Lovelace", "ada@example.invalid"),
+        co_authors: vec![person("Grace Hopper", "grace@example.invalid")],
+        authored_unix: now,
+        authored_at: "2024-05-01 09:30".to_owned(),
+        message: "newer estuary note\n\nFixes #12".to_owned(),
+        stats: Some(CommitStats {
+            files: 2,
+            insertions: 4,
+            deletions: 1,
+        }),
+    });
+    let mut harness = harness(
+        history_window(),
+        screen(repo, HistoryColumns::default(), false, true),
+    );
+    let at = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
+    click_at(&mut harness, at);
+    settle(&mut harness);
+    assert_selected(&harness, &newer);
+    harness.get_by_label("just now · 2024-05-01 09:30");
+    harness.get_by_label("2 files changed");
+    harness.get_by_label("4 insertions(+)");
+    harness.get_by_label("1 deletion(-)");
+    harness.get_by_label("Grace Hopper");
+    harness.get_by_label("#12");
+    harness.get_by_label("Open on GitHub");
+    assert!(
+        harness.query_by_label("Copy").is_none(),
+        "the hash still has a copy button\n{}",
+        labels(&harness)
+    );
+    let title = harness.get_by_label("Selected commit").rect();
+    let chips: Vec<_> = label_rects(&harness, "main")
+        .into_iter()
+        .filter(|rect| rect.left() >= title.left() - 8.0 && rect.top() >= title.bottom() - 2.0)
+        .collect();
+    assert_eq!(
+        chips.len(),
+        1,
+        "the sidebar should show the branch on this commit\n{}",
+        labels(&harness)
+    );
+}
+
+#[test]
+fn double_clicking_the_hash_copies_it_and_keeps_the_commit() {
+    let (repo, newer, _) = two_commits();
+    let mut harness = harness(
+        history_window(),
+        screen(repo, HistoryColumns::default(), false, true),
+    );
+    let at = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
+    let before = harness.state().actions.len();
+    double_click_at(&mut harness, at);
+    assert_eq!(copied_texts(&harness), vec![newer.clone()]);
+    settle(&mut harness);
+    assert_selected(&harness, &newer);
+    harness.get_by_label(&copied_notice(&newer));
+    assert_eq!(detail_toggles(&harness.state().actions[before..]), 0);
+    assert!(
+        !harness.state().actions[before..]
+            .iter()
+            .any(|action| matches!(action, Action::SetHistoryColumns(_))),
+        "double-clicking the hash resized a column"
+    );
+
+    click_at(&mut harness, at);
+    assert!(
+        copied_texts(&harness).is_empty(),
+        "another click copied the hash again: {:?}",
+        copied_texts(&harness)
+    );
+    settle(&mut harness);
+    assert_selected(&harness, &newer);
+    assert_eq!(detail_toggles(&harness.state().actions[before..]), 0);
+    harness.get_by_label(&copied_notice(&newer));
+}
+
+#[test]
+fn double_clicking_the_message_does_not_copy_the_hash() {
+    let (repo, _, older) = two_commits();
+    let mut harness = harness(
+        history_window(),
+        screen(repo, HistoryColumns::default(), false, true),
+    );
+    let message = harness.get_by_label("older estuary note").rect().center();
+    double_click_at(&mut harness, message);
+    assert!(
+        copied_texts(&harness).is_empty(),
+        "the message column copied {:?}",
+        copied_texts(&harness)
+    );
+    settle(&mut harness);
+    assert_selected(&harness, &older);
+    assert!(harness.query_by_label_contains("Copied ").is_none());
+}
+
+#[test]
+fn clicking_the_sidebar_hash_copies_it() {
+    let (mut repo, newer, _) = two_commits();
+    repo.github = Some(GitHubRepo {
+        owner: "ada".to_owned(),
+        name: "notes".to_owned(),
+    });
+    let mut harness = harness(
+        history_window(),
+        screen(repo, HistoryColumns::default(), false, true),
+    );
+    let at = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
+    click_at(&mut harness, at);
+    assert!(copied_texts(&harness).is_empty());
+    settle(&mut harness);
+    assert_selected(&harness, &newer);
+    assert!(
+        harness.query_by_label("Copy").is_none(),
+        "the sidebar hash still has a copy button\n{}",
+        labels(&harness)
+    );
+    harness.get_by_label("Open on GitHub");
+    let hash = harness.get_by_label(&newer).rect().center();
+    click_at(&mut harness, hash);
+    assert_eq!(copied_texts(&harness), vec![newer.clone()]);
+    settle(&mut harness);
+    harness.get_by_label(&copied_notice(&newer));
+    assert_selected(&harness, &newer);
+}
+
+/// Rest on `at` until `label` is shown, then one more frame so a card with a
+/// clickable hash can take the pointer.
+fn hover_until(harness: &mut Harness<'_, Screen>, at: Pos2, label: &str) {
+    move_pointer(harness, at);
+    for _ in 0..45 {
+        if harness.query_by_label(label).is_some() {
+            harness.step();
+            return;
+        }
+        harness.step();
+    }
+    panic!("never showed {label}\n{}", labels(harness));
+}
+
+#[test]
+fn clicking_the_author_card_hash_copies_it() {
+    let (mut repo, _, older) = two_commits();
+    repo.github = Some(GitHubRepo {
+        owner: "ada".to_owned(),
+        name: "notes".to_owned(),
+    });
+    let mut harness = harness(
+        history_window(),
+        screen(repo, HistoryColumns::default(), false, false),
+    );
+    let message = harness.get_by_label("older estuary note").rect();
+    let author = header_title(&harness, "Author");
+    let at = content_rect(&harness, "Ada Lovelace", author, Some(message.center().y)).center();
+    hover_until(&mut harness, at, &older);
+    harness.get_by_label("Open on GitHub");
+    assert!(
+        harness.query_by_label("Copy").is_none(),
+        "the author card still has a copy button\n{}",
+        labels(&harness)
+    );
+    let hashes = label_rects(&harness, &older);
+    assert_eq!(
+        hashes.len(),
+        1,
+        "expected the card hash once\n{}",
+        labels(&harness)
+    );
+    click_at(&mut harness, hashes[0].center());
+    assert_eq!(
+        copied_texts(&harness),
+        vec![older.clone()],
+        "clicked {:?}\nlabels:\n{}",
+        hashes[0],
+        labels(&harness)
+    );
+    settle(&mut harness);
+    harness.get_by_label(&copied_notice(&older));
 }
 
 fn panel_toggle_rects(harness: &Harness<'_, Screen>) -> Vec<egui::Rect> {

@@ -11,12 +11,15 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cthulhu_git::git::{self, CommitHover, Git, GraphRow, Person};
+use cthulhu_git::git::{self, CommitHover, CommitStats, Git, GraphBranch, GraphRow, Person};
 use cthulhu_git::github::{GitHubRepo, RepoContext};
-use eframe::egui::{self, Button, Context, CursorIcon, RichText, Sense, Ui, Vec2};
+use eframe::egui::{
+    self, Context, CursorIcon, FontSelection, Label, RichText, Sense, Ui, Vec2, WidgetText,
+};
 
 use super::avatars::{self, AvatarService};
 use super::theme::Palette;
+use super::widgets;
 
 const CARD_WIDTH: f32 = 440.0;
 const AUTHOR_AVATAR: f32 = 40.0;
@@ -28,6 +31,13 @@ enum State {
     Loading,
     Ready(Box<CommitHover>),
     Failed(String),
+}
+
+/// What [`HoverCache::cached`] found for one commit.
+pub(super) enum CachedCommit<'a> {
+    Pending,
+    Ready(&'a CommitHover),
+    Failed(&'a str),
 }
 
 /// Details already read, and the one `git show` in flight.
@@ -79,7 +89,8 @@ impl HoverCache {
         }
     }
 
-    fn request(&mut self, oid: &str) {
+    /// Starts a read unless this commit is already stored or in flight.
+    pub(super) fn request(&mut self, oid: &str) {
         let busy_with_it = self
             .inflight
             .as_ref()
@@ -105,6 +116,22 @@ impl HoverCache {
         self.entries.insert(oid.clone(), State::Loading);
         self.inflight = Some((oid, receiver));
     }
+
+    /// The read for `oid`, when one has been asked for.
+    pub(super) fn cached(&self, oid: &str) -> Option<CachedCommit<'_>> {
+        self.entries.get(oid).map(|state| match state {
+            State::Loading => CachedCommit::Pending,
+            State::Ready(hover) => CachedCommit::Ready(hover),
+            State::Failed(message) => CachedCommit::Failed(message),
+        })
+    }
+
+    /// Stores a finished read so a test can draw the sidebar without `git show`.
+    #[cfg(test)]
+    pub(super) fn store_ready(&mut self, hover: CommitHover) {
+        let oid = hover.oid.clone();
+        self.insert(oid, State::Ready(Box::new(hover)));
+    }
 }
 
 /// What the card needs besides the row.
@@ -114,7 +141,49 @@ pub struct CardContext<'a> {
     pub repo: Option<&'a RepoContext>,
 }
 
-pub fn card(
+/// Opens the author card while the pointer rests on `response` or on the card.
+///
+/// A hover tooltip never becomes clickable here, so the hash could not be
+/// copied. This popup takes clicks, and it stays up when the pointer moves
+/// from the author cell onto the hash.
+pub fn show_card(
+    response: &egui::Response,
+    row: &GraphRow,
+    cache: &mut HoverCache,
+    avatars: &mut AvatarService,
+    context: &CardContext<'_>,
+) {
+    let rect_id = response.id.with("author-card-rect");
+    let ctx = &response.ctx;
+    let last_rect = ctx.data(|data| data.get_temp::<egui::Rect>(rect_id));
+    let pointer = ctx.input(|input| input.pointer.hover_pos());
+    let over_card = pointer.is_some_and(|pos| last_rect.is_some_and(|rect| rect.contains(pos)));
+    if !(response.hovered() || over_card) {
+        if last_rect.is_some() {
+            ctx.data_mut(|data| data.remove::<egui::Rect>(rect_id));
+        }
+        return;
+    }
+
+    let width = ctx.global_style().spacing.tooltip_width;
+    let shown = egui::Popup::from_response(response)
+        .kind(egui::PopupKind::Tooltip)
+        .gap(4.0)
+        .width(width)
+        .sense(Sense::hover())
+        .interactable(true)
+        .show(|ui| {
+            ui.style_mut().interaction.selectable_labels = false;
+            card(ui, row, cache, avatars, context);
+        });
+    if let Some(shown) = shown {
+        // The gap between the author cell and the card is not part of either
+        // rect. A few points of slack let the pointer cross it.
+        ctx.data_mut(|data| data.insert_temp(rect_id, shown.response.rect.expand(8.0)));
+    }
+}
+
+fn card(
     ui: &mut Ui,
     row: &GraphRow,
     cache: &mut HoverCache,
@@ -178,64 +247,32 @@ pub fn card(
 
     if !row.branches.is_empty() {
         ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            for branch in &row.branches {
-                let color = palette.graph_color(branch.color);
-                let text = RichText::new(&branch.name).color(color);
-                let text = if branch.current { text.strong() } else { text };
-                egui::Frame::new()
-                    .fill(palette.graph_chip(branch.color, branch.current))
-                    .corner_radius(4)
-                    .inner_margin(egui::Margin::symmetric(6, 2))
-                    .show(ui, |ui| {
-                        ui.label(text);
-                    });
-            }
-        });
+        branch_chips(ui, &row.branches, palette);
     }
 
     if let Some(stats) = detail.and_then(|hover| hover.stats) {
         ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            let files = if stats.files == 1 {
-                "1 file changed".to_owned()
-            } else {
-                format!("{} files changed", stats.files)
-            };
-            ui.label(RichText::new(files).color(palette.text));
-            if stats.insertions > 0 {
-                ui.label(RichText::new(", ").color(palette.text_muted));
-                ui.label(
-                    RichText::new(plural(stats.insertions, "insertion", "(+)"))
-                        .color(palette.diff_added),
-                );
-            }
-            if stats.deletions > 0 {
-                ui.label(RichText::new(", ").color(palette.text_muted));
-                ui.label(
-                    RichText::new(plural(stats.deletions, "deletion", "(-)"))
-                        .color(palette.diff_removed),
-                );
-            }
-        });
+        commit_stats_line(ui, stats, palette);
     }
 
     ui.separator();
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(&row.oid)
-                .monospace()
-                .small()
-                .color(palette.hash),
-        );
-        if ui
-            .add(Button::new("Copy").small())
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let hash = ui
+            .add(
+                Label::new(
+                    RichText::new(&row.oid)
+                        .monospace()
+                        .small()
+                        .color(palette.hash),
+                )
+                .sense(Sense::click())
+                .selectable(false),
+            )
             .on_hover_text("Copy the full commit hash")
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .clicked()
-        {
-            ui.ctx().copy_text(row.oid.clone());
+            .on_hover_cursor(CursorIcon::PointingHand);
+        if hash.clicked() {
+            widgets::copy_commit_hash(ui.ctx(), &row.oid);
         }
         if let Some(github) = context.github {
             ui.hyperlink_to("Open on GitHub", github.commit_url(&row.oid));
@@ -265,19 +302,87 @@ fn avatar(
 }
 
 /// `<email>` as a mail link when it is a plain address, as text otherwise.
-fn email_link(ui: &mut Ui, email: &str, palette: &Palette) {
+///
+/// A long address breaks inside the token so it cannot widen the sidebar.
+pub(super) fn email_link(ui: &mut Ui, email: &str, palette: &Palette) {
     if email.is_empty() {
         return;
     }
     let text = format!("<{email}>");
     match mailto_url(email) {
-        Some(url) => {
-            ui.hyperlink_to(RichText::new(text).color(palette.accent), url);
-        }
-        None => {
-            ui.label(RichText::new(text).color(palette.text_muted));
-        }
+        Some(url) => fitting_link(ui, RichText::new(text).color(palette.accent), &url),
+        None => fitting_label(ui, RichText::new(text).color(palette.text_muted)),
     }
+}
+
+/// One line, broken anywhere inside `ui`'s width.
+fn fitting_label(ui: &mut Ui, text: RichText) {
+    let galley = fitting_galley(ui, text);
+    ui.add(Label::new(galley));
+}
+
+fn fitting_link(ui: &mut Ui, text: RichText, url: &str) {
+    let galley = fitting_galley(ui, text);
+    ui.hyperlink_to(galley, url);
+}
+
+fn fitting_galley(ui: &mut Ui, text: RichText) -> std::sync::Arc<egui::Galley> {
+    let width = ui.available_width().max(0.0);
+    let mut job = std::sync::Arc::unwrap_or_clone(WidgetText::from(text).into_layout_job(
+        ui.style(),
+        FontSelection::Default,
+        ui.text_valign(),
+    ));
+    job.wrap.max_width = width;
+    job.wrap.break_anywhere = true;
+    job.wrap.max_rows = usize::MAX;
+    job.wrap.overflow_character = None;
+    ui.fonts_mut(|fonts| fonts.layout_job(job))
+}
+
+/// Branch names that point at one commit, in the graph's colors.
+pub(super) fn branch_chips(ui: &mut Ui, branches: &[GraphBranch], palette: &Palette) {
+    ui.horizontal_wrapped(|ui| {
+        for branch in branches {
+            let color = palette.graph_color(branch.color);
+            let text = RichText::new(&branch.name).color(color);
+            let text = if branch.current { text.strong() } else { text };
+            egui::Frame::new()
+                .fill(palette.graph_chip(branch.color, branch.current))
+                .corner_radius(4)
+                .inner_margin(egui::Margin::symmetric(6, 2))
+                .show(ui, |ui| {
+                    ui.label(text);
+                });
+        }
+    });
+}
+
+/// `N files changed, N insertions(+), N deletions(-)`.
+pub(super) fn commit_stats_line(ui: &mut Ui, stats: CommitStats, palette: &Palette) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let files = if stats.files == 1 {
+            "1 file changed".to_owned()
+        } else {
+            format!("{} files changed", stats.files)
+        };
+        ui.label(RichText::new(files).color(palette.text));
+        if stats.insertions > 0 {
+            ui.label(RichText::new(", ").color(palette.text_muted));
+            ui.label(
+                RichText::new(plural(stats.insertions, "insertion", "(+)"))
+                    .color(palette.diff_added),
+            );
+        }
+        if stats.deletions > 0 {
+            ui.label(RichText::new(", ").color(palette.text_muted));
+            ui.label(
+                RichText::new(plural(stats.deletions, "deletion", "(-)"))
+                    .color(palette.diff_removed),
+            );
+        }
+    });
 }
 
 /// A commit's address is whatever its author typed. Only `local@domain`
@@ -382,7 +487,12 @@ pub(crate) fn issue_segments(text: &str) -> Vec<Segment<'_>> {
     segments
 }
 
-fn message_with_links(ui: &mut Ui, message: &str, github: Option<&GitHubRepo>, palette: &Palette) {
+pub(super) fn message_with_links(
+    ui: &mut Ui,
+    message: &str,
+    github: Option<&GitHubRepo>,
+    palette: &Palette,
+) {
     let mut lines = message.lines();
     if let Some(subject) = lines.next() {
         line_with_links(ui, subject, github, palette, true);
@@ -412,7 +522,7 @@ fn line_with_links(
         if strong { rich.strong() } else { rich }
     };
     let Some(github) = github else {
-        ui.label(text(line));
+        fitting_label(ui, text(line));
         return;
     };
     ui.horizontal_wrapped(|ui| {
@@ -420,7 +530,7 @@ fn line_with_links(
         for segment in issue_segments(line) {
             match segment {
                 Segment::Text(content) => {
-                    ui.label(text(content));
+                    fitting_label(ui, text(content));
                 }
                 Segment::Issue {
                     label,
@@ -443,7 +553,7 @@ fn line_with_links(
     });
 }
 
-fn now_unix() -> i64 {
+pub(super) fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)

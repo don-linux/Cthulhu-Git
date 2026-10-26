@@ -1,12 +1,13 @@
 //! Repository screen. A top bar with the branch and detail toggles and the
 //! repository name, a sidebar of local branches, the commit history in the
-//! middle ([`super::history`]), the latest commit on the right with the
-//! terminal beneath it, and a bottom bar with Home, a folder shortcut and
-//! Settings, the current branch (a menu that checks out another local branch),
-//! fetch and pull, and the terminal toggle at the right end.
+//! middle ([`super::history`]), the chosen commit on the right (the latest,
+//! until a hash or message is clicked) with the terminal beneath it, and a
+//! bottom bar with Home, a folder shortcut and Settings, the current branch
+//! (a menu that checks out another local branch), fetch and pull, and the
+//! terminal toggle at the right end.
 
-use cthulhu_git::git::{Branch, Head, Person, Upstream};
-use cthulhu_git::github::RepoContext;
+use cthulhu_git::git::{Branch, CommitStats, GraphBranch, Head, Person, Upstream};
+use cthulhu_git::github::{GitHubRepo, RepoContext};
 use cthulhu_git::settings::HistoryColumns;
 use eframe::egui::{
     self, Align, Button, Color32, CursorIcon, FontSelection, Frame, Label, Layout, Margin, Pos2,
@@ -15,6 +16,7 @@ use eframe::egui::{
 
 use super::avatars::{self, AvatarService};
 use super::history;
+use super::hover::{self, CachedCommit};
 use super::icons::{self, Icon};
 use super::terminal;
 use super::theme::{self, Palette};
@@ -221,15 +223,21 @@ pub fn show(
                 widgets::error_banner(ui, error);
                 ui.add_space(12.0);
             }
-            if let Some(columns) = history::show(
+            let history = history::show(
                 ui,
                 repo,
                 &palette,
                 state.columns,
                 avatars,
                 state.history_loading,
-            ) {
+            );
+            if let Some(columns) = history.columns {
                 actions.push(Action::SetHistoryColumns(columns));
+            }
+            // Choosing a commit opens the sidebar. A commit that is already
+            // chosen does not, so closing the panel by hand stays closed.
+            if history.reveal_detail && !detail_open {
+                detail_open = true;
             }
         });
 
@@ -245,6 +253,7 @@ pub fn show(
     if !terminal_open || !detail_open {
         terminal::surrender_focus(ui.ctx(), repo.view_id);
     }
+    widgets::show_clipboard_toast(ui.ctx());
     actions
 }
 
@@ -471,69 +480,269 @@ fn branch_metrics(branch: &Branch) -> String {
     }
 }
 
-fn detail_panel(ui: &mut Ui, repo: &OpenedRepo, palette: &Palette, avatars: &mut AvatarService) {
-    ui.add(Label::new(RichText::new("Latest commit").strong().color(palette.text)).truncate());
+fn detail_panel(
+    ui: &mut Ui,
+    repo: &mut OpenedRepo,
+    palette: &Palette,
+    avatars: &mut AvatarService,
+) {
+    let selected = history::selected_commit(ui.ctx(), repo.view_id);
+    let title = if selected.is_some() {
+        "Selected commit"
+    } else {
+        "Latest commit"
+    };
+    ui.add(Label::new(RichText::new(title).strong().color(palette.text)).truncate());
     ui.add_space(6.0);
 
-    let Some(commit) = &repo.latest else {
+    if selected.is_none() && repo.latest.is_none() {
         ui.label(RichText::new("No commits yet.").color(palette.text_muted));
         return;
-    };
-    let context = repo.github.as_ref().map(|github| RepoContext {
-        repo: github.clone(),
-        head: commit.oid.clone(),
-    });
+    }
+    if let Some(oid) = selected
+        .as_deref()
+        .or(repo.latest.as_ref().map(|commit| commit.oid.as_str()))
+    {
+        repo.hover.request(oid);
+    }
 
     ScrollArea::vertical()
         .id_salt(repo.view_id.with("detail"))
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            detail_field(
-                ui,
-                palette,
-                "Hash",
-                RichText::new(&commit.oid).monospace().color(palette.hash),
-            );
-            ui.label(RichText::new("Author").small().color(palette.text_muted));
-            ui.add_space(2.0);
-            person_line(
-                ui,
-                palette,
-                avatars,
-                &commit.author,
-                context.as_ref(),
-                Some(&commit.oid),
-            );
-            ui.add_space(10.0);
-            if !commit.co_authors.is_empty() {
-                ui.label(
-                    RichText::new("Co-authors")
-                        .small()
-                        .color(palette.text_muted),
-                );
-                ui.add_space(2.0);
-                for person in &commit.co_authors {
-                    person_line(ui, palette, avatars, person, context.as_ref(), None);
-                }
-                ui.add_space(10.0);
-            }
-            detail_field(
-                ui,
-                palette,
-                "Date",
-                RichText::new(&commit.authored_at).color(palette.text),
-            );
-            ui.label(RichText::new("Message").small().color(palette.text_muted));
-            ui.add_space(2.0);
-            if commit.message.is_empty() {
-                ui.label(RichText::new("No message.").color(palette.text_muted));
+            if let Some(oid) = selected.as_deref() {
+                paint_selected(ui, repo, palette, avatars, oid);
             } else {
-                sidebar_text(ui, RichText::new(&commit.message).color(palette.text));
+                paint_latest(ui, repo, palette, avatars);
             }
         });
 }
 
-/// Avatar, then `Name <email>` wrapping beside it.
+/// The latest commit. Its date and message are already known; the hover read
+/// only adds the relative time and the short stat.
+fn paint_latest(ui: &mut Ui, repo: &OpenedRepo, palette: &Palette, avatars: &mut AvatarService) {
+    let Some(commit) = repo.latest.as_ref() else {
+        return;
+    };
+    let cached = repo.hover.cached(&commit.oid);
+    let (unix, stats, failed) = hover_extras(cached);
+    let branches = repo
+        .graph
+        .rows
+        .iter()
+        .find(|row| row.oid == commit.oid)
+        .map(|row| row.branches.as_slice())
+        .unwrap_or(&[]);
+    paint_commit(
+        ui,
+        repo.github.as_ref(),
+        palette,
+        avatars,
+        CommitBody {
+            oid: &commit.oid,
+            author: Some(&commit.author),
+            co_authors: &commit.co_authors,
+            message: Some(&commit.message),
+            date: DetailDate::Known {
+                absolute: &commit.authored_at,
+                unix,
+            },
+            notice: failed,
+            branches,
+            stats,
+        },
+    );
+}
+
+/// A commit chosen from its hash or message. The row paints immediately; the
+/// date stays on "Loading…" until `git show` returns.
+fn paint_selected(
+    ui: &mut Ui,
+    repo: &OpenedRepo,
+    palette: &Palette,
+    avatars: &mut AvatarService,
+    oid: &str,
+) {
+    let row = repo.graph.rows.iter().find(|row| row.oid == oid);
+    let (ready, failed) = match repo.hover.cached(oid) {
+        Some(CachedCommit::Ready(hover)) => (Some(hover), None),
+        Some(CachedCommit::Failed(message)) => (None, Some(message)),
+        Some(CachedCommit::Pending) | None => (None, None),
+    };
+    let author = ready
+        .map(|hover| &hover.author)
+        .or_else(|| row.map(|row| &row.author));
+    let co_authors = ready
+        .map(|hover| hover.co_authors.as_slice())
+        .or_else(|| row.map(|row| row.co_authors.as_slice()))
+        .unwrap_or(&[]);
+    let message = ready
+        .map(|hover| hover.message.as_str())
+        .or_else(|| row.map(|row| row.summary.as_str()));
+    let date = if let Some(hover) = ready {
+        DetailDate::Known {
+            absolute: &hover.authored_at,
+            unix: Some(hover.authored_unix),
+        }
+    } else if let Some(message) = failed {
+        DetailDate::Failed(message)
+    } else {
+        DetailDate::Pending
+    };
+    let stats = ready.and_then(|hover| hover.stats);
+    let branches = row.map(|row| row.branches.as_slice()).unwrap_or(&[]);
+    paint_commit(
+        ui,
+        repo.github.as_ref(),
+        palette,
+        avatars,
+        CommitBody {
+            oid,
+            author,
+            co_authors,
+            message,
+            date,
+            notice: None,
+            branches,
+            stats,
+        },
+    );
+}
+
+fn hover_extras(
+    cached: Option<CachedCommit<'_>>,
+) -> (Option<i64>, Option<CommitStats>, Option<&str>) {
+    match cached {
+        Some(CachedCommit::Ready(hover)) => (Some(hover.authored_unix), hover.stats, None),
+        Some(CachedCommit::Failed(message)) => (None, None, Some(message)),
+        Some(CachedCommit::Pending) | None => (None, None, None),
+    }
+}
+
+struct CommitBody<'a> {
+    oid: &'a str,
+    author: Option<&'a Person>,
+    co_authors: &'a [Person],
+    message: Option<&'a str>,
+    date: DetailDate<'a>,
+    /// Hover failed after the date was already known, so the date stays.
+    notice: Option<&'a str>,
+    branches: &'a [GraphBranch],
+    stats: Option<CommitStats>,
+}
+
+enum DetailDate<'a> {
+    Known {
+        absolute: &'a str,
+        unix: Option<i64>,
+    },
+    Pending,
+    Failed(&'a str),
+}
+
+fn paint_commit(
+    ui: &mut Ui,
+    github: Option<&GitHubRepo>,
+    palette: &Palette,
+    avatars: &mut AvatarService,
+    body: CommitBody<'_>,
+) {
+    let context = github.map(|github| RepoContext {
+        repo: github.clone(),
+        head: body.oid.to_owned(),
+    });
+    hash_block(ui, palette, body.oid, github);
+    if let Some(author) = body.author {
+        ui.label(RichText::new("Author").small().color(palette.text_muted));
+        ui.add_space(2.0);
+        person_line(
+            ui,
+            palette,
+            avatars,
+            author,
+            context.as_ref(),
+            Some(body.oid),
+        );
+        ui.add_space(10.0);
+        if !body.co_authors.is_empty() {
+            ui.label(
+                RichText::new("Co-authors")
+                    .small()
+                    .color(palette.text_muted),
+            );
+            ui.add_space(2.0);
+            for person in body.co_authors {
+                person_line(ui, palette, avatars, person, context.as_ref(), None);
+            }
+            ui.add_space(10.0);
+        }
+    }
+    ui.label(RichText::new("Date").small().color(palette.text_muted));
+    ui.add_space(2.0);
+    match body.date {
+        DetailDate::Known { absolute, unix } => {
+            let text = match unix {
+                Some(unix) => {
+                    format!(
+                        "{} · {absolute}",
+                        hover::relative_time(hover::now_unix(), unix)
+                    )
+                }
+                None => absolute.to_owned(),
+            };
+            sidebar_text(ui, RichText::new(text).color(palette.text));
+        }
+        DetailDate::Pending => {
+            ui.label(RichText::new("Loading…").color(palette.text_muted));
+        }
+        DetailDate::Failed(message) => {
+            sidebar_text(ui, RichText::new(message).color(palette.error));
+        }
+    }
+    if let Some(notice) = body.notice {
+        ui.add_space(2.0);
+        sidebar_text(ui, RichText::new(notice).color(palette.error));
+    }
+    ui.add_space(10.0);
+    ui.label(RichText::new("Message").small().color(palette.text_muted));
+    ui.add_space(2.0);
+    match body.message {
+        Some("") => {
+            ui.label(RichText::new("No message.").color(palette.text_muted));
+        }
+        Some(message) => hover::message_with_links(ui, message, github, palette),
+        None => {
+            ui.label(RichText::new("Loading…").color(palette.text_muted));
+        }
+    }
+    if !body.branches.is_empty() {
+        ui.add_space(10.0);
+        hover::branch_chips(ui, body.branches, palette);
+    }
+    if let Some(stats) = body.stats {
+        ui.add_space(10.0);
+        hover::commit_stats_line(ui, stats, palette);
+    }
+}
+
+fn hash_block(ui: &mut Ui, palette: &Palette, oid: &str, github: Option<&GitHubRepo>) {
+    ui.label(RichText::new("Hash").small().color(palette.text_muted));
+    ui.add_space(2.0);
+    let hash = place_sidebar_text(ui, RichText::new(oid).monospace().color(palette.hash), true)
+        .on_hover_text("Copy the full commit hash")
+        .on_hover_cursor(CursorIcon::PointingHand);
+    if hash.clicked() {
+        widgets::copy_commit_hash(ui.ctx(), oid);
+    }
+    if let Some(github) = github {
+        ui.add_space(4.0);
+        ui.hyperlink_to("Open on GitHub", github.commit_url(oid));
+    }
+    ui.add_space(10.0);
+}
+
+/// Avatar, then the name and the address. The address is a mail link when it
+/// is a plain `local@domain`.
 fn person_line(
     ui: &mut Ui,
     palette: &Palette,
@@ -554,18 +763,17 @@ fn person_line(
             palette,
             None,
         );
-        sidebar_text(
-            ui,
-            RichText::new(format!("{} <{}>", person.name, person.email)).color(palette.text),
-        );
+        ui.vertical(|ui| {
+            if !person.name.trim().is_empty() {
+                sidebar_text(ui, RichText::new(&person.name).color(palette.text));
+            }
+            hover::email_link(ui, &person.email, palette);
+        });
     });
 }
 
-fn detail_field(ui: &mut Ui, palette: &Palette, label: &str, value: RichText) {
-    ui.label(RichText::new(label).small().color(palette.text_muted));
-    ui.add_space(2.0);
-    sidebar_text(ui, value);
-    ui.add_space(10.0);
+fn sidebar_text(ui: &mut Ui, text: impl Into<WidgetText>) {
+    let _ = place_sidebar_text(ui, text, false);
 }
 
 /// Draws `text` inside the width this sidebar was given.
@@ -573,7 +781,10 @@ fn detail_field(ui: &mut Ui, palette: &Palette, label: &str, value: RichText) {
 /// A commit hash and a name with an address are single tokens. Letting either extend
 /// grows the sidebar up to the remaining window and leaves the history column
 /// with no room. Breaking inside the token keeps the whole string visible.
-fn sidebar_text(ui: &mut Ui, text: impl Into<WidgetText>) {
+///
+/// `clickable` makes the line a click target and turns text selection off, so
+/// the click is the action.
+fn place_sidebar_text(ui: &mut Ui, text: impl Into<WidgetText>, clickable: bool) -> egui::Response {
     let width = ui.available_width().max(0.0);
     let mut job = std::sync::Arc::unwrap_or_clone(text.into().into_layout_job(
         ui.style(),
@@ -585,7 +796,11 @@ fn sidebar_text(ui: &mut Ui, text: impl Into<WidgetText>) {
     job.wrap.max_rows = usize::MAX;
     job.wrap.overflow_character = None;
     let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-    ui.add(Label::new(galley));
+    let mut label = Label::new(galley);
+    if clickable {
+        label = label.selectable(false).sense(Sense::click());
+    }
+    ui.add(label)
 }
 
 struct SyncOffer {

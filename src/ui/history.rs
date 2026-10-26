@@ -23,6 +23,7 @@ use super::avatars::{self, AvatarService};
 use super::hover::{self, CardContext, HoverCache};
 use super::icons::{self, Icon};
 use super::theme::Palette;
+use super::widgets;
 use super::{ListedBranch, OpenedRepo};
 
 /// Commit text and branch labels, relative to egui's body size.
@@ -224,8 +225,16 @@ fn default_per_mille(column: Column) -> u16 {
     column.per_mille(&HistoryColumns::default())
 }
 
-/// Draws the history and returns new column widths when a divider was released
-/// or double-clicked, for the app to save.
+/// What [`show`] asks the repository screen to keep after this frame.
+pub struct HistoryOutput {
+    /// New column widths when a divider was released or double-clicked.
+    pub columns: Option<HistoryColumns>,
+    /// A different commit was chosen. A closed detail sidebar should open.
+    /// Clicking the commit that is already chosen does not set this.
+    pub reveal_detail: bool,
+}
+
+/// Draws the history.
 ///
 /// When `loading` is set and there are no rows yet, the muted line says the
 /// history is still opening. A finished load with no commits keeps
@@ -237,7 +246,7 @@ pub fn show(
     saved: HistoryColumns,
     avatars: &mut AvatarService,
     loading: bool,
-) -> Option<HistoryColumns> {
+) -> HistoryOutput {
     // While this view's log is still running, an empty table is not "no commits".
     let empty = if loading {
         "Opening history…"
@@ -272,9 +281,16 @@ pub fn show(
         // Wrap inside it; truncating would drop the line the loading state shows.
         ui.ctx()
             .data_mut(|data| data.remove::<String>(lit_branch_id(*view_id)));
+        // A reload that has not landed yet keeps the commit the user chose.
+        retain_selected(ui, *view_id, rows, loading);
         wrapped_line(ui, empty, palette.text_muted);
-        return None;
+        return HistoryOutput {
+            columns: None,
+            reveal_detail: false,
+        };
     }
+    retain_selected(ui, *view_id, rows, loading);
+    let selected = selected_commit(ui.ctx(), *view_id);
     if graph.truncated {
         ui.label(
             RichText::new(format!("Showing the latest {} commits.", rows.len()))
@@ -346,52 +362,62 @@ pub fn show(
         ui.ctx().request_repaint_after(GLOW_FRAME);
     }
 
-    ui.scope(|ui| {
-        ui.spacing_mut().item_spacing = Vec2::ZERO;
-        let (header_rect, _) =
-            ui.allocate_exact_size(Vec2::new(panel, HEADER_HEIGHT), Sense::hover());
-        let mut cells = RowContext {
-            palette,
-            avatars,
-            hover,
-            github: github.as_ref(),
-            repo: context.as_ref(),
-            text_font,
-            mono_font,
-            view_id: *view_id,
-            lit,
-            time,
-        };
-        // Where the rows were placed this frame. The scroll area's returned
-        // offset already includes this frame's wheel and scrollbar input,
-        // which the rows only follow next frame.
-        let mut origin_x = header_rect.left();
-        ScrollArea::both()
-            .id_salt(view_id.with("history"))
-            .auto_shrink([false, false])
-            .show_rows(ui, row_height, rows.len(), |ui, range| {
-                origin_x = ui.max_rect().left();
-                ui.set_min_width(layout.content_width);
-                let start = range.start;
-                for (offset, row) in rows[range].iter().enumerate() {
-                    history_row(ui, row, &layout, row_height, start + offset, &mut cells);
-                }
-            });
-        ui.ctx()
-            .data_mut(|data| data.insert_temp(origin_id, origin_x));
-        header(ui, header_rect, origin_x, &layout, *view_id, palette);
-    });
+    let reveal_detail = ui
+        .scope(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            let (header_rect, _) =
+                ui.allocate_exact_size(Vec2::new(panel, HEADER_HEIGHT), Sense::hover());
+            let mut cells = RowContext {
+                palette,
+                avatars,
+                hover,
+                github: github.as_ref(),
+                repo: context.as_ref(),
+                text_font,
+                mono_font,
+                view_id: *view_id,
+                lit,
+                time,
+                selected,
+                reveal_detail: false,
+            };
+            // Where the rows were placed this frame. The scroll area's returned
+            // offset already includes this frame's wheel and scrollbar input,
+            // which the rows only follow next frame.
+            let mut origin_x = header_rect.left();
+            ScrollArea::both()
+                .id_salt(view_id.with("history"))
+                .auto_shrink([false, false])
+                .show_rows(ui, row_height, rows.len(), |ui, range| {
+                    origin_x = ui.max_rect().left();
+                    ui.set_min_width(layout.content_width);
+                    let start = range.start;
+                    for (offset, row) in rows[range].iter().enumerate() {
+                        history_row(ui, row, &layout, row_height, start + offset, &mut cells);
+                    }
+                });
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(origin_id, origin_x));
+            header(ui, header_rect, origin_x, &layout, *view_id, palette);
+            cells.reveal_detail
+        })
+        .inner;
 
-    if let Some(columns) = done {
+    let columns = if let Some(columns) = done {
         ui.ctx()
             .data_mut(|data| data.remove::<HistoryColumns>(live_id));
-        return Some(columns);
-    }
-    if dragging {
+        Some(columns)
+    } else if dragging {
         ui.ctx().data_mut(|data| data.insert_temp(live_id, live));
         ui.ctx().request_repaint();
+        None
+    } else {
+        None
+    };
+    HistoryOutput {
+        columns,
+        reveal_detail,
     }
-    None
 }
 
 fn divider_id(view_id: Id, index: usize) -> Id {
@@ -556,6 +582,10 @@ struct RowContext<'a> {
     view_id: Id,
     lit: Option<LitBranch>,
     time: f64,
+    /// Commit whose row stays filled. `None` is the latest commit in the sidebar.
+    selected: Option<String>,
+    /// Set when this frame chooses a commit that was not already chosen.
+    reveal_detail: bool,
 }
 
 /// Branch whose lane is lit. The name is what the tag toggles; the color is
@@ -589,14 +619,21 @@ fn history_row(
         return;
     }
     let row_id = ui.id().with(("history-row", row.oid.as_str()));
-    let response = ui.interact(rect, row_id, Sense::hover());
     let palette = cx.palette;
-    let fill = if response.hovered() {
-        ui.painter().rect_filled(rect, 0.0, palette.surface_hover);
+    // The pointer, not a hover widget: the hash and message click sensors sit
+    // on top of the row and must not take this highlight away.
+    let selected = cx.selected.as_deref() == Some(row.oid.as_str());
+    let hovered = ui.rect_contains_pointer(rect);
+    let fill = if selected {
+        palette.selection
+    } else if hovered {
         palette.surface_hover
     } else {
         palette.background
     };
+    if selected || hovered {
+        ui.painter().rect_filled(rect, 0.0, fill);
+    }
 
     let branch = content(layout.cell(rect, Column::Branch));
     let graph = layout.cell(rect, Column::Graph);
@@ -665,25 +702,49 @@ fn history_row(
     );
 
     // The card opens from Author only. A row is wide, and a card on every
-    // column would follow the pointer across the whole commit.
-    ui.interact(
+    // column would follow the pointer across the whole commit. A click here
+    // leaves the chosen commit and returns the sidebar to the latest one.
+    let author = ui.interact(
         layout.cell(rect, Column::Author),
         row_id.with("card"),
-        Sense::hover(),
-    )
-    .on_hover_ui(|ui| {
-        hover::card(
-            ui,
-            row,
-            cx.hover,
-            cx.avatars,
-            &CardContext {
-                palette: cx.palette,
-                github: cx.github,
-                repo: cx.repo,
-            },
-        );
-    });
+        Sense::CLICK,
+    );
+    if author.clicked() {
+        clear_selected_commit(ui, cx.view_id);
+    }
+    hover::show_card(
+        &author,
+        row,
+        cx.hover,
+        cx.avatars,
+        &CardContext {
+            palette: cx.palette,
+            github: cx.github,
+            repo: cx.repo,
+        },
+    );
+
+    // The accessible name stays on the painted glyphs. These sensors cover
+    // the whole column, padding included, and nothing outside it. A later
+    // click on the same commit changes nothing else. Only the hash column
+    // copies, and only on a double click.
+    if click_commit(
+        ui,
+        layout.cell(rect, Column::Hash),
+        row_id.with("pick-hash"),
+        &row.oid,
+        cx.view_id,
+        true,
+    ) || click_commit(
+        ui,
+        layout.cell(rect, Column::Message),
+        row_id.with("pick-message"),
+        &row.oid,
+        cx.view_id,
+        false,
+    ) {
+        cx.reveal_detail = true;
+    }
 }
 
 /// One line, ellipsized to `max_width`.
@@ -1174,6 +1235,87 @@ fn lit_branch_id(view_id: Id) -> Id {
     view_id.with("history-lit-branch")
 }
 
+fn selected_commit_id(view_id: Id) -> Id {
+    view_id.with("history-selected-commit")
+}
+
+/// The commit the sidebar is showing instead of the latest one.
+pub(super) fn selected_commit(ctx: &egui::Context, view_id: Id) -> Option<String> {
+    ctx.data(|data| data.get_temp(selected_commit_id(view_id)))
+}
+
+/// Remembers `oid` when it is not already the chosen commit.
+///
+/// Returns whether the choice changed. A second click on the same commit
+/// does not.
+fn select_commit(ui: &Ui, view_id: Id, oid: &str) -> bool {
+    let id = selected_commit_id(view_id);
+    let current: Option<String> = ui.ctx().data(|data| data.get_temp(id));
+    if current.as_deref() == Some(oid) {
+        return false;
+    }
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(id, oid.to_owned()));
+    ui.ctx().request_repaint();
+    true
+}
+
+fn clear_selected_commit(ui: &Ui, view_id: Id) {
+    let id = selected_commit_id(view_id);
+    let present = ui.ctx().data(|data| data.get_temp::<String>(id).is_some());
+    if !present {
+        return;
+    }
+    ui.ctx().data_mut(|data| data.remove::<String>(id));
+    ui.ctx().request_repaint();
+}
+
+/// Forgets a chosen commit that is no longer in `rows`. An empty table that
+/// is still loading keeps it, so a reload does not snap back to the latest.
+fn retain_selected(ui: &Ui, view_id: Id, rows: &[GraphRow], loading: bool) {
+    let id = selected_commit_id(view_id);
+    let Some(oid) = ui.ctx().data(|data| data.get_temp::<String>(id)) else {
+        return;
+    };
+    if rows.iter().any(|row| row.oid == oid) || (loading && rows.is_empty()) {
+        return;
+    }
+    ui.ctx().data_mut(|data| data.remove::<String>(id));
+    ui.ctx().request_repaint();
+}
+
+/// Click target for one hash or message cell.
+///
+/// Returns whether this click chose a different commit. A repeat click on the
+/// chosen commit returns false, so the sidebar and the accent stay put.
+/// `copy_on_double_click` copies the full hash on the second click of a double
+/// click. That second click is also a normal click, and it finds the commit
+/// already chosen.
+fn click_commit(
+    ui: &mut Ui,
+    cell: Rect,
+    id: Id,
+    oid: &str,
+    view_id: Id,
+    copy_on_double_click: bool,
+) -> bool {
+    if cell.width() <= 0.0 {
+        return false;
+    }
+    let response = ui
+        .interact(cell, id, Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand);
+    let response = if copy_on_double_click {
+        response.on_hover_text("Double-click to copy the full hash")
+    } else {
+        response
+    };
+    if copy_on_double_click && response.double_clicked() {
+        widgets::copy_commit_hash(ui.ctx(), oid);
+    }
+    response.clicked() && select_commit(ui, view_id, oid)
+}
+
 fn toggle_lit_branch(ui: &Ui, view_id: Id, name: &str) {
     let id = lit_branch_id(view_id);
     let current: Option<String> = ui.ctx().data(|data| data.get_temp(id));
@@ -1320,6 +1462,7 @@ fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette, lit: boo
         .on_hover_cursor(CursorIcon::PointingHand);
     if response.clicked() {
         toggle_lit_branch(ui, view_id, &chip.name);
+        clear_selected_commit(ui, view_id);
     }
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, chip.names.as_str()));
 }
