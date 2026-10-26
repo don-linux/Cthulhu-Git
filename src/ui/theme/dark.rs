@@ -34,5 +34,7 @@ pub const THEME: Theme = Theme {
         error: Color32::from_rgb(0xf4, 0x70, 0x67),
         diff_added: Color32::from_rgb(0x3f, 0xb9, 0x50),
         diff_removed: Color32::from_rgb(0xf8, 0x51, 0x49),
+        diff_added_fill: Color32::from_rgb(0x12, 0x2d, 0x1b),
+        diff_removed_fill: Color32::from_rgb(0x3f, 0x1d, 0x20),
     },
 };

@@ -293,6 +293,31 @@ pub struct CommitStats {
     pub deletions: u64,
 }
 
+/// One path from `git show --numstat -z`.
+///
+/// A rename or a copy stores the old path in `previous` and the new one in
+/// `path`. A deletion has only `path`. `insertions` and `deletions` are
+/// `None` for a binary file, where git prints `-`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitFile {
+    pub path: String,
+    pub previous: Option<String>,
+    pub insertions: Option<u64>,
+    pub deletions: Option<u64>,
+}
+
+impl CommitFile {
+    pub fn is_binary(&self) -> bool {
+        self.insertions.is_none() || self.deletions.is_none()
+    }
+
+    /// Path passed to `git show -- <path>`. For a deletion this is the path
+    /// that was removed; for a rename it is the post-image path.
+    pub fn diff_path(&self) -> &str {
+        &self.path
+    }
+}
+
 /// Everything the history hover shows that the graph log does not carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitHover {
@@ -305,8 +330,14 @@ pub struct CommitHover {
     pub authored_at: String,
     /// Full message, without git's trailing newline.
     pub message: String,
-    /// `None` for a merge or a commit that changes nothing.
+    /// Files the commit changes against its first parent. Empty when nothing
+    /// changed. A merge lists what landed, not a combined diff.
+    pub files: Vec<CommitFile>,
+    /// Summed from `files`. `None` when that list is empty.
     pub stats: Option<CommitStats>,
+    /// Tags that point at this commit, annotated or lightweight. Empty when
+    /// the lookup fails, so the rest of the commit still shows.
+    pub tags: Vec<String>,
 }
 
 /// Ends the message; the short stat follows it.
@@ -315,11 +346,15 @@ const RECORD_END: u8 = 0x1d;
 const HOVER_FORMAT: &str =
     "--format=%H%x1f%aN%x1f%aE%x1f%an%x1f%ae%x1f%at%x1f%ad%x1f%(trailers:only,unfold)%x1e%B%x1d";
 
-/// Reads one commit for the hover: author, dates, full message and the
-/// short stat, like VS Code's `git show -s --shortstat`. Asked only when the
-/// hover opens, because `--shortstat` over the whole history would be slow.
+/// Reads one commit for the hover: author, dates, full message, the files it
+/// changes and the tags that point at it. Asked only when the hover opens,
+/// because `--numstat` over the whole history would be slow.
+///
+/// `-m --first-parent` makes a merge list what landed on the first parent, as
+/// a normal diff. A commit with one parent is unchanged. Tag lookup is a
+/// second local command; if it fails the commit is still returned.
 pub fn commit_hover(git: &Git, root: &Path, oid: &str) -> Result<CommitHover, GitError> {
-    if oid.is_empty() || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !is_commit_oid(oid) {
         return Err(super::exec::rejected(
             "git show",
             format!("{oid} is not a commit hash"),
@@ -328,24 +363,68 @@ pub fn commit_hover(git: &Git, root: &Path, oid: &str) -> Result<CommitHover, Gi
     let args = [
         "show",
         "--no-color",
-        "--shortstat",
+        "-m",
+        "--first-parent",
+        "--numstat",
+        "-z",
         "--date=format-local:%Y-%m-%d %H:%M",
         HOVER_FORMAT,
         oid,
         "--",
     ];
     let output = git.require_ok(root, &args)?;
-    parse_commit_hover(&output.stdout).ok_or_else(|| {
+    let mut hover = parse_commit_hover(&output.stdout).ok_or_else(|| {
         super::exec::rejected(
             &format!("git {}", args.join(" ")),
             "unrecognized show output",
         )
-    })
+    })?;
+    hover.tags = commit_tags(git, root, &hover.oid);
+    Ok(hover)
+}
+
+fn is_commit_oid(oid: &str) -> bool {
+    !oid.is_empty() && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Tags that point at `oid`. A failure becomes an empty list.
+///
+/// `for-each-ref` has no `-z` (not in Git 2.15, and not in 2.53 either).
+/// A ref name cannot contain a newline, so one short name per line keeps a
+/// comma inside the name.
+fn commit_tags(git: &Git, root: &Path, oid: &str) -> Vec<String> {
+    let points_at = format!("--points-at={oid}");
+    let args = [
+        "for-each-ref",
+        points_at.as_str(),
+        "--format=%(refname:short)",
+        "refs/tags",
+    ];
+    match git.require_ok(root, &args) {
+        Ok(output) => parse_tag_names(&output.stdout),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// One tag name per line. A NUL is also a separator, so `%00` in the format
+/// is accepted. A comma inside a name stays.
+pub(crate) fn parse_tag_names(stdout: &[u8]) -> Vec<String> {
+    stdout
+        .split(|byte| matches!(byte, 0 | b'\n'))
+        .map(|name| {
+            let name = name.strip_suffix(b"\r").unwrap_or(name);
+            String::from_utf8_lossy(name).trim().to_owned()
+        })
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 /// Fixed fields split by the first seven unit separators, the trailer block
 /// up to the first record separator, the message up to the last group
-/// separator, and the short stat after it.
+/// separator, and the numstat after it.
+///
+/// The group separator ends the message. Numstat paths are not expected to
+/// contain that byte; one that does is rejected with the rest of the record.
 pub(crate) fn parse_commit_hover(stdout: &[u8]) -> Option<CommitHover> {
     let end = stdout.iter().rposition(|byte| *byte == RECORD_END)?;
     let (record, stat) = (&stdout[..end], &stdout[end + 1..]);
@@ -363,6 +442,8 @@ pub(crate) fn parse_commit_hover(stdout: &[u8]) -> Option<CommitHover> {
         .trim_end_matches(['\n', '\r'])
         .to_owned();
     let (author, co_authors) = author_and_co_authors(identity, &trailers);
+    let files = parse_numstat(stat)?;
+    let stats = stats_from_files(&files);
     Some(CommitHover {
         oid: String::from_utf8_lossy(oid).into_owned(),
         author,
@@ -370,32 +451,274 @@ pub(crate) fn parse_commit_hover(stdout: &[u8]) -> Option<CommitHover> {
         authored_unix,
         authored_at: String::from_utf8_lossy(authored_at).into_owned(),
         message,
-        stats: parse_shortstat(&String::from_utf8_lossy(stat)),
+        files,
+        stats,
+        tags: Vec::new(),
     })
 }
 
-/// Git prints this line in English because every call runs with `LC_ALL=C`.
-pub(crate) fn parse_shortstat(text: &str) -> Option<CommitStats> {
-    let line = text
+/// `added \t deleted \t path \0`, or for a rename `added \t deleted \t \0 old \0 new \0`.
+///
+/// `git show -z` puts a NUL, then a newline, between the format and this
+/// list. Both are skipped. `-` is a binary file. An empty slice is an empty list.
+pub(crate) fn parse_numstat(mut bytes: &[u8]) -> Option<Vec<CommitFile>> {
+    while bytes
+        .first()
+        .is_some_and(|byte| matches!(byte, b'\n' | b'\r' | 0))
+    {
+        bytes = &bytes[1..];
+    }
+    let mut files = Vec::new();
+    while !bytes.is_empty() {
+        let (insertions, rest) = take_count(bytes)?;
+        let rest = rest.strip_prefix(b"\t")?;
+        let (deletions, rest) = take_count(rest)?;
+        let rest = rest.strip_prefix(b"\t")?;
+        let (path, rest) = split_nul(rest)?;
+        let (path, previous, rest) = if path.is_empty() {
+            let (old, rest) = split_nul(rest)?;
+            let (new, rest) = split_nul(rest)?;
+            if old.is_empty() || new.is_empty() {
+                return None;
+            }
+            (new, Some(old), rest)
+        } else {
+            (path, None, rest)
+        };
+        files.push(CommitFile {
+            path: String::from_utf8_lossy(path).into_owned(),
+            previous: previous.map(|old| String::from_utf8_lossy(old).into_owned()),
+            insertions,
+            deletions,
+        });
+        bytes = rest;
+    }
+    Some(files)
+}
+
+/// A run of digits, or a single `-` for a binary file.
+fn take_count(bytes: &[u8]) -> Option<(Option<u64>, &[u8])> {
+    if bytes.first() == Some(&b'-') {
+        return Some((None, &bytes[1..]));
+    }
+    let end = bytes.iter().position(|byte| !byte.is_ascii_digit())?;
+    if end == 0 {
+        return None;
+    }
+    let number = std::str::from_utf8(&bytes[..end]).ok()?.parse().ok()?;
+    Some((Some(number), &bytes[end..]))
+}
+
+fn split_nul(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let end = bytes.iter().position(|byte| *byte == 0)?;
+    Some((&bytes[..end], &bytes[end + 1..]))
+}
+
+fn stats_from_files(files: &[CommitFile]) -> Option<CommitStats> {
+    if files.is_empty() {
+        return None;
+    }
+    let mut insertions = 0u64;
+    let mut deletions = 0u64;
+    for file in files {
+        insertions = insertions.saturating_add(file.insertions.unwrap_or(0));
+        deletions = deletions.saturating_add(file.deletions.unwrap_or(0));
+    }
+    Some(CommitStats {
+        files: u64::try_from(files.len()).unwrap_or(u64::MAX),
+        insertions,
+        deletions,
+    })
+}
+
+/// One line of a unified diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    Context,
+    Added,
+    Removed,
+    /// A `@@` hunk header. `text` is the whole line.
+    Hunk,
+    /// `\ No newline at end of file`, without the marker prefix.
+    Meta,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffLine {
+    pub kind: DiffKind,
+    pub old: Option<u32>,
+    pub new: Option<u32>,
+    pub text: String,
+}
+
+/// The unified diff of one file, or a sentence when there are no lines to paint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiff {
+    pub notice: Option<String>,
+    pub lines: Vec<DiffLine>,
+    /// Widest `text`, counting a tab as four columns. The gutter is extra.
+    pub columns: usize,
+}
+
+const NOTICE_BINARY: &str = "Binary file.";
+const NOTICE_SUBMODULE: &str = "Submodule update.";
+const NOTICE_MODE: &str = "File mode changed.";
+const NOTICE_EMPTY: &str = "No line changes.";
+
+/// The patch of one path. `path` is the post-image path, or the removed path
+/// for a deletion. `:(literal)` keeps a path that starts with `:` from being
+/// read as pathspec magic.
+pub fn file_diff(git: &Git, root: &Path, oid: &str, path: &str) -> Result<FileDiff, GitError> {
+    if !is_commit_oid(oid) {
+        return Err(super::exec::rejected(
+            "git show",
+            format!("{oid} is not a commit hash"),
+        ));
+    }
+    if path.is_empty() || path.as_bytes().contains(&0) {
+        return Err(super::exec::rejected("git show", "the path is empty"));
+    }
+    let spec = format!(":(literal){path}");
+    let args = [
+        "show",
+        "--no-color",
+        "--format=",
+        "-m",
+        "--first-parent",
+        "-p",
+        oid,
+        "--",
+        spec.as_str(),
+    ];
+    let output = git.require_ok(root, &args)?;
+    Ok(parse_file_diff(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Turns one `git show -p` into lines. The `diff --git` preamble is dropped.
+/// A binary file, a submodule, or a mode-only change becomes `notice` and no lines.
+pub(crate) fn parse_file_diff(text: &str) -> FileDiff {
+    if text
         .lines()
-        .map(str::trim)
-        .find(|line| line.contains("changed"))?;
-    let mut stats = CommitStats::default();
-    let mut saw_files = false;
-    for part in line.split(',') {
-        let part = part.trim();
-        let (number, rest) = part.split_once(' ')?;
-        let number: u64 = number.parse().ok()?;
-        if rest.starts_with("file") {
-            stats.files = number;
-            saw_files = true;
-        } else if rest.starts_with("insertion") {
-            stats.insertions = number;
-        } else if rest.starts_with("deletion") {
-            stats.deletions = number;
+        .any(|line| line.starts_with("Binary files ") || line.starts_with("GIT binary patch"))
+    {
+        return noticed(NOTICE_BINARY);
+    }
+    if text
+        .lines()
+        .any(|line| line.contains("Subproject commit") || line.contains(" 160000"))
+    {
+        return noticed(NOTICE_SUBMODULE);
+    }
+
+    let mut saw_mode = false;
+    let mut lines = Vec::new();
+    let mut old_no = 0u32;
+    let mut new_no = 0u32;
+    let mut in_hunk = false;
+    for line in text.lines() {
+        if line.starts_with("old mode ") || line.starts_with("new mode ") {
+            saw_mode = true;
+        }
+        if let Some((old, new)) = hunk_starts(line) {
+            in_hunk = true;
+            old_no = old;
+            new_no = new;
+            lines.push(DiffLine {
+                kind: DiffKind::Hunk,
+                old: None,
+                new: None,
+                text: line.to_owned(),
+            });
+            continue;
+        }
+        if !in_hunk {
+            continue;
+        }
+        let Some(prefix) = line.chars().next() else {
+            continue;
+        };
+        match prefix {
+            '+' => {
+                lines.push(DiffLine {
+                    kind: DiffKind::Added,
+                    old: None,
+                    new: (new_no > 0).then_some(new_no),
+                    text: line[1..].to_owned(),
+                });
+                new_no = new_no.saturating_add(1);
+            }
+            '-' => {
+                lines.push(DiffLine {
+                    kind: DiffKind::Removed,
+                    old: (old_no > 0).then_some(old_no),
+                    new: None,
+                    text: line[1..].to_owned(),
+                });
+                old_no = old_no.saturating_add(1);
+            }
+            ' ' => {
+                lines.push(DiffLine {
+                    kind: DiffKind::Context,
+                    old: (old_no > 0).then_some(old_no),
+                    new: (new_no > 0).then_some(new_no),
+                    text: line[1..].to_owned(),
+                });
+                old_no = old_no.saturating_add(1);
+                new_no = new_no.saturating_add(1);
+            }
+            '\\' => lines.push(DiffLine {
+                kind: DiffKind::Meta,
+                old: None,
+                new: None,
+                text: "No newline at end of file".to_owned(),
+            }),
+            _ => {}
         }
     }
-    saw_files.then_some(stats)
+
+    if lines.is_empty() {
+        return noticed(if saw_mode { NOTICE_MODE } else { NOTICE_EMPTY });
+    }
+    let columns = lines
+        .iter()
+        .map(|line| {
+            line.text
+                .chars()
+                .map(|ch| if ch == '\t' { 4 } else { 1 })
+                .sum()
+        })
+        .max()
+        .unwrap_or(0);
+    FileDiff {
+        notice: None,
+        lines,
+        columns,
+    }
+}
+
+fn noticed(notice: &str) -> FileDiff {
+    FileDiff {
+        notice: Some(notice.to_owned()),
+        lines: Vec::new(),
+        columns: 0,
+    }
+}
+
+/// `@@ -old[,count] +new[,count] @@`, the first line number of each side.
+fn hunk_starts(line: &str) -> Option<(u32, u32)> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old_spec, rest) = rest.split_once(' ')?;
+    let rest = rest.strip_prefix('+')?;
+    let new_spec = rest.split(" @@").next()?;
+    Some((spec_start(old_spec)?, spec_start(new_spec)?))
+}
+
+fn spec_start(spec: &str) -> Option<u32> {
+    spec.split_once(',')
+        .map(|(start, _)| start)
+        .unwrap_or(spec)
+        .parse()
+        .ok()
 }
 
 pub fn short_oid(oid: &str) -> &str {
@@ -680,7 +1003,7 @@ mod tests {
         );
     }
 
-    fn hover_record(message: &[u8], stat: &[u8]) -> Vec<u8> {
+    fn hover_record(message: &[u8], numstat: &[u8]) -> Vec<u8> {
         let mut out = OID_A.as_bytes().to_vec();
         for field in [
             b"Ada Voss".as_slice(),
@@ -698,15 +1021,15 @@ mod tests {
         out.push(TRAILERS_END);
         out.extend_from_slice(message);
         out.push(RECORD_END);
-        out.extend_from_slice(stat);
+        out.extend_from_slice(numstat);
         out
     }
 
     #[test]
-    fn parses_the_hover_record_and_its_short_stat() {
+    fn parses_the_hover_record_and_its_numstat() {
         let stdout = hover_record(
             b"Seal the vault\n\nBody with \x1f, \x1e and \x1d inside.\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\n",
-            b"\n\n 3 files changed, 42 insertions(+), 7 deletions(-)\n",
+            b"\x00\n10\t2\ta.rs\x0032\t5\tb.rs\x000\t0\tc.rs\x00",
         );
         let hover = parse_commit_hover(&stdout).expect("parsable");
         assert_eq!(hover.oid, OID_A);
@@ -724,6 +1047,29 @@ mod tests {
         );
         assert!(hover.message.ends_with("<cursoragent@cursor.com>"));
         assert_eq!(
+            hover.files,
+            [
+                CommitFile {
+                    path: "a.rs".to_owned(),
+                    previous: None,
+                    insertions: Some(10),
+                    deletions: Some(2),
+                },
+                CommitFile {
+                    path: "b.rs".to_owned(),
+                    previous: None,
+                    insertions: Some(32),
+                    deletions: Some(5),
+                },
+                CommitFile {
+                    path: "c.rs".to_owned(),
+                    previous: None,
+                    insertions: Some(0),
+                    deletions: Some(0),
+                },
+            ]
+        );
+        assert_eq!(
             hover.stats,
             Some(CommitStats {
                 files: 3,
@@ -731,31 +1077,150 @@ mod tests {
                 deletions: 7,
             })
         );
+        assert!(hover.tags.is_empty());
     }
 
     #[test]
-    fn short_stat_variants() {
+    fn numstat_keeps_a_rename_a_binary_and_a_newline_in_the_path() {
+        let files =
+            parse_numstat(b"\n1\t0\t\x00old name\x00new name\x00-\t-\tbin.dat\x001\t0\ta\nb\x00")
+                .expect("parsable");
         assert_eq!(
-            parse_shortstat(" 1 file changed, 1 insertion(+)"),
-            Some(CommitStats {
-                files: 1,
-                insertions: 1,
-                deletions: 0,
-            })
+            files,
+            [
+                CommitFile {
+                    path: "new name".to_owned(),
+                    previous: Some("old name".to_owned()),
+                    insertions: Some(1),
+                    deletions: Some(0),
+                },
+                CommitFile {
+                    path: "bin.dat".to_owned(),
+                    previous: None,
+                    insertions: None,
+                    deletions: None,
+                },
+                CommitFile {
+                    path: "a\nb".to_owned(),
+                    previous: None,
+                    insertions: Some(1),
+                    deletions: Some(0),
+                },
+            ]
+        );
+        assert!(files[1].is_binary());
+        assert_eq!(files[0].diff_path(), "new name");
+    }
+
+    #[test]
+    fn empty_numstat_is_an_empty_file_list() {
+        assert_eq!(parse_numstat(b""), Some(Vec::new()));
+        assert_eq!(parse_numstat(b"\n"), Some(Vec::new()));
+        let empty = hover_record(b"Merge branch 'topic'\n", b"\n");
+        let hover = parse_commit_hover(&empty).expect("empty");
+        assert!(hover.files.is_empty());
+        assert_eq!(hover.stats, None);
+    }
+
+    #[test]
+    fn malformed_numstat_is_rejected() {
+        assert_eq!(parse_numstat(b"\nno tabs"), None);
+        assert_eq!(parse_numstat(b"\n1\t0\t\0only-old\0"), None);
+        assert_eq!(
+            parse_commit_hover(&hover_record(b"m", b"\nnot-numstat")),
+            None
+        );
+    }
+
+    #[test]
+    fn tag_names_keep_a_comma_and_skip_empty_records() {
+        assert_eq!(
+            parse_tag_names(b"v1,0\nv0.0.1\n"),
+            ["v1,0".to_owned(), "v0.0.1".to_owned()]
         );
         assert_eq!(
-            parse_shortstat(" 2 files changed, 5 deletions(-)\n"),
-            Some(CommitStats {
-                files: 2,
-                insertions: 0,
-                deletions: 5,
-            })
+            parse_tag_names(b"v1,0\0\nv0.0.1\r\n"),
+            ["v1,0".to_owned(), "v0.0.1".to_owned()]
         );
-        assert_eq!(parse_shortstat(""), None);
-        assert_eq!(parse_shortstat("\n\n"), None);
-        assert_eq!(parse_shortstat("x files changed"), None);
-        let merge = hover_record(b"Merge branch 'topic'\n", b"\n");
-        assert_eq!(parse_commit_hover(&merge).expect("merge").stats, None);
+        assert!(parse_tag_names(b"").is_empty());
+        assert!(parse_tag_names(b"\n").is_empty());
+    }
+
+    #[test]
+    fn unified_diff_numbers_lines_and_keeps_the_no_newline_marker() {
+        let diff = parse_file_diff(
+            "diff --git a/noeol.txt b/noeol.txt\n--- a/noeol.txt\n+++ b/noeol.txt\n@@ -1,2 +1,2 @@\n kept\n-old line\n+new line\n\\ No newline at end of file\n",
+        );
+        assert_eq!(diff.notice, None);
+        assert_eq!(
+            diff.lines,
+            [
+                DiffLine {
+                    kind: DiffKind::Hunk,
+                    old: None,
+                    new: None,
+                    text: "@@ -1,2 +1,2 @@".to_owned(),
+                },
+                DiffLine {
+                    kind: DiffKind::Context,
+                    old: Some(1),
+                    new: Some(1),
+                    text: "kept".to_owned(),
+                },
+                DiffLine {
+                    kind: DiffKind::Removed,
+                    old: Some(2),
+                    new: None,
+                    text: "old line".to_owned(),
+                },
+                DiffLine {
+                    kind: DiffKind::Added,
+                    old: None,
+                    new: Some(2),
+                    text: "new line".to_owned(),
+                },
+                DiffLine {
+                    kind: DiffKind::Meta,
+                    old: None,
+                    new: None,
+                    text: "No newline at end of file".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unified_diff_notices_replace_lines_that_are_not_a_text_hunk() {
+        assert_eq!(
+            parse_file_diff("Binary files a/bin.dat and b/bin.dat differ\n")
+                .notice
+                .as_deref(),
+            Some("Binary file.")
+        );
+        assert_eq!(
+            parse_file_diff("GIT binary patch\ndelta 1\n")
+                .notice
+                .as_deref(),
+            Some("Binary file.")
+        );
+        assert_eq!(
+            parse_file_diff(
+                "index abc..def 160000\n@@ -1 +1 @@\n-Subproject commit abc\n+Subproject commit def\n"
+            )
+            .notice
+            .as_deref(),
+            Some("Submodule update.")
+        );
+        assert_eq!(
+            parse_file_diff("old mode 100644\nnew mode 100755\n")
+                .notice
+                .as_deref(),
+            Some("File mode changed.")
+        );
+        assert_eq!(
+            parse_file_diff("diff --git a/x b/x\n").notice.as_deref(),
+            Some("No line changes.")
+        );
     }
 
     #[test]

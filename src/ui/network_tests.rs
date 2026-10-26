@@ -1077,6 +1077,8 @@ fn hover_repo() -> OpenedRepo {
         terminal: None,
         github: None,
         hover: HoverCache::default(),
+        diffs: super::changes::DiffCache::default(),
+        changes: None,
     }
 }
 

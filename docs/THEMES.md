@@ -50,10 +50,12 @@ tint of an avatar texture and the terminal's ANSI colors are the exceptions.
 | `selection` | Selected text background |
 | `hash` | Commit hashes |
 | `graph` | Commit-graph lanes. Index 0 is the principal branch (`#3794FF` in the dark theme); the rest cycle when there are more lanes than colors. The same hues, faded, fill the branch-name labels, and a translucent stroke of the same hue joins a label to its commit. Author initials (when there is no avatar) use one of these hues, chosen from the address |
-| `warning` | Detached HEAD, a rejected GitHub token and the rate-limit pause on GitHub Auth |
+| `warning` | Detached HEAD, a rejected GitHub token, the rate-limit pause on GitHub Auth, and tag chips on a commit |
 | `error` | Error banner |
-| `diff_added` | Insertions in the commit hover's short stat, and the "Connected as …" line on GitHub Auth |
-| `diff_removed` | Deletions in the commit hover's short stat |
+| `diff_added` | Insertions in the commit hover's short stat, the `+` on an added diff line, and the "Connected as …" line on GitHub Auth |
+| `diff_removed` | Deletions in the commit hover's short stat, and the `-` on a removed diff line |
+| `diff_added_fill` | Background of an added line in the commit diff |
+| `diff_removed_fill` | Background of a removed line in the commit diff |
 
 ## Add a theme
 

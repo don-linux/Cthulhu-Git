@@ -468,6 +468,8 @@ fn opened(name: &str, commits: Vec<Commit>, truncated: bool) -> OpenedRepo {
         terminal: None,
         github: None,
         hover: HoverCache::default(),
+        diffs: super::changes::DiffCache::default(),
+        changes: None,
     }
 }
 

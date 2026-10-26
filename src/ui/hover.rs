@@ -1,6 +1,6 @@
 //! The card shown while the pointer rests on a commit, modeled on VS Code's
 //! Source Control Graph hover: author, date, co-authors, the full message,
-//! branches, the short stat, the hash and a link to GitHub.
+//! branches, tags, the short stat, the hash and a link to GitHub.
 //!
 //! The details come from one `git show` per commit, run on a worker thread
 //! the first time that commit's card opens.
@@ -250,6 +250,13 @@ fn card(
         branch_chips(ui, &row.branches, palette);
     }
 
+    if let Some(tags) = detail.map(|hover| hover.tags.as_slice())
+        && !tags.is_empty()
+    {
+        ui.separator();
+        tag_chips(ui, tags, palette);
+    }
+
     if let Some(stats) = detail.and_then(|hover| hover.stats) {
         ui.separator();
         commit_stats_line(ui, stats, palette);
@@ -353,6 +360,21 @@ pub(super) fn branch_chips(ui: &mut Ui, branches: &[GraphBranch], palette: &Pale
                 .inner_margin(egui::Margin::symmetric(6, 2))
                 .show(ui, |ui| {
                     ui.label(text);
+                });
+        }
+    });
+}
+
+/// Tag names that point at one commit, in the warning color.
+pub(super) fn tag_chips(ui: &mut Ui, tags: &[String], palette: &Palette) {
+    ui.horizontal_wrapped(|ui| {
+        for tag in tags {
+            egui::Frame::new()
+                .fill(palette.tag_chip())
+                .corner_radius(4)
+                .inner_margin(egui::Margin::symmetric(6, 2))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(tag).color(palette.warning));
                 });
         }
     });

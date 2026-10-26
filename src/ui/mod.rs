@@ -10,6 +10,7 @@
 #[cfg(test)]
 mod adversarial_tests;
 mod avatars;
+mod changes;
 mod folder_picker;
 mod fonts;
 mod github_auth;
@@ -66,6 +67,10 @@ pub struct OpenedRepo {
     pub github: Option<GitHubRepo>,
     /// Commit details read for the history hover.
     pub hover: hover::HoverCache,
+    /// Patches for the changes modal. Kept across opens of the same file.
+    pub diffs: changes::DiffCache,
+    /// The file list and diff, when View changes is open.
+    pub changes: Option<changes::Changes>,
 }
 
 /// A local branch and whether it is drawn in the history graph.
@@ -324,6 +329,8 @@ impl CthulhuApp {
                     terminal: None,
                     github: refreshed.github,
                     hover: hover::HoverCache::default(),
+                    diffs: changes::DiffCache::default(),
+                    changes: None,
                 }));
                 true
             }

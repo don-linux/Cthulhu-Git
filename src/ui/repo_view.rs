@@ -6,7 +6,7 @@
 //! (a menu that checks out another local branch), fetch and pull, and the
 //! terminal toggle at the right end.
 
-use cthulhu_git::git::{Branch, CommitStats, GraphBranch, Head, Person, Upstream};
+use cthulhu_git::git::{Branch, CommitFile, CommitStats, GraphBranch, Head, Person, Upstream};
 use cthulhu_git::github::{GitHubRepo, RepoContext};
 use cthulhu_git::settings::HistoryColumns;
 use eframe::egui::{
@@ -15,6 +15,7 @@ use eframe::egui::{
 };
 
 use super::avatars::{self, AvatarService};
+use super::changes;
 use super::history;
 use super::hover::{self, CachedCommit};
 use super::icons::{self, Icon};
@@ -53,6 +54,7 @@ pub fn show(
 ) -> Vec<Action> {
     let palette = theme::current(ui.ctx()).palette;
     let mut actions = Vec::new();
+    repo.diffs.poll(ui.ctx(), &repo.info.root);
     // The toggle buttons and dragging a sidebar edge past its minimum width
     // both flip these; the app saves the change.
     let branches_were_open = state.branches_open;
@@ -247,6 +249,20 @@ pub fn show(
     if detail_open != detail_was_open && !(terminal_open && !terminal_was_open) {
         actions.push(Action::ToggleDetailSidebar);
     }
+    close_changes_for_other_commit(ui.ctx(), repo);
+    if let Some(mut changes) = repo.changes.take() {
+        let close = changes::show(
+            ui.ctx(),
+            &mut changes,
+            &mut repo.diffs,
+            &repo.info.root,
+            &palette,
+        );
+        if !close {
+            repo.changes = Some(changes);
+        }
+    }
+
     if terminal_open != terminal_was_open {
         actions.push(Action::ToggleTerminal);
     }
@@ -506,26 +522,55 @@ fn detail_panel(
         repo.hover.request(oid);
     }
 
-    ScrollArea::vertical()
+    let open_changes = ScrollArea::vertical()
         .id_salt(repo.view_id.with("detail"))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             if let Some(oid) = selected.as_deref() {
-                paint_selected(ui, repo, palette, avatars, oid);
+                paint_selected(ui, repo, palette, avatars, oid)
             } else {
-                paint_latest(ui, repo, palette, avatars);
+                paint_latest(ui, repo, palette, avatars)
             }
-        });
+        })
+        .inner;
+    if open_changes
+        && let Some(oid) = selected
+            .as_deref()
+            .or(repo.latest.as_ref().map(|commit| commit.oid.as_str()))
+        && let Some(CachedCommit::Ready(hover)) = repo.hover.cached(oid)
+        && !hover.files.is_empty()
+    {
+        repo.changes = Some(changes::Changes::new(oid.to_owned(), hover.files.clone()));
+    }
+}
+
+/// Drops the diff modal when the sidebar moves to a different commit.
+fn close_changes_for_other_commit(ctx: &egui::Context, repo: &mut OpenedRepo) {
+    let shown = history::selected_commit(ctx, repo.view_id)
+        .or_else(|| repo.latest.as_ref().map(|commit| commit.oid.clone()));
+    if repo
+        .changes
+        .as_ref()
+        .is_some_and(|changes| Some(changes.oid.as_str()) != shown.as_deref())
+    {
+        repo.changes = None;
+    }
 }
 
 /// The latest commit. Its date and message are already known; the hover read
 /// only adds the relative time and the short stat.
-fn paint_latest(ui: &mut Ui, repo: &OpenedRepo, palette: &Palette, avatars: &mut AvatarService) {
+fn paint_latest(
+    ui: &mut Ui,
+    repo: &OpenedRepo,
+    palette: &Palette,
+    avatars: &mut AvatarService,
+) -> bool {
     let Some(commit) = repo.latest.as_ref() else {
-        return;
+        return false;
     };
     let cached = repo.hover.cached(&commit.oid);
-    let (unix, stats, failed) = hover_extras(cached);
+    let (unix, stats, failed) = hover_extras(cached.as_ref());
+    let (tags, files) = hover_files(cached.as_ref());
     let branches = repo
         .graph
         .rows
@@ -549,9 +594,11 @@ fn paint_latest(ui: &mut Ui, repo: &OpenedRepo, palette: &Palette, avatars: &mut
             },
             notice: failed,
             branches,
+            tags,
+            files,
             stats,
         },
-    );
+    )
 }
 
 /// A commit chosen from its hash or message. The row paints immediately; the
@@ -562,7 +609,7 @@ fn paint_selected(
     palette: &Palette,
     avatars: &mut AvatarService,
     oid: &str,
-) {
+) -> bool {
     let row = repo.graph.rows.iter().find(|row| row.oid == oid);
     let (ready, failed) = match repo.hover.cached(oid) {
         Some(CachedCommit::Ready(hover)) => (Some(hover), None),
@@ -590,6 +637,8 @@ fn paint_selected(
         DetailDate::Pending
     };
     let stats = ready.and_then(|hover| hover.stats);
+    let tags = ready.map(|hover| hover.tags.as_slice()).unwrap_or(&[]);
+    let files = ready.map(|hover| hover.files.as_slice()).unwrap_or(&[]);
     let branches = row.map(|row| row.branches.as_slice()).unwrap_or(&[]);
     paint_commit(
         ui,
@@ -604,18 +653,27 @@ fn paint_selected(
             date,
             notice: None,
             branches,
+            tags,
+            files,
             stats,
         },
-    );
+    )
 }
 
-fn hover_extras(
-    cached: Option<CachedCommit<'_>>,
-) -> (Option<i64>, Option<CommitStats>, Option<&str>) {
+fn hover_extras<'a>(
+    cached: Option<&'a CachedCommit<'a>>,
+) -> (Option<i64>, Option<CommitStats>, Option<&'a str>) {
     match cached {
         Some(CachedCommit::Ready(hover)) => (Some(hover.authored_unix), hover.stats, None),
         Some(CachedCommit::Failed(message)) => (None, None, Some(message)),
         Some(CachedCommit::Pending) | None => (None, None, None),
+    }
+}
+
+fn hover_files<'a>(cached: Option<&'a CachedCommit<'a>>) -> (&'a [String], &'a [CommitFile]) {
+    match cached {
+        Some(CachedCommit::Ready(hover)) => (hover.tags.as_slice(), hover.files.as_slice()),
+        Some(CachedCommit::Failed(_) | CachedCommit::Pending) | None => (&[], &[]),
     }
 }
 
@@ -628,6 +686,8 @@ struct CommitBody<'a> {
     /// Hover failed after the date was already known, so the date stays.
     notice: Option<&'a str>,
     branches: &'a [GraphBranch],
+    tags: &'a [String],
+    files: &'a [CommitFile],
     stats: Option<CommitStats>,
 }
 
@@ -640,13 +700,14 @@ enum DetailDate<'a> {
     Failed(&'a str),
 }
 
+/// `true` when View changes was clicked.
 fn paint_commit(
     ui: &mut Ui,
     github: Option<&GitHubRepo>,
     palette: &Palette,
     avatars: &mut AvatarService,
     body: CommitBody<'_>,
-) {
+) -> bool {
     let context = github.map(|github| RepoContext {
         repo: github.clone(),
         head: body.oid.to_owned(),
@@ -719,10 +780,27 @@ fn paint_commit(
         ui.add_space(10.0);
         hover::branch_chips(ui, body.branches, palette);
     }
+    if !body.tags.is_empty() {
+        ui.add_space(10.0);
+        hover::tag_chips(ui, body.tags, palette);
+    }
     if let Some(stats) = body.stats {
         ui.add_space(10.0);
         hover::commit_stats_line(ui, stats, palette);
     }
+    if body.files.is_empty() {
+        return false;
+    }
+    ui.add_space(10.0);
+    view_changes_button(ui, palette).clicked()
+}
+
+fn view_changes_button(ui: &mut Ui, palette: &Palette) -> egui::Response {
+    let button = Button::new(RichText::new("View changes").color(palette.text))
+        .fill(palette.surface)
+        .stroke(Stroke::new(1.0, palette.border))
+        .corner_radius(widgets::CORNER_RADIUS);
+    ui.add(button).on_hover_cursor(CursorIcon::PointingHand)
 }
 
 fn hash_block(ui: &mut Ui, palette: &Palette, oid: &str, github: Option<&GitHubRepo>) {

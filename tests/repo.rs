@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cthulhu_git::git::{
-    CommitStats, Git, GitError, GraphCandidate, GraphTip, Head, History, Person, Remote, RepoInfo,
-    SHORT_OID_LEN, Upstream, branch_graph, branches, commit_hover, graph_tips, head_commit_oid,
-    history, inspect, latest_commit, pull_ff_only, remotes,
+    CommitFile, CommitStats, DiffKind, Git, GitError, GraphCandidate, GraphTip, Head, History,
+    Person, Remote, RepoInfo, SHORT_OID_LEN, Upstream, branch_graph, branches, commit_hover,
+    file_diff, graph_tips, head_commit_oid, history, inspect, latest_commit, pull_ff_only, remotes,
 };
 use tempfile::TempDir;
 
@@ -498,6 +498,49 @@ fn commit_hover_reads_the_message_dates_and_short_stat() {
     assert_eq!(empty.stats, None);
 
     assert!(commit_hover(&fixture.git, &info.root, "--output=/tmp/x").is_err());
+}
+
+#[test]
+fn commit_hover_reads_a_root_commit_a_merge_and_an_annotated_tag() {
+    let fixture = Fixture::with_commit();
+    let info = fixture.inspect();
+    let root = fixture.git(&["rev-parse", "HEAD"]);
+    fixture.git(&["tag", "-a", "v1,0", "-m", "annotated", &root]);
+
+    let hover = commit_hover(&fixture.git, &info.root, &root).expect("root");
+    assert_eq!(hover.tags, ["v1,0".to_owned()]);
+    assert_eq!(
+        hover.files,
+        [CommitFile {
+            path: "README.md".to_owned(),
+            previous: None,
+            insertions: Some(1),
+            deletions: Some(0),
+        }]
+    );
+    let diff = file_diff(&fixture.git, &info.root, &root, "README.md").expect("patch");
+    assert!(
+        diff.lines
+            .iter()
+            .any(|line| line.kind == DiffKind::Added && line.text.contains("Ph'nglui")),
+        "{diff:?}"
+    );
+
+    fixture.git(&["checkout", "-b", "topic"]);
+    fixture.write("topic.txt", "from the topic\n");
+    fixture.git(&["add", "topic.txt"]);
+    fixture.git(&["commit", "-m", "topic work"]);
+    fixture.git(&["checkout", "main"]);
+    fixture.git(&["merge", "--no-ff", "-m", "Merge topic", "topic"]);
+    let merge = fixture.git(&["rev-parse", "HEAD"]);
+    let merged = commit_hover(&fixture.git, &info.root, &merge).expect("merge");
+    assert!(
+        merged.files.iter().any(|file| file.path == "topic.txt"),
+        "{:?}",
+        merged.files
+    );
+    assert!(merged.stats.is_some_and(|stats| stats.files >= 1));
+    assert!(merged.tags.is_empty());
 }
 
 #[test]

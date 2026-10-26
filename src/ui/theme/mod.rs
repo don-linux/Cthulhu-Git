@@ -43,10 +43,14 @@ pub struct Palette {
     /// Detached HEAD and other cautions.
     pub warning: Color32,
     pub error: Color32,
-    /// Insertions in a commit's short stat.
+    /// Insertions in a commit's short stat, and the `+` on an added diff line.
     pub diff_added: Color32,
-    /// Deletions in a commit's short stat.
+    /// Deletions in a commit's short stat, and the `-` on a removed diff line.
     pub diff_removed: Color32,
+    /// Background of an added line in the commit diff.
+    pub diff_added_fill: Color32,
+    /// Background of a removed line in the commit diff.
+    pub diff_removed_fill: Color32,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -171,6 +175,12 @@ impl Palette {
     pub fn graph_connector(self, index: usize) -> Color32 {
         let color = self.graph_color(index);
         Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 160)
+    }
+
+    /// Faded `warning` fill behind a tag name.
+    pub fn tag_chip(self) -> Color32 {
+        let color = self.warning;
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 48)
     }
 }
 

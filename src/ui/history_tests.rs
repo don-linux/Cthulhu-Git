@@ -6,8 +6,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cthulhu_git::git::{
-    Branch, Commit, CommitDetail, CommitHover, CommitStats, GraphBranch, GraphCommit, GraphRow,
-    GraphTip, Head, HistoryGraph, Person, RepoInfo, SHORT_OID_LEN, Upstream, layout_graph,
+    Branch, Commit, CommitDetail, CommitFile, CommitHover, CommitStats, DiffKind, DiffLine,
+    FileDiff, GraphBranch, GraphCommit, GraphRow, GraphTip, Head, HistoryGraph, Person, RepoInfo,
+    SHORT_OID_LEN, Upstream, layout_graph,
 };
 use cthulhu_git::github::GitHubRepo;
 use cthulhu_git::settings::HistoryColumns;
@@ -165,6 +166,8 @@ fn opened(name: &str, commits: &[Commit], truncated: bool) -> OpenedRepo {
         terminal: None,
         github: None,
         hover: HoverCache::default(),
+        diffs: super::changes::DiffCache::default(),
+        changes: None,
     }
 }
 
@@ -1993,11 +1996,13 @@ fn selected_commit_shows_the_hover_details() {
         authored_unix: now,
         authored_at: "2024-05-01 09:30".to_owned(),
         message: "newer estuary note\n\nFixes #12".to_owned(),
+        files: Vec::new(),
         stats: Some(CommitStats {
             files: 2,
             insertions: 4,
             deletions: 1,
         }),
+        tags: Vec::new(),
     });
     let mut harness = harness(
         history_window(),
@@ -2167,6 +2172,117 @@ fn clicking_the_author_card_hash_copies_it() {
     );
     settle(&mut harness);
     harness.get_by_label(&copied_notice(&older));
+}
+
+#[test]
+fn view_changes_shows_tags_and_a_colored_diff() {
+    let mut repo = one_commit("field notes from the estuary");
+    let oid = repo.latest.as_ref().expect("commit").oid.clone();
+    repo.hover.store_ready(CommitHover {
+        oid: oid.clone(),
+        author: person("Ada Lovelace", "ada@example.invalid"),
+        co_authors: vec![person("Grace Hopper", "grace@example.invalid")],
+        authored_unix: 1_700_000_000,
+        authored_at: "2024-05-01 09:30".to_owned(),
+        message: "field notes from the estuary".to_owned(),
+        files: vec![CommitFile {
+            path: "notes/seal.txt".to_owned(),
+            previous: None,
+            insertions: Some(1),
+            deletions: Some(1),
+        }],
+        stats: Some(CommitStats {
+            files: 1,
+            insertions: 1,
+            deletions: 1,
+        }),
+        tags: vec!["v1,0".to_owned()],
+    });
+    repo.diffs.store_ready(
+        &oid,
+        "notes/seal.txt",
+        FileDiff {
+            notice: None,
+            columns: "vault door opens".chars().count(),
+            lines: vec![
+                DiffLine {
+                    kind: DiffKind::Removed,
+                    old: Some(1),
+                    new: None,
+                    text: "vault door shuts".to_owned(),
+                },
+                DiffLine {
+                    kind: DiffKind::Added,
+                    old: None,
+                    new: Some(1),
+                    text: "vault door opens".to_owned(),
+                },
+            ],
+        },
+    );
+    let mut harness = harness(
+        history_window(),
+        screen(repo, HistoryColumns::default(), false, true),
+    );
+    harness.get_by_label("v1,0");
+    harness.get_by_label("1 file changed");
+    let author_title = header_title(&harness, "Author");
+    let row_author = label_rects(&harness, "Ada Lovelace")
+        .into_iter()
+        .find(|rect| (rect.left() - author_title.left()).abs() < 80.0)
+        .expect("history author");
+    hover_until(&mut harness, row_author.center(), "Co-author");
+    assert!(
+        label_rects(&harness, "v1,0").len() >= 2,
+        "the tag should be on the sidebar and the card\n{}",
+        labels(&harness)
+    );
+    // The author card can cover the sidebar. Leave it before clicking.
+    move_pointer(&mut harness, egui::pos2(8.0, 8.0));
+    harness.step();
+    let button = harness.get_by_label("View changes").rect().center();
+    click_at(&mut harness, button);
+    settle(&mut harness);
+    assert!(
+        !label_rects(&harness, "notes/seal.txt").is_empty(),
+        "the file list did not open\n{}",
+        labels(&harness)
+    );
+    let added = harness.get_by_label("vault door opens").rect();
+    let removed = harness.get_by_label("vault door shuts").rect();
+    let palette = theme::DEFAULT_THEME.palette;
+    assert!(
+        rects_filled(&harness, palette.diff_added_fill)
+            .iter()
+            .any(|rect| rect.contains(added.center())),
+        "the added line has no green background"
+    );
+    assert!(
+        rects_filled(&harness, palette.diff_removed_fill)
+            .iter()
+            .any(|rect| rect.contains(removed.center())),
+        "the removed line has no red background"
+    );
+}
+
+fn rects_filled(harness: &Harness<'_, Screen>, color: egui::Color32) -> Vec<egui::Rect> {
+    let mut found = Vec::new();
+    for clipped in &harness.output().shapes {
+        collect_filled(&clipped.shape, color, &mut found);
+    }
+    found
+}
+
+fn collect_filled(shape: &egui::Shape, color: egui::Color32, found: &mut Vec<egui::Rect>) {
+    match shape {
+        egui::Shape::Rect(rect) if rect.fill == color => found.push(rect.rect),
+        egui::Shape::Vec(shapes) => {
+            for shape in shapes {
+                collect_filled(shape, color, found);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn panel_toggle_rects(harness: &Harness<'_, Screen>) -> Vec<egui::Rect> {
