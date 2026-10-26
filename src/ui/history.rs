@@ -8,14 +8,15 @@
 //! panel, the table scrolls sideways.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use cthulhu_git::git::{GraphBranch, GraphRow, Person};
 use cthulhu_git::github::{GitHubRepo, RepoContext};
 use cthulhu_git::settings::HistoryColumns;
 use eframe::egui::text::{LayoutJob, TextFormat, TextWrapping};
 use eframe::egui::{
-    self, Align, Color32, CursorIcon, FontId, Galley, Id, Label, Layout, Pos2, Rect, RichText,
-    ScrollArea, Sense, Stroke, TextStyle, Ui, UiBuilder, Vec2, WidgetInfo, WidgetType,
+    self, Align, Color32, CursorIcon, FontId, Galley, Id, Label, Layout, Mesh, Pos2, Rect,
+    RichText, ScrollArea, Sense, Stroke, TextStyle, Ui, UiBuilder, Vec2, WidgetInfo, WidgetType,
 };
 
 use super::avatars::{self, AvatarService};
@@ -40,6 +41,48 @@ const DOT_INNER: f32 = 6.0;
 const CONNECTOR_STROKE: f32 = 1.5;
 const CHIP_ICON: f32 = 16.0;
 const CHIP_PAD: f32 = 5.0;
+/// Extra fill on the branch tag while its line is lit. The tag stays a steady
+/// fill; only the lane carries the traveling crest.
+const CHIP_LIT_BOOST: u8 = 40;
+/// Halo around a lit lane, measured from the stroke's center. On the narrowest
+/// lane the next stroke starts 5.5 points away, so this does not reach it.
+const GLOW_RADIUS: f32 = 5.0;
+/// One crest travels this far down the branch. About sixteen rows, so a
+/// typical window shows a single crest.
+const GLOW_WAVELENGTH: f32 = 640.0;
+/// How wide the crest is. A couple of rows stay bright, then it fades.
+const GLOW_SIGMA: f32 = 110.0;
+/// Seconds for the crest to travel one [`GLOW_WAVELENGTH`], from newer
+/// commits toward older ones.
+const GLOW_PERIOD: f64 = 3.2;
+/// Alpha at the stroke's edge when the crest is elsewhere. The opaque stroke
+/// covers the center of the ribbon, so this is the glow that actually shows.
+const GLOW_ALPHA_BASE: u8 = 96;
+/// Alpha at the stroke's edge where the crest is.
+const GLOW_ALPHA_PEAK: u8 = 188;
+/// Middle of the falloff outside the stroke. Full alpha holds to the stroke
+/// edge; the halo is clear at [`GLOW_RADIUS`].
+const GLOW_SHOULDER: f32 = 3.2;
+/// Share of the local alpha at [`GLOW_SHOULDER`].
+const GLOW_EDGE_SHARE: f32 = 0.45;
+/// Distance between samples along a segment, so a diagonal lane change
+/// carries the crest instead of wearing one flat tint.
+const GLOW_SAMPLE: f32 = 10.0;
+/// The spark in front of the traveling light. Narrow, so it reads as a spot
+/// on the line rather than a wash over the whole branch.
+const GLOW_CREST_FRONT: f32 = 18.0;
+/// Tail the spark leaves behind it. Longer than the front, so the light is
+/// clearly moving down the branch.
+const GLOW_CREST_TAIL: f32 = 46.0;
+/// How far the spark reaches from the stroke center. Short of the next lane,
+/// whose stroke starts 5.5 points away on the narrowest lane.
+const GLOW_CREST_RADIUS: f32 = 4.0;
+/// Mix toward white at the spark's center. The stroke is already the lane
+/// color, so a same-color glow painted on top of it would not show.
+const GLOW_CREST_WHITE: f32 = 0.45;
+/// Alpha at the spark's center. The edges fade to clear.
+const GLOW_CREST_ALPHA: u8 = 210;
+const GLOW_FRAME: Duration = Duration::from_millis(16);
 const AVATAR: f32 = 26.0;
 /// How far each stacked avatar sits from the previous one.
 const AVATAR_STEP: f32 = AVATAR * 0.62;
@@ -227,6 +270,8 @@ pub fn show(
     if rows.is_empty() {
         // The column between the sidebars can be narrower than these sentences.
         // Wrap inside it; truncating would drop the line the loading state shows.
+        ui.ctx()
+            .data_mut(|data| data.remove::<String>(lit_branch_id(*view_id)));
         wrapped_line(ui, empty, palette.text_muted);
         return None;
     }
@@ -295,6 +340,11 @@ pub fn show(
         repo: repo.clone(),
         head: rows[0].oid.clone(),
     });
+    let lit = lit_branch(ui, *view_id, rows);
+    let time = ui.input(|input| input.time);
+    if lit.is_some() {
+        ui.ctx().request_repaint_after(GLOW_FRAME);
+    }
 
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -308,6 +358,9 @@ pub fn show(
             repo: context.as_ref(),
             text_font,
             mono_font,
+            view_id: *view_id,
+            lit,
+            time,
         };
         // Where the rows were placed this frame. The scroll area's returned
         // offset already includes this frame's wheel and scrollbar input,
@@ -319,8 +372,9 @@ pub fn show(
             .show_rows(ui, row_height, rows.len(), |ui, range| {
                 origin_x = ui.max_rect().left();
                 ui.set_min_width(layout.content_width);
-                for row in &rows[range] {
-                    history_row(ui, row, &layout, row_height, &mut cells);
+                let start = range.start;
+                for (offset, row) in rows[range].iter().enumerate() {
+                    history_row(ui, row, &layout, row_height, start + offset, &mut cells);
                 }
             });
         ui.ctx()
@@ -499,6 +553,16 @@ struct RowContext<'a> {
     repo: Option<&'a RepoContext>,
     text_font: FontId,
     mono_font: FontId,
+    view_id: Id,
+    lit: Option<LitBranch>,
+    time: f64,
+}
+
+/// Branch whose lane is lit. The name is what the tag toggles; the color is
+/// the lane strokes the crest travels along.
+struct LitBranch {
+    name: String,
+    color: usize,
 }
 
 /// `cell` without its padding: where the content and the title start.
@@ -517,6 +581,7 @@ fn history_row(
     row: &GraphRow,
     layout: &ColumnLayout,
     row_height: f32,
+    row_index: usize,
     cx: &mut RowContext<'_>,
 ) {
     let (_, rect) = ui.allocate_space(Vec2::new(layout.content_width, row_height));
@@ -553,10 +618,25 @@ fn history_row(
             }
         }
         let lanes = painter.with_clip_rect(graph.intersect(ui.clip_rect()));
-        paint_lanes(&lanes, graph, row, palette, layout.lane_width, fill);
+        paint_lanes(
+            &lanes,
+            graph,
+            row,
+            palette,
+            layout.lane_width,
+            fill,
+            cx.lit.as_ref().map(|lit| LaneGlow {
+                time: cx.time,
+                color: lit.color,
+                // `origin + screen_y` is the content Y, so the crest stays on
+                // the same commits when the table scrolls.
+                origin: row_index as f32 * row_height - rect.top(),
+            }),
+        );
     }
     if let Some(chip) = &chip {
-        paint_branch_chip(ui, chip, palette);
+        let lit = cx.lit.as_ref().is_some_and(|lit| lit.name == chip.name);
+        paint_branch_chip(ui, chip, palette, lit, cx.view_id);
     }
 
     text_cell(
@@ -739,6 +819,14 @@ fn lane_center(graph: Rect, lane: usize, lane_width: f32) -> f32 {
     graph.left() + CELL_PAD + lane as f32 * lane_width + lane_width / 2.0
 }
 
+/// The lit lane. `origin + screen_y` is how far a point sits down the branch.
+#[derive(Clone, Copy)]
+struct LaneGlow {
+    time: f64,
+    color: usize,
+    origin: f32,
+}
+
 fn paint_lanes(
     painter: &egui::Painter,
     graph: Rect,
@@ -746,20 +834,45 @@ fn paint_lanes(
     palette: &Palette,
     lane_width: f32,
     fill: Color32,
+    glow: Option<LaneGlow>,
 ) {
     let dot = Pos2::new(
         lane_center(graph, row.commit_lane, lane_width),
         graph.center().y,
     );
+    let outer = DOT_OUTER.min(lane_width / 2.0 - 1.0);
+    if let Some(glow) = glow {
+        let color = palette.graph_color(glow.color);
+        let mut mesh = Mesh::default();
+        for trace in &row.traces {
+            if trace.color != glow.color {
+                continue;
+            }
+            let (start, end) = trace_ends(graph, trace.from_lane, trace.to_lane, dot, lane_width);
+            add_glow_segment(&mut mesh, start, end, color, glow);
+        }
+        if row.commit_color == glow.color {
+            // The commit circle is opaque, so the aura is the band outside it.
+            // `gap` is measured from the dot's edge, and it stops short of the
+            // next lane's stroke.
+            let gap = lane_width / 2.0 - outer - 0.5;
+            if gap >= 1.0 {
+                add_glow_disc(
+                    &mut mesh,
+                    dot,
+                    outer,
+                    outer + GLOW_RADIUS.min(gap),
+                    color,
+                    glow_alpha(glow.time, glow.origin + dot.y),
+                );
+            }
+        }
+        if !mesh.is_empty() {
+            painter.add(mesh);
+        }
+    }
     for trace in &row.traces {
-        let start = match trace.from_lane {
-            Some(lane) => Pos2::new(lane_center(graph, lane, lane_width), graph.top()),
-            None => dot,
-        };
-        let end = match trace.to_lane {
-            Some(lane) => Pos2::new(lane_center(graph, lane, lane_width), graph.bottom()),
-            None => dot,
-        };
+        let (start, end) = trace_ends(graph, trace.from_lane, trace.to_lane, dot, lane_width);
         if start.distance(end) < 0.5 {
             continue;
         }
@@ -769,10 +882,326 @@ fn paint_lanes(
         );
     }
     // At the narrowest lanes the dots shrink so neighbors do not touch.
-    let outer = DOT_OUTER.min(lane_width / 2.0 - 1.0);
     let inner = DOT_INNER.min(outer - 1.5).max(1.0);
     painter.circle_filled(dot, outer, fill);
     painter.circle_filled(dot, inner, palette.graph_color(row.commit_color));
+    // After the stroke and the dot, so the spark sits on the line the eye
+    // follows. The halo underneath stays the steady glow.
+    if let Some(glow) = glow {
+        paint_crest(painter, graph, row, palette, lane_width, glow);
+    }
+}
+
+fn trace_ends(
+    graph: Rect,
+    from_lane: Option<usize>,
+    to_lane: Option<usize>,
+    dot: Pos2,
+    lane_width: f32,
+) -> (Pos2, Pos2) {
+    let start = match from_lane {
+        Some(lane) => Pos2::new(lane_center(graph, lane, lane_width), graph.top()),
+        None => dot,
+    };
+    let end = match to_lane {
+        Some(lane) => Pos2::new(lane_center(graph, lane, lane_width), graph.bottom()),
+        None => dot,
+    };
+    (start, end)
+}
+
+/// How far the bright point has traveled down the branch. The cycle stays in
+/// f64 so a long session does not hitch the light.
+fn glow_travel(time: f64) -> f32 {
+    let cycles = (time / GLOW_PERIOD).rem_euclid(1.0);
+    (cycles as f32) * GLOW_WAVELENGTH
+}
+
+/// Alpha of the halo at `distance` points down the branch. `time` is seconds.
+/// The bright band is a wide gaussian, so the tube stays lit between passes.
+fn glow_alpha(time: f64, distance: f32) -> u8 {
+    let along = (distance - glow_travel(time)).rem_euclid(GLOW_WAVELENGTH);
+    let delta = along.min(GLOW_WAVELENGTH - along);
+    let lobe = (-0.5 * (delta / GLOW_SIGMA).powi(2)).exp();
+    let alpha = f32::from(GLOW_ALPHA_BASE) + lobe * f32::from(GLOW_ALPHA_PEAK - GLOW_ALPHA_BASE);
+    alpha
+        .round()
+        .clamp(f32::from(GLOW_ALPHA_BASE), f32::from(GLOW_ALPHA_PEAK)) as u8
+}
+
+/// Strength of the spark at `distance`. One in front of the head, and a longer
+/// tail behind it, where the light has already passed.
+fn crest_lobe(time: f64, distance: f32) -> f32 {
+    let travel = glow_travel(time);
+    let ahead = (distance - travel).rem_euclid(GLOW_WAVELENGTH);
+    let behind = (travel - distance).rem_euclid(GLOW_WAVELENGTH);
+    let (delta, sigma) = if ahead <= behind {
+        (ahead, GLOW_CREST_FRONT)
+    } else {
+        (behind, GLOW_CREST_TAIL)
+    };
+    (-0.5 * (delta / sigma).powi(2)).exp()
+}
+
+fn glow_color(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
+fn glow_share(alpha: u8, share: f32) -> u8 {
+    (f32::from(alpha) * share).round() as u8
+}
+
+/// A ribbon along `start`→`end`. Full alpha out to the stroke edge, since the
+/// stroke is painted on top of the center, then a falloff that clears before
+/// the next lane. Samples follow content Y, including on a diagonal.
+fn add_glow_segment(mesh: &mut Mesh, start: Pos2, end: Pos2, color: Color32, glow: LaneGlow) {
+    // Offset from the stroke center, and the share of this sample's alpha.
+    const STOPS: [(f32, f32); 6] = [
+        (-GLOW_RADIUS, 0.0),
+        (-GLOW_SHOULDER, GLOW_EDGE_SHARE),
+        (-LANE_STROKE / 2.0, 1.0),
+        (LANE_STROKE / 2.0, 1.0),
+        (GLOW_SHOULDER, GLOW_EDGE_SHARE),
+        (GLOW_RADIUS, 0.0),
+    ];
+    let delta = end - start;
+    let length = delta.length();
+    if length < 0.5 {
+        return;
+    }
+    let steps = (length / GLOW_SAMPLE).ceil().max(1.0) as usize;
+    let tangent = delta / length;
+    let normal = Vec2::new(-tangent.y, tangent.x);
+    let base = mesh.vertices.len() as u32;
+    let across = STOPS.len() as u32;
+    for step in 0..=steps {
+        let point = start + delta * (step as f32 / steps as f32);
+        let alpha = glow_alpha(glow.time, glow.origin + point.y);
+        for (offset, share) in STOPS {
+            mesh.colored_vertex(
+                point + normal * offset,
+                glow_color(color, glow_share(alpha, share)),
+            );
+        }
+    }
+    for step in 0..steps as u32 {
+        let row = base + step * across;
+        let next = row + across;
+        for index in 0..across - 1 {
+            let left = row + index;
+            let right = left + 1;
+            let next_left = next + index;
+            let next_right = next_left + 1;
+            mesh.add_triangle(left, next_left, right);
+            mesh.add_triangle(right, next_left, next_right);
+        }
+    }
+}
+
+/// Ring outside the commit dot. `inner` is the opaque circle; `outer` is where
+/// the aura fades out. `peak` is the alpha at the circle's edge.
+fn add_glow_disc(mesh: &mut Mesh, center: Pos2, inner: f32, outer: f32, color: Color32, peak: u8) {
+    if outer < inner + 0.5 {
+        return;
+    }
+    const STEPS: usize = 16;
+    let mid_radius = (inner + outer) * 0.5;
+    let rings = [
+        (inner, peak),
+        (mid_radius, glow_share(peak, GLOW_EDGE_SHARE)),
+        (outer, 0),
+    ];
+    let base = mesh.vertices.len() as u32;
+    for (radius, alpha) in rings {
+        for step in 0..STEPS {
+            let angle = step as f32 / STEPS as f32 * std::f32::consts::TAU;
+            let (sin, cos) = angle.sin_cos();
+            mesh.colored_vertex(
+                center + Vec2::new(cos, sin) * radius,
+                glow_color(color, alpha),
+            );
+        }
+    }
+    for ring in 0..2 {
+        let inner_ring = base + ring * STEPS as u32;
+        let outer_ring = inner_ring + STEPS as u32;
+        for step in 0..STEPS {
+            let next = (step + 1) % STEPS;
+            let a = inner_ring + step as u32;
+            let b = inner_ring + next as u32;
+            let c = outer_ring + step as u32;
+            let d = outer_ring + next as u32;
+            mesh.add_triangle(a, c, b);
+            mesh.add_triangle(b, c, d);
+        }
+    }
+}
+
+/// The spark on top of the stroke and the commit dot. The dot's light stays
+/// inside the colored circle, so it does not reach the next lane.
+fn paint_crest(
+    painter: &egui::Painter,
+    graph: Rect,
+    row: &GraphRow,
+    palette: &Palette,
+    lane_width: f32,
+    glow: LaneGlow,
+) {
+    let dot = Pos2::new(
+        lane_center(graph, row.commit_lane, lane_width),
+        graph.center().y,
+    );
+    let outer = DOT_OUTER.min(lane_width / 2.0 - 1.0);
+    let dot_radius = DOT_INNER.min(outer - 1.5).max(1.0);
+    let color = palette.graph_color(glow.color);
+    let mut mesh = Mesh::default();
+    for trace in &row.traces {
+        if trace.color != glow.color {
+            continue;
+        }
+        let (start, end) = trace_ends(graph, trace.from_lane, trace.to_lane, dot, lane_width);
+        add_crest_segment(&mut mesh, start, end, color, glow);
+    }
+    if row.commit_color == glow.color {
+        let lobe = crest_lobe(glow.time, glow.origin + dot.y);
+        if lobe > 0.02 {
+            add_crest_disc(&mut mesh, dot, dot_radius, color, lobe);
+        }
+    }
+    if !mesh.is_empty() {
+        painter.add(mesh);
+    }
+}
+
+fn crest_color(lane: Color32, lobe: f32, share: f32) -> Color32 {
+    let mix = (lobe * GLOW_CREST_WHITE).clamp(0.0, 1.0);
+    let channel = |value: u8| -> u8 {
+        let colored = f32::from(value);
+        (colored + (255.0 - colored) * mix).round() as u8
+    };
+    let alpha = (lobe * f32::from(GLOW_CREST_ALPHA) * share)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    Color32::from_rgba_unmultiplied(
+        channel(lane.r()),
+        channel(lane.g()),
+        channel(lane.b()),
+        alpha,
+    )
+}
+
+/// A short light along `start`→`end`, sampled so it follows a diagonal.
+fn add_crest_segment(mesh: &mut Mesh, start: Pos2, end: Pos2, color: Color32, glow: LaneGlow) {
+    // Offset from the stroke center, and the share of this sample's alpha.
+    const STOPS: [(f32, f32); 5] = [
+        (-GLOW_CREST_RADIUS, 0.0),
+        (-LANE_STROKE / 2.0, 0.7),
+        (0.0, 1.0),
+        (LANE_STROKE / 2.0, 0.7),
+        (GLOW_CREST_RADIUS, 0.0),
+    ];
+    let delta = end - start;
+    let length = delta.length();
+    if length < 0.5 {
+        return;
+    }
+    let steps = (length / GLOW_SAMPLE).ceil().max(1.0) as usize;
+    let tangent = delta / length;
+    let normal = Vec2::new(-tangent.y, tangent.x);
+    let lobe_at = |point: Pos2| crest_lobe(glow.time, glow.origin + point.y);
+    let crosses = (0..=steps).any(|step| {
+        let point = start + delta * (step as f32 / steps as f32);
+        lobe_at(point) > 0.02
+    });
+    if !crosses {
+        return;
+    }
+    let base = mesh.vertices.len() as u32;
+    let across = STOPS.len() as u32;
+    for step in 0..=steps {
+        let point = start + delta * (step as f32 / steps as f32);
+        let lobe = lobe_at(point);
+        for (offset, share) in STOPS {
+            mesh.colored_vertex(point + normal * offset, crest_color(color, lobe, share));
+        }
+    }
+    for step in 0..steps as u32 {
+        let row = base + step * across;
+        let next = row + across;
+        for index in 0..across - 1 {
+            let left = row + index;
+            let right = left + 1;
+            let next_left = next + index;
+            let next_right = next_left + 1;
+            mesh.add_triangle(left, next_left, right);
+            mesh.add_triangle(right, next_left, next_right);
+        }
+    }
+}
+
+/// Soft spot on the commit dot, fading at `radius`.
+fn add_crest_disc(mesh: &mut Mesh, center: Pos2, radius: f32, color: Color32, lobe: f32) {
+    if radius < 0.5 {
+        return;
+    }
+    const STEPS: usize = 12;
+    let rings = [(0.0, 1.0), (0.55, 0.45), (1.0, 0.0)];
+    let base = mesh.vertices.len() as u32;
+    for (scale, share) in rings {
+        let tint = crest_color(color, lobe, share);
+        for step in 0..STEPS {
+            let angle = step as f32 / STEPS as f32 * std::f32::consts::TAU;
+            let (sin, cos) = angle.sin_cos();
+            mesh.colored_vertex(center + Vec2::new(cos, sin) * radius * scale, tint);
+        }
+    }
+    for ring in 0..2 {
+        let inner_ring = base + ring * STEPS as u32;
+        let outer_ring = inner_ring + STEPS as u32;
+        for step in 0..STEPS {
+            let next = (step + 1) % STEPS;
+            let a = inner_ring + step as u32;
+            let b = inner_ring + next as u32;
+            let c = outer_ring + step as u32;
+            let d = outer_ring + next as u32;
+            mesh.add_triangle(a, c, b);
+            mesh.add_triangle(b, c, d);
+        }
+    }
+}
+
+fn lit_branch_id(view_id: Id) -> Id {
+    view_id.with("history-lit-branch")
+}
+
+fn toggle_lit_branch(ui: &Ui, view_id: Id, name: &str) {
+    let id = lit_branch_id(view_id);
+    let current: Option<String> = ui.ctx().data(|data| data.get_temp(id));
+    if current.as_deref() == Some(name) {
+        ui.ctx().data_mut(|data| data.remove::<String>(id));
+    } else {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(id, name.to_owned()));
+    }
+    // The lanes for this frame are already drawn. One more frame shows the change.
+    ui.ctx().request_repaint();
+}
+
+/// The stored name, when that branch is still on a row. A missing branch is forgotten.
+fn lit_branch(ui: &Ui, view_id: Id, rows: &[GraphRow]) -> Option<LitBranch> {
+    let id = lit_branch_id(view_id);
+    let name: String = ui.ctx().data(|data| data.get_temp(id))?;
+    let color = rows.iter().find_map(|row| {
+        row.branches
+            .iter()
+            .find(|branch| branch.name == name)
+            .map(|branch| branch.color)
+    });
+    let Some(color) = color else {
+        ui.ctx().data_mut(|data| data.remove::<String>(id));
+        return None;
+    };
+    Some(LitBranch { name, color })
 }
 
 /// Checked-out branch first, then the sidebar order the row already has.
@@ -786,6 +1215,8 @@ struct BranchChip {
     rect: Rect,
     color: usize,
     current: bool,
+    /// The name drawn on the tag. A click lights this branch, not the `+N` tips.
+    name: String,
     names: String,
     oid: String,
     text: Arc<Galley>,
@@ -835,6 +1266,7 @@ fn branch_chip(
         rect,
         color: primary.color,
         current: primary.current,
+        name: primary.name.clone(),
         names,
         oid: row.oid.clone(),
         text,
@@ -842,7 +1274,7 @@ fn branch_chip(
     })
 }
 
-fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette) {
+fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette, lit: bool, view_id: Id) {
     let color = palette.graph_color(chip.color);
     let icon_rect = Rect::from_center_size(
         Pos2::new(
@@ -855,7 +1287,11 @@ fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette) {
         let painter = ui
             .painter()
             .with_clip_rect(chip.rect.intersect(ui.clip_rect()));
-        painter.rect_filled(chip.rect, 4.0, palette.graph_chip(chip.color, chip.current));
+        painter.rect_filled(
+            chip.rect,
+            4.0,
+            chip_fill(palette, chip.color, chip.current, lit),
+        );
         icons::paint_icon(&painter, ui.ctx(), icon_rect, Icon::GitBranch, color);
         let text_x = icon_rect.right() + CHIP_PAD;
         painter.galley(
@@ -875,12 +1311,31 @@ fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette) {
         }
     }
     // Painted text is invisible to accesskit unless the widget carries it.
-    ui.interact(
-        chip.rect,
-        ui.id().with(("branch-label", chip.oid.as_str())),
-        Sense::hover(),
+    let response = ui
+        .interact(
+            chip.rect,
+            ui.id().with(("branch-label", chip.oid.as_str())),
+            Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand);
+    if response.clicked() {
+        toggle_lit_branch(ui, view_id, &chip.name);
+    }
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, chip.names.as_str()));
+}
+
+fn chip_fill(palette: &Palette, color: usize, current: bool, lit: bool) -> Color32 {
+    let fill = palette.graph_chip(color, current);
+    if !lit {
+        return fill;
+    }
+    let lane = palette.graph_color(color);
+    Color32::from_rgba_unmultiplied(
+        lane.r(),
+        lane.g(),
+        lane.b(),
+        fill.a().saturating_add(CHIP_LIT_BOOST),
     )
-    .widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, chip.names.as_str()));
 }
 
 #[cfg(test)]
@@ -1045,6 +1500,64 @@ mod tests {
                 .map(|branch| branch.name.as_str())
                 .collect::<Vec<_>>(),
             ["main", "feature", "topic"]
+        );
+    }
+
+    #[test]
+    fn glow_alpha_holds_a_floor_and_a_crest_that_travels_down_the_branch() {
+        let mut time = 0.0;
+        while time < GLOW_PERIOD * 2.0 {
+            let mut distance = 0.0;
+            while distance <= GLOW_WAVELENGTH {
+                let alpha = glow_alpha(time, distance);
+                assert!(
+                    (GLOW_ALPHA_BASE..=GLOW_ALPHA_PEAK).contains(&alpha),
+                    "alpha {alpha} at time {time}, distance {distance}"
+                );
+                distance += 20.0;
+            }
+            time += 0.1;
+        }
+
+        assert_eq!(glow_alpha(0.0, 0.0), GLOW_ALPHA_PEAK);
+        assert_eq!(glow_alpha(GLOW_PERIOD, GLOW_WAVELENGTH), GLOW_ALPHA_PEAK);
+        // Half a period moves the crest half a wavelength down the branch.
+        assert_eq!(
+            glow_alpha(GLOW_PERIOD / 2.0, GLOW_WAVELENGTH / 2.0),
+            GLOW_ALPHA_PEAK
+        );
+
+        // Half a wavelength is the far side of the wave. The tail sits on the
+        // floor, or one step above it when the gaussian rounds up.
+        let dim = glow_alpha(0.0, GLOW_WAVELENGTH / 2.0);
+        assert!(
+            (GLOW_ALPHA_BASE..=GLOW_ALPHA_BASE + 1).contains(&dim),
+            "half a wavelength should be the floor, got {dim}"
+        );
+        let shoulder = glow_alpha(0.0, GLOW_SIGMA);
+        assert!(
+            dim < shoulder && shoulder < GLOW_ALPHA_PEAK,
+            "the crest should fall off between the peak and the floor"
+        );
+    }
+
+    #[test]
+    fn crest_lobe_is_a_spark_that_travels_down_the_branch() {
+        assert!((crest_lobe(0.0, 0.0) - 1.0).abs() < 1.0e-5);
+        assert!(
+            crest_lobe(0.0, GLOW_WAVELENGTH / 2.0) < 0.01,
+            "half a wavelength should be dark"
+        );
+        assert!(
+            (crest_lobe(GLOW_PERIOD / 2.0, GLOW_WAVELENGTH / 2.0) - 1.0).abs() < 1.0e-5,
+            "after half a period the spark is half a wavelength further down"
+        );
+        // The same distance behind the spark is brighter than ahead of it.
+        let ahead = crest_lobe(0.0, 36.0);
+        let behind = crest_lobe(0.0, -36.0);
+        assert!(
+            behind > ahead && ahead > 0.0,
+            "the tail should outlast the front, ahead {ahead}, behind {behind}"
         );
     }
 }

@@ -1439,6 +1439,235 @@ fn hovering_a_panel_toggle_does_not_grow_the_top_bar() {
 }
 
 /// The two icon buttons in the top bar, not the ones in the bottom bar.
+/// `main` on the spine and `feature` on its own color, joined at the root.
+fn fork_graph() -> HistoryGraph {
+    let author = person("Ada Lovelace", "ada@example.invalid");
+    let commit = |oid: u8, summary: &str, parents: &[u8]| GraphCommit {
+        oid: format!("{oid:040x}"),
+        summary: summary.to_owned(),
+        parents: parents
+            .iter()
+            .map(|parent| format!("{parent:040x}"))
+            .collect(),
+        author: author.clone(),
+        co_authors: Vec::new(),
+    };
+    layout_graph(
+        &[
+            commit(1, "on main", &[2]),
+            commit(3, "on feature", &[4]),
+            commit(2, "mid main", &[4]),
+            commit(4, "base", &[]),
+        ],
+        &[
+            GraphTip {
+                name: "main".to_owned(),
+                oid: format!("{:040x}", 1),
+                color: 0,
+                principal: true,
+                current: true,
+            },
+            GraphTip {
+                name: "feature".to_owned(),
+                oid: format!("{:040x}", 3),
+                color: 3,
+                principal: false,
+                current: false,
+            },
+        ],
+    )
+}
+
+fn history_chip_center(harness: &Harness<'_, Screen>, name: &str) -> Pos2 {
+    let headers = header_row(harness);
+    let branch_left = title_left(&headers, "Branch");
+    let graph_left = title_left(&headers, "Graph");
+    let header_bottom = headers
+        .iter()
+        .map(|(_, rect)| rect.bottom())
+        .fold(0.0_f32, f32::max);
+    let chips: Vec<_> = label_rects(harness, name)
+        .into_iter()
+        .filter(|rect| {
+            rect.center().x >= branch_left
+                && rect.center().x < graph_left
+                && rect.top() >= header_bottom - 1.0
+        })
+        .collect();
+    assert_eq!(
+        chips.len(),
+        1,
+        "expected one {name} tag in the history, labels:\n{}",
+        labels(harness)
+    );
+    chips[0].center()
+}
+
+fn click_branch(harness: &mut Harness<'_, Screen>, name: &str) {
+    let at = history_chip_center(harness, name);
+    click_at(harness, at);
+    // The click lands after the lanes are painted, so the halo shows on the next frame.
+    harness.step();
+}
+
+fn glow_vertices(harness: &Harness<'_, Screen>) -> Vec<egui::epaint::Vertex> {
+    let mut found = Vec::new();
+    for clipped in &harness.output().shapes {
+        collect_glow(&clipped.shape, &mut found);
+    }
+    found
+}
+
+fn collect_glow(shape: &egui::Shape, found: &mut Vec<egui::epaint::Vertex>) {
+    match shape {
+        egui::Shape::Mesh(mesh) if mesh.texture_id == egui::TextureId::default() => {
+            found.extend(mesh.vertices.iter().copied());
+        }
+        egui::Shape::Vec(shapes) => {
+            for shape in shapes {
+                collect_glow(shape, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+struct LaneMarks {
+    segments: Vec<[Pos2; 2]>,
+    dots: Vec<Pos2>,
+}
+
+fn lane_marks(harness: &Harness<'_, Screen>, color: egui::Color32) -> LaneMarks {
+    let mut marks = LaneMarks {
+        segments: Vec::new(),
+        dots: Vec::new(),
+    };
+    for clipped in &harness.output().shapes {
+        collect_lane_marks(&clipped.shape, color, &mut marks);
+    }
+    marks
+}
+
+fn collect_lane_marks(shape: &egui::Shape, color: egui::Color32, marks: &mut LaneMarks) {
+    match shape {
+        egui::Shape::LineSegment { points, stroke } if stroke.color == color => {
+            marks.segments.push(*points);
+        }
+        egui::Shape::Circle(circle) if circle.fill == color => {
+            marks.dots.push(circle.center);
+        }
+        egui::Shape::Vec(shapes) => {
+            for shape in shapes {
+                collect_lane_marks(shape, color, marks);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn distance_to_segment(point: Pos2, start: Pos2, end: Pos2) -> f32 {
+    let delta = end - start;
+    let len2 = delta.length_sq();
+    if len2 <= f32::EPSILON {
+        return point.distance(start);
+    }
+    let t = ((point - start).dot(delta) / len2).clamp(0.0, 1.0);
+    point.distance(start + delta * t)
+}
+
+/// The commit dot is 8 points and the aura extends 5 past a stroke, plus a point of slack.
+const HALO_REACH: f32 = 14.0;
+
+fn near_lane(point: Pos2, marks: &LaneMarks) -> bool {
+    marks
+        .segments
+        .iter()
+        .any(|segment| distance_to_segment(point, segment[0], segment[1]) <= HALO_REACH)
+        || marks
+            .dots
+            .iter()
+            .any(|dot| point.distance(*dot) <= HALO_REACH)
+}
+
+fn assert_no_glow(harness: &Harness<'_, Screen>) {
+    assert!(
+        glow_vertices(harness).is_empty(),
+        "a halo is drawn with no branch lit"
+    );
+}
+
+/// The halo is the lane color. The traveling spark is that color pushed
+/// toward white. Both are stored premultiplied, and a low alpha does not
+/// round-trip, so compare in that space against the lane and against white.
+fn is_lane_glow(color: egui::Color32, lane: egui::Color32) -> bool {
+    let alpha = color.a();
+    if alpha == 0 {
+        return true;
+    }
+    let floor = egui::Color32::from_rgba_unmultiplied(lane.r(), lane.g(), lane.b(), alpha);
+    let ceil = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
+    let within =
+        |channel: u8, low: u8, high: u8| channel + 1 >= low && channel <= high.saturating_add(1);
+    within(color.r(), floor.r(), ceil.r())
+        && within(color.g(), floor.g(), ceil.g())
+        && within(color.b(), floor.b(), ceil.b())
+}
+
+fn assert_glow_is(harness: &Harness<'_, Screen>, lane: egui::Color32) {
+    let vertices = glow_vertices(harness);
+    let colored: Vec<_> = vertices
+        .iter()
+        .filter(|vertex| vertex.color.a() > 0)
+        .copied()
+        .collect();
+    assert!(!colored.is_empty(), "the lit branch has no halo");
+    for vertex in &colored {
+        assert!(
+            is_lane_glow(vertex.color, lane),
+            "halo vertex {:?} is not the lit lane color",
+            vertex.color
+        );
+    }
+    let marks = lane_marks(harness, lane);
+    assert!(
+        !marks.segments.is_empty(),
+        "the lit lane has no stroke to follow"
+    );
+    for vertex in &vertices {
+        assert!(
+            near_lane(vertex.pos, &marks),
+            "halo point {:?} is away from the lit lane",
+            vertex.pos
+        );
+    }
+}
+
+#[test]
+fn clicking_a_branch_tag_lights_only_that_lanes_halo() {
+    let repo = opened_graph("lane-glow", fork_graph());
+    let mut harness = harness(
+        egui::vec2(1400.0, HEIGHT),
+        screen(repo, HistoryColumns::default(), false, false),
+    );
+    let palette = theme::DEFAULT_THEME.palette;
+    let main = palette.graph_color(0);
+    let feature = palette.graph_color(3);
+
+    assert_no_glow(&harness);
+
+    click_branch(&mut harness, "main");
+    assert_glow_is(&harness, main);
+
+    click_branch(&mut harness, "main");
+    assert_no_glow(&harness);
+
+    click_branch(&mut harness, "feature");
+    assert_glow_is(&harness, feature);
+
+    click_branch(&mut harness, "main");
+    assert_glow_is(&harness, main);
+}
+
 fn panel_toggle_rects(harness: &Harness<'_, Screen>) -> Vec<egui::Rect> {
     let buttons: Vec<_> = harness
         .query_all_by_role(Role::Button)
