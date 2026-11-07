@@ -351,7 +351,10 @@ fn nfd_filename_matches_nfc_index() {
     }
 
     let info = inspect(&git, &root).expect("inspect");
-    assert_eq!(info.root, fs::canonicalize(&root).expect("canonical root"));
+    assert_eq!(
+        info.root,
+        dunce::canonicalize(&root).expect("canonical root")
+    );
 
     let status = git
         .run(&root, &["status", "--porcelain", "-z"])
@@ -363,13 +366,19 @@ fn nfd_filename_matches_nfc_index() {
         String::from_utf8_lossy(&status.stdout)
     );
 
+    // macOS git defaults to core.precomposeUnicode=true and stores the NFC form.
+    let indexed = if cfg!(target_os = "macos") {
+        "\u{00E9}"
+    } else {
+        name
+    };
     let listed = git.run(&root, &["ls-files", "-z"]).expect("ls-files");
     assert!(
         listed.status.success()
             && listed
                 .stdout
-                .windows(name.len())
-                .any(|window| window == name.as_bytes()),
+                .windows(indexed.len())
+                .any(|window| window == indexed.as_bytes()),
         "index lost the NFD filename: {}",
         String::from_utf8_lossy(&listed.stdout)
     );
