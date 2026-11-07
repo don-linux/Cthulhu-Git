@@ -103,16 +103,18 @@ jobs:
             cargo test --locked
           fi
       # Finder launches apps with /usr/bin:/bin:/usr/sbin:/sbin, so this step
-      # runs against Apple's git. Cargo on the GitHub macOS runner is
-      # $HOME/.cargo/bin, which is /Users/runner/.cargo/bin.
+      # runs against Apple's git. The runner's rustup may come from Homebrew,
+      # whose bin directory also holds a newer git, so only the toolchain's own
+      # bin directory is added.
       - name: Test with Apple git
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -Eeuo pipefail
-          export PATH="${HOME}/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          toolchain_bin="$(dirname "$(rustup which cargo)")"
+          export PATH="${toolchain_bin}:/usr/bin:/bin:/usr/sbin:/sbin"
           command -v cargo
-          command -v git
+          test "$(command -v git)" = /usr/bin/git
           git --version
           cargo test --locked
       - name: Check the Intel macOS build
