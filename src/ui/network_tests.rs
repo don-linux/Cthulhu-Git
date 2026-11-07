@@ -995,6 +995,129 @@ fn appearance_and_terminal_offer_different_bundled_faces() {
     );
 }
 
+type FontChoice = Rc<RefCell<(Option<String>, Option<String>)>>;
+
+/// Faces are installed before the page draws, the way the app does each frame.
+fn open_font_settings(
+    ui_font: Option<String>,
+    terminal_font: Option<String>,
+) -> (Harness<'static, ()>, Rc<RefCell<Vec<Action>>>, FontChoice) {
+    let chosen = Rc::new(RefCell::new((ui_font, terminal_font)));
+    let chosen_ui = Rc::clone(&chosen);
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let actions_ui = Rc::clone(&actions);
+    let service = Rc::new(RefCell::new(super::fonts::FontService::default()));
+    let service_ui = Rc::clone(&service);
+    let github = Rc::new(RefCell::new(GitHubAuth::default()));
+    let github_ui = Rc::clone(&github);
+    let mut preview = None;
+    let view = SettingsView {
+        author_avatars: true,
+        api_status: ApiStatus::default(),
+        busy: false,
+        about: AboutInfo::current("2.43.0"),
+    };
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(1100.0, 1600.0))
+        .with_pixels_per_point(1.0)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), theme::DEFAULT_THEME);
+            let (ui_font, terminal_font) = chosen_ui.borrow().clone();
+            service_ui
+                .borrow_mut()
+                .sync(ui.ctx(), ui_font.as_deref(), terminal_font.as_deref());
+            let produced = settings::show(
+                ui,
+                ui_font.as_deref(),
+                terminal_font.as_deref(),
+                &mut preview,
+                None,
+                &view,
+                &mut github_ui.borrow_mut(),
+            );
+            *actions_ui.borrow_mut() = produced;
+        });
+    // The builder already ran the pass that queues the faces.
+    harness.step();
+    (harness, actions, chosen)
+}
+
+#[test]
+fn obel_on_one_surface_does_not_change_the_other() {
+    let (mut harness, actions, chosen) = open_font_settings(None, None);
+    click_label(&mut harness, "Obel Mono");
+    let got: Vec<_> = actions.borrow().iter().map(action_label).collect();
+    assert_eq!(got, vec!["SetUiFont(Some(\"obel-mono\"))".to_owned()]);
+    chosen.borrow_mut().0 = Some("obel-mono".to_owned());
+    harness.step();
+    assert!(
+        harness.query_by_label("Meslo LGS NF").is_none(),
+        "terminal face listed on Appearance\n{}",
+        label_dump(&harness)
+    );
+
+    click_label(&mut harness, "Terminal");
+    assert!(
+        actions
+            .borrow()
+            .iter()
+            .all(|action| !matches!(action, Action::SetUiFont(_))),
+        "opening Terminal changed the interface face: {:?}",
+        actions
+            .borrow()
+            .iter()
+            .map(action_label)
+            .collect::<Vec<_>>()
+    );
+    click_label(&mut harness, "Obel Mono");
+    let got: Vec<_> = actions.borrow().iter().map(action_label).collect();
+    assert_eq!(
+        got,
+        vec!["SetTerminalFont(Some(\"obel-mono\"))".to_owned()],
+        "{got:?}"
+    );
+    assert_eq!(chosen.borrow().0.as_deref(), Some("obel-mono"));
+}
+
+#[test]
+fn unknown_font_name_is_reported_and_does_not_pick_a_bundled_id() {
+    let (mut harness, actions, chosen) = open_font_settings(
+        Some("JetBrains Mono".to_owned()),
+        Some("Fira Code".to_owned()),
+    );
+    assert!(
+        actions.borrow().is_empty(),
+        "opening Appearance rewrote the font: {:?}",
+        actions
+            .borrow()
+            .iter()
+            .map(action_label)
+            .collect::<Vec<_>>()
+    );
+    harness.get_by_label("\"JetBrains Mono\" is not bundled. The interface is using Ubuntu Sans.");
+    assert!(
+        harness.query_by_label("Meslo LGS NF").is_none(),
+        "terminal face listed on Appearance\n{}",
+        label_dump(&harness)
+    );
+
+    click_label(&mut harness, "Terminal");
+    assert!(
+        actions.borrow().is_empty(),
+        "opening Terminal rewrote the font: {:?}",
+        actions
+            .borrow()
+            .iter()
+            .map(action_label)
+            .collect::<Vec<_>>()
+    );
+    harness.get_by_label(
+        "\"Fira Code\" is not bundled. The terminal is using the built-in monospace.",
+    );
+    assert_eq!(chosen.borrow().0.as_deref(), Some("JetBrains Mono"));
+    assert_eq!(chosen.borrow().1.as_deref(), Some("Fira Code"));
+}
+
 #[test]
 fn about_puts_the_copyright_opposite_copy_version_info() {
     let (mut harness, _github, _actions) = open_settings();

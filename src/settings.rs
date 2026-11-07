@@ -568,6 +568,24 @@ mod tests {
     }
 
     #[test]
+    fn hostile_font_ids_round_trip_and_unknown_names_stay_stored() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path(&dir);
+        let mut settings = Settings::default();
+        settings.set_ui_font(Some("  obel-mono \n".to_owned()));
+        settings.set_terminal_font(Some("  Fira Code \n".to_owned()));
+        settings.save_to(&path).expect("save");
+
+        let loaded = Settings::load_from(&path).expect("load");
+        assert_eq!(loaded.ui_font.as_deref(), Some("obel-mono"));
+        assert_eq!(loaded.terminal_font.as_deref(), Some("Fira Code"));
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
+        assert_eq!(value["ui_font"], "obel-mono");
+        assert_eq!(value["terminal_font"], "Fira Code");
+    }
+
+    #[test]
     fn terminal_stays_hidden_unless_saved_open() {
         let dir = TempDir::new().expect("temp dir");
         let path = settings_path(&dir);

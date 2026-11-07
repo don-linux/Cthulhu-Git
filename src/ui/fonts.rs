@@ -403,6 +403,151 @@ mod tests {
         finish_pass(&ctx);
     }
 
+    /// nf-oct-terminal. Meslo LGS NF has it; Obel Mono does not.
+    const PROMPT_ICON: char = '\u{f120}';
+
+    #[test]
+    fn hostile_ids_stay_inside_the_bundled_catalog_and_off_disk() {
+        let missing =
+            std::env::temp_dir().join(format!("cthulhu-font-probe-{}", std::process::id()));
+        let _ = std::fs::remove_file(&missing);
+        let path = missing.to_string_lossy().into_owned();
+        let huge = "x".repeat(100_000);
+        let samples = [
+            "",
+            " ",
+            " \n\t ",
+            "UBUNTU-SANS",
+            " Obel-Mono ",
+            "inter\n",
+            "obel\nmono",
+            "JetBrains Mono",
+            "Fira Code",
+            "\u{202e}obel-mono",
+            path.as_str(),
+            huge.as_str(),
+        ];
+        for name in samples {
+            let ui = resolve_ui(Some(name));
+            assert!(
+                UI_FACES.iter().any(|face| face.id == ui),
+                "{name:?} resolved to {ui}"
+            );
+            if let Some(terminal) = resolve_terminal(Some(name)) {
+                assert!(
+                    TERMINAL_FACES.iter().any(|face| face.id == terminal),
+                    "{name:?} resolved to {terminal}"
+                );
+            }
+        }
+        assert_eq!(resolve_ui(Some("JetBrains Mono")), DEFAULT_UI_ID);
+        assert_eq!(resolve_ui(Some(&path)), DEFAULT_UI_ID);
+        assert_eq!(resolve_ui(Some("\u{202e}obel-mono")), DEFAULT_UI_ID);
+        assert_eq!(resolve_terminal(Some("Fira Code")), None);
+        assert_eq!(resolve_terminal(Some(&path)), None);
+        assert_eq!(resolve_terminal(Some(" Obel-Mono ")), Some("obel-mono"));
+        assert!(
+            !missing.exists(),
+            "font lookup created {}",
+            missing.display()
+        );
+
+        let ctx = egui::Context::default();
+        let mut service = FontService::default();
+        settle(&ctx, &mut service, Some(&huge), Some(path.as_str()));
+        assert_loaded(&ctx, DEFAULT_UI_ID, None);
+        assert!(!missing.exists(), "sync created {}", missing.display());
+        finish_pass(&ctx);
+    }
+
+    #[test]
+    fn every_face_pair_applies_without_clobbering_the_other() {
+        let ctx = egui::Context::default();
+        let mut service = FontService::default();
+        let terminals = [
+            None,
+            Some("obel-mono"),
+            Some("meslo-lgs-nf"),
+            Some("departure-mono"),
+        ];
+        for ui in ["ubuntu-sans", "obel-mono", "aspekta", "inter"] {
+            for terminal in terminals {
+                // The choice queued on the first pass is what the next pass loads.
+                settle(&ctx, &mut service, Some(ui), terminal);
+                assert_loaded(&ctx, ui, terminal);
+                if ui == "ubuntu-sans" && terminal == Some("meslo-lgs-nf") {
+                    ctx.fonts_mut(|fonts| {
+                        let meslo = FontId::new(14.0, FontFamily::Name("meslo-lgs-nf".into()));
+                        let obel = FontId::new(14.0, FontFamily::Name("obel-mono".into()));
+                        assert!(fonts.glyph_width(&meslo, 'M') > 0.0);
+                        assert!(fonts.glyph_width(&obel, 'M') > 0.0);
+                        // A missing glyph is zero wide. Meslo's notdef is not used here:
+                        // the same code point on Obel Mono measures zero.
+                        assert!(fonts.glyph_width(&meslo, PROMPT_ICON) > 0.0);
+                        assert_eq!(fonts.glyph_width(&obel, PROMPT_ICON), 0.0);
+                    });
+                }
+                finish_pass(&ctx);
+            }
+        }
+    }
+
+    /// One pass queues the faces. The next pass is the one egui has loaded,
+    /// and it is left open so the caller can measure.
+    fn settle(
+        ctx: &egui::Context,
+        service: &mut FontService,
+        ui: Option<&str>,
+        terminal: Option<&str>,
+    ) {
+        ctx.begin_pass(egui::RawInput::default());
+        service.sync(ctx, ui, terminal);
+        finish_pass(ctx);
+        ctx.begin_pass(egui::RawInput::default());
+        service.sync(ctx, ui, terminal);
+    }
+
+    fn assert_loaded(ctx: &egui::Context, ui: &str, terminal: Option<&str>) {
+        assert!(faces_ready(ctx));
+        match terminal {
+            Some("departure-mono") => {
+                assert!(terminal_active(ctx));
+                assert_eq!(terminal_size(ctx), Some(DEPARTURE_SIZE));
+            }
+            Some(_) => {
+                assert!(terminal_active(ctx));
+                assert!(terminal_size(ctx).is_none());
+            }
+            None => {
+                assert!(!terminal_active(ctx));
+                assert!(terminal_size(ctx).is_none());
+            }
+        }
+        ctx.fonts(|fonts| {
+            let definitions = fonts.definitions();
+            let proportional = definitions
+                .families
+                .get(&FontFamily::Proportional)
+                .expect("proportional");
+            assert_eq!(proportional.first().map(String::as_str), Some(ui));
+            let terminal_family = FontFamily::Name(TERMINAL_FAMILY.into());
+            match terminal {
+                Some(id) => {
+                    let chain = definitions
+                        .families
+                        .get(&terminal_family)
+                        .expect("terminal family");
+                    assert_eq!(chain.first().map(String::as_str), Some(id));
+                    assert!(chain.len() > 1, "monospace fallback was dropped");
+                }
+                None => assert!(
+                    !definitions.families.contains_key(&terminal_family),
+                    "built-in terminal still installed a named face"
+                ),
+            }
+        });
+    }
+
     fn finish_pass(ctx: &egui::Context) {
         // Dropping an unapplied texture delta panics. This test has no renderer.
         let mut output = ctx.end_pass();
