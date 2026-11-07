@@ -24,7 +24,9 @@ use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config as TermConfig, RenderableCursor, Term, TermMode, color};
+use alacritty_terminal::term::{
+    Config as TermConfig, Osc52, RenderableCursor, Term, TermMode, color,
+};
 use alacritty_terminal::tty::{self, Pty};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use eframe::egui::{
@@ -397,7 +399,7 @@ impl ShellSession {
             screen_lines: metrics.rows,
         };
         let term = Arc::new(FairMutex::new(Term::new(
-            TermConfig::default(),
+            term_config(),
             &grid,
             bridge.clone(),
         )));
@@ -496,6 +498,14 @@ impl ShellSession {
             screen_lines: usize::from(size.num_lines),
         });
         let _ = self.io.send(Msg::Resize(size));
+    }
+}
+
+/// OSC 52 is off. A program in the shell must not write the clipboard.
+fn term_config() -> TermConfig {
+    TermConfig {
+        osc52: Osc52::Disabled,
+        ..TermConfig::default()
     }
 }
 
@@ -2106,6 +2116,50 @@ END
         let size = window_size(&huge, 10.0);
         assert!(pty_size_is_safe(size), "{size:?}");
         assert!(size.cell_width < 1_000, "cell width was not clamped");
+    }
+
+    #[test]
+    fn osc52_store_is_disabled() {
+        use std::sync::Mutex;
+
+        struct Clipboard(Arc<Mutex<Vec<String>>>);
+
+        impl EventListener for Clipboard {
+            fn send_event(&self, event: TermEvent) {
+                if let TermEvent::ClipboardStore(_, text) = event {
+                    self.0.lock().expect("clipboard").push(text);
+                }
+            }
+        }
+
+        let copies = Arc::new(Mutex::new(Vec::new()));
+        let grid = GridSize {
+            columns: 8,
+            screen_lines: 2,
+        };
+        let mut term = Term::new(term_config(), &grid, Clipboard(Arc::clone(&copies)));
+        let mut parser = alacritty_terminal::vte::ansi::Processor::<
+            alacritty_terminal::vte::ansi::StdSyncHandler,
+        >::new();
+        // "hi" is aGk= in standard base64.
+        parser.advance(&mut term, b"\x1b]52;c;aGk=\x07");
+        assert!(copies.lock().expect("clipboard").is_empty());
+        assert_eq!(term_config().osc52, Osc52::Disabled);
+
+        let accepted = Arc::new(Mutex::new(Vec::new()));
+        let mut copying = Term::new(
+            TermConfig {
+                osc52: Osc52::OnlyCopy,
+                ..term_config()
+            },
+            &grid,
+            Clipboard(Arc::clone(&accepted)),
+        );
+        let mut parser = alacritty_terminal::vte::ansi::Processor::<
+            alacritty_terminal::vte::ansi::StdSyncHandler,
+        >::new();
+        parser.advance(&mut copying, b"\x1b]52;c;aGk=\x07");
+        assert_eq!(accepted.lock().expect("clipboard").as_slice(), ["hi"]);
     }
 
     #[test]
