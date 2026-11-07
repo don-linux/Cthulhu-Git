@@ -100,6 +100,7 @@ fn probe_fake(path: &Path) -> cthulhu_git::git::Git {
         path_var: None,
         exe_name: "git",
         fallbacks: Vec::new(),
+        skip_paths: Vec::new(),
     };
     discover_with(&inputs).unwrap_or_else(|error| panic!("probe fake git: {error}"))
 }
