@@ -39,11 +39,12 @@ pub struct Settings {
     /// so this field names its own default.
     #[serde(default = "default_terminal_hidden")]
     pub terminal_hidden: bool,
-    /// Interface typeface. `None`, blank, or an unknown id keeps Ubuntu Sans.
+    /// Interface typeface. `None`, blank, or an unknown id keeps Obel Mono.
     /// An id from the bundled catalog, not a file path or a system family.
     pub ui_font: Option<String>,
-    /// Font drawn in the terminal. `None`, blank, or an unknown id keeps the
-    /// built-in monospace. An id from the bundled catalog, not a file path.
+    /// Font drawn in the terminal. `None`, blank, or an unknown id keeps
+    /// Meslo LGS NF. `builtin` keeps the monospace shipped with the app.
+    /// Any other value is an id from the bundled catalog, not a file path.
     pub terminal_font: Option<String>,
     /// Width of each commit history column. A value that is not an object
     /// keeps every default; a bad field keeps only its own default.

@@ -16,7 +16,13 @@ use eframe::egui::{self, FontData, FontDefinitions, FontFamily, FontId, Id, Text
 pub const TERMINAL_FAMILY: &str = "terminal";
 
 /// Saved `ui_font` of `None` or an unknown id uses this face.
-pub const DEFAULT_UI_ID: &str = "ubuntu-sans";
+pub const DEFAULT_UI_ID: &str = "obel-mono";
+
+/// Saved `terminal_font` of `None` or an unknown id uses this face.
+pub const DEFAULT_TERMINAL_ID: &str = "meslo-lgs-nf";
+
+/// Saved `terminal_font` that keeps egui's built-in monospace.
+pub const BUILTIN_TERMINAL_ID: &str = "builtin";
 
 /// Departure Mono is a pixel face. 11pt lands on its grid.
 const DEPARTURE_SIZE: f32 = 11.0;
@@ -38,16 +44,16 @@ pub struct Face {
 pub const UI_FACES: &[Face] = &[
     Face {
         id: DEFAULT_UI_ID,
-        name: "Ubuntu Sans",
+        name: "Obel Mono",
         note: "Default",
-        bytes: include_bytes!("../../assets/fonts/ubuntu-sans/UbuntuSans-Regular.ttf"),
+        bytes: OBEL_MONO,
         terminal_size: None,
     },
     Face {
-        id: "obel-mono",
-        name: "Obel Mono",
-        note: "Monospace",
-        bytes: OBEL_MONO,
+        id: "ubuntu-sans",
+        name: "Ubuntu Sans",
+        note: "Sans",
+        bytes: include_bytes!("../../assets/fonts/ubuntu-sans/UbuntuSans-Regular.ttf"),
         terminal_size: None,
     },
     Face {
@@ -69,17 +75,17 @@ pub const UI_FACES: &[Face] = &[
 /// Terminal faces, in the order the Terminal page lists them.
 pub const TERMINAL_FACES: &[Face] = &[
     Face {
+        id: DEFAULT_TERMINAL_ID,
+        name: "Meslo LGS NF",
+        note: "Default",
+        bytes: include_bytes!("../../assets/fonts/meslo-lgs-nf/MesloLGS-NF-Regular.ttf"),
+        terminal_size: None,
+    },
+    Face {
         id: "obel-mono",
         name: "Obel Mono",
         note: "Monospace",
         bytes: OBEL_MONO,
-        terminal_size: None,
-    },
-    Face {
-        id: "meslo-lgs-nf",
-        name: "Meslo LGS NF",
-        note: "Prompt icons",
-        bytes: include_bytes!("../../assets/fonts/meslo-lgs-nf/MesloLGS-NF-Regular.ttf"),
         terminal_size: None,
     },
     Face {
@@ -109,11 +115,26 @@ pub fn resolve_ui(saved: Option<&str>) -> &'static str {
         .unwrap_or(DEFAULT_UI_ID)
 }
 
-/// Id drawn in the terminal. Unknown names keep the built-in monospace.
+/// `true` when `name` asks for egui's built-in monospace.
+pub fn is_builtin_terminal(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case(BUILTIN_TERMINAL_ID)
+}
+
+/// Id drawn in the terminal. `None` means the built-in monospace, which is
+/// stored as [`BUILTIN_TERMINAL_ID`]. A missing or unknown id uses
+/// [`DEFAULT_TERMINAL_ID`].
 pub fn resolve_terminal(saved: Option<&str>) -> Option<&'static str> {
-    saved
-        .and_then(|name| face_by_id(TERMINAL_FACES, name))
-        .map(|face| face.id)
+    let Some(name) = saved.map(str::trim).filter(|name| !name.is_empty()) else {
+        return Some(DEFAULT_TERMINAL_ID);
+    };
+    if is_builtin_terminal(name) {
+        return None;
+    }
+    Some(
+        face_by_id(TERMINAL_FACES, name)
+            .map(|face| face.id)
+            .unwrap_or(DEFAULT_TERMINAL_ID),
+    )
 }
 
 /// The specimen font for a bundled face. Proportional until egui has loaded
@@ -141,8 +162,9 @@ pub struct FontService {
 impl FontService {
     /// Installs `ui_font` and `terminal_font` when either id changed.
     ///
-    /// A missing or unknown interface id is Ubuntu Sans. A missing or unknown
-    /// terminal id is the built-in monospace.
+    /// A missing or unknown interface id is Obel Mono. A missing or unknown
+    /// terminal id is Meslo LGS NF. [`BUILTIN_TERMINAL_ID`] keeps the built-in
+    /// monospace.
     pub fn sync(
         &mut self,
         ctx: &egui::Context,
@@ -349,8 +371,13 @@ mod tests {
         assert_eq!(resolve_ui(Some("  ")), DEFAULT_UI_ID);
         assert_eq!(resolve_ui(Some("Comic Sans")), DEFAULT_UI_ID);
         assert_eq!(resolve_ui(Some(" INTER ")), "inter");
-        assert_eq!(resolve_terminal(None), None);
-        assert_eq!(resolve_terminal(Some("Fira Code")), None);
+        assert_eq!(resolve_terminal(None), Some(DEFAULT_TERMINAL_ID));
+        assert_eq!(
+            resolve_terminal(Some("Fira Code")),
+            Some(DEFAULT_TERMINAL_ID)
+        );
+        assert_eq!(resolve_terminal(Some("builtin")), None);
+        assert_eq!(resolve_terminal(Some(" BUILTIN ")), None);
         assert_eq!(resolve_terminal(Some("meslo-lgs-nf")), Some("meslo-lgs-nf"));
         assert_eq!(
             resolve_terminal(Some("Departure-Mono")),
@@ -443,8 +470,12 @@ mod tests {
         assert_eq!(resolve_ui(Some("JetBrains Mono")), DEFAULT_UI_ID);
         assert_eq!(resolve_ui(Some(&path)), DEFAULT_UI_ID);
         assert_eq!(resolve_ui(Some("\u{202e}obel-mono")), DEFAULT_UI_ID);
-        assert_eq!(resolve_terminal(Some("Fira Code")), None);
-        assert_eq!(resolve_terminal(Some(&path)), None);
+        assert_eq!(
+            resolve_terminal(Some("Fira Code")),
+            Some(DEFAULT_TERMINAL_ID)
+        );
+        assert_eq!(resolve_terminal(Some(&path)), Some(DEFAULT_TERMINAL_ID));
+        assert_eq!(resolve_terminal(Some("builtin")), None);
         assert_eq!(resolve_terminal(Some(" Obel-Mono ")), Some("obel-mono"));
         assert!(
             !missing.exists(),
@@ -455,7 +486,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut service = FontService::default();
         settle(&ctx, &mut service, Some(&huge), Some(path.as_str()));
-        assert_loaded(&ctx, DEFAULT_UI_ID, None);
+        assert_loaded(&ctx, DEFAULT_UI_ID, Some(DEFAULT_TERMINAL_ID));
         assert!(!missing.exists(), "sync created {}", missing.display());
         finish_pass(&ctx);
     }
@@ -466,6 +497,7 @@ mod tests {
         let mut service = FontService::default();
         let terminals = [
             None,
+            Some("builtin"),
             Some("obel-mono"),
             Some("meslo-lgs-nf"),
             Some("departure-mono"),
@@ -474,7 +506,7 @@ mod tests {
             for terminal in terminals {
                 // The choice queued on the first pass is what the next pass loads.
                 settle(&ctx, &mut service, Some(ui), terminal);
-                assert_loaded(&ctx, ui, terminal);
+                assert_loaded(&ctx, ui, resolve_terminal(terminal));
                 if ui == "ubuntu-sans" && terminal == Some("meslo-lgs-nf") {
                     ctx.fonts_mut(|fonts| {
                         let meslo = FontId::new(14.0, FontFamily::Name("meslo-lgs-nf".into()));

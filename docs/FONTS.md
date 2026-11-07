@@ -11,11 +11,12 @@ with the font.
 
 ```text
 settings.json "ui_font": "inter"
-  -> fonts::resolve_ui            unknown or missing id -> ubuntu-sans
+  -> fonts::resolve_ui            unknown or missing id -> obel-mono
   -> FontService::sync            egui proportional family
 
-settings.json "terminal_font": "meslo-lgs-nf"
-  -> fonts::resolve_terminal      unknown or missing id -> built-in monospace
+settings.json "terminal_font": null
+  -> fonts::resolve_terminal      unknown or missing id -> meslo-lgs-nf
+                                  "builtin" -> built-in monospace
   -> FontService::sync            egui family "terminal", measured one pass later
 ```
 
@@ -32,7 +33,9 @@ the Regular cut of each family is bundled.
 | ---- | ------ | ---------------- |
 | `src/ui/fonts.rs` | `UI_FACES` | Interface catalog, in page order |
 | `src/ui/fonts.rs` | `TERMINAL_FACES` | Terminal catalog, in page order |
-| `src/ui/fonts.rs` | `DEFAULT_UI_ID` | Ubuntu Sans |
+| `src/ui/fonts.rs` | `DEFAULT_UI_ID` | Obel Mono |
+| `src/ui/fonts.rs` | `DEFAULT_TERMINAL_ID` | Meslo LGS NF |
+| `src/ui/fonts.rs` | `BUILTIN_TERMINAL_ID` | `builtin`, the monospace shipped with egui |
 | `src/ui/fonts.rs` | `FontService::sync` | Installs both choices with one `set_fonts` |
 | `src/ui/settings.rs` | Appearance page | Interface choice |
 | `src/ui/settings.rs` | Terminal page | Terminal choice, plus the one-line preview |
@@ -42,23 +45,24 @@ the Regular cut of each family is bundled.
 
 | Id | Name | File | License |
 | -- | ---- | ---- | ------- |
-| `ubuntu-sans` | Ubuntu Sans | `assets/fonts/ubuntu-sans/UbuntuSans-Regular.ttf` | Ubuntu Font Licence 1.0 |
 | `obel-mono` | Obel Mono | `assets/fonts/obel-mono/ObelMono-Regular.ttf` | SIL OFL 1.1 |
+| `ubuntu-sans` | Ubuntu Sans | `assets/fonts/ubuntu-sans/UbuntuSans-Regular.ttf` | Ubuntu Font Licence 1.0 |
 | `aspekta` | Aspekta | `assets/fonts/aspekta/Aspekta-400.ttf` | SIL OFL 1.1 |
 | `inter` | Inter | `assets/fonts/inter/Inter-Regular.ttf` | SIL OFL 1.1 |
 
-`null` uses `ubuntu-sans`.
+`null` uses `obel-mono`.
 
 ## Terminal
 
 | Id | Name | File | License |
 | -- | ---- | ---- | ------- |
-| `obel-mono` | Obel Mono | same file as the interface face | SIL OFL 1.1 |
 | `meslo-lgs-nf` | Meslo LGS NF | `assets/fonts/meslo-lgs-nf/MesloLGS-NF-Regular.ttf` | Apache 2.0 |
+| `obel-mono` | Obel Mono | same file as the interface face | SIL OFL 1.1 |
 | `departure-mono` | Departure Mono | `assets/fonts/departure-mono/DepartureMono-Regular.otf` | SIL OFL 1.1 |
 
-`null` uses the built-in monospace. Departure Mono is drawn at 11 pt so its
-pixels sit on the grid. Meslo LGS NF is the face that includes prompt icons.
+`null` uses `meslo-lgs-nf`. `builtin` keeps the monospace shipped with the
+app. Departure Mono is drawn at 11 pt so its pixels sit on the grid. Meslo
+LGS NF is the face that includes prompt icons.
 
 ## Add a face
 

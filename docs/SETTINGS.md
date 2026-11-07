@@ -12,8 +12,9 @@ change    mutate CthulhuApp.settings -> CthulhuApp::save_settings() -> Settings:
 token     github_token_in_keyring -> GitHubAuth::load reads the keychain on a worker thread
 columns   history_columns is read every frame; a divider release saves it
 font      ui_font and terminal_font are ids of faces compiled into the app
-          a missing or unknown ui_font uses Ubuntu Sans
-          a missing or unknown terminal_font keeps the built-in monospace
+          a missing or unknown ui_font uses Obel Mono
+          a missing or unknown terminal_font uses Meslo LGS NF
+          terminal_font "builtin" keeps the monospace shipped with the app
           the Terminal page shows one prompt line from a 240-point preview shell and ignores input; the preview is not saved
           catalog and licenses: docs/FONTS.md
 ```
@@ -97,8 +98,8 @@ For manual tests on Linux, point `XDG_CONFIG_HOME` at a temp folder.
 | `history_sidebar_hidden` | The branches sidebar is hidden (toggled with the left panel button in the top bar). The JSON name is historical: this flag used to hide the commit list, which is now the center of the window. Negated so a missing field shows the sidebar | `false` |
 | `detail_sidebar_hidden` | The latest-commit sidebar on the right is hidden (toggled with the right panel button). Negated so a missing field shows the sidebar | `false` |
 | `terminal_hidden` | The terminal strip at the bottom of the right sidebar is hidden (toggled with the terminal button in the bottom bar). A missing field keeps it hidden. Showing it also opens the right sidebar. Its height is not saved | `true` |
-| `ui_font` | Interface typeface. `null`, blank, or an unknown id keeps Ubuntu Sans. An id from the bundled catalog (`docs/FONTS.md`), not a file path or a system family. A missing field keeps the default | `null` |
-| `terminal_font` | Font drawn in the terminal. `null`, blank, or an unknown id keeps the built-in monospace. An id from the bundled catalog, not a file path. A name saved by an older version that scanned the system is unknown and falls back. A missing field keeps the default | `null` |
+| `ui_font` | Interface typeface. `null`, blank, or an unknown id keeps Obel Mono. An id from the bundled catalog (`docs/FONTS.md`), not a file path or a system family. A missing field keeps the default | `null` |
+| `terminal_font` | Font drawn in the terminal. `null`, blank, or an unknown id keeps Meslo LGS NF. `builtin` keeps the monospace shipped with the app. Any other value is an id from the bundled catalog, not a file path. A name saved by an older version that scanned the system is unknown and falls back to Meslo LGS NF. A missing field keeps the default | `null` |
 | `history_columns` | Width of each commit history column (Branch, Graph, Commit Hash, Commit Message, Author), in thousandths of the history panel, so it follows the window and the open sidebars. Each column is independent: no width is derived from another and the sum need not be 1000. A column never gets narrower than its own content needs; when the columns add up to more than the panel, the history scrolls sideways. Each field outside `20..=1000`, or not a number, falls back to its own default; a value that is not an object keeps every default | `{ "branch": 180, "graph": 140, "hash": 110, "message": 370, "author": 200 }` |
 | `author_avatars` | Download author pictures from GitHub and Gravatar (Settings → History). Off draws initials and sends nothing | `true` |
 | `github_token_in_keyring` | A GitHub token was saved in the system keychain (Settings → GitHub Auth), so it is read at startup. The token itself is never written to this file. `false` means the keychain is never asked, so a user without a token never sees a keychain prompt | `false` |

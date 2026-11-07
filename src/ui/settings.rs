@@ -258,7 +258,7 @@ fn appearance_page(ui: &mut Ui, palette: &Palette, saved: Option<&str>, actions:
             help(
                 ui,
                 palette,
-                &format!("\"{text}\" is not bundled. The interface is using Ubuntu Sans."),
+                &format!("\"{text}\" is not bundled. The interface is using Obel Mono."),
             );
         }
         for face in fonts::UI_FACES {
@@ -281,32 +281,34 @@ fn terminal_page(ui: &mut Ui, palette: &Palette, saved: Option<&str>, actions: &
         ui,
         palette,
         "Terminal Font",
-        "Typeface for the terminal only. Built-in keeps the monospace shipped with the app.",
+        "Typeface for the terminal only. Meslo LGS NF is the default.",
     );
     section(ui, |ui| {
-        if let Some(text) = stale_font(saved, fonts::TERMINAL_FACES) {
+        if let Some(text) = stale_terminal(saved) {
             help(
                 ui,
                 palette,
-                &format!(
-                    "\"{text}\" is not bundled. The terminal is using the built-in monospace."
-                ),
+                &format!("\"{text}\" is not bundled. The terminal is using Meslo LGS NF."),
             );
         }
-        let known = stale_font(saved, fonts::TERMINAL_FACES).is_none();
-        if choice_builtin(
-            ui,
-            palette,
-            known && fonts::resolve_terminal(saved).is_none(),
-        )
-        .clicked()
-        {
-            store_font(saved, None, actions, Action::SetTerminalFont);
+        let builtin = saved.is_some_and(fonts::is_builtin_terminal);
+        if choice_builtin(ui, palette, builtin).clicked() {
+            store_font(
+                saved,
+                Some(fonts::BUILTIN_TERMINAL_ID),
+                actions,
+                Action::SetTerminalFont,
+            );
         }
         for face in fonts::TERMINAL_FACES {
-            let selected = known && fonts::resolve_terminal(saved) == Some(face.id);
+            let selected = !builtin && fonts::resolve_terminal(saved) == Some(face.id);
             if choice_row(ui, palette, face, TERMINAL_SAMPLE, selected).clicked() {
-                store_font(saved, Some(face.id), actions, Action::SetTerminalFont);
+                let next = if face.id == fonts::DEFAULT_TERMINAL_ID {
+                    None
+                } else {
+                    Some(face.id)
+                };
+                store_font(saved, next, actions, Action::SetTerminalFont);
             }
         }
         help(
@@ -321,6 +323,17 @@ fn terminal_page(ui: &mut Ui, palette: &Palette, saved: Option<&str>, actions: &
 fn stale_font<'a>(saved: Option<&'a str>, faces: &[Face]) -> Option<&'a str> {
     let name = saved.map(str::trim).filter(|text| !text.is_empty())?;
     if fonts::face_by_id(faces, name).is_some() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Like [`stale_font`] for the terminal. `builtin` is a real choice.
+fn stale_terminal(saved: Option<&str>) -> Option<&str> {
+    let name = saved.map(str::trim).filter(|text| !text.is_empty())?;
+    if fonts::is_builtin_terminal(name) || fonts::face_by_id(fonts::TERMINAL_FACES, name).is_some()
+    {
         None
     } else {
         Some(name)

@@ -986,11 +986,11 @@ fn appearance_and_terminal_offer_different_bundled_faces() {
         label_dump(&harness)
     );
 
-    click_label(&mut harness, "Meslo LGS NF");
+    click_label(&mut harness, "Departure Mono");
     let got: Vec<_> = actions.borrow().iter().map(action_label).collect();
     assert_eq!(
         got,
-        vec!["SetTerminalFont(Some(\"meslo-lgs-nf\"))".to_owned()],
+        vec!["SetTerminalFont(Some(\"departure-mono\"))".to_owned()],
         "{got:?}"
     );
 }
@@ -1044,11 +1044,12 @@ fn open_font_settings(
 
 #[test]
 fn obel_on_one_surface_does_not_change_the_other() {
-    let (mut harness, actions, chosen) = open_font_settings(None, None);
+    let (mut harness, actions, chosen) =
+        open_font_settings(Some("ubuntu-sans".to_owned()), Some("builtin".to_owned()));
     click_label(&mut harness, "Obel Mono");
     let got: Vec<_> = actions.borrow().iter().map(action_label).collect();
-    assert_eq!(got, vec!["SetUiFont(Some(\"obel-mono\"))".to_owned()]);
-    chosen.borrow_mut().0 = Some("obel-mono".to_owned());
+    assert_eq!(got, vec!["SetUiFont(None)".to_owned()]);
+    chosen.borrow_mut().0 = None;
     harness.step();
     assert!(
         harness.query_by_label("Meslo LGS NF").is_none(),
@@ -1076,7 +1077,7 @@ fn obel_on_one_surface_does_not_change_the_other() {
         vec!["SetTerminalFont(Some(\"obel-mono\"))".to_owned()],
         "{got:?}"
     );
-    assert_eq!(chosen.borrow().0.as_deref(), Some("obel-mono"));
+    assert_eq!(chosen.borrow().0.as_deref(), None);
 }
 
 #[test]
@@ -1094,7 +1095,7 @@ fn unknown_font_name_is_reported_and_does_not_pick_a_bundled_id() {
             .map(action_label)
             .collect::<Vec<_>>()
     );
-    harness.get_by_label("\"JetBrains Mono\" is not bundled. The interface is using Ubuntu Sans.");
+    harness.get_by_label("\"JetBrains Mono\" is not bundled. The interface is using Obel Mono.");
     assert!(
         harness.query_by_label("Meslo LGS NF").is_none(),
         "terminal face listed on Appearance\n{}",
@@ -1111,9 +1112,7 @@ fn unknown_font_name_is_reported_and_does_not_pick_a_bundled_id() {
             .map(action_label)
             .collect::<Vec<_>>()
     );
-    harness.get_by_label(
-        "\"Fira Code\" is not bundled. The terminal is using the built-in monospace.",
-    );
+    harness.get_by_label("\"Fira Code\" is not bundled. The terminal is using Meslo LGS NF.");
     assert_eq!(chosen.borrow().0.as_deref(), Some("JetBrains Mono"));
     assert_eq!(chosen.borrow().1.as_deref(), Some("Fira Code"));
 }
