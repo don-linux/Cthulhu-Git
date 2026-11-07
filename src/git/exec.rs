@@ -685,11 +685,13 @@ pub(crate) fn classify_failure(
 }
 
 /// The primary fatal, not a path or a sentence that merely contains the words.
+/// Newer git reports a `.git` file whose `gitdir:` target is missing as
+/// "gitfile does not point to a valid repository" instead of "not a git repository".
 fn is_not_a_repository_message(stderr: &str) -> bool {
     stderr.lines().any(|line| {
-        line.trim_start()
-            .to_ascii_lowercase()
-            .starts_with("fatal: not a git repository")
+        let line = line.trim_start().to_ascii_lowercase();
+        line.starts_with("fatal: not a git repository")
+            || line.starts_with("fatal: gitfile does not point to a valid repository")
     })
 }
 
@@ -855,6 +857,17 @@ mod tests {
             "fatal: Not a git repository (or any of the parent directories): .git",
         );
         assert!(matches!(older, GitError::NotARepository(_)), "{older:?}");
+
+        let broken_gitfile = classify_failure(
+            Path::new("/tmp/broken"),
+            &["rev-parse", "--is-bare-repository"],
+            status_raw(128),
+            "fatal: gitfile does not point to a valid repository: /tmp/broken/.git",
+        );
+        assert!(
+            matches!(broken_gitfile, GitError::NotARepository(_)),
+            "{broken_gitfile:?}"
+        );
 
         let mentioned = classify_failure(
             Path::new("/tmp/plain"),

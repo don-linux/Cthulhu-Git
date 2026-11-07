@@ -228,9 +228,9 @@ fn version_meets_floor(version: &GitVersion) -> bool {
 
 fn line_is_not_a_repository(stderr: &str) -> bool {
     stderr.lines().any(|line| {
-        line.trim_start()
-            .to_ascii_lowercase()
-            .starts_with("fatal: not a git repository")
+        let line = line.trim_start().to_ascii_lowercase();
+        line.starts_with("fatal: not a git repository")
+            || line.starts_with("fatal: gitfile does not point to a valid repository")
     })
 }
 
