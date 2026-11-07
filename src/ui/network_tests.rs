@@ -959,7 +959,15 @@ fn about_shows_the_commit_and_a_repository_url_without_a_token() {
 #[test]
 fn appearance_and_terminal_offer_different_bundled_faces() {
     let (mut harness, _github, actions) = open_settings();
-    for name in ["Ubuntu Sans", "Obel Mono", "Aspekta", "Inter"] {
+    for name in [
+        "Ubuntu",
+        "Ubuntu Mono",
+        "Ubuntu Sans",
+        "IBM Plex Sans",
+        "Obel Mono",
+        "Aspekta",
+        "Inter",
+    ] {
         harness.get_by_label(name);
     }
     assert!(
@@ -1048,8 +1056,8 @@ fn obel_on_one_surface_does_not_change_the_other() {
         open_font_settings(Some("ubuntu-sans".to_owned()), Some("builtin".to_owned()));
     click_label(&mut harness, "Obel Mono");
     let got: Vec<_> = actions.borrow().iter().map(action_label).collect();
-    assert_eq!(got, vec!["SetUiFont(None)".to_owned()]);
-    chosen.borrow_mut().0 = None;
+    assert_eq!(got, vec!["SetUiFont(Some(\"obel-mono\"))".to_owned()]);
+    chosen.borrow_mut().0 = Some("obel-mono".to_owned());
     harness.step();
     assert!(
         harness.query_by_label("Meslo LGS NF").is_none(),
@@ -1077,7 +1085,7 @@ fn obel_on_one_surface_does_not_change_the_other() {
         vec!["SetTerminalFont(Some(\"obel-mono\"))".to_owned()],
         "{got:?}"
     );
-    assert_eq!(chosen.borrow().0.as_deref(), None);
+    assert_eq!(chosen.borrow().0.as_deref(), Some("obel-mono"));
 }
 
 #[test]
@@ -1095,7 +1103,7 @@ fn unknown_font_name_is_reported_and_does_not_pick_a_bundled_id() {
             .map(action_label)
             .collect::<Vec<_>>()
     );
-    harness.get_by_label("\"JetBrains Mono\" is not bundled. The interface is using Obel Mono.");
+    harness.get_by_label("\"JetBrains Mono\" is not bundled. The interface is using Ubuntu.");
     assert!(
         harness.query_by_label("Meslo LGS NF").is_none(),
         "terminal face listed on Appearance\n{}",

@@ -11,7 +11,7 @@ with the font.
 
 ```text
 settings.json "ui_font": "inter"
-  -> fonts::resolve_ui            unknown or missing id -> obel-mono
+  -> fonts::resolve_ui            unknown or missing id -> ubuntu
   -> FontService::sync            egui proportional family
 
 settings.json "terminal_font": null
@@ -33,7 +33,7 @@ the Regular cut of each family is bundled.
 | ---- | ------ | ---------------- |
 | `src/ui/fonts.rs` | `UI_FACES` | Interface catalog, in page order |
 | `src/ui/fonts.rs` | `TERMINAL_FACES` | Terminal catalog, in page order |
-| `src/ui/fonts.rs` | `DEFAULT_UI_ID` | Obel Mono |
+| `src/ui/fonts.rs` | `DEFAULT_UI_ID` | Ubuntu |
 | `src/ui/fonts.rs` | `DEFAULT_TERMINAL_ID` | Meslo LGS NF |
 | `src/ui/fonts.rs` | `BUILTIN_TERMINAL_ID` | `builtin`, the monospace shipped with egui |
 | `src/ui/fonts.rs` | `FontService::sync` | Installs both choices with one `set_fonts` |
@@ -45,12 +45,15 @@ the Regular cut of each family is bundled.
 
 | Id | Name | File | License |
 | -- | ---- | ---- | ------- |
-| `obel-mono` | Obel Mono | `assets/fonts/obel-mono/ObelMono-Regular.ttf` | SIL OFL 1.1 |
+| `ubuntu` | Ubuntu | `assets/fonts/ubuntu/Ubuntu-Regular.ttf` | Ubuntu Font Licence 1.0 |
+| `ubuntu-mono` | Ubuntu Mono | `assets/fonts/ubuntu-mono/UbuntuMono-Regular.ttf` | Ubuntu Font Licence 1.0 |
 | `ubuntu-sans` | Ubuntu Sans | `assets/fonts/ubuntu-sans/UbuntuSans-Regular.ttf` | Ubuntu Font Licence 1.0 |
+| `ibm-plex-sans` | IBM Plex Sans | `assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf` | SIL OFL 1.1 |
+| `obel-mono` | Obel Mono | `assets/fonts/obel-mono/ObelMono-Regular.ttf` | SIL OFL 1.1 |
 | `aspekta` | Aspekta | `assets/fonts/aspekta/Aspekta-400.ttf` | SIL OFL 1.1 |
 | `inter` | Inter | `assets/fonts/inter/Inter-Regular.ttf` | SIL OFL 1.1 |
 
-`null` uses `obel-mono`.
+`null` uses `ubuntu`.
 
 ## Terminal
 

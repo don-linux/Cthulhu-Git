@@ -39,7 +39,7 @@ pub struct Settings {
     /// so this field names its own default.
     #[serde(default = "default_terminal_hidden")]
     pub terminal_hidden: bool,
-    /// Interface typeface. `None`, blank, or an unknown id keeps Obel Mono.
+    /// Interface typeface. `None`, blank, or an unknown id keeps Ubuntu.
     /// An id from the bundled catalog, not a file path or a system family.
     pub ui_font: Option<String>,
     /// Font drawn in the terminal. `None`, blank, or an unknown id keeps

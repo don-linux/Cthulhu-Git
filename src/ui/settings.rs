@@ -258,7 +258,7 @@ fn appearance_page(ui: &mut Ui, palette: &Palette, saved: Option<&str>, actions:
             help(
                 ui,
                 palette,
-                &format!("\"{text}\" is not bundled. The interface is using Obel Mono."),
+                &format!("\"{text}\" is not bundled. The interface is using Ubuntu."),
             );
         }
         for face in fonts::UI_FACES {

@@ -16,7 +16,7 @@ use eframe::egui::{self, FontData, FontDefinitions, FontFamily, FontId, Id, Text
 pub const TERMINAL_FAMILY: &str = "terminal";
 
 /// Saved `ui_font` of `None` or an unknown id uses this face.
-pub const DEFAULT_UI_ID: &str = "obel-mono";
+pub const DEFAULT_UI_ID: &str = "ubuntu";
 
 /// Saved `terminal_font` of `None` or an unknown id uses this face.
 pub const DEFAULT_TERMINAL_ID: &str = "meslo-lgs-nf";
@@ -44,9 +44,16 @@ pub struct Face {
 pub const UI_FACES: &[Face] = &[
     Face {
         id: DEFAULT_UI_ID,
-        name: "Obel Mono",
+        name: "Ubuntu",
         note: "Default",
-        bytes: OBEL_MONO,
+        bytes: include_bytes!("../../assets/fonts/ubuntu/Ubuntu-Regular.ttf"),
+        terminal_size: None,
+    },
+    Face {
+        id: "ubuntu-mono",
+        name: "Ubuntu Mono",
+        note: "Monospace",
+        bytes: include_bytes!("../../assets/fonts/ubuntu-mono/UbuntuMono-Regular.ttf"),
         terminal_size: None,
     },
     Face {
@@ -54,6 +61,20 @@ pub const UI_FACES: &[Face] = &[
         name: "Ubuntu Sans",
         note: "Sans",
         bytes: include_bytes!("../../assets/fonts/ubuntu-sans/UbuntuSans-Regular.ttf"),
+        terminal_size: None,
+    },
+    Face {
+        id: "ibm-plex-sans",
+        name: "IBM Plex Sans",
+        note: "Sans",
+        bytes: include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"),
+        terminal_size: None,
+    },
+    Face {
+        id: "obel-mono",
+        name: "Obel Mono",
+        note: "Monospace",
+        bytes: OBEL_MONO,
         terminal_size: None,
     },
     Face {
@@ -162,7 +183,7 @@ pub struct FontService {
 impl FontService {
     /// Installs `ui_font` and `terminal_font` when either id changed.
     ///
-    /// A missing or unknown interface id is Obel Mono. A missing or unknown
+    /// A missing or unknown interface id is Ubuntu. A missing or unknown
     /// terminal id is Meslo LGS NF. [`BUILTIN_TERMINAL_ID`] keeps the built-in
     /// monospace.
     pub fn sync(
@@ -638,7 +659,15 @@ mod tests {
             Some("meslo-lgs-nf"),
             Some("departure-mono"),
         ];
-        for ui in ["ubuntu-sans", "obel-mono", "aspekta", "inter"] {
+        for ui in [
+            "ubuntu",
+            "ubuntu-mono",
+            "ubuntu-sans",
+            "ibm-plex-sans",
+            "obel-mono",
+            "aspekta",
+            "inter",
+        ] {
             for terminal in terminals {
                 // The choice queued on the first pass is what the next pass loads.
                 settle(&ctx, &mut service, Some(ui), terminal);
