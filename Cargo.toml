@@ -75,6 +75,18 @@ assets = [
     ["target/icons/hicolor/128x128/apps/cthulhu-git.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
     ["target/icons/hicolor/256x256/apps/cthulhu-git.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["target/icons/hicolor/512x512/apps/cthulhu-git.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+    # The binaries embed the fonts, so the notices have to ship with the package.
+    ["docs/FONTS.md", "usr/share/doc/cthulhu-git/fonts/", "644"],
+    ["assets/fonts/aspekta/OFL.txt", "usr/share/doc/cthulhu-git/fonts/aspekta/", "644"],
+    ["assets/fonts/departure-mono/OFL.txt", "usr/share/doc/cthulhu-git/fonts/departure-mono/", "644"],
+    ["assets/fonts/ibm-plex-sans/OFL.txt", "usr/share/doc/cthulhu-git/fonts/ibm-plex-sans/", "644"],
+    ["assets/fonts/inter/OFL.txt", "usr/share/doc/cthulhu-git/fonts/inter/", "644"],
+    ["assets/fonts/meslo-lgs-nf/LICENSE.txt", "usr/share/doc/cthulhu-git/fonts/meslo-lgs-nf/", "644"],
+    ["assets/fonts/meslo-lgs-nf/NOTICE.txt", "usr/share/doc/cthulhu-git/fonts/meslo-lgs-nf/", "644"],
+    ["assets/fonts/obel-mono/OFL.txt", "usr/share/doc/cthulhu-git/fonts/obel-mono/", "644"],
+    ["assets/fonts/ubuntu/LICENCE.txt", "usr/share/doc/cthulhu-git/fonts/ubuntu/", "644"],
+    ["assets/fonts/ubuntu-mono/LICENCE.txt", "usr/share/doc/cthulhu-git/fonts/ubuntu-mono/", "644"],
+    ["assets/fonts/ubuntu-sans/LICENCE.txt", "usr/share/doc/cthulhu-git/fonts/ubuntu-sans/", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -93,6 +105,17 @@ assets = [
     { source = "target/icons/hicolor/128x128/apps/cthulhu-git.png", dest = "/usr/share/icons/hicolor/128x128/apps/cthulhu-git.png", mode = "644" },
     { source = "target/icons/hicolor/256x256/apps/cthulhu-git.png", dest = "/usr/share/icons/hicolor/256x256/apps/cthulhu-git.png", mode = "644" },
     { source = "target/icons/hicolor/512x512/apps/cthulhu-git.png", dest = "/usr/share/icons/hicolor/512x512/apps/cthulhu-git.png", mode = "644" },
+    { source = "docs/FONTS.md", dest = "/usr/share/doc/cthulhu-git/fonts/FONTS.md", mode = "644", doc = true },
+    { source = "assets/fonts/aspekta/OFL.txt", dest = "/usr/share/doc/cthulhu-git/fonts/aspekta/OFL.txt", mode = "644", doc = true },
+    { source = "assets/fonts/departure-mono/OFL.txt", dest = "/usr/share/doc/cthulhu-git/fonts/departure-mono/OFL.txt", mode = "644", doc = true },
+    { source = "assets/fonts/ibm-plex-sans/OFL.txt", dest = "/usr/share/doc/cthulhu-git/fonts/ibm-plex-sans/OFL.txt", mode = "644", doc = true },
+    { source = "assets/fonts/inter/OFL.txt", dest = "/usr/share/doc/cthulhu-git/fonts/inter/OFL.txt", mode = "644", doc = true },
+    { source = "assets/fonts/meslo-lgs-nf/LICENSE.txt", dest = "/usr/share/doc/cthulhu-git/fonts/meslo-lgs-nf/LICENSE.txt", mode = "644", doc = true },
+    { source = "assets/fonts/meslo-lgs-nf/NOTICE.txt", dest = "/usr/share/doc/cthulhu-git/fonts/meslo-lgs-nf/NOTICE.txt", mode = "644", doc = true },
+    { source = "assets/fonts/obel-mono/OFL.txt", dest = "/usr/share/doc/cthulhu-git/fonts/obel-mono/OFL.txt", mode = "644", doc = true },
+    { source = "assets/fonts/ubuntu/LICENCE.txt", dest = "/usr/share/doc/cthulhu-git/fonts/ubuntu/LICENCE.txt", mode = "644", doc = true },
+    { source = "assets/fonts/ubuntu-mono/LICENCE.txt", dest = "/usr/share/doc/cthulhu-git/fonts/ubuntu-mono/LICENCE.txt", mode = "644", doc = true },
+    { source = "assets/fonts/ubuntu-sans/LICENCE.txt", dest = "/usr/share/doc/cthulhu-git/fonts/ubuntu-sans/LICENCE.txt", mode = "644", doc = true },
 ]
 
 [package.metadata.generate-rpm.requires]

@@ -15,11 +15,13 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
 
 jobs:
   checks:
     name: fmt, clippy, and tests
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,6 +46,15 @@ jobs:
           "$RUNNER_TEMP/tools/actionlint" -color
           zizmor --persona auditor .github/workflows
       - run: rustup toolchain install
+      - name: Tool versions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sw_vers || true
+          xcode-select -p || true
+          command -v git && git --version
+          /usr/bin/git --version || true
+          rustc --version
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
@@ -51,30 +62,60 @@ jobs:
   test:
     name: cargo test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [windows-latest, macos-26]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Test
+      - name: Rust toolchain
         shell: bash
         run: |
           set -Eeuo pipefail
           rustup toolchain install
+      - name: Tool versions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sw_vers || true
+          xcode-select -p || true
+          command -v git && git --version
+          /usr/bin/git --version || true
+          rustc --version
+      - name: Test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked
-      - name: Check the Intel macOS build
+      # Finder launches apps with /usr/bin:/bin:/usr/sbin:/sbin, so this step
+      # runs against Apple's git. Cargo on the GitHub macOS runner is
+      # $HOME/.cargo/bin, which is /Users/runner/.cargo/bin.
+      - name: Test with Apple git
         if: runner.os == 'macOS'
         shell: bash
+        run: |
+          set -Eeuo pipefail
+          export PATH="${HOME}/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          command -v cargo
+          command -v git
+          git --version
+          cargo test --locked
+      - name: Check the Intel macOS build
+        if: ${{ runner.os == 'macOS' && !cancelled() }}
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: |
           set -Eeuo pipefail
           rustup target add x86_64-apple-darwin
           cargo check --locked --target x86_64-apple-darwin --lib --bins
 
   build:
+    timeout-minutes: 30
     uses: ./.github/workflows/build.yml
     with:
       label: pr-${{ github.event.pull_request.number }}

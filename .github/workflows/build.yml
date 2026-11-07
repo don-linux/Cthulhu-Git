@@ -35,6 +35,7 @@ jobs:
     # The glibc of this image is the oldest one the packages run on (2.39:
     # Ubuntu 24.04, Debian 13, Fedora 40 and newer).
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     env:
       TARGET: x86_64-unknown-linux-gnu
       APPIMAGETOOL_VERSION: "1.9.1"
@@ -51,6 +52,21 @@ jobs:
       # No compiler cache: published binaries never build from outputs
       # restored from an Actions cache.
       - run: cargo build --release --locked --target "$TARGET"
+
+      - name: Version smoke test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [[ -z "${version}" ]]; then
+            printf 'could not read version from Cargo.toml\n' >&2
+            exit 1
+          fi
+          got="$(timeout 20s "target/${TARGET}/release/cthulhu-git" --version | tr -d '\r')"
+          if [[ "${got}" != "${version}" ]]; then
+            printf 'expected version %s, got %s\n' "${version}" "${got}" >&2
+            exit 1
+          fi
 
       - name: Packaging tools
         run: |
@@ -87,11 +103,24 @@ jobs:
       - name: Archive
         run: |
           set -Eeuo pipefail
+          stage_font_licenses() {
+            local dest="$1"
+            local licence rel family
+            mkdir -p "$dest"
+            while IFS= read -r -d '' licence; do
+              rel="${licence#assets/fonts/}"
+              family="$(dirname "$rel")"
+              mkdir -p "$dest/$family"
+              cp "$licence" "$dest/$family/"
+            done < <(find assets/fonts -type f -name '*.txt' -print0)
+            cp docs/FONTS.md "$dest/FONTS.md"
+          }
           name="cthulhu-git-${LABEL}-$TARGET"
           mkdir -p "dist/$name/share/applications" "dist/$name/share/icons"
           cp "target/$TARGET/release/cthulhu-git" README.md LICENSE "dist/$name/"
           cp packaging/linux/cthulhu-git.desktop "dist/$name/share/applications/"
           cp -R target/icons/hicolor "dist/$name/share/icons/"
+          stage_font_licenses "dist/$name/share/doc/cthulhu-git/fonts"
           tar czf "dist/$name.tar.gz" -C dist "$name"
           rm -rf "dist/$name"
 
@@ -112,12 +141,25 @@ jobs:
       - name: AppImage
         run: |
           set -Eeuo pipefail
+          stage_font_licenses() {
+            local dest="$1"
+            local licence rel family
+            mkdir -p "$dest"
+            while IFS= read -r -d '' licence; do
+              rel="${licence#assets/fonts/}"
+              family="$(dirname "$rel")"
+              mkdir -p "$dest/$family"
+              cp "$licence" "$dest/$family/"
+            done < <(find assets/fonts -type f -name '*.txt' -print0)
+            cp docs/FONTS.md "$dest/FONTS.md"
+          }
           appdir="$RUNNER_TEMP/AppDir"
           mkdir -p "$appdir/usr/bin" "$appdir/usr/share/applications" "$appdir/usr/share/icons"
           cp "target/$TARGET/release/cthulhu-git" "$appdir/usr/bin/"
           cp packaging/linux/cthulhu-git.desktop "$appdir/"
           cp packaging/linux/cthulhu-git.desktop "$appdir/usr/share/applications/"
           cp -R target/icons/hicolor "$appdir/usr/share/icons/"
+          stage_font_licenses "$appdir/usr/share/doc/cthulhu-git/fonts"
           cp target/icons/hicolor/256x256/apps/cthulhu-git.png "$appdir/cthulhu-git.png"
           ln -sfn cthulhu-git.png "$appdir/.DirIcon"
           ln -sfn usr/bin/cthulhu-git "$appdir/AppRun"
@@ -138,10 +180,16 @@ jobs:
           sudo apt-get install -y "./$deb"
           test -x /usr/bin/cthulhu-git
           test -f /usr/share/icons/hicolor/256x256/apps/cthulhu-git.png
+          dpkg-deb --contents "$deb" | grep -F 'usr/share/doc/cthulhu-git/fonts/FONTS.md'
+          dpkg-deb --contents "$deb" | grep -F 'usr/share/doc/cthulhu-git/fonts/ubuntu/LICENCE.txt'
+          test -f /usr/share/doc/cthulhu-git/fonts/FONTS.md
+          test -f /usr/share/doc/cthulhu-git/fonts/ubuntu/LICENCE.txt
 
           rpm -qpi "$rpm"
           rpm -qpR "$rpm"
           rpm -qpl "$rpm" | grep -qx /usr/share/applications/cthulhu-git.desktop
+          rpm -qpl "$rpm" | grep -qx /usr/share/doc/cthulhu-git/fonts/FONTS.md
+          rpm -qpl "$rpm" | grep -qx /usr/share/doc/cthulhu-git/fonts/ubuntu/LICENCE.txt
 
           cd "$RUNNER_TEMP"
           rm -rf -- "$RUNNER_TEMP/squashfs-root"
@@ -149,6 +197,8 @@ jobs:
           test -x squashfs-root/AppRun
           test -f squashfs-root/cthulhu-git.desktop
           test -f squashfs-root/.DirIcon
+          test -f squashfs-root/usr/share/doc/cthulhu-git/fonts/FONTS.md
+          test -f squashfs-root/usr/share/doc/cthulhu-git/fonts/ubuntu/LICENCE.txt
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -164,6 +214,7 @@ jobs:
   windows:
     name: Windows x86-64 (zip)
     runs-on: windows-latest
+    timeout-minutes: 30
     env:
       TARGET: x86_64-pc-windows-msvc
     steps:
@@ -195,13 +246,71 @@ jobs:
           if ($icons -lt 1) { throw "No icon embedded in $exe" }
           "Icons embedded: $icons"
 
+          # IMAGE_SUBSYSTEM_WINDOWS_GUI is 2. Optional header + 68 is e_lfanew + 0x5C
+          # for both PE32 and PE32+. Do not start the executable here: a GUI
+          # subsystem binary would open a window if this check launched it.
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $exe))
+          if ($bytes.Length -lt 0x40) { throw "PE image is too small: $exe" }
+          $eLfanew = [BitConverter]::ToInt32($bytes, 0x3C)
+          if ($eLfanew -le 0 -or ($eLfanew + 0x5E) -gt $bytes.Length) {
+            throw "e_lfanew $eLfanew is out of range in $exe"
+          }
+          $signature = [System.Text.Encoding]::ASCII.GetString($bytes, $eLfanew, 4)
+          if ($signature -ne "PE`0`0") { throw "Missing PE signature in $exe" }
+          $optional = $eLfanew + 24
+          $magic = [BitConverter]::ToUInt16($bytes, $optional)
+          if ($magic -ne 0x10B -and $magic -ne 0x20B) {
+            throw ("Unexpected optional-header magic 0x{0:X} in {1}" -f $magic, $exe)
+          }
+          $subsystem = [BitConverter]::ToUInt16($bytes, $optional + 68)
+          "PE subsystem: $subsystem"
+          if ($subsystem -ne 2) {
+            throw "Expected IMAGE_SUBSYSTEM_WINDOWS_GUI (2), got $subsystem"
+          }
+
+      - name: Version smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = (Resolve-Path "target\$env:TARGET\release\cthulhu-git.exe").Path
+          $match = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          if (-not $match) { throw "Could not read version from Cargo.toml" }
+          $version = $match.Matches[0].Groups[1].Value
+          if (-not $env:RUNNER_TEMP) { throw "RUNNER_TEMP is not set" }
+          $outFile = Join-Path $env:RUNNER_TEMP "cthulhu-version-out.txt"
+          $errFile = Join-Path $env:RUNNER_TEMP "cthulhu-version-err.txt"
+          $proc = Start-Process -FilePath $exe -ArgumentList "--version" -PassThru -WindowStyle Hidden -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+          if (-not $proc.WaitForExit(20000)) {
+            try { $proc.Kill() } catch { }
+            throw "cthulhu-git --version did not exit; refusing to leave a window open"
+          }
+          if ($proc.ExitCode -ne 0) {
+            throw "cthulhu-git --version exited $($proc.ExitCode)"
+          }
+          $got = (Get-Content -Raw $outFile).Trim()
+          if ($got -ne $version) { throw "expected version $version, got $got" }
+          "version: $got"
+
       - name: Archive
         shell: bash
         run: |
           set -Eeuo pipefail
+          stage_font_licenses() {
+            local dest="$1"
+            local licence rel family
+            mkdir -p "$dest"
+            while IFS= read -r -d '' licence; do
+              rel="${licence#assets/fonts/}"
+              family="$(dirname "$rel")"
+              mkdir -p "$dest/$family"
+              cp "$licence" "$dest/$family/"
+            done < <(find assets/fonts -type f -name '*.txt' -print0)
+            cp docs/FONTS.md "$dest/FONTS.md"
+          }
           name="cthulhu-git-${LABEL}-$TARGET"
           mkdir -p "dist/$name"
           cp "target/$TARGET/release/cthulhu-git.exe" README.md LICENSE "dist/$name/"
+          stage_font_licenses "dist/$name/fonts"
           cd dist
           7z a "$name.zip" "$name"
 
@@ -215,6 +324,7 @@ jobs:
   macos:
     name: macOS universal app (dmg)
     runs-on: macos-latest
+    timeout-minutes: 30
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
@@ -267,26 +377,99 @@ jobs:
             target/aarch64-apple-darwin/release/cthulhu-git \
             target/x86_64-apple-darwin/release/cthulhu-git \
             -output "$app/Contents/MacOS/cthulhu-git"
-          lipo -info "$app/Contents/MacOS/cthulhu-git"
+          archs="$(lipo -archs "$app/Contents/MacOS/cthulhu-git" | tr '\n' ' ')"
+          printf '%s\n' "$archs"
+          case " $archs " in
+            *" x86_64 "*) ;;
+            *) printf 'universal binary missing x86_64: %s\n' "$archs" >&2; exit 1 ;;
+          esac
+          case " $archs " in
+            *" arm64 "*) ;;
+            *) printf 'universal binary missing arm64: %s\n' "$archs" >&2; exit 1 ;;
+          esac
           cp "$RUNNER_TEMP/AppIcon.icns" "$app/Contents/Resources/"
           sed "s/__VERSION__/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
           plutil -lint "$app/Contents/Info.plist"
           # Apple Silicon refuses to run unsigned code; an ad-hoc signature is
-          # enough to start. Gatekeeper still asks on first open because the
-          # app is not notarized.
+          # enough to start. The app is not notarized. On macOS Sequoia and
+          # later the user allows it from System Settings; Gatekeeper does not
+          # offer a Control-click bypass on first open.
           codesign --force --sign - "$app"
-          codesign --verify --verbose "$app"
+          codesign --verify --strict --verbose=4 "$app"
+
+      - name: Version smoke test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Monitor mode gives the watchdog its own process group, so stopping
+          # it also stops the sleep it is waiting on.
+          set -m
+          version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [[ -z "${version}" ]]; then
+            printf 'could not read version from Cargo.toml\n' >&2
+            exit 1
+          fi
+          # `kill -0` stays true for a zombie, so poll-then-wait would treat a
+          # fast exit as a hang. `wait` reaps the child; the watchdog kills it
+          # if `--version` opens a window instead of returning.
+          output="$(mktemp)"
+          "dist/Cthulhu Git.app/Contents/MacOS/cthulhu-git" --version >"$output" &
+          pid="$!"
+          (
+            sleep 20
+            kill -TERM "$pid" 2>/dev/null || true
+          ) &
+          watchdog="$!"
+          set +e
+          wait "$pid"
+          status="$?"
+          set -e
+          kill -TERM -- "-${watchdog}" 2>/dev/null || true
+          set +e
+          wait "$watchdog"
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            printf 'version smoke exited %s\n' "$status" >&2
+            exit "$status"
+          fi
+          got="$(tr -d '\r' <"$output")"
+          if [[ "${got}" != "${version}" ]]; then
+            printf 'expected version %s, got %s\n' "${version}" "${got}" >&2
+            exit 1
+          fi
 
       - name: Disk image
         run: |
           set -Eeuo pipefail
+          stage_font_licenses() {
+            local dest="$1"
+            local licence rel family
+            mkdir -p "$dest"
+            while IFS= read -r -d '' licence; do
+              rel="${licence#assets/fonts/}"
+              family="$(dirname "$rel")"
+              mkdir -p "$dest/$family"
+              cp "$licence" "$dest/$family/"
+            done < <(find assets/fonts -type f -name '*.txt' -print0)
+            cp docs/FONTS.md "$dest/FONTS.md"
+          }
           staging="$RUNNER_TEMP/dmg"
           mkdir -p "$staging"
           cp -R "dist/Cthulhu Git.app" "$staging/"
           ln -sfn /Applications "$staging/Applications"
           cp README.md LICENSE "$staging/"
-          hdiutil create -volname "Cthulhu Git" -srcfolder "$staging" -ov -format UDZO \
-            "dist/cthulhu-git-${LABEL}-macos-universal.dmg"
+          stage_font_licenses "$staging/fonts"
+          dmg="dist/cthulhu-git-${LABEL}-macos-universal.dmg"
+          hdiutil create -volname "Cthulhu Git" -srcfolder "$staging" -ov -format UDZO "$dmg"
+          hdiutil verify "$dmg"
+          mount="$RUNNER_TEMP/dmg-mount"
+          rm -rf "$mount"
+          mkdir -p "$mount"
+          trap 'hdiutil detach "$mount" || true' EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg"
+          codesign --verify --deep --strict --verbose=4 "$mount/Cthulhu Git.app"
+          hdiutil detach "$mount"
+          trap - EXIT
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
