@@ -6,8 +6,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::Cursor;
-use std::path::PathBuf;
+use std::io::{Cursor, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -424,13 +424,28 @@ impl DiskCache {
         let _ = self.write(&self.path(key, "miss"), b"");
     }
 
-    fn write(&self, path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         fs::create_dir_all(&self.dir)?;
-        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-        fs::write(&tmp, bytes)?;
-        fs::rename(&tmp, path).inspect_err(|_| {
+        // Same sequence as `Settings::save_to`: a temp name that keeps the
+        // real extension, unlink a planted symlink, then `create_new` so a
+        // symlink recreated in the gap fails instead of truncating its target.
+        let tmp = temporary_cache_path(path);
+        if fs::symlink_metadata(&tmp).is_ok() {
+            fs::remove_file(&tmp)?;
+        }
+        let written = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .and_then(|mut file| {
+                file.write_all(bytes)?;
+                file.sync_all()
+            });
+        if let Err(error) = written.and_then(|()| fs::rename(&tmp, path)) {
             let _ = fs::remove_file(&tmp);
-        })
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn clear_misses(&self) {
@@ -447,6 +462,17 @@ impl DiskCache {
             }
         }
     }
+}
+
+/// `{name}.img.{pid}.tmp` next to `{name}.img`, and the same for `.miss`.
+/// Including the real extension keeps a picture write from sharing a temp
+/// file with a miss write in the same process.
+fn temporary_cache_path(path: &Path) -> PathBuf {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("part");
+    path.with_extension(format!("{extension}.{}.tmp", std::process::id()))
 }
 
 fn fresh(path: &std::path::Path, ttl: Duration) -> bool {
@@ -787,5 +813,59 @@ mod tests {
             files.is_empty(),
             "a timeout must not be stored as a miss: {files:?}"
         );
+    }
+
+    /// A planted `{hash}.img.{pid}.tmp` symlink must not be followed. The
+    /// outside file keeps its bytes and the cache path receives the image.
+    #[cfg(unix)]
+    #[test]
+    fn avatar_cache_does_not_follow_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let cache_dir = tempfile::TempDir::new().expect("cache dir");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        let cache = DiskCache {
+            dir: cache_dir.path().to_path_buf(),
+        };
+        let key = "ada@miskatonic.test";
+        let image = cache.path(key, "img");
+        let tmp = temporary_cache_path(&image);
+        let target = outside.path().join("precious.txt");
+        let original = b"precious-outside-target\n";
+        assert!(target.is_absolute());
+        assert!(!target.starts_with(cache_dir.path()));
+        fs::create_dir_all(cache_dir.path()).expect("cache dir exists");
+        fs::write(&target, original).expect("target");
+        symlink(&target, &tmp).expect("temp symlink");
+        assert!(
+            fs::symlink_metadata(&tmp)
+                .expect("temp meta")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            tmp.file_name().and_then(|name| name.to_str()),
+            Some(format!("{}.img.{}.tmp", sha256_hex(key), std::process::id()).as_str())
+        );
+
+        cache.store_image(key, b"image-bytes");
+
+        assert_eq!(
+            fs::read(&target).expect("target after store"),
+            original,
+            "store_image followed the temp symlink and modified a file outside the cache"
+        );
+        assert_eq!(
+            fs::read(&image).expect("cached image"),
+            b"image-bytes",
+            "the cache path should hold the image after the planted symlink is replaced"
+        );
+        assert!(
+            fs::symlink_metadata(&image)
+                .expect("image meta")
+                .file_type()
+                .is_file()
+        );
+        assert!(!tmp.exists(), "temp path must not remain");
     }
 }
