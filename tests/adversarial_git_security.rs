@@ -2420,6 +2420,12 @@ fn checkout_runs_post_checkout_and_smudge_like_the_terminal() {
     for path in [&clean_marker, &smudge_marker, &hook_log, &hook_marker] {
         remove_artifact(path);
     }
+    // tracked.txt is the same blob on both commits. Git 2.56 trusts a
+    // stat-clean index entry and skips the clean filter. Move the mtime so
+    // switch must re-hash the file, which runs filter.evil.clean. Do not
+    // do this before the switch back: that direction asserts clean does
+    // not run, and the new .gitattributes file is what invokes smudge.
+    make_stat_dirty(&fixture.root.join("tracked.txt"));
     switch_branch(&fixture.git, &fixture.root, "other").unwrap_or_else(|error| {
         panic!("switch to other failed: {error}");
     });
