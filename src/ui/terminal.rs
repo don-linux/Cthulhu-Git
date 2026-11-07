@@ -60,8 +60,9 @@ pub struct ShellArgv {
 ///
 /// macOS is a login shell (`-l`) so `/etc/zprofile` and `~/.zprofile` run.
 /// Linux stays non-login, so an interactive bash still reads `~/.bashrc`.
-/// A relative, empty, or non-Unicode `SHELL` uses an absolute `passwd_shell`,
-/// then `/bin/sh`.
+/// A relative, empty, non-Unicode, missing, or non-executable `SHELL` uses
+/// an absolute executable `passwd_shell`. macOS then tries `/bin/zsh`.
+/// `/bin/sh` is the last resort.
 /// `unset` is applied with `/usr/bin/env -u`, which can remove names.
 /// `Options.env` can only add them.
 pub fn shell_argv(
@@ -105,7 +106,7 @@ fn bare_shell(
             args: Vec::new(),
         });
     }
-    let program = chosen_unix_shell(shell, passwd_shell);
+    let program = chosen_unix_shell(host, shell, passwd_shell);
     let args = if host == HostOs::Macos {
         vec!["-l".to_owned()]
     } else {
@@ -114,18 +115,52 @@ fn bare_shell(
     Ok(ShellArgv { program, args })
 }
 
-fn chosen_unix_shell(shell: Option<&OsStr>, passwd_shell: Option<&str>) -> String {
-    if let Some(value) = shell
-        && !value.is_empty()
-        && let Some(text) = value.to_str()
-        && unix_shell_is_absolute(text)
-    {
-        return text.to_owned();
+fn chosen_unix_shell(host: HostOs, shell: Option<&OsStr>, passwd_shell: Option<&str>) -> String {
+    chosen_unix_shell_with(host, shell, passwd_shell, unix_shell_is_executable)
+}
+
+fn chosen_unix_shell_with(
+    host: HostOs,
+    shell: Option<&OsStr>,
+    passwd_shell: Option<&str>,
+    executable: impl Fn(&str) -> bool,
+) -> String {
+    let shell_text = shell.and_then(OsStr::to_str);
+    let candidates = [
+        shell_text,
+        passwd_shell,
+        (host == HostOs::Macos).then_some("/bin/zsh"),
+        Some("/bin/sh"),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if unix_shell_is_absolute(candidate) && executable(candidate) {
+            return candidate.to_owned();
+        }
     }
-    passwd_shell
-        .filter(|shell| !shell.is_empty() && unix_shell_is_absolute(shell))
-        .unwrap_or("/bin/sh")
-        .to_owned()
+    "/bin/sh".to_owned()
+}
+
+/// Absolute and executable. A missing path or a mode without an execute bit
+/// falls through so the PTY is not pointed at a file `execve` will reject.
+fn unix_shell_is_executable(path: &str) -> bool {
+    if !unix_shell_is_absolute(path) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        // Permission bits are a Unix property. Callers on this target still
+        // require an absolute path via [`unix_shell_is_absolute`].
+        let _ = path;
+        true
+    }
 }
 
 /// Absolute Unix path. On Unix this is [`Path::is_absolute`].
@@ -1672,18 +1707,18 @@ mod tests {
 
     #[test]
     fn shell_argv_follows_shell_login_and_unset() {
-        let zsh = shell_argv(HostOs::Linux, Some(OsStr::new("/bin/zsh")), None, &[]).expect("zsh");
-        assert_eq!(zsh.program, "/bin/zsh");
+        let zsh = shell_argv(HostOs::Linux, Some(OsStr::new("/bin/bash")), None, &[]).expect("zsh");
+        assert_eq!(zsh.program, "/bin/bash");
         assert!(zsh.args.is_empty());
 
         let login =
-            shell_argv(HostOs::Macos, Some(OsStr::new("/bin/zsh")), None, &[]).expect("login");
-        assert_eq!(login.program, "/bin/zsh");
+            shell_argv(HostOs::Macos, Some(OsStr::new("/bin/bash")), None, &[]).expect("login");
+        assert_eq!(login.program, "/bin/bash");
         assert_eq!(login.args, ["-l"]);
 
         let scrubbed = shell_argv(
             HostOs::Macos,
-            Some(OsStr::new("/bin/zsh")),
+            Some(OsStr::new("/bin/bash")),
             None,
             &["GIT_DIR", "GH_TOKEN"],
         )
@@ -1691,7 +1726,7 @@ mod tests {
         assert_eq!(scrubbed.program, "/usr/bin/env");
         assert_eq!(
             scrubbed.args,
-            ["-u", "GIT_DIR", "-u", "GH_TOKEN", "--", "/bin/zsh", "-l"]
+            ["-u", "GIT_DIR", "-u", "GH_TOKEN", "--", "/bin/bash", "-l"]
         );
 
         let passwd =
@@ -1705,7 +1740,7 @@ mod tests {
 
         let windows = shell_argv(
             HostOs::Windows,
-            Some(OsStr::new("/bin/zsh")),
+            Some(OsStr::new("/bin/bash")),
             None,
             &["GIT_DIR"],
         )
@@ -1754,17 +1789,17 @@ mod tests {
             );
         }
 
-        let zsh = shell_argv(HostOs::Linux, Some(OsStr::new("/bin/zsh")), None, &[]).expect("zsh");
-        assert_eq!(zsh.program, "/bin/zsh");
+        let zsh = shell_argv(HostOs::Linux, Some(OsStr::new("/bin/bash")), None, &[]).expect("zsh");
+        assert_eq!(zsh.program, "/bin/bash");
         let wrapped_zsh = shell_argv(
             HostOs::Linux,
-            Some(OsStr::new("/bin/zsh")),
+            Some(OsStr::new("/bin/bash")),
             None,
             &["GIT_DIR"],
         )
         .expect("wrapped zsh");
         assert_eq!(wrapped_zsh.program, "/usr/bin/env");
-        assert_eq!(wrapped_zsh.args, ["-u", "GIT_DIR", "--", "/bin/zsh"]);
+        assert_eq!(wrapped_zsh.args, ["-u", "GIT_DIR", "--", "/bin/bash"]);
 
         let passwd = shell_argv(
             HostOs::Linux,
@@ -2172,6 +2207,44 @@ END
         let size = window_size(&huge, 10.0);
         assert!(pty_size_is_safe(size), "{size:?}");
         assert!(size.cell_width < 1_000, "cell width was not clamped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_executable_absolute_shell_falls_through() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let locked = dir.path().join("locked-shell");
+        let next = dir.path().join("next-shell");
+        std::fs::write(&locked, "#!/bin/sh\n").expect("write locked");
+        std::fs::write(&next, "#!/bin/sh\n").expect("write next");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644))
+            .expect("mode 0644");
+        std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o755)).expect("mode 0755");
+        let locked = locked.to_str().expect("utf-8 locked path");
+        let next = next.to_str().expect("utf-8 next path");
+
+        let argv =
+            shell_argv(HostOs::Linux, Some(OsStr::new(locked)), Some(next), &[]).expect("argv");
+        assert_eq!(argv.program, next);
+        assert_ne!(argv.program, locked);
+
+        let macos = chosen_unix_shell_with(
+            HostOs::Macos,
+            Some(OsStr::new(locked)),
+            Some(locked),
+            |path| path == "/bin/zsh" || path == "/bin/sh",
+        );
+        assert_eq!(macos, "/bin/zsh");
+
+        let linux = chosen_unix_shell_with(
+            HostOs::Linux,
+            Some(OsStr::new("/no/such/shell")),
+            None,
+            |path| path == "/bin/sh",
+        );
+        assert_eq!(linux, "/bin/sh");
     }
 
     #[test]
