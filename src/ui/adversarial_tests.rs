@@ -672,28 +672,51 @@ fn label_values<State>(harness: &Harness<'_, State>) -> BTreeSet<String> {
         .collect()
 }
 
+/// How far a tip may sit from the control. The gap is 8px and the popup frame
+/// adds its own margin. A label on the other side of the window is not a tip.
+const TOOLTIP_REACH: f32 = 32.0;
+
 /// Hover `rect` and wait out egui's 0.5s tooltip delay. Default `step_dt` is 0.25s.
+///
+/// The detail sidebar asks git for the latest commit and may paint that failure
+/// while the pointer is still waiting on the button. Any new label counts only
+/// when it sits against `rect`, so that sidebar text is not the tip.
 fn hover_tooltip<State>(harness: &mut Harness<'_, State>, rect: egui::Rect) -> String {
     let before = label_values(harness);
     harness.hover_at(rect.center());
-    let mut appeared = Vec::new();
+    let mut nearby = Vec::new();
     for _ in 0..8 {
         harness.step();
-        appeared = label_values(harness)
-            .into_iter()
-            .filter(|label| !before.contains(label))
-            .collect();
-        if !appeared.is_empty() {
+        nearby = labels_near(harness, &before, rect);
+        if !nearby.is_empty() {
             break;
         }
     }
     assert_eq!(
-        appeared.len(),
+        nearby.len(),
         1,
-        "tooltip at {rect:?} appeared as {appeared:?}\n{}",
+        "tooltip at {rect:?} appeared as {nearby:?}\n{}",
         visible_text(harness)
     );
-    appeared.remove(0)
+    nearby.remove(0)
+}
+
+fn labels_near<State>(
+    harness: &Harness<'_, State>,
+    before: &BTreeSet<String>,
+    rect: egui::Rect,
+) -> Vec<String> {
+    let reach = rect.expand(TOOLTIP_REACH);
+    harness
+        .query_all_by_role(Role::Label)
+        .filter_map(|node| {
+            let text = node.value()?;
+            if before.contains(&text) || !reach.intersects(node.rect()) {
+                return None;
+            }
+            Some(text)
+        })
+        .collect()
 }
 
 fn click_bottom_index<State>(harness: &Harness<'_, State>, index: usize) {
