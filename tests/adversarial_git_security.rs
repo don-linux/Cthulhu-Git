@@ -260,6 +260,7 @@ fn probe_fake(path: &Path) -> Git {
         path_var: None,
         exe_name: "git",
         fallbacks: Vec::new(),
+        skip_paths: Vec::new(),
     };
     discover_with(&inputs).unwrap_or_else(|error| panic!("probe fake git: {error}"))
 }
@@ -1618,6 +1619,7 @@ fn slow_version_probe_does_not_block_discovery() {
         path_var: Some(env::join_paths([&slow_dir, &fast_dir]).expect("PATH")),
         exe_name: "git",
         fallbacks: Vec::new(),
+        skip_paths: Vec::new(),
     };
     let fast_path = fast.clone();
     let (tx, rx) = mpsc::channel();

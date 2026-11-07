@@ -91,6 +91,7 @@ fn inputs(path_dirs: &[&Path], fallbacks: Vec<PathBuf>) -> DiscoverInputs {
         path_var: Some(env::join_paths(path_dirs).expect("joinable PATH")),
         exe_name: "git",
         fallbacks,
+        skip_paths: Vec::new(),
     }
 }
 
@@ -166,6 +167,7 @@ fn child_relative_bare_override_uses_cwd_git() {
         path_var: Some(path_dir),
         exe_name: "git",
         fallbacks: Vec::new(),
+        skip_paths: Vec::new(),
     })
     .expect("bare relative override");
 
@@ -215,6 +217,7 @@ fn child_relative_slash_override_uses_cwd_git() {
         path_var: Some(path_dir),
         exe_name: "git",
         fallbacks: Vec::new(),
+        skip_paths: Vec::new(),
     })
     .expect("slash relative override");
 
@@ -324,6 +327,7 @@ fn sleeping_override_is_bounded_to_about_one_second() {
             path_var: None,
             exe_name: "git",
             fallbacks: Vec::new(),
+            skip_paths: Vec::new(),
         };
         let _ = tx.send(discover_with(&inputs));
     });
@@ -356,6 +360,7 @@ fn setsid_grandchild_of_a_timed_out_git_is_dead() {
             path_var: None,
             exe_name: "git",
             fallbacks: Vec::new(),
+            skip_paths: Vec::new(),
         };
         let _ = tx.send(discover_with(&inputs));
     });
@@ -477,6 +482,7 @@ fn windows_path_with_trailing_slash_finds_git_exe() {
         path_var: Some(element),
         exe_name: "git.exe",
         fallbacks: Vec::new(),
+        skip_paths: Vec::new(),
     })
     .expect("trailing-slash PATH element");
     assert_eq!(found.path, git_exe);
@@ -500,6 +506,7 @@ fn quoted_absolute_path_element_is_unquoted_and_searched() {
         path_var: Some(OsString::from(&quoted)),
         exe_name: "git.exe",
         fallbacks: Vec::new(),
+        skip_paths: Vec::new(),
     })
     .expect("quoted absolute PATH element must be unquoted and searched");
     assert_eq!(found.path, git_exe);
@@ -521,6 +528,7 @@ fn very_long_absolute_path_does_not_panic() {
         path_var: Some(path_dir.into_os_string()),
         exe_name: "git.exe",
         fallbacks: Vec::new(),
+        skip_paths: Vec::new(),
     })
     .expect("200-character absolute PATH element");
     assert_eq!(found.path, git_exe);
@@ -542,6 +550,7 @@ fn broken_xcode_shim_falls_through_to_the_next_fallback() {
         path_var: None,
         exe_name: "git",
         fallbacks: vec![shim, brew.clone()],
+        skip_paths: Vec::new(),
     })
     .expect("second fallback after a broken shim");
     assert_eq!(git.path, brew);
