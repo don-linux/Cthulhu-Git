@@ -422,8 +422,33 @@ mod tests {
         });
         finish_pass(&ctx);
 
+        // A blank setting is Meslo. The face egui has loaded is still Departure
+        // until the next pass, and the 11 pt size is cleared on this one.
         ctx.begin_pass(egui::RawInput::default());
         service.sync(&ctx, None, None);
+        assert!(faces_ready(&ctx));
+        assert!(terminal_active(&ctx));
+        assert!(terminal_size(&ctx).is_none());
+        let named = FontId::new(DEPARTURE_SIZE, FontFamily::Name(TERMINAL_FAMILY.into()));
+        ctx.fonts_mut(|fonts| {
+            assert!(fonts.glyph_width(&named, 'M') > 0.0);
+            let chain = fonts
+                .definitions()
+                .families
+                .get(&FontFamily::Name(TERMINAL_FAMILY.into()))
+                .expect("terminal family");
+            assert_eq!(chain.first().map(String::as_str), Some("departure-mono"));
+        });
+        finish_pass(&ctx);
+
+        ctx.begin_pass(egui::RawInput::default());
+        service.sync(&ctx, None, None);
+        assert_loaded(&ctx, DEFAULT_UI_ID, Some(DEFAULT_TERMINAL_ID));
+        finish_pass(&ctx);
+
+        // `builtin` is the choice that drops the named family, on this pass.
+        ctx.begin_pass(egui::RawInput::default());
+        service.sync(&ctx, None, Some("builtin"));
         assert!(faces_ready(&ctx));
         assert!(!terminal_active(&ctx));
         assert!(terminal_size(&ctx).is_none());
@@ -489,6 +514,117 @@ mod tests {
         assert_loaded(&ctx, DEFAULT_UI_ID, Some(DEFAULT_TERMINAL_ID));
         assert!(!missing.exists(), "sync created {}", missing.display());
         finish_pass(&ctx);
+    }
+
+    /// Measuring `terminal` on the pass that first installs it panics. Blank
+    /// and unknown names stay on Meslo. Only `builtin` turns that family off,
+    /// and it turns off before the next pass drops it from the font map.
+    #[test]
+    fn hostile_terminal_names_wait_one_pass_and_only_builtin_turns_the_face_off() {
+        let missing =
+            std::env::temp_dir().join(format!("cthulhu-font-delay-probe-{}", std::process::id()));
+        let _ = std::fs::remove_file(&missing);
+        let path = missing.to_string_lossy().into_owned();
+        let ctx = egui::Context::default();
+        let mut service = FontService::default();
+
+        for spelling in [" BUILTIN ", "Builtin"] {
+            settle(&ctx, &mut service, None, Some("departure-mono"));
+            finish_pass(&ctx);
+            ctx.begin_pass(egui::RawInput::default());
+            service.sync(&ctx, None, Some(spelling));
+            assert!(!terminal_active(&ctx), "{spelling}");
+            assert!(terminal_size(&ctx).is_none(), "{spelling}");
+            assert_terminal_grid(&ctx, false);
+            finish_pass(&ctx);
+            ctx.begin_pass(egui::RawInput::default());
+            service.sync(&ctx, None, Some(spelling));
+            assert_loaded(&ctx, DEFAULT_UI_ID, None);
+            assert_terminal_grid(&ctx, false);
+            finish_pass(&ctx);
+        }
+
+        let lookalikes = [
+            None,
+            Some(""),
+            Some(" \n\t "),
+            Some("Fira Code"),
+            Some("\u{202e}builtin"),
+            Some("builtin.ttf"),
+            Some("built-in"),
+            Some(path.as_str()),
+        ];
+        for name in lookalikes {
+            settle(&ctx, &mut service, None, Some("departure-mono"));
+            finish_pass(&ctx);
+            ctx.begin_pass(egui::RawInput::default());
+            service.sync(&ctx, None, name);
+            assert!(terminal_active(&ctx), "{name:?}");
+            assert!(terminal_size(&ctx).is_none(), "{name:?}");
+            assert_terminal_grid(&ctx, true);
+            let named = FontId::new(16.0, FontFamily::Name(TERMINAL_FAMILY.into()));
+            ctx.fonts_mut(|fonts| {
+                assert!(fonts.glyph_width(&named, 'M') > 0.0, "{name:?}");
+                let chain = fonts
+                    .definitions()
+                    .families
+                    .get(&FontFamily::Name(TERMINAL_FAMILY.into()))
+                    .expect("terminal family");
+                assert_eq!(
+                    chain.first().map(String::as_str),
+                    Some("departure-mono"),
+                    "{name:?}"
+                );
+            });
+            finish_pass(&ctx);
+            ctx.begin_pass(egui::RawInput::default());
+            service.sync(&ctx, None, name);
+            assert_loaded(&ctx, DEFAULT_UI_ID, Some(DEFAULT_TERMINAL_ID));
+            assert_terminal_grid(&ctx, true);
+            finish_pass(&ctx);
+            assert!(!missing.exists(), "sync created {}", missing.display());
+        }
+
+        // From the built-in face, the first pass may store Departure's 11 pt
+        // size, but the grid keeps the style monospace until the family loads.
+        settle(&ctx, &mut service, None, Some("builtin"));
+        finish_pass(&ctx);
+        ctx.begin_pass(egui::RawInput::default());
+        service.sync(&ctx, None, Some("departure-mono"));
+        assert!(!terminal_active(&ctx));
+        assert_eq!(terminal_size(&ctx), Some(DEPARTURE_SIZE));
+        assert_terminal_grid(&ctx, false);
+        finish_pass(&ctx);
+        ctx.begin_pass(egui::RawInput::default());
+        service.sync(&ctx, None, Some("departure-mono"));
+        assert!(terminal_active(&ctx));
+        assert_eq!(terminal_size(&ctx), Some(DEPARTURE_SIZE));
+        assert_terminal_grid(&ctx, true);
+        let named = FontId::new(DEPARTURE_SIZE, FontFamily::Name(TERMINAL_FAMILY.into()));
+        ctx.fonts_mut(|fonts| {
+            assert!(fonts.glyph_width(&named, 'M') > 0.0);
+        });
+        finish_pass(&ctx);
+
+        for blank in [None, Some(""), Some(" \n\t ")] {
+            settle(&ctx, &mut service, None, Some("builtin"));
+            finish_pass(&ctx);
+            ctx.begin_pass(egui::RawInput::default());
+            service.sync(&ctx, None, blank);
+            assert!(!terminal_active(&ctx), "{blank:?}");
+            assert!(terminal_size(&ctx).is_none(), "{blank:?}");
+            assert_terminal_grid(&ctx, false);
+            finish_pass(&ctx);
+            ctx.begin_pass(egui::RawInput::default());
+            service.sync(&ctx, None, blank);
+            assert_loaded(&ctx, DEFAULT_UI_ID, Some(DEFAULT_TERMINAL_ID));
+            assert_terminal_grid(&ctx, true);
+            let named = FontId::new(16.0, FontFamily::Name(TERMINAL_FAMILY.into()));
+            ctx.fonts_mut(|fonts| {
+                assert!(fonts.glyph_width(&named, 'M') > 0.0, "{blank:?}");
+            });
+            finish_pass(&ctx);
+        }
     }
 
     #[test]
@@ -584,5 +720,24 @@ mod tests {
         // Dropping an unapplied texture delta panics. This test has no renderer.
         let mut output = ctx.end_pass();
         output.textures_delta.clear();
+    }
+
+    /// `named` is the terminal family. Otherwise the grid stays on egui's
+    /// monospace, including its size, even when a custom size is already stored.
+    fn assert_terminal_grid(ctx: &egui::Context, named: bool) {
+        let mut ran = false;
+        egui::Area::new(Id::new("cthulhu-terminal-grid-probe")).show(ctx, |ui| {
+            let font = terminal_font_id(ui);
+            let monospace = TextStyle::Monospace.resolve(ui.style());
+            if named {
+                assert_eq!(font.family, FontFamily::Name(TERMINAL_FAMILY.into()));
+                assert_eq!(font.size, terminal_size(ui.ctx()).unwrap_or(monospace.size));
+            } else {
+                assert_eq!(font.family, FontFamily::Monospace);
+                assert_eq!(font.size, monospace.size);
+            }
+            ran = true;
+        });
+        assert!(ran, "terminal grid probe did not run");
     }
 }
