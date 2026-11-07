@@ -11,9 +11,11 @@ decide    command-line folder > settings.last_repository > home screen
 change    mutate CthulhuApp.settings -> CthulhuApp::save_settings() -> Settings::save_to(path)
 token     github_token_in_keyring -> GitHubAuth::load reads the keychain on a worker thread
 columns   history_columns is read every frame; a divider release saves it
-font      a saved terminal_font starts a background scan of installed families
-          until the face is registered, the terminal keeps the built-in monospace
+font      ui_font and terminal_font are ids of faces compiled into the app
+          a missing or unknown ui_font uses Ubuntu Sans
+          a missing or unknown terminal_font keeps the built-in monospace
           the Terminal page shows one prompt line from a 240-point preview shell and ignores input; the preview is not saved
+          catalog and licenses: docs/FONTS.md
 ```
 
 Saved right away on every change (no timer, no save-on-exit). The write is
@@ -29,11 +31,13 @@ atomic: a temp file next to `settings.json` is renamed over it
 | `src/settings.rs` | `Settings::load_from` | Read + parse; dedupes and caps recents |
 | `src/settings.rs` | `Settings::save_to` | Atomic write |
 | `src/settings.rs` | `remember_repository`, `forget_last_repository` | Last and recent repositories |
-| `src/settings.rs` | `set_terminal_font` | Trims the terminal family; a blank name clears it |
-| `src/ui/settings.rs` | `show` | Settings sidebar and the Terminal, History and GitHub Auth pages |
+| `src/settings.rs` | `set_ui_font` | Trims the interface face id; a blank name clears it |
+| `src/settings.rs` | `set_terminal_font` | Trims the terminal face id; a blank name clears it |
+| `src/ui/settings.rs` | `show` | Settings sidebar and the Appearance, Terminal, History and GitHub Auth pages |
 | `src/ui/mod.rs` | `CthulhuApp::font_preview` | A 240-point preview shell on the Terminal page, clipped to one prompt line. Ignores pointer and keyboard. Dropped when settings closes. Not saved |
-| `src/ui/fonts.rs` | `FontService` | Lists installed families on a background thread and registers the terminal face |
-| `src/ui/mod.rs` | `Action::SetTerminalFont` | Stores the family and saves |
+| `src/ui/fonts.rs` | `FontService` | Registers the bundled interface and terminal faces |
+| `src/ui/mod.rs` | `Action::SetUiFont` | Stores the interface face id and saves |
+| `src/ui/mod.rs` | `Action::SetTerminalFont` | Stores the terminal face id and saves |
 | `src/settings.rs` | `MAX_RECENT_REPOSITORIES` | Recent list size (10) |
 | `src/settings.rs` | `SettingsError` | Read / parse / write errors shown to the user |
 | `src/ui/mod.rs` | `CthulhuApp::new` | Loads settings, applies the theme, picks the startup screen |
@@ -69,6 +73,7 @@ For manual tests on Linux, point `XDG_CONFIG_HOME` at a temp folder.
   "history_sidebar_hidden": false,
   "detail_sidebar_hidden": false,
   "terminal_hidden": true,
+  "ui_font": null,
   "terminal_font": null,
   "history_columns": {
     "branch": 180,
@@ -92,7 +97,8 @@ For manual tests on Linux, point `XDG_CONFIG_HOME` at a temp folder.
 | `history_sidebar_hidden` | The branches sidebar is hidden (toggled with the left panel button in the top bar). The JSON name is historical: this flag used to hide the commit list, which is now the center of the window. Negated so a missing field shows the sidebar | `false` |
 | `detail_sidebar_hidden` | The latest-commit sidebar on the right is hidden (toggled with the right panel button). Negated so a missing field shows the sidebar | `false` |
 | `terminal_hidden` | The terminal strip at the bottom of the right sidebar is hidden (toggled with the terminal button in the bottom bar). A missing field keeps it hidden. Showing it also opens the right sidebar. Its height is not saved | `true` |
-| `terminal_font` | Font family drawn in the terminal. `null`, blank, or an unknown name keeps the built-in monospace. A family name, not a file path. A missing field keeps the default | `null` |
+| `ui_font` | Interface typeface. `null`, blank, or an unknown id keeps Ubuntu Sans. An id from the bundled catalog (`docs/FONTS.md`), not a file path or a system family. A missing field keeps the default | `null` |
+| `terminal_font` | Font drawn in the terminal. `null`, blank, or an unknown id keeps the built-in monospace. An id from the bundled catalog, not a file path. A name saved by an older version that scanned the system is unknown and falls back. A missing field keeps the default | `null` |
 | `history_columns` | Width of each commit history column (Branch, Graph, Commit Hash, Commit Message, Author), in thousandths of the history panel, so it follows the window and the open sidebars. Each column is independent: no width is derived from another and the sum need not be 1000. A column never gets narrower than its own content needs; when the columns add up to more than the panel, the history scrolls sideways. Each field outside `20..=1000`, or not a number, falls back to its own default; a value that is not an object keeps every default | `{ "branch": 180, "graph": 140, "hash": 110, "message": 370, "author": 200 }` |
 | `author_avatars` | Download author pictures from GitHub and Gravatar (Settings → History). Off draws initials and sends nothing | `true` |
 | `github_token_in_keyring` | A GitHub token was saved in the system keychain (Settings → GitHub Auth), so it is read at startup. The token itself is never written to this file. `false` means the keychain is never asked, so a user without a token never sees a keychain prompt | `false` |

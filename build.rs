@@ -23,12 +23,13 @@ const WINDOWS_ICON_SIZES: [u32; 8] = [16, 20, 24, 32, 40, 48, 64, 256];
 const UI_ICONS_DIR: &str = "assets/icons";
 
 /// Interface icons, by file name without `.svg`. Must match `src/ui/icons.rs`.
-const UI_ICONS: [&str; 14] = [
+const UI_ICONS: [&str; 15] = [
     "panel-left",
     "panel-right",
     "house",
     "git-branch",
     "terminal",
+    "type",
     "settings",
     "arrow-left",
     "cloud-download",

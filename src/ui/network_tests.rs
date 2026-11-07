@@ -29,7 +29,6 @@ use proptest::string::string_regex;
 use proptest::test_runner::FileFailurePersistence;
 
 use super::avatars::{self, AvatarService};
-use super::fonts::FontService;
 use super::github_auth::{GitHubAuth, Stored};
 use super::hover::{self, HoverCache, Segment};
 use super::repo_view;
@@ -654,8 +653,8 @@ fn action_label(action: &Action) -> String {
         Action::ToggleBranchesSidebar => "ToggleBranchesSidebar".to_owned(),
         Action::ToggleDetailSidebar => "ToggleDetailSidebar".to_owned(),
         Action::ToggleTerminal => "ToggleTerminal".to_owned(),
+        Action::SetUiFont(name) => format!("SetUiFont({name:?})"),
         Action::SetTerminalFont(name) => format!("SetTerminalFont({name:?})"),
-        Action::EnsureFontCatalog => "EnsureFontCatalog".to_owned(),
         Action::Fetch(upstream) => format!("Fetch({upstream})"),
         Action::Pull => "Pull".to_owned(),
         Action::Checkout(name) => format!("Checkout({name})"),
@@ -676,7 +675,6 @@ fn open_settings_with(about: AboutInfo) -> SettingsHarness {
     let github_ui = Rc::clone(&github);
     let actions = Rc::new(RefCell::new(Vec::new()));
     let actions_ui = Rc::clone(&actions);
-    let fonts = FontService::default();
     let mut preview = None;
     let view = SettingsView {
         author_avatars: true,
@@ -692,7 +690,7 @@ fn open_settings_with(about: AboutInfo) -> SettingsHarness {
             let produced = settings::show(
                 ui,
                 None,
-                &fonts,
+                None,
                 &mut preview,
                 None,
                 &view,
@@ -959,27 +957,41 @@ fn about_shows_the_commit_and_a_repository_url_without_a_token() {
 }
 
 #[test]
-fn terminal_font_field_is_half_the_column_and_centered_beside_browse() {
-    let (harness, _github, _actions) = open_settings();
-    let title = harness.get_by_label("Terminal Font").rect();
-    let field = harness.get_by_role(Role::TextInput).rect();
-    let browse = harness.get_by_label("Browse fonts").rect();
+fn appearance_and_terminal_offer_different_bundled_faces() {
+    let (mut harness, _github, actions) = open_settings();
+    for name in ["Ubuntu Sans", "Obel Mono", "Aspekta", "Inter"] {
+        harness.get_by_label(name);
+    }
     assert!(
-        (field.width() - 390.0).abs() < 2.0,
-        "font field width {:.1}\n{}",
-        field.width(),
+        harness.query_by_label("Meslo LGS NF").is_none(),
+        "terminal face listed on Appearance\n{}",
         label_dump(&harness)
     );
-    let gap = browse.left() - field.right();
-    assert!(
-        (0.0..16.0).contains(&gap),
-        "browse gap {gap:.1} (field {field:?}, browse {browse:?})"
+
+    click_label(&mut harness, "Inter");
+    let got: Vec<_> = actions.borrow().iter().map(action_label).collect();
+    assert_eq!(
+        got,
+        vec!["SetUiFont(Some(\"inter\"))".to_owned()],
+        "{got:?}"
     );
-    let pair_center = (field.left() + browse.right()) / 2.0;
+
+    click_label(&mut harness, "Terminal");
+    for name in ["Built-in", "Meslo LGS NF", "Departure Mono"] {
+        harness.get_by_label(name);
+    }
     assert!(
-        (pair_center - title.center().x).abs() < 4.0,
-        "pair center {pair_center:.1}, title center {:.1}",
-        title.center().x
+        harness.query_by_label("Ubuntu Sans").is_none(),
+        "interface face listed on Terminal\n{}",
+        label_dump(&harness)
+    );
+
+    click_label(&mut harness, "Meslo LGS NF");
+    let got: Vec<_> = actions.borrow().iter().map(action_label).collect();
+    assert_eq!(
+        got,
+        vec!["SetTerminalFont(Some(\"meslo-lgs-nf\"))".to_owned()],
+        "{got:?}"
     );
 }
 

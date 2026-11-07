@@ -5,7 +5,7 @@
 //! repository chrome is ready before the window appears; the history graph
 //! follows on the worker. A later open stays on a worker because the window
 //! is visible then. Settings are described in `docs/SETTINGS.md`, themes in
-//! `docs/THEMES.md`.
+//! `docs/THEMES.md`, bundled faces in `docs/FONTS.md`.
 
 #[cfg(test)]
 mod adversarial_tests;
@@ -89,8 +89,8 @@ pub enum Action {
     ToggleBranchesSidebar,
     ToggleDetailSidebar,
     ToggleTerminal,
+    SetUiFont(Option<String>),
     SetTerminalFont(Option<String>),
-    EnsureFontCatalog,
     /// `upstream` is `%(upstream:short)`, for example `origin/main`.
     Fetch(String),
     Pull,
@@ -168,6 +168,12 @@ impl CthulhuApp {
             }
         };
         theme::apply(ctx, theme::resolve(settings.theme.as_deref()));
+        let mut fonts = fonts::FontService::default();
+        fonts.sync(
+            ctx,
+            settings.ui_font.as_deref(),
+            settings.terminal_font.as_deref(),
+        );
 
         let startup = command_line.or_else(|| settings.last_repository.clone());
         // Tests never reach the network.
@@ -190,7 +196,7 @@ impl CthulhuApp {
             error,
             opened_count: 0,
             settings_open: false,
-            fonts: fonts::FontService::default(),
+            fonts,
             font_preview: None,
             graph_load: None,
             graph_generation: 0,
@@ -403,8 +409,11 @@ impl eframe::App for CthulhuApp {
         self.poll_picker(ui.ctx());
         self.poll_github(ui.ctx());
         self.avatars.poll(ui.ctx());
-        self.fonts
-            .sync(ui.ctx(), self.settings.terminal_font.as_deref());
+        self.fonts.sync(
+            ui.ctx(),
+            self.settings.ui_font.as_deref(),
+            self.settings.terminal_font.as_deref(),
+        );
         if self.settings_open {
             self.ensure_git_version(ui.ctx());
         }
@@ -440,8 +449,8 @@ impl eframe::App for CthulhuApp {
             };
             settings::show(
                 ui,
+                self.settings.ui_font.as_deref(),
                 self.settings.terminal_font.as_deref(),
-                &self.fonts,
                 &mut self.font_preview,
                 cwd.as_deref(),
                 &view,
@@ -519,12 +528,13 @@ impl eframe::App for CthulhuApp {
                     }
                     self.save_settings();
                 }
+                Action::SetUiFont(name) => {
+                    self.settings.set_ui_font(name);
+                    self.save_settings();
+                }
                 Action::SetTerminalFont(name) => {
                     self.settings.set_terminal_font(name);
                     self.save_settings();
-                }
-                Action::EnsureFontCatalog => {
-                    self.fonts.ensure(ui.ctx(), true);
                 }
                 Action::Fetch(upstream) => {
                     self.start_sync(ui.ctx(), SyncCommand::Fetch(upstream));

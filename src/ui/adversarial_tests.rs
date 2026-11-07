@@ -44,7 +44,6 @@ use egui_kittest::kittest::{NodeT, Queryable};
 use tempfile::TempDir;
 
 use super::avatars::AvatarService;
-use super::fonts::FontService;
 use super::github_auth::GitHubAuth;
 use super::home::{self, HomeState};
 use super::hover::HoverCache;
@@ -594,7 +593,6 @@ fn drive_settings(busy: Rc<RefCell<bool>>) -> (Harness<'static, ()>, ActionLog) 
     let actions = Rc::new(RefCell::new(Vec::new()));
     let actions_ui = Rc::clone(&actions);
     let busy_ui = Rc::clone(&busy);
-    let fonts = FontService::default();
     let mut preview: Option<Terminal> = None;
     let mut github = GitHubAuth::default();
     let harness = Harness::builder()
@@ -608,7 +606,7 @@ fn drive_settings(busy: Rc<RefCell<bool>>) -> (Harness<'static, ()>, ActionLog) 
                 busy: *busy_ui.borrow(),
                 about: about_info(),
             };
-            let produced = settings::show(ui, None, &fonts, &mut preview, None, &view, &mut github);
+            let produced = settings::show(ui, None, None, &mut preview, None, &view, &mut github);
             *actions_ui.borrow_mut() = produced;
         });
     (harness, actions)
@@ -731,8 +729,8 @@ fn describe_action(action: &Action) -> String {
         Action::ToggleBranchesSidebar => "ToggleBranchesSidebar".to_owned(),
         Action::ToggleDetailSidebar => "ToggleDetailSidebar".to_owned(),
         Action::ToggleTerminal => "ToggleTerminal".to_owned(),
+        Action::SetUiFont(name) => format!("SetUiFont({name:?})"),
         Action::SetTerminalFont(name) => format!("SetTerminalFont({name:?})"),
-        Action::EnsureFontCatalog => "EnsureFontCatalog".to_owned(),
         Action::Fetch(upstream) => format!("Fetch({upstream})"),
         Action::Pull => "Pull".to_owned(),
         Action::Checkout(name) => format!("Checkout({name})"),

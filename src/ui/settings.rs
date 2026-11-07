@@ -3,8 +3,8 @@
 //! at the right. Pages are listed on the left; the chosen page is a centered
 //! column on the right. Both columns scroll.
 //!
-//! The font browser is a modal drawn after the panels, so its veil covers the
-//! bar, the navigation, and the page.
+//! Appearance chooses the interface typeface. Terminal chooses the typeface
+//! of the terminal only. Both lists are the faces compiled into the app.
 //!
 //! The Terminal page draws one prompt line in the chosen font. That shell
 //! ignores pointer and keyboard, and it is not the repository terminal.
@@ -23,7 +23,7 @@ use eframe::egui::{
 };
 
 use super::Action;
-use super::fonts::{self, CatalogPhase, FacePhase, FontService};
+use super::fonts::{self, Face};
 use super::github_auth::{GitHubAuth, Notice, Stored, token_field_id};
 use super::icons::{self, Icon};
 use super::terminal::{self, Terminal};
@@ -32,12 +32,8 @@ use super::widgets;
 
 const NAV_WIDTH: f32 = 260.0;
 const PAGE_WIDTH: f32 = 780.0;
-/// Half the settings column. The family field stays this wide, with Browse fonts beside it.
-const FONT_FIELD_WIDTH: f32 = PAGE_WIDTH / 2.0;
-const BROWSE_FONTS: &str = "Browse fonts";
-const MODAL_WIDTH: f32 = 520.0;
-const MODAL_FADE_SECS: f32 = 0.15;
-const MODAL_BACKDROP_ALPHA: u8 = 160;
+const UI_SAMPLE: &str = "The quick brown fox jumps over the lazy dog.";
+const TERMINAL_SAMPLE: &str = "main  21de8d4a3b7c  Rise from the sea";
 /// Space above and below the prompt, inside the preview border.
 const PREVIEW_PAD: f32 = 8.0;
 /// Scales the one-line preview so the prompt is not flush with the border.
@@ -61,16 +57,11 @@ const NAV_ITEM_GAP: f32 = 6.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
+    Appearance,
     Terminal,
     History,
     GitHubAuth,
     About,
-}
-
-#[derive(Clone, Default)]
-struct FontPicker {
-    open: bool,
-    query: String,
 }
 
 /// What the History, GitHub Auth, and About pages read.
@@ -127,8 +118,8 @@ impl AboutInfo {
 
 pub fn show(
     ui: &mut Ui,
+    ui_font: Option<&str>,
     terminal_font: Option<&str>,
-    fonts: &FontService,
     preview: &mut Option<Terminal>,
     cwd: Option<&Path>,
     view_state: &SettingsView,
@@ -139,17 +130,7 @@ pub fn show(
     let mut page = ui
         .ctx()
         .data(|data| data.get_temp(page_id()))
-        .unwrap_or(Page::Terminal);
-    let mut picker = ui
-        .ctx()
-        .data(|data| data.get_temp::<FontPicker>(picker_id()))
-        .unwrap_or_default();
-    // Seeded at 0 the first time settings is shown, so opening fades in
-    // instead of snapping to opaque. Closing keeps the modal up until 0.
-    let fade = ui
-        .ctx()
-        .animate_bool_with_time(modal_fade_id(), picker.open, MODAL_FADE_SECS);
-    let modal_visible = picker.open || fade > 0.0;
+        .unwrap_or(Page::Appearance);
 
     egui::Panel::top("settings-top-bar")
         .frame(bar_frame(&palette))
@@ -201,6 +182,10 @@ pub fn show(
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = NAV_ITEM_GAP;
+                    if nav_button(ui, "Appearance", Icon::Type, page == Page::Appearance).clicked()
+                    {
+                        page = Page::Appearance;
+                    }
                     if nav_button(ui, "Terminal", Icon::Terminal, page == Page::Terminal).clicked()
                     {
                         page = Page::Terminal;
@@ -221,23 +206,17 @@ pub fn show(
                 });
         });
 
-    let view = fonts.view(terminal_font);
     egui::CentralPanel::default().show(ui, |ui| {
         ScrollArea::vertical()
             .id_salt("settings-page")
             .auto_shrink(false)
             .show(ui, |ui| {
                 page_column(ui, |ui| match page {
+                    Page::Appearance => {
+                        appearance_page(ui, &palette, ui_font, &mut actions);
+                    }
                     Page::Terminal => {
-                        terminal_page(
-                            ui,
-                            &palette,
-                            terminal_font,
-                            &view,
-                            &mut picker,
-                            modal_visible,
-                            &mut actions,
-                        );
+                        terminal_page(ui, &palette, terminal_font, &mut actions);
                         if let Some(cwd) = cwd {
                             section(ui, |ui| {
                                 centered_text(
@@ -261,46 +240,212 @@ pub fn show(
             });
     });
 
-    if fade > 0.0 {
-        font_modal(
-            ui.ctx(),
-            &palette,
-            terminal_font,
-            &view,
-            &mut picker,
-            fade,
-            &mut actions,
-        );
-    }
-
     ui.ctx().data_mut(|data| {
         data.insert_temp(page_id(), page);
-        data.insert_temp(picker_id(), picker);
     });
     actions
 }
 
-fn terminal_page(
-    ui: &mut Ui,
-    palette: &Palette,
-    saved: Option<&str>,
-    view: &fonts::FontView<'_>,
-    picker: &mut FontPicker,
-    modal_visible: bool,
-    actions: &mut Vec<Action>,
-) {
+fn appearance_page(ui: &mut Ui, palette: &Palette, saved: Option<&str>, actions: &mut Vec<Action>) {
+    page_header(
+        ui,
+        palette,
+        "Appearance",
+        "Typeface for the interface. Every face here is bundled with the app.",
+    );
+    section(ui, |ui| {
+        if let Some(text) = stale_font(saved, fonts::UI_FACES) {
+            help(
+                ui,
+                palette,
+                &format!("\"{text}\" is not bundled. The interface is using Ubuntu Sans."),
+            );
+        }
+        for face in fonts::UI_FACES {
+            let selected = fonts::resolve_ui(saved) == face.id;
+            if choice_row(ui, palette, face, UI_SAMPLE, selected).clicked() {
+                let next = if face.id == fonts::DEFAULT_UI_ID {
+                    None
+                } else {
+                    Some(face.id)
+                };
+                store_font(saved, next, actions, Action::SetUiFont);
+            }
+        }
+        help(ui, palette, "Commit hashes keep the built-in monospace.");
+    });
+}
+
+fn terminal_page(ui: &mut Ui, palette: &Palette, saved: Option<&str>, actions: &mut Vec<Action>) {
     page_header(
         ui,
         palette,
         "Terminal Font",
-        "Family used by the terminal. Leave this empty to keep the built-in monospace.",
+        "Typeface for the terminal only. Built-in keeps the monospace shipped with the app.",
     );
     section(ui, |ui| {
-        if let Some(name) = font_name_row(ui, saved, picker, modal_visible, actions) {
-            actions.push(Action::SetTerminalFont(name));
+        if let Some(text) = stale_font(saved, fonts::TERMINAL_FACES) {
+            help(
+                ui,
+                palette,
+                &format!(
+                    "\"{text}\" is not bundled. The terminal is using the built-in monospace."
+                ),
+            );
         }
-        font_hint(ui, palette, view);
+        let known = stale_font(saved, fonts::TERMINAL_FACES).is_none();
+        if choice_builtin(
+            ui,
+            palette,
+            known && fonts::resolve_terminal(saved).is_none(),
+        )
+        .clicked()
+        {
+            store_font(saved, None, actions, Action::SetTerminalFont);
+        }
+        for face in fonts::TERMINAL_FACES {
+            let selected = known && fonts::resolve_terminal(saved) == Some(face.id);
+            if choice_row(ui, palette, face, TERMINAL_SAMPLE, selected).clicked() {
+                store_font(saved, Some(face.id), actions, Action::SetTerminalFont);
+            }
+        }
+        help(
+            ui,
+            palette,
+            "Prompt icons are in Meslo LGS NF. The other faces do not include them.",
+        );
     });
+}
+
+/// The saved string when it names nothing in `faces`.
+fn stale_font<'a>(saved: Option<&'a str>, faces: &[Face]) -> Option<&'a str> {
+    let name = saved.map(str::trim).filter(|text| !text.is_empty())?;
+    if fonts::face_by_id(faces, name).is_some() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+fn store_font(
+    saved: Option<&str>,
+    next: Option<&str>,
+    actions: &mut Vec<Action>,
+    make: impl Fn(Option<String>) -> Action,
+) {
+    let current = saved.map(str::trim).filter(|text| !text.is_empty());
+    if current != next {
+        actions.push(make(next.map(str::to_owned)));
+    }
+}
+
+struct Specimen<'a> {
+    id: &'a str,
+    title: &'a str,
+    note: &'a str,
+    sample: &'a str,
+    title_font: egui::FontId,
+    sample_font: egui::FontId,
+}
+
+fn choice_row(
+    ui: &mut Ui,
+    palette: &Palette,
+    face: &Face,
+    sample: &str,
+    selected: bool,
+) -> egui::Response {
+    specimen_row(
+        ui,
+        palette,
+        Specimen {
+            id: face.id,
+            title: face.name,
+            note: face.note,
+            sample,
+            title_font: fonts::preview_font(ui, face.id, BODY_SIZE),
+            sample_font: fonts::preview_font(ui, face.id, HELP_SIZE),
+        },
+        selected,
+    )
+}
+
+fn choice_builtin(ui: &mut Ui, palette: &Palette, selected: bool) -> egui::Response {
+    let mut title = egui::TextStyle::Monospace.resolve(ui.style());
+    title.size = BODY_SIZE;
+    let mut sample = title.clone();
+    sample.size = HELP_SIZE;
+    specimen_row(
+        ui,
+        palette,
+        Specimen {
+            id: "builtin",
+            title: "Built-in",
+            note: "Shipped with the app",
+            sample: TERMINAL_SAMPLE,
+            title_font: title,
+            sample_font: sample,
+        },
+        selected,
+    )
+}
+
+fn specimen_row(
+    ui: &mut Ui,
+    palette: &Palette,
+    row: Specimen<'_>,
+    selected: bool,
+) -> egui::Response {
+    let Specimen {
+        id,
+        title,
+        note,
+        sample,
+        title_font,
+        sample_font,
+    } = row;
+    let response = ui
+        .scope_builder(UiBuilder::new().id_salt(id).sense(Sense::click()), |ui| {
+            let hovered = ui.response().hovered();
+            let fill = if selected {
+                palette.surface_active
+            } else if hovered {
+                palette.surface_hover
+            } else {
+                Color32::TRANSPARENT
+            };
+            Frame::new()
+                .fill(fill)
+                .corner_radius(widgets::CORNER_RADIUS)
+                .inner_margin(Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            Label::new(RichText::new(title).font(title_font).color(palette.text))
+                                .selectable(false),
+                        );
+                        ui.add(
+                            Label::new(
+                                RichText::new(note)
+                                    .size(HELP_SIZE)
+                                    .color(palette.text_muted),
+                            )
+                            .selectable(false),
+                        );
+                    });
+                    ui.add(
+                        Label::new(
+                            RichText::new(sample)
+                                .font(sample_font)
+                                .color(palette.text_muted),
+                        )
+                        .selectable(false),
+                    );
+                });
+        })
+        .response;
+    response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 fn about_page(ui: &mut Ui, palette: &Palette, about: &AboutInfo) {
@@ -682,282 +827,6 @@ fn preview_view_id() -> Id {
     Id::new("settings-font-preview")
 }
 
-/// Commits when the field loses focus, including Enter. Escape reverts.
-/// Clicking another control reports the loss on the next frame, so the typed
-/// text is kept in temporary data until then.
-///
-/// The modal is drawn after this field and consumes Escape to close. While it
-/// is visible, Escape must not also revert the draft.
-fn font_name_row(
-    ui: &mut Ui,
-    saved: Option<&str>,
-    picker: &mut FontPicker,
-    modal_visible: bool,
-    actions: &mut Vec<Action>,
-) -> Option<Option<String>> {
-    let width = font_row_width(ui);
-    let indent = ((ui.available_width() - width) / 2.0).max(0.0);
-    // Right-to-left keeps the button ahead of the field, so a click this frame
-    // already counts as the modal being up and Escape does not revert the draft.
-    with_width_at(
-        ui,
-        indent,
-        width,
-        Layout::right_to_left(Align::Center),
-        |ui| {
-            if text_button(ui, BROWSE_FONTS, true).clicked() {
-                picker.open = true;
-                actions.push(Action::EnsureFontCatalog);
-            }
-            font_editor(ui, saved, modal_visible || picker.open, FONT_FIELD_WIDTH)
-        },
-    )
-}
-
-fn font_editor(
-    ui: &mut Ui,
-    saved: Option<&str>,
-    modal_visible: bool,
-    width: f32,
-) -> Option<Option<String>> {
-    let saved_text = saved.unwrap_or("");
-    let escape = !modal_visible && ui.input(|input| input.key_pressed(Key::Escape));
-    let mut draft = if escape {
-        saved_text.to_owned()
-    } else {
-        ui.ctx()
-            .data(|data| data.get_temp(draft_id()))
-            .unwrap_or_else(|| saved_text.to_owned())
-    };
-    let response = ui.add(
-        TextEdit::singleline(&mut draft)
-            .id(font_field_id())
-            .hint_text("Monospace")
-            .font(field_font())
-            .desired_width(width),
-    );
-    if response.has_focus() {
-        ui.ctx()
-            .data_mut(|data| data.insert_temp(draft_id(), draft.clone()));
-        return None;
-    }
-    ui.ctx().data_mut(|data| data.remove::<String>(draft_id()));
-    if response.lost_focus() && !escape {
-        let name = normalize_draft(&draft);
-        if name.as_deref() != saved {
-            return Some(name);
-        }
-    }
-    None
-}
-
-fn font_hint(ui: &mut Ui, palette: &Palette, view: &fonts::FontView<'_>) {
-    let (text, error) = match &view.face {
-        FacePhase::Builtin { pending: true } => ("Looking up installed fonts…", false),
-        FacePhase::Missing => (
-            "Font not found. The terminal is using the built-in monospace.",
-            false,
-        ),
-        FacePhase::Ready { monospace: false } => (
-            "This font is not monospace. The terminal grid expects a fixed width.",
-            false,
-        ),
-        FacePhase::Unreadable(message) | FacePhase::ScanFailed(message) => (message.as_str(), true),
-        FacePhase::Builtin { pending: false } | FacePhase::Ready { monospace: true } => return,
-    };
-    let indent = ((ui.available_width() - font_row_width(ui)) / 2.0).max(0.0);
-    with_width_at(
-        ui,
-        indent,
-        FONT_FIELD_WIDTH,
-        Layout::top_down(Align::Min),
-        |ui| {
-            if error {
-                colored(ui, text, palette.error);
-            } else {
-                note(ui, text, palette.text_muted);
-            }
-        },
-    );
-}
-
-/// Width of Browse fonts, so the family field can stay `FONT_FIELD_WIDTH`
-/// and the pair can be centered without laying the button out twice.
-fn browse_button_width(ui: &Ui) -> f32 {
-    let text = ui
-        .painter()
-        .layout_no_wrap(
-            BROWSE_FONTS.to_owned(),
-            FontId::proportional(BODY_SIZE),
-            Color32::PLACEHOLDER,
-        )
-        .rect
-        .width();
-    text + ui.spacing().button_padding.x * 2.0
-}
-
-fn font_row_width(ui: &Ui) -> f32 {
-    FONT_FIELD_WIDTH + ui.spacing().item_spacing.x + browse_button_width(ui)
-}
-
-/// A strip `width` wide, starting `indent` from the left of this row.
-fn with_width_at<R>(
-    ui: &mut Ui,
-    indent: f32,
-    width: f32,
-    layout: Layout,
-    add: impl FnOnce(&mut Ui) -> R,
-) -> R {
-    ui.horizontal(|ui| {
-        if indent > 0.0 {
-            ui.add_space(indent);
-        }
-        let mut rect = ui.available_rect_before_wrap();
-        rect.max.x = rect.min.x + width;
-        ui.scope_builder(UiBuilder::new().max_rect(rect).layout(layout), add)
-            .inner
-    })
-    .inner
-}
-
-fn font_modal(
-    ctx: &egui::Context,
-    palette: &Palette,
-    saved: Option<&str>,
-    view: &fonts::FontView<'_>,
-    picker: &mut FontPicker,
-    fade: f32,
-    actions: &mut Vec<Action>,
-) {
-    let alpha = (f32::from(MODAL_BACKDROP_ALPHA) * fade)
-        .round()
-        .clamp(0.0, 255.0) as u8;
-    let response = egui::Modal::new(modal_id())
-        .frame(Frame::NONE)
-        .backdrop_color(Color32::from_black_alpha(alpha))
-        .show(ctx, |ui| {
-            ui.set_opacity(fade);
-            Frame::popup(ui.style())
-                .fill(palette.surface)
-                .stroke(Stroke::new(1.0, palette.border))
-                .corner_radius(widgets::CORNER_RADIUS)
-                .inner_margin(Margin::same(20))
-                .show(ui, |ui| {
-                    ui.set_min_width(MODAL_WIDTH);
-                    ui.set_max_width(MODAL_WIDTH);
-                    ui.spacing_mut().item_spacing.y = COLUMN_SPACING;
-                    ui.label(
-                        RichText::new("Terminal Font")
-                            .size(TITLE_SIZE)
-                            .strong()
-                            .color(palette.text),
-                    );
-                    font_browser(ui, palette, saved, view, picker, actions);
-                });
-        });
-    if response.should_close() {
-        picker.open = false;
-    }
-}
-
-fn font_browser(
-    ui: &mut Ui,
-    palette: &Palette,
-    saved: Option<&str>,
-    view: &fonts::FontView<'_>,
-    picker: &mut FontPicker,
-    actions: &mut Vec<Action>,
-) {
-    match view.catalog {
-        CatalogPhase::Idle | CatalogPhase::Loading => {
-            note(ui, "Looking up installed fonts…", palette.text_muted);
-        }
-        CatalogPhase::Failed(message) => colored(ui, message, palette.error),
-        CatalogPhase::Ready(catalog) => {
-            let mut query = picker.query.clone();
-            ui.add(
-                TextEdit::singleline(&mut query)
-                    .id_salt("font-search")
-                    .hint_text("Search fonts")
-                    .font(field_font())
-                    .desired_width(f32::INFINITY),
-            );
-            let query_changed = query != picker.query;
-            if query_changed {
-                picker.query = query;
-            }
-
-            if catalog.names().is_empty() {
-                note(ui, "No installed fonts were found.", palette.text_muted);
-                return;
-            }
-            // One page the size of the catalog is every match, so the modal can scroll.
-            let listed = fonts::page_names(
-                catalog.names(),
-                &picker.query,
-                0,
-                catalog.names().len().max(1),
-            );
-            if listed.names.is_empty() {
-                note(ui, "No fonts match.", palette.text_muted);
-                return;
-            }
-            let list_height = (ui.ctx().content_rect().height() - 180.0).clamp(120.0, 360.0);
-            ScrollArea::vertical()
-                .id_salt("font-modal-list")
-                .max_height(list_height)
-                .auto_shrink([false, true])
-                .animated(false)
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    if query_changed {
-                        ui.scroll_to_cursor(Some(Align::TOP));
-                    }
-                    for name in &listed.names {
-                        let selected = saved.is_some_and(|saved| same_family(saved, name));
-                        if font_row(ui, palette, name, selected).clicked() {
-                            ui.ctx().data_mut(|data| data.remove::<String>(draft_id()));
-                            actions.push(Action::SetTerminalFont(Some(name.clone())));
-                            picker.open = false;
-                        }
-                    }
-                });
-        }
-    }
-}
-
-fn font_row(ui: &mut Ui, palette: &Palette, name: &str, selected: bool) -> egui::Response {
-    let response = ui
-        .scope_builder(UiBuilder::new().id_salt(name).sense(Sense::click()), |ui| {
-            let hovered = ui.response().hovered();
-            let fill = if selected {
-                palette.surface_active
-            } else if hovered {
-                palette.surface_hover
-            } else {
-                Color32::TRANSPARENT
-            };
-            Frame::new()
-                .fill(fill)
-                .corner_radius(widgets::CORNER_RADIUS)
-                .inner_margin(Margin::symmetric(12, 10))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.add(
-                        egui::Label::new(RichText::new(name).size(BODY_SIZE).color(palette.text))
-                            .selectable(false)
-                            .truncate(),
-                    );
-                });
-        })
-        .response;
-    response.on_hover_cursor(CursorIcon::PointingHand)
-}
-
-fn same_family(left: &str, right: &str) -> bool {
-    left.to_lowercase() == right.to_lowercase()
-}
-
 fn nav_button(ui: &mut Ui, label: &str, icon: Icon, selected: bool) -> egui::Response {
     let palette = theme::current(ui.ctx()).palette;
     let response = ui
@@ -1006,37 +875,8 @@ fn note(ui: &mut Ui, text: &str, color: Color32) {
     ui.label(RichText::new(text).size(HELP_SIZE).color(color));
 }
 
-fn normalize_draft(draft: &str) -> Option<String> {
-    let trimmed = draft.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_owned())
-    }
-}
-
 fn page_id() -> Id {
     Id::new("settings-page")
-}
-
-fn picker_id() -> Id {
-    Id::new("settings-font-picker")
-}
-
-fn modal_id() -> Id {
-    Id::new("settings-font-modal")
-}
-
-fn modal_fade_id() -> Id {
-    Id::new("settings-font-modal-fade")
-}
-
-fn font_field_id() -> Id {
-    Id::new("settings-terminal-font")
-}
-
-fn draft_id() -> Id {
-    font_field_id().with("draft")
 }
 
 /// Same chrome as the repository bars.

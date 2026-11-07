@@ -15,7 +15,6 @@ dunce = "1.0.5"
 # persistence is not a default feature in eframe 0.36. It remembers the
 # window position, restored size, and whether it was maximized.
 eframe = { version = "0.36.2", features = ["persistence"] }
-fontdb = "0.23.0"
 # Author avatars. Already in the tree through eframe; only these decoders.
 # No GIF: its decoder allocates up to 50 MB before image's limits apply.
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }

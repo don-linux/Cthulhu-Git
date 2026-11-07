@@ -39,8 +39,11 @@ pub struct Settings {
     /// so this field names its own default.
     #[serde(default = "default_terminal_hidden")]
     pub terminal_hidden: bool,
-    /// Font family drawn in the terminal. `None`, blank, or an unknown name
-    /// keeps the built-in monospace. A family name, not a file path.
+    /// Interface typeface. `None`, blank, or an unknown id keeps Ubuntu Sans.
+    /// An id from the bundled catalog, not a file path or a system family.
+    pub ui_font: Option<String>,
+    /// Font drawn in the terminal. `None`, blank, or an unknown id keeps the
+    /// built-in monospace. An id from the bundled catalog, not a file path.
     pub terminal_font: Option<String>,
     /// Width of each commit history column. A value that is not an object
     /// keeps every default; a bad field keeps only its own default.
@@ -158,6 +161,7 @@ impl Default for Settings {
             history_sidebar_hidden: false,
             detail_sidebar_hidden: false,
             terminal_hidden: default_terminal_hidden(),
+            ui_font: None,
             terminal_font: None,
             history_columns: HistoryColumns::default(),
             author_avatars: default_author_avatars(),
@@ -201,7 +205,7 @@ impl Settings {
         let mut settings: Self = serde_json::from_slice(json)
             .map_err(|error| SettingsError::Parse(path.to_path_buf(), error))?;
         settings.normalize_recent();
-        settings.normalize_terminal_font();
+        settings.normalize_fonts();
         Ok(settings)
     }
 
@@ -219,10 +223,10 @@ impl Settings {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(fail)?;
         }
-        // A blank family is not a font. Writing the normalized copy keeps a
+        // A blank id is not a font. Writing the normalized copy keeps a
         // direct field assignment consistent with `load_from`.
         let mut stored = self.clone();
-        stored.normalize_terminal_font();
+        stored.normalize_fonts();
         stored.history_columns = stored.history_columns.normalized();
         let mut json = serde_json::to_vec_pretty(&stored).map_err(|error| fail(error.into()))?;
         json.push(b'\n');
@@ -268,10 +272,16 @@ impl Settings {
         self.last_repository = None;
     }
 
-    /// Stores the terminal font family. Blank and whitespace-only names clear it.
+    /// Stores the interface typeface. Blank and whitespace-only names clear it.
+    pub fn set_ui_font(&mut self, name: Option<String>) {
+        self.ui_font = name;
+        normalize_font_name(&mut self.ui_font);
+    }
+
+    /// Stores the terminal typeface. Blank and whitespace-only names clear it.
     pub fn set_terminal_font(&mut self, name: Option<String>) {
         self.terminal_font = name;
-        self.normalize_terminal_font();
+        normalize_font_name(&mut self.terminal_font);
     }
 
     /// A hand-edited file may repeat or pile up entries.
@@ -287,18 +297,22 @@ impl Settings {
         self.recent_repositories.truncate(MAX_RECENT_REPOSITORIES);
     }
 
-    /// Drops a blank family and trims the rest, so `"  Fira Code  "` is stored
-    /// as `"Fira Code"`.
-    fn normalize_terminal_font(&mut self) {
-        let Some(name) = self.terminal_font.as_deref() else {
-            return;
-        };
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
-            self.terminal_font = None;
-        } else if trimmed.len() != name.len() {
-            self.terminal_font = Some(trimmed.to_owned());
-        }
+    fn normalize_fonts(&mut self) {
+        normalize_font_name(&mut self.ui_font);
+        normalize_font_name(&mut self.terminal_font);
+    }
+}
+
+/// Drops a blank id and trims the rest, so `"  inter  "` is stored as `"inter"`.
+fn normalize_font_name(slot: &mut Option<String>) {
+    let Some(name) = slot.as_deref() else {
+        return;
+    };
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        *slot = None;
+    } else if trimmed.len() != name.len() {
+        *slot = Some(trimmed.to_owned());
     }
 }
 
@@ -520,6 +534,37 @@ mod tests {
         assert_eq!(settings.terminal_font, None);
         settings.set_terminal_font(Some("  IBM Plex Mono  ".to_owned()));
         assert_eq!(settings.terminal_font.as_deref(), Some("IBM Plex Mono"));
+    }
+
+    #[test]
+    fn ui_font_trims_and_old_files_keep_the_default() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        fs::write(&path, r#"{ "theme": "abyss" }"#).expect("write");
+        assert_eq!(Settings::load_from(&path).expect("old file").ui_font, None);
+
+        let settings = Settings {
+            ui_font: Some("inter".to_owned()),
+            ..Settings::default()
+        };
+        settings.save_to(&path).expect("save");
+        assert_eq!(Settings::load_from(&path).expect("load"), settings);
+
+        let padded = Settings {
+            ui_font: Some("  aspekta  ".to_owned()),
+            ..Settings::default()
+        };
+        padded.save_to(&path).expect("save");
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
+        assert_eq!(value["ui_font"], "aspekta");
+
+        let mut settings = Settings::default();
+        settings.set_ui_font(Some("   ".to_owned()));
+        assert_eq!(settings.ui_font, None);
+        settings.set_ui_font(Some("  obel-mono  ".to_owned()));
+        assert_eq!(settings.ui_font.as_deref(), Some("obel-mono"));
     }
 
     #[test]
