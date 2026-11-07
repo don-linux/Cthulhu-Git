@@ -3,6 +3,9 @@
 //! Fixtures shell out to the system git. Author identity is set on those
 //! commands only, so the test process environment stays untouched.
 
+#[path = "common/mod.rs"]
+mod common;
+
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -29,6 +32,7 @@ impl Repo {
         let repo = Self { tmp, root, git };
         let cwd = repo.root.clone();
         repo.run(&cwd, &["init", "-b", "main"]);
+        repo.localize(&cwd);
         repo
     }
 
@@ -40,6 +44,7 @@ impl Repo {
         let repo = Self { tmp, root, git };
         let cwd = repo.root.clone();
         repo.run(&cwd, &["init", "--object-format=sha256", "-b", "main"]);
+        repo.localize(&cwd);
         repo
     }
 
@@ -51,6 +56,8 @@ impl Repo {
         let cwd = repo.tmp.path().to_path_buf();
         let spec = repo.root.to_str().expect("utf8 bare path").to_owned();
         repo.run(&cwd, &["init", "--bare", "-b", "main", &spec]);
+        let bare = repo.root.clone();
+        repo.localize(&bare);
         repo
     }
 
@@ -64,27 +71,17 @@ impl Repo {
         let mut command = Command::new(&self.git.path);
         command
             .current_dir(cwd)
-            .env("GIT_AUTHOR_NAME", "cthulhu")
-            .env("GIT_AUTHOR_EMAIL", "cthulhu@example.invalid")
-            .env("GIT_COMMITTER_NAME", "cthulhu")
-            .env("GIT_COMMITTER_EMAIL", "cthulhu@example.invalid")
             .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", self.tmp.path().join("empty.gitconfig"))
-            .env(
-                "GIT_CONFIG_SYSTEM",
-                self.tmp.path().join("empty.system.gitconfig"),
-            )
-            .args(["-c", "commit.gpgSign=false"]);
-        let hooks = self.tmp.path().join("empty-hooks");
-        let _ = fs::create_dir_all(&hooks);
-        let _ = fs::write(self.tmp.path().join("empty.gitconfig"), "");
-        let _ = fs::write(self.tmp.path().join("empty.system.gitconfig"), "");
+            .env_remove("GIT_WORK_TREE");
+        common::isolate(&mut command, self.tmp.path());
         command
-            .arg("-c")
-            .arg(format!("core.hooksPath={}", hooks.display()));
-        command
+    }
+
+    /// Local config beats a hostile `HOME` gitconfig for product git, which
+    /// does not see `GIT_CONFIG_GLOBAL`.
+    fn localize(&self, cwd: &Path) {
+        self.git_at(cwd, &["config", "--local", "core.autocrlf", "false"]);
+        self.git_at(cwd, &["config", "--local", "commit.gpgsign", "false"]);
     }
 
     fn run(&self, cwd: &Path, args: &[&str]) -> std::process::Output {
@@ -385,12 +382,7 @@ fn submodule_reports_submodule_root() {
     super_repo.run(&origin, &["init", "-b", "main"]);
     super_repo.commit_in(&origin, "module initial");
 
-    let url = format!(
-        "file://{}",
-        dunce::canonicalize(&origin)
-            .expect("canonical origin")
-            .display()
-    );
+    let url = file_url(&origin);
     let super_root = super_repo.root.clone();
     super_repo.git_at(
         &super_root,
@@ -474,23 +466,51 @@ fn dot_git_directory_resolves_to_parent_or_clear_error() {
     }
 }
 
+fn missing_gitdir() -> &'static str {
+    // Git for Windows rewrites a POSIX absolute path, so the gitfile has to
+    // name a drive path or the assertion is about that rewrite.
+    if cfg!(windows) {
+        r"C:\does\not\exist"
+    } else {
+        "/does/not/exist"
+    }
+}
+
+/// `file://` URL for a local path. Windows needs `file:///C:/...`.
+fn file_url(path: &Path) -> String {
+    let canonical = dunce::canonicalize(path)
+        .unwrap_or_else(|error| panic!("canonical {}: {error}", path.display()));
+    #[cfg(windows)]
+    {
+        let text = canonical
+            .to_str()
+            .unwrap_or_else(|| panic!("utf-8 path {}", canonical.display()))
+            .replace('\\', "/");
+        format!("file:///{text}")
+    }
+    #[cfg(not(windows))]
+    {
+        format!("file://{}", canonical.display())
+    }
+}
+
 #[test]
 fn broken_gitfile_is_a_typed_error() {
     let repo = Repo::init_named("gitfile-host");
     let broken = repo.tmp.path().join("broken-gitfile");
     fs::create_dir(&broken).expect("dir");
-    fs::write(broken.join(".git"), "gitdir: /does/not/exist\n").expect("gitfile");
+    fs::write(
+        broken.join(".git"),
+        format!("gitdir: {}\n", missing_gitdir()),
+    )
+    .expect("gitfile");
 
     let error = inspect(&repo.git, &broken).expect_err("missing gitdir");
-    // inspect canonicalizes first. macOS rewrites /var to /private/var, and
-    // Windows may rewrite the temp path, so either form is the same directory.
-    let canonical = dunce::canonicalize(&broken).unwrap_or_else(|_| broken.clone());
+    // inspect canonicalizes before classifying. The typed error carries that path.
+    let canonical = dunce::canonicalize(&broken).expect("canonical broken gitfile");
     assert!(
-        matches!(
-            &error,
-            GitError::NotARepository(path) if path == &broken || path == &canonical
-        ) || matches!(error, GitError::Command { .. } | GitError::Rejected { .. }),
-        "typed error, got {error:?}"
+        matches!(error, GitError::NotARepository(ref path) if path == &canonical),
+        "broken gitfile must be NotARepository, got {error:?}"
     );
     let _ = error.to_string();
 }
@@ -585,7 +605,7 @@ fn shallow_clone_returns_only_the_tip() {
     repo.commit("first");
     repo.commit("second");
     let shallow = repo.tmp.path().join("shallow");
-    let url = format!("file://{}", repo.canonical().display());
+    let url = file_url(&repo.root);
     let shallow_arg = shallow.to_str().expect("utf8").to_owned();
     let cwd = repo.tmp.path().to_path_buf();
     repo.git_at(
@@ -728,6 +748,7 @@ impl ModeRestore {
         use std::os::unix::fs::PermissionsExt;
 
         let mode = fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+        common::strip_acls(path);
         fs::set_permissions(path, fs::Permissions::from_mode(0o000)).expect("chmod 000");
         Self {
             path: path.to_path_buf(),
@@ -748,7 +769,12 @@ impl Drop for ModeRestore {
 #[test]
 fn unreadable_git_dir_is_a_typed_error() {
     let repo = Repo::init_named("noperm");
-    let _restore = ModeRestore::lock_down(&repo.root.join(".git"));
+    let git_dir = repo.root.join(".git");
+    let _restore = ModeRestore::lock_down(&git_dir);
+    // Filesystem grants access despite mode 000.
+    if File::open(&git_dir).is_ok() {
+        return;
+    }
 
     let error = inspect(&repo.git, &repo.root).expect_err("unreadable .git");
     assert!(
@@ -1240,12 +1266,7 @@ fn checkout_does_not_wipe_superproject_or_submodule() {
     super_repo.git_at(&origin, &["add", "--", "mod.txt"]);
     super_repo.commit_in(&origin, "module initial");
 
-    let url = format!(
-        "file://{}",
-        dunce::canonicalize(&origin)
-            .expect("canonical origin")
-            .display()
-    );
+    let url = file_url(&origin);
     super_repo.git_at(
         &super_repo.root,
         &[
