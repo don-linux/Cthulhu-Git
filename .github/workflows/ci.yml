@@ -62,7 +62,9 @@ jobs:
   test:
     name: cargo test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Temporary flake hunt: the macOS Test step runs cargo test three times.
+    # Restore timeout-minutes: 30 when that loop is removed.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -90,7 +92,16 @@ jobs:
         run: |
           set -Eeuo pipefail
           cargo clippy --locked --all-targets -- -D warnings
-          cargo test --locked
+          # Temporary: repeat the macOS suite to surface flakes. The Apple git
+          # step below stays a single run. Remove this loop after CI is green.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            for i in 1 2 3; do
+              echo "cargo test --locked (macOS pass ${i}/3)"
+              cargo test --locked
+            done
+          else
+            cargo test --locked
+          fi
       # Finder launches apps with /usr/bin:/bin:/usr/sbin:/sbin, so this step
       # runs against Apple's git. Cargo on the GitHub macOS runner is
       # $HOME/.cargo/bin, which is /Users/runner/.cargo/bin.
