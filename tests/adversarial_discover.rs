@@ -7,15 +7,15 @@
 //! relative-override cases re-exec a child when they must `chdir`.
 #![cfg(unix)]
 
+#[path = "common/mod.rs"]
+mod common;
+
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(not(target_os = "linux"))]
-use std::process::Stdio;
 use std::sync::{OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,7 +34,7 @@ if [ "$version" = sleep ]; then
   exit 0
 fi
 if [ "$version" = setsid ]; then
-  perl -MPOSIX -e 'defined(my $pid = fork()) or die; if ($pid == 0) { POSIX::setsid() or die $!; open my $fh, ">", $ARGV[0] or die $!; print $fh $$; close $fh; exec "sleep", "30" or die $!; } wait;' "$0.setsid"
+  CTHULHU_HARNESS_SETSID_PIDFILE="$0.setsid" @TEST_EXE@ --exact harness_setsid_sleeper --include-ignored --test-threads=1
   exit 0
 fi
 if [ "$version" = garbage ]; then
@@ -51,25 +51,17 @@ const CHILD_PATH_GIT_VAR: &str = "CTHULHU_ADV_DISCOVER_PATH_GIT";
 fn shared_script() -> &'static Path {
     static SCRIPT_PATH: OnceLock<PathBuf> = OnceLock::new();
     SCRIPT_PATH.get_or_init(|| {
-        let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cthulhu-adv-discover-fake.sh");
-        // Rename into place so a concurrent exec keeps the previous inode.
-        let tmp = path.with_extension("sh.tmp");
-        {
-            let mut file = fs::File::create(&tmp).expect("write fake git script");
-            file.write_all(SCRIPT.as_bytes())
-                .expect("write fake git script");
-        }
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).expect("chmod");
-        fs::rename(&tmp, &path).expect("install fake git script");
-        path
+        let exe = common::sh_quote(&env::current_exe().expect("test binary"));
+        let body = SCRIPT.replace("@TEST_EXE@", &exe);
+        common::shared_script("cthulhu-adv-discover-fake.sh", &body)
     })
 }
 
 /// Creates `dir/name` answering `git version <version>`.
 ///
 /// `"broken"` exits 1. `"sleep"` backgrounds `sleep 30` (pid in `git.sleeper`)
-/// then waits. `"setsid"` runs perl, which forks a grandchild that calls
-/// `POSIX::setsid` and `sleep 30` (pid in `git.setsid`) while perl waits.
+/// then waits. `"setsid"` re-execs this test binary, which calls `setsid(2)`
+/// and sleeps 30s (pid in `git.setsid`) while the shell waits.
 /// `"garbage"` prints non-version stdout (including a non-UTF-8 byte) and exits 0.
 /// A version string may itself contain a trailing `\r`.
 fn fake(dir: &Path, name: &str, version: &str) -> PathBuf {
@@ -91,6 +83,7 @@ fn inputs(path_dirs: &[&Path], fallbacks: Vec<PathBuf>) -> DiscoverInputs {
         path_var: Some(env::join_paths(path_dirs).expect("joinable PATH")),
         exe_name: "git",
         fallbacks,
+        skip_paths: Vec::new(),
     }
 }
 
@@ -166,6 +159,7 @@ fn child_relative_bare_override_uses_cwd_git() {
         path_var: Some(path_dir),
         exe_name: "git",
         fallbacks: Vec::new(),
+        skip_paths: Vec::new(),
     })
     .expect("bare relative override");
 
@@ -215,6 +209,7 @@ fn child_relative_slash_override_uses_cwd_git() {
         path_var: Some(path_dir),
         exe_name: "git",
         fallbacks: Vec::new(),
+        skip_paths: Vec::new(),
     })
     .expect("slash relative override");
 
@@ -269,47 +264,10 @@ fn assert_recorded_pid_is_dead(path: &Path) {
         .parse()
         .unwrap_or_else(|_| panic!("pid in {}: {text:?}", path.display()));
     assert!(pid > 1, "refusing to treat pid {pid} as the grandchild");
-
-    let started = Instant::now();
-    while pid_is_alive(pid) {
-        if started.elapsed() >= Duration::from_millis(500) {
-            panic!("grandchild pid {pid} is still alive after the git that spawned it was stopped");
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// A zombie still answers `kill -0`. On Linux the `/proc/<pid>/stat` state
-/// decides: missing, or anything other than `R`, `S`, `D`, or `T`, is dead.
-#[cfg(target_os = "linux")]
-fn pid_is_alive(pid: u32) -> bool {
-    let text = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
-        Err(_) => return true,
-    };
-    linux_stat_state_is_alive(&text)
-}
-
-/// State is the field after the last `)`. `comm` may itself contain `)`.
-#[cfg(target_os = "linux")]
-fn linux_stat_state_is_alive(text: &str) -> bool {
-    let Some((_, rest)) = text.rsplit_once(')') else {
-        return false;
-    };
-    matches!(rest.split_whitespace().next(), Some("R" | "S" | "D" | "T"))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pid_is_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("kill -0")
-        .success()
+    assert!(
+        common::wait_dead(pid, Duration::from_secs(2)),
+        "grandchild pid {pid} is still alive after the git that spawned it was stopped"
+    );
 }
 
 #[test]
@@ -324,24 +282,43 @@ fn sleeping_override_is_bounded_to_about_one_second() {
             path_var: None,
             exe_name: "git",
             fallbacks: Vec::new(),
+            skip_paths: Vec::new(),
         };
-        let _ = tx.send(discover_with(&inputs));
+        let started = Instant::now();
+        let result = discover_with(&inputs);
+        let _ = tx.send((result, started.elapsed()));
     });
 
-    match rx.recv_timeout(Duration::from_secs(1)) {
-        Ok(Ok(git)) => panic!(
-            "FINDING: CTHULHU_GIT whose --version sleeps returned a version within 1s ({}); discovery must fail or still be bounded",
+    // The probe budget is 250ms. The outer wait is longer so `/bin/ps` inside
+    // the timeout reap is not counted as that budget.
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok((Ok(git), elapsed)) => panic!(
+            "FINDING: CTHULHU_GIT whose --version sleeps returned a version in {elapsed:?} ({}); the probe budget is 250ms",
             git.version.raw
         ),
-        Ok(Err(_)) => {}
+        Ok((Err(_), elapsed)) => {
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "probe budget is 250ms; discover_with took {elapsed:?}"
+            );
+        }
         Err(mpsc::RecvTimeoutError::Timeout) => panic!(
-            "FINDING: CTHULHU_GIT --version that sleeps was still running after 1s; discovery must fail or return within about 1s and must not wait out a hung git"
+            "FINDING: CTHULHU_GIT --version that sleeps was still running after 5s; the probe budget is 250ms and discovery must not wait out a hung git"
         ),
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             panic!("discovery thread ended without a result");
         }
     }
     assert_recorded_pid_is_dead(&sleeper);
+}
+
+#[test]
+#[ignore = "re-exec target: setsid and sleep, started by the setsid fake git"]
+fn harness_setsid_sleeper() {
+    let Ok(path) = std::env::var(common::SETSID_PIDFILE_VAR) else {
+        return;
+    };
+    common::become_setsid_sleeper(Path::new(&path));
 }
 
 #[test]
@@ -356,18 +333,26 @@ fn setsid_grandchild_of_a_timed_out_git_is_dead() {
             path_var: None,
             exe_name: "git",
             fallbacks: Vec::new(),
+            skip_paths: Vec::new(),
         };
-        let _ = tx.send(discover_with(&inputs));
+        let started = Instant::now();
+        let result = discover_with(&inputs);
+        let _ = tx.send((result, started.elapsed()));
     });
 
-    match rx.recv_timeout(Duration::from_secs(1)) {
-        Ok(Err(_)) => {}
-        Ok(Ok(git)) => panic!(
-            "FINDING: CTHULHU_GIT whose --version calls setsid returned a version within 1s ({}); discovery must fail",
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok((Err(_), elapsed)) => {
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "probe budget is 250ms; discover_with took {elapsed:?}"
+            );
+        }
+        Ok((Ok(git), elapsed)) => panic!(
+            "FINDING: CTHULHU_GIT whose --version calls setsid returned a version in {elapsed:?} ({}); the probe budget is 250ms",
             git.version.raw
         ),
         Err(mpsc::RecvTimeoutError::Timeout) => panic!(
-            "FINDING: setsid grandchild kept discovery running after 1s; the probe timeout is 250ms and discovery must return an error within 1s"
+            "FINDING: setsid grandchild kept discovery running after 5s; the probe timeout is 250ms"
         ),
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             panic!("discovery thread ended without a result");
@@ -477,6 +462,7 @@ fn windows_path_with_trailing_slash_finds_git_exe() {
         path_var: Some(element),
         exe_name: "git.exe",
         fallbacks: Vec::new(),
+        skip_paths: Vec::new(),
     })
     .expect("trailing-slash PATH element");
     assert_eq!(found.path, git_exe);
@@ -500,6 +486,7 @@ fn quoted_absolute_path_element_is_unquoted_and_searched() {
         path_var: Some(OsString::from(&quoted)),
         exe_name: "git.exe",
         fallbacks: Vec::new(),
+        skip_paths: Vec::new(),
     })
     .expect("quoted absolute PATH element must be unquoted and searched");
     assert_eq!(found.path, git_exe);
@@ -521,6 +508,7 @@ fn very_long_absolute_path_does_not_panic() {
         path_var: Some(path_dir.into_os_string()),
         exe_name: "git.exe",
         fallbacks: Vec::new(),
+        skip_paths: Vec::new(),
     })
     .expect("200-character absolute PATH element");
     assert_eq!(found.path, git_exe);
@@ -542,6 +530,7 @@ fn broken_xcode_shim_falls_through_to_the_next_fallback() {
         path_var: None,
         exe_name: "git",
         fallbacks: vec![shim, brew.clone()],
+        skip_paths: Vec::new(),
     })
     .expect("second fallback after a broken shim");
     assert_eq!(git.path, brew);

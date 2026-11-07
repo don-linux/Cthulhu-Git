@@ -13,6 +13,9 @@
 //! graph is a second worker and is not part of that wait; a load still in
 //! flight keeps repainting, so the graph cases wait on that separately.
 
+#[path = "../../tests/common/mod.rs"]
+mod harness;
+
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -27,7 +30,6 @@ use std::process::Command;
 #[cfg(unix)]
 use std::process::Output;
 use std::rc::Rc;
-#[cfg(unix)]
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
@@ -44,7 +46,6 @@ use egui_kittest::kittest::{NodeT, Queryable};
 use tempfile::TempDir;
 
 use super::avatars::AvatarService;
-use super::fonts::FontService;
 use super::github_auth::GitHubAuth;
 use super::home::{self, HomeState};
 use super::hover::HoverCache;
@@ -57,7 +58,8 @@ use super::{Action, CthulhuApp, ListedBranch, OpenedRepo, Screen, SyncKind};
 const CHILD_ENV: &str = "CTHULHU_ADVERSARIAL_UI_CHILD";
 const WINDOW_SIZE: egui::Vec2 = egui::Vec2::new(520.0, 400.0);
 const PIXELS_PER_POINT: f32 = 2.0;
-const OPEN_ATTEMPTS: usize = 80;
+/// 200 × 100ms. Opening a repository on a slow runner can take longer than 8s.
+const OPEN_ATTEMPTS: usize = 200;
 
 fn spawned() -> bool {
     std::env::var_os(CHILD_ENV).is_some()
@@ -226,19 +228,21 @@ fn assert_only_settings_file(expected: &[u8]) {
     assert_eq!(fs::read(&path).expect("read settings"), expected);
 }
 
+fn git_program() -> PathBuf {
+    static GIT: OnceLock<PathBuf> = OnceLock::new();
+    GIT.get_or_init(|| cthulhu_git::git::Git::discover().expect("system git").path)
+        .clone()
+}
+
 fn run_git(root: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let scratch = root.parent().unwrap_or(root);
+    let mut command = Command::new(git_program());
+    command
         .current_dir(root)
-        .env("GIT_AUTHOR_NAME", "cthulhu")
-        .env("GIT_AUTHOR_EMAIL", "cthulhu@example.invalid")
-        .env("GIT_COMMITTER_NAME", "cthulhu")
-        .env("GIT_COMMITTER_EMAIL", "cthulhu@example.invalid")
         .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .args(["-c", "commit.gpgSign=false"])
-        .args(args)
-        .output()
-        .expect("run git");
+        .env_remove("GIT_WORK_TREE");
+    harness::isolate(&mut command, scratch);
+    let output = command.args(args).output().expect("run git");
     assert!(
         output.status.success(),
         "git {args:?} failed: {}",
@@ -594,7 +598,6 @@ fn drive_settings(busy: Rc<RefCell<bool>>) -> (Harness<'static, ()>, ActionLog) 
     let actions = Rc::new(RefCell::new(Vec::new()));
     let actions_ui = Rc::clone(&actions);
     let busy_ui = Rc::clone(&busy);
-    let fonts = FontService::default();
     let mut preview: Option<Terminal> = None;
     let mut github = GitHubAuth::default();
     let harness = Harness::builder()
@@ -608,7 +611,7 @@ fn drive_settings(busy: Rc<RefCell<bool>>) -> (Harness<'static, ()>, ActionLog) 
                 busy: *busy_ui.borrow(),
                 about: about_info(),
             };
-            let produced = settings::show(ui, None, &fonts, &mut preview, None, &view, &mut github);
+            let produced = settings::show(ui, None, None, &mut preview, None, &view, &mut github);
             *actions_ui.borrow_mut() = produced;
         });
     (harness, actions)
@@ -674,28 +677,72 @@ fn label_values<State>(harness: &Harness<'_, State>) -> BTreeSet<String> {
         .collect()
 }
 
+/// How far a tip may sit from the control. The gap is 8px and the popup frame
+/// adds its own margin. A label on the other side of the window is not a tip.
+const TOOLTIP_REACH: f32 = 32.0;
+
 /// Hover `rect` and wait out egui's 0.5s tooltip delay. Default `step_dt` is 0.25s.
+///
+/// The detail sidebar asks git for the latest commit and may paint that failure
+/// while the pointer is still waiting on the button. Any new label counts only
+/// when it sits against `rect`, so that sidebar text is not the tip.
 fn hover_tooltip<State>(harness: &mut Harness<'_, State>, rect: egui::Rect) -> String {
+    let (button_id, button_rect) = {
+        let button = button_covering(harness, rect);
+        (button.accesskit_node().locate().0, button.rect())
+    };
     let before = label_values(harness);
-    harness.hover_at(rect.center());
-    let mut appeared = Vec::new();
+    harness.hover_at(button_rect.center());
+    let mut tips = Vec::new();
     for _ in 0..8 {
         harness.step();
-        appeared = label_values(harness)
-            .into_iter()
-            .filter(|label| !before.contains(label))
-            .collect();
-        if !appeared.is_empty() {
+        tips = tooltip_for_button(harness, button_id, &before, button_rect);
+        if !tips.is_empty() {
             break;
         }
     }
     assert_eq!(
-        appeared.len(),
+        tips.len(),
         1,
-        "tooltip at {rect:?} appeared as {appeared:?}\n{}",
+        "tooltip for button {button_id:?} at {button_rect:?} was {tips:?}\n{}",
         visible_text(harness)
     );
-    appeared.remove(0)
+    tips.remove(0)
+}
+
+/// The popup label for `button_id`, not a label painted inside that button
+/// and not the first new label anywhere in the window.
+fn tooltip_for_button<State>(
+    harness: &Harness<'_, State>,
+    button_id: egui::accesskit::NodeId,
+    before: &BTreeSet<String>,
+    rect: egui::Rect,
+) -> Vec<String> {
+    let reach = rect.expand(TOOLTIP_REACH);
+    harness
+        .query_all_by_role(Role::Label)
+        .filter_map(|node| {
+            let text = node.value()?;
+            if before.contains(&text) || !reach.intersects(node.rect()) {
+                return None;
+            }
+            if node_is_under(&node, button_id) {
+                return None;
+            }
+            Some(text)
+        })
+        .collect()
+}
+
+fn node_is_under(node: &egui_kittest::Node<'_>, ancestor: egui::accesskit::NodeId) -> bool {
+    let mut current = Some(*node);
+    while let Some(node) = current {
+        if node.accesskit_node().locate().0 == ancestor {
+            return true;
+        }
+        current = node.parent();
+    }
+    false
 }
 
 fn click_bottom_index<State>(harness: &Harness<'_, State>, index: usize) {
@@ -731,8 +778,8 @@ fn describe_action(action: &Action) -> String {
         Action::ToggleBranchesSidebar => "ToggleBranchesSidebar".to_owned(),
         Action::ToggleDetailSidebar => "ToggleDetailSidebar".to_owned(),
         Action::ToggleTerminal => "ToggleTerminal".to_owned(),
+        Action::SetUiFont(name) => format!("SetUiFont({name:?})"),
         Action::SetTerminalFont(name) => format!("SetTerminalFont({name:?})"),
-        Action::EnsureFontCatalog => "EnsureFontCatalog".to_owned(),
         Action::Fetch(upstream) => format!("Fetch({upstream})"),
         Action::Pull => "Pull".to_owned(),
         Action::Checkout(name) => format!("Checkout({name})"),
@@ -1309,9 +1356,32 @@ fn adversarial_min_window_long_name_and_bidi_summary() {
     assert_text(&harness, "main");
 }
 
+/// The detail sidebar asks `git show` for the latest commit. A seeded hover
+/// answers that without spawning git against a missing directory.
+fn seed_latest_hover(repo: &mut OpenedRepo) {
+    let Some(latest) = repo.latest.clone() else {
+        return;
+    };
+    repo.hover.store_ready(cthulhu_git::git::CommitHover {
+        oid: latest.oid,
+        author: latest.author,
+        co_authors: latest.co_authors,
+        authored_unix: 1_700_000_000,
+        authored_at: latest.authored_at,
+        message: latest.message,
+        files: Vec::new(),
+        stats: None,
+        tags: Vec::new(),
+    });
+}
+
 #[test]
 fn fetch_and_pull_sit_beside_the_branch_name() {
+    let scratch = temp_dir("cthulhu-adv-ui-beside-");
     let mut repo = opened("beside", vec![commit("one")], false);
+    repo.info.root = scratch.path().join("beside");
+    fs::create_dir_all(&repo.info.root).expect("repo root");
+    seed_latest_hover(&mut repo);
     repo.branches[0].branch.upstream = Upstream::Tracking {
         name: "origin/main".to_owned(),
         ahead: 1,
@@ -1370,6 +1440,9 @@ fn fetch_and_pull_sit_beside_the_branch_name() {
 
     let long = "b".repeat(240);
     let mut repo = opened("beside-long", vec![commit("one")], false);
+    repo.info.root = scratch.path().join("beside-long");
+    fs::create_dir_all(&repo.info.root).expect("repo root");
+    seed_latest_hover(&mut repo);
     repo.info.head = Head::Branch(long.clone());
     repo.branches[0].branch.name = long.clone();
     repo.branches[0].branch.upstream = Upstream::Tracking {

@@ -1,5 +1,8 @@
 //! `inspect` against real temporary repositories and the system git.
 
+#[path = "common/mod.rs"]
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -54,13 +57,8 @@ impl Fixture {
         let mut command = Command::new(&self.git.path);
         command
             .current_dir(&self.root)
-            .env("GIT_AUTHOR_NAME", "cthulhu")
-            .env("GIT_AUTHOR_EMAIL", "cthulhu@example.invalid")
-            .env("GIT_COMMITTER_NAME", "cthulhu")
-            .env("GIT_COMMITTER_EMAIL", "cthulhu@example.invalid")
             .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .args(["-c", "commit.gpgSign=false"]);
+            .env_remove("GIT_WORK_TREE");
         without_user_git_config(&mut command, self._tmp.path());
         command.args(args);
         let output = command.output().expect("run git");
@@ -95,17 +93,13 @@ impl Fixture {
         let mut command = Command::new(&self.git.path);
         command
             .current_dir(&self.root)
-            .env("GIT_AUTHOR_NAME", "cthulhu")
-            .env("GIT_AUTHOR_EMAIL", "cthulhu@example.invalid")
-            .env("GIT_COMMITTER_NAME", "cthulhu")
-            .env("GIT_COMMITTER_EMAIL", "cthulhu@example.invalid")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE");
+        without_user_git_config(&mut command, self._tmp.path());
+        command
             .env("GIT_AUTHOR_DATE", date)
             .env("GIT_COMMITTER_DATE", date)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .args(["-c", "commit.gpgSign=false"]);
-        without_user_git_config(&mut command, self._tmp.path());
-        command.args(["commit", "--allow-empty", "-m", message]);
+            .args(["commit", "--allow-empty", "-m", message]);
         let output = command.output().expect("run git");
         assert!(
             output.status.success(),
@@ -121,18 +115,7 @@ impl Fixture {
 }
 
 fn without_user_git_config(command: &mut Command, scratch: &Path) {
-    let global = scratch.join("empty.gitconfig");
-    let system = scratch.join("empty.system.gitconfig");
-    let hooks = scratch.join("empty-hooks");
-    let _ = fs::create_dir_all(&hooks);
-    let _ = fs::write(&global, "");
-    let _ = fs::write(&system, "");
-    command
-        .env("GIT_CONFIG_GLOBAL", &global)
-        .env("GIT_CONFIG_SYSTEM", &system)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .arg("-c")
-        .arg(format!("core.hooksPath={}", hooks.display()));
+    common::isolate(command, scratch);
 }
 
 #[test]
@@ -145,13 +128,7 @@ fn divergent_pull_with_rebase_config_does_not_rewrite_head() {
     let local_tmp = TempDir::with_prefix("cthulhu-pull-").expect("temp dir");
     let local_root = local_tmp.path().join("local");
     let mut clone = Command::new(&origin.git.path);
-    clone
-        .env("GIT_AUTHOR_NAME", "cthulhu")
-        .env("GIT_AUTHOR_EMAIL", "cthulhu@example.invalid")
-        .env("GIT_COMMITTER_NAME", "cthulhu")
-        .env("GIT_COMMITTER_EMAIL", "cthulhu@example.invalid")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE");
+    clone.env_remove("GIT_DIR").env_remove("GIT_WORK_TREE");
     without_user_git_config(&mut clone, origin._tmp.path());
     clone.args([
         "clone",

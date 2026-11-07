@@ -11,6 +11,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 pub const FILE_NAME: &str = "settings.json";
 pub const MAX_RECENT_REPOSITORIES: usize = 10;
+/// Saved font ids are cut here, on a char boundary. A longer name is not stored raw.
+const MAX_FONT_NAME_BYTES: usize = 128;
 
 /// Every field has a default, so files written by older or newer versions
 /// still load: missing fields take the default and unknown ones are ignored.
@@ -39,8 +41,16 @@ pub struct Settings {
     /// so this field names its own default.
     #[serde(default = "default_terminal_hidden")]
     pub terminal_hidden: bool,
-    /// Font family drawn in the terminal. `None`, blank, or an unknown name
-    /// keeps the built-in monospace. A family name, not a file path.
+    /// Interface typeface. `None`, blank, or an unknown id keeps Ubuntu.
+    /// An id from the bundled catalog, not a file path or a system family.
+    /// A value that is not a string is ignored, so the rest of the file loads.
+    #[serde(default, deserialize_with = "lenient_font")]
+    pub ui_font: Option<String>,
+    /// Font drawn in the terminal. `None`, blank, or an unknown id keeps
+    /// Meslo LGS NF. `builtin` keeps the monospace shipped with the app.
+    /// Any other value is an id from the bundled catalog, not a file path.
+    /// A value that is not a string is ignored, so the rest of the file loads.
+    #[serde(default, deserialize_with = "lenient_font")]
     pub terminal_font: Option<String>,
     /// Width of each commit history column. A value that is not an object
     /// keeps every default; a bad field keeps only its own default.
@@ -139,6 +149,19 @@ where
         .unwrap_or(0))
 }
 
+/// A non-string is not a font id. `null` and any other JSON type become
+/// `None`, which is the same as a missing field.
+fn lenient_font<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(text) => Some(text),
+        _ => None,
+    })
+}
+
 fn lenient_columns<'de, D>(deserializer: D) -> Result<HistoryColumns, D::Error>
 where
     D: Deserializer<'de>,
@@ -158,6 +181,7 @@ impl Default for Settings {
             history_sidebar_hidden: false,
             detail_sidebar_hidden: false,
             terminal_hidden: default_terminal_hidden(),
+            ui_font: None,
             terminal_font: None,
             history_columns: HistoryColumns::default(),
             author_avatars: default_author_avatars(),
@@ -201,7 +225,7 @@ impl Settings {
         let mut settings: Self = serde_json::from_slice(json)
             .map_err(|error| SettingsError::Parse(path.to_path_buf(), error))?;
         settings.normalize_recent();
-        settings.normalize_terminal_font();
+        settings.normalize_fonts();
         Ok(settings)
     }
 
@@ -219,10 +243,10 @@ impl Settings {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(fail)?;
         }
-        // A blank family is not a font. Writing the normalized copy keeps a
+        // A blank id is not a font. Writing the normalized copy keeps a
         // direct field assignment consistent with `load_from`.
         let mut stored = self.clone();
-        stored.normalize_terminal_font();
+        stored.normalize_fonts();
         stored.history_columns = stored.history_columns.normalized();
         let mut json = serde_json::to_vec_pretty(&stored).map_err(|error| fail(error.into()))?;
         json.push(b'\n');
@@ -268,10 +292,18 @@ impl Settings {
         self.last_repository = None;
     }
 
-    /// Stores the terminal font family. Blank and whitespace-only names clear it.
+    /// Stores the interface typeface. Blank names, interior newlines, and a
+    /// name that is empty after sanitizing clear it.
+    pub fn set_ui_font(&mut self, name: Option<String>) {
+        self.ui_font = name;
+        normalize_font_name(&mut self.ui_font);
+    }
+
+    /// Stores the terminal typeface. Blank names, interior newlines, and a
+    /// name that is empty after sanitizing clear it.
     pub fn set_terminal_font(&mut self, name: Option<String>) {
         self.terminal_font = name;
-        self.normalize_terminal_font();
+        normalize_font_name(&mut self.terminal_font);
     }
 
     /// A hand-edited file may repeat or pile up entries.
@@ -287,19 +319,59 @@ impl Settings {
         self.recent_repositories.truncate(MAX_RECENT_REPOSITORIES);
     }
 
-    /// Drops a blank family and trims the rest, so `"  Fira Code  "` is stored
-    /// as `"Fira Code"`.
-    fn normalize_terminal_font(&mut self) {
-        let Some(name) = self.terminal_font.as_deref() else {
-            return;
-        };
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
-            self.terminal_font = None;
-        } else if trimmed.len() != name.len() {
-            self.terminal_font = Some(trimmed.to_owned());
-        }
+    fn normalize_fonts(&mut self) {
+        normalize_font_name(&mut self.ui_font);
+        normalize_font_name(&mut self.terminal_font);
     }
+}
+
+/// Drops a blank id and stores [`sanitize_font_name`] for the rest.
+fn normalize_font_name(slot: &mut Option<String>) {
+    let Some(name) = slot.as_deref() else {
+        return;
+    };
+    match sanitize_font_name(name) {
+        Some(clean) if clean == name => {}
+        other => *slot = other,
+    }
+}
+
+/// Font id safe to store and to show in a warning.
+///
+/// Trims, strips bidi controls (U+202A–U+202E and U+2066–U+2069), and keeps
+/// at most 128 bytes. An interior newline is rejected, and so is a name that
+/// is empty afterwards. The stored value is this sanitized token, or `None`.
+pub fn sanitize_font_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || has_interior_newline(trimmed) {
+        return None;
+    }
+    let stripped: String = trimmed.chars().filter(|ch| !is_bidi_control(*ch)).collect();
+    let stripped = stripped.trim();
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(truncate_to_bytes(stripped, MAX_FONT_NAME_BYTES))
+    }
+}
+
+fn has_interior_newline(name: &str) -> bool {
+    name.contains(['\n', '\r'])
+}
+
+fn is_bidi_control(ch: char) -> bool {
+    matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+fn truncate_to_bytes(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
 }
 
 fn save_lock() -> &'static Mutex<()> {
@@ -520,6 +592,134 @@ mod tests {
         assert_eq!(settings.terminal_font, None);
         settings.set_terminal_font(Some("  IBM Plex Mono  ".to_owned()));
         assert_eq!(settings.terminal_font.as_deref(), Some("IBM Plex Mono"));
+    }
+
+    #[test]
+    fn ui_font_trims_and_old_files_keep_the_default() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        fs::write(&path, r#"{ "theme": "abyss" }"#).expect("write");
+        assert_eq!(Settings::load_from(&path).expect("old file").ui_font, None);
+
+        let settings = Settings {
+            ui_font: Some("inter".to_owned()),
+            ..Settings::default()
+        };
+        settings.save_to(&path).expect("save");
+        assert_eq!(Settings::load_from(&path).expect("load"), settings);
+
+        let padded = Settings {
+            ui_font: Some("  aspekta  ".to_owned()),
+            ..Settings::default()
+        };
+        padded.save_to(&path).expect("save");
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
+        assert_eq!(value["ui_font"], "aspekta");
+
+        let mut settings = Settings::default();
+        settings.set_ui_font(Some("   ".to_owned()));
+        assert_eq!(settings.ui_font, None);
+        settings.set_ui_font(Some("  obel-mono  ".to_owned()));
+        assert_eq!(settings.ui_font.as_deref(), Some("obel-mono"));
+    }
+
+    #[test]
+    fn bad_font_field_keeps_the_theme() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+
+        fs::write(&path, r#"{"ui_font": 1, "theme": "abyss"}"#).expect("write");
+        let loaded = Settings::load_from(&path).expect("load");
+        assert_eq!(loaded.theme.as_deref(), Some("abyss"));
+        assert_eq!(loaded.ui_font, None);
+
+        fs::write(
+            &path,
+            r#"{"terminal_font": [], "theme": "abyss", "recent_repositories": ["/src/rlyeh"]}"#,
+        )
+        .expect("write");
+        let loaded = Settings::load_from(&path).expect("load");
+        assert_eq!(loaded.theme.as_deref(), Some("abyss"));
+        assert_eq!(loaded.terminal_font, None);
+        assert_eq!(
+            loaded.recent_repositories,
+            vec![PathBuf::from("/src/rlyeh")]
+        );
+
+        fs::write(&path, r#"{"ui_font": "Comic Sans", "theme": "abyss"}"#).expect("write");
+        let loaded = Settings::load_from(&path).expect("load");
+        assert_eq!(loaded.ui_font.as_deref(), Some("Comic Sans"));
+        assert_eq!(loaded.theme.as_deref(), Some("abyss"));
+    }
+
+    #[test]
+    fn hostile_font_ids_round_trip_and_unknown_names_stay_stored() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path(&dir);
+        let mut settings = Settings::default();
+        settings.set_ui_font(Some("  obel-mono \n".to_owned()));
+        settings.set_terminal_font(Some("  Fira Code \n".to_owned()));
+        settings.save_to(&path).expect("save");
+
+        let loaded = Settings::load_from(&path).expect("load");
+        assert_eq!(loaded.ui_font.as_deref(), Some("obel-mono"));
+        assert_eq!(loaded.terminal_font.as_deref(), Some("Fira Code"));
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
+        assert_eq!(value["ui_font"], "obel-mono");
+        assert_eq!(value["terminal_font"], "Fira Code");
+    }
+
+    #[test]
+    fn hostile_font_names_are_stored_sanitized() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path(&dir);
+        let huge = "a".repeat(100_000);
+        let mut settings = Settings::default();
+        settings.set_ui_font(Some(huge.clone()));
+        assert_eq!(settings.ui_font.as_deref(), Some("a".repeat(128).as_str()));
+        assert_ne!(settings.ui_font.as_deref(), Some(huge.as_str()));
+
+        settings.set_terminal_font(Some("\u{202E}obel-mono".to_owned()));
+        let stored = settings.terminal_font.clone().expect("sanitized");
+        assert_eq!(stored, "obel-mono");
+        assert!(!stored.contains('\u{202E}'));
+
+        settings.set_ui_font(Some("obel\nmono".to_owned()));
+        assert_eq!(settings.ui_font, None);
+        settings.set_terminal_font(Some("fira\rmono".to_owned()));
+        assert_eq!(settings.terminal_font, None);
+        settings.set_terminal_font(Some("\u{202E}".to_owned()));
+        assert_eq!(settings.terminal_font, None);
+
+        let accented = "é".repeat(100);
+        settings.set_ui_font(Some(accented));
+        let stored = settings.ui_font.clone().expect("truncated");
+        assert_eq!(stored.len(), 128);
+        assert_eq!(stored, "é".repeat(64));
+
+        settings.set_ui_font(Some(huge));
+        settings.set_terminal_font(Some("meslo\u{202E}".to_owned()));
+        settings.save_to(&path).expect("save");
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(!text.contains(&"a".repeat(200)));
+        assert!(!text.contains('\u{202E}'));
+        let loaded = Settings::load_from(&path).expect("load");
+        assert_eq!(loaded.ui_font.as_deref(), Some("a".repeat(128).as_str()));
+        assert_eq!(loaded.terminal_font.as_deref(), Some("meslo"));
+
+        fs::write(
+            &path,
+            "{\"ui_font\":\"obel\\nmono\",\"terminal_font\":\"\\u202EFira\",\"theme\":\"abyss\"}\n",
+        )
+        .expect("write");
+        let loaded = Settings::load_from(&path).expect("load");
+        assert_eq!(loaded.theme.as_deref(), Some("abyss"));
+        assert_eq!(loaded.ui_font, None);
+        assert_eq!(loaded.terminal_font.as_deref(), Some("Fira"));
     }
 
     #[test]

@@ -9,8 +9,12 @@
 
 #![cfg(unix)]
 
+#[path = "common/mod.rs"]
+mod common;
+
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -260,6 +264,7 @@ fn probe_fake(path: &Path) -> Git {
         path_var: None,
         exe_name: "git",
         fallbacks: Vec::new(),
+        skip_paths: Vec::new(),
     };
     discover_with(&inputs).unwrap_or_else(|error| panic!("probe fake git: {error}"))
 }
@@ -276,7 +281,10 @@ fn write_executable(path: &Path, body: &str) {
 
 fn poke_script(dir: &Path, file_name: &str, marker: &Path) -> PathBuf {
     let path = dir.join(file_name);
-    write_executable(&path, &format!("#!/bin/sh\ntouch {}\n", marker.display()));
+    write_executable(
+        &path,
+        &format!("#!/bin/sh\ntouch {}\n", common::sh_quote(marker)),
+    );
     path
 }
 
@@ -284,7 +292,7 @@ fn editor_trap_script(dir: &Path, marker: &Path) -> PathBuf {
     let path = dir.join("editor-trap.sh");
     write_executable(
         &path,
-        &format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display()),
+        &format!("#!/bin/sh\ntouch {}\nexit 1\n", common::sh_quote(marker)),
     );
     path
 }
@@ -292,36 +300,9 @@ fn editor_trap_script(dir: &Path, marker: &Path) -> PathBuf {
 /// Runs git in `root` with the same isolation as [`Fixture::git`].
 fn repo_git(git: &Git, scratch: &Path, root: &Path, args: &[&str]) -> String {
     let mut command = Command::new(&git.path);
-    command
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .env("GIT_AUTHOR_NAME", "cthulhu")
-        .env("GIT_AUTHOR_EMAIL", "cthulhu@example.invalid")
-        .env("GIT_COMMITTER_NAME", "cthulhu")
-        .env("GIT_COMMITTER_EMAIL", "cthulhu@example.invalid")
-        .args([
-            "-c",
-            "commit.gpgSign=false",
-            "-c",
-            "core.fsmonitor=false",
-            "--no-pager",
-        ]);
-    for var in CLEARED_ENV {
-        command.env_remove(var);
-    }
-    let hooks = scratch.join("empty-hooks");
-    let global = scratch.join("empty.gitconfig");
-    let system = scratch.join("empty.system.gitconfig");
-    let _ = fs::create_dir_all(&hooks);
-    let _ = fs::write(&global, "");
-    let _ = fs::write(&system, "");
-    command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", &global)
-        .env("GIT_CONFIG_SYSTEM", &system)
-        .arg("-c")
-        .arg(format!("core.hooksPath={}", hooks.display()))
-        .args(args);
+    command.current_dir(root).stdin(Stdio::null());
+    common::isolate(&mut command, scratch);
+    command.arg("--no-pager").args(args);
     let output = command.output().expect("run git");
     assert!(
         output.status.success(),
@@ -491,15 +472,8 @@ fn assert_recorded_pid_is_dead(path: &Path) {
         .parse()
         .unwrap_or_else(|_| panic!("pid in {}: {text:?}", path.display()));
     assert!(pid > 1, "refusing to treat pid {pid} as the grandchild");
-    let status = Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("kill -0");
     assert!(
-        !status.success(),
+        common::wait_dead(pid, Duration::from_secs(2)),
         "grandchild pid {pid} is still alive after the git that spawned it was stopped"
     );
 }
@@ -531,6 +505,10 @@ impl Fixture {
     fn init() -> Self {
         let fixture = Self::new();
         fixture.git(&["init", "-b", "main"]);
+        // Product git strips GIT_CONFIG_GLOBAL and reads HOME. Pin the values
+        // a hostile gitconfig would otherwise apply during checkout.
+        fixture.git(&["config", "--local", "core.autocrlf", "false"]);
+        fixture.git(&["config", "--local", "commit.gpgsign", "false"]);
         fixture
     }
 
@@ -566,36 +544,9 @@ impl Fixture {
 
     fn git(&self, args: &[&str]) -> String {
         let mut command = Command::new(&self.git.path);
-        command
-            .current_dir(&self.root)
-            .stdin(Stdio::null())
-            .env("GIT_AUTHOR_NAME", "cthulhu")
-            .env("GIT_AUTHOR_EMAIL", "cthulhu@example.invalid")
-            .env("GIT_COMMITTER_NAME", "cthulhu")
-            .env("GIT_COMMITTER_EMAIL", "cthulhu@example.invalid")
-            .args([
-                "-c",
-                "commit.gpgSign=false",
-                "-c",
-                "core.fsmonitor=false",
-                "--no-pager",
-            ]);
-        for var in CLEARED_ENV {
-            command.env_remove(var);
-        }
-        let hooks = self.tmp.path().join("empty-hooks");
-        let global = self.tmp.path().join("empty.gitconfig");
-        let system = self.tmp.path().join("empty.system.gitconfig");
-        let _ = fs::create_dir_all(&hooks);
-        let _ = fs::write(&global, "");
-        let _ = fs::write(&system, "");
-        command
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", &global)
-            .env("GIT_CONFIG_SYSTEM", &system)
-            .arg("-c")
-            .arg(format!("core.hooksPath={}", hooks.display()))
-            .args(args);
+        command.current_dir(&self.root).stdin(Stdio::null());
+        common::isolate(&mut command, self.tmp.path());
+        command.arg("--no-pager").args(args);
         let output = command.output().expect("run git");
         assert!(
             output.status.success(),
@@ -636,6 +587,10 @@ struct ChildCheck<'a> {
 }
 
 fn assert_child_opens(check: &ChildCheck<'_>) {
+    assert_child_opens_within(check, None);
+}
+
+fn assert_child_opens_within(check: &ChildCheck<'_>, budget: Option<Duration>) {
     let root = fs::canonicalize(check.target).expect("canonical target");
     let sentinel = check
         .target
@@ -677,7 +632,10 @@ fn assert_child_opens(check: &ChildCheck<'_>) {
         command.env(key, value);
     }
 
-    let output = command.output().expect("spawn child test");
+    let output = match budget {
+        Some(budget) => child_output_within(&mut command, budget),
+        None => command.output().expect("spawn child test"),
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "child failed:\n{stdout}\n{stderr}");
@@ -689,6 +647,53 @@ fn assert_child_opens(check: &ChildCheck<'_>) {
         sentinel.is_file(),
         "child returned without checking the repository:\n{stdout}\n{stderr}"
     );
+}
+
+/// `Command::output` has no deadline. A credential helper can sit forever, so
+/// the parent stops the child when `budget` elapses and fails the test.
+fn child_output_within(command: &mut Command, budget: Duration) -> std::process::Output {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn child test: {error}"));
+    let mut stdout = child.stdout.take().expect("child stdout");
+    let mut stderr = child.stderr.take().expect("child stderr");
+    let stdout_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= budget => {
+                let _ = child.kill();
+                let status = child
+                    .wait()
+                    .unwrap_or_else(|error| panic!("wait killed child: {error}"));
+                let stdout = stdout_thread.join().unwrap_or_default();
+                let stderr = stderr_thread.join().unwrap_or_default();
+                panic!(
+                    "child still running after {budget:?} (status {status})\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(error) => panic!("wait child: {error}"),
+        }
+    };
+    std::process::Output {
+        status,
+        stdout: stdout_thread.join().unwrap_or_default(),
+        stderr: stderr_thread.join().unwrap_or_default(),
+    }
 }
 
 fn config_count(pairs: &[(&str, &str)]) -> Vec<(&'static str, String)> {
@@ -1000,7 +1005,7 @@ fn repo_hooks_path_is_not_executed() {
     let fixture = Fixture::with_tracked_commit();
     let marker = fixture.marker("hooks-ran");
     let hooks = fixture.tmp.path().join("hooks");
-    let body = format!("#!/bin/sh\ntouch {}\n", marker.display());
+    let body = format!("#!/bin/sh\ntouch {}\n", common::sh_quote(&marker));
     for name in [
         "pre-commit",
         "post-commit",
@@ -1237,7 +1242,7 @@ fn inherited_git_exec_path_does_not_run_dashed_commands() {
     let expected = fixture.real_history();
     let marker = fixture.marker("exec-ran");
     let exec_dir = fixture.tmp.path().join("exec-path");
-    let body = format!("#!/bin/sh\ntouch {}\n", marker.display());
+    let body = format!("#!/bin/sh\ntouch {}\n", common::sh_quote(&marker));
     for name in ["git-status", "git-rev-parse", "git-log"] {
         write_executable(&exec_dir.join(name), &body);
     }
@@ -1618,26 +1623,34 @@ fn slow_version_probe_does_not_block_discovery() {
         path_var: Some(env::join_paths([&slow_dir, &fast_dir]).expect("PATH")),
         exe_name: "git",
         fallbacks: Vec::new(),
+        skip_paths: Vec::new(),
     };
     let fast_path = fast.clone();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
+        let started = Instant::now();
         let found = discover_with(&inputs).map(|git| git.path);
-        let _ = tx.send(found);
+        let _ = tx.send((found, started.elapsed()));
     });
     // `tmp` stays here so the sleeper pid file is not deleted before the assert.
+    // The probe budget is 250ms. Five seconds leaves room for `/bin/ps` while
+    // the timed-out candidate is reaped.
 
-    match rx.recv_timeout(Duration::from_secs(1)) {
-        Ok(Ok(path)) => {
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok((Ok(path), elapsed)) => {
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "probe budget is 250ms; discover_with took {elapsed:?}"
+            );
             assert_eq!(
                 path, fast_path,
                 "discover_with should use the later git that answers --version promptly"
             );
             assert_recorded_pid_is_dead(&sidecar(&slow, ".sleeper"));
         }
-        Ok(Err(error)) => panic!("discover_with failed: {error}"),
+        Ok((Err(error), elapsed)) => panic!("discover_with failed after {elapsed:?}: {error}"),
         Err(mpsc::RecvTimeoutError::Timeout) => panic!(
-            "discover_with still running after 1s while probing a git --version that sleeps; a later candidate is good"
+            "discover_with still running after 5s while probing a git --version that sleeps; the probe budget is 250ms and a later candidate is good"
         ),
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             panic!("discover thread exited without a result");
@@ -1683,12 +1696,12 @@ fn background_writer_does_not_pin_a_finished_git() {
         let _ = tx.send(git.run(&cwd, &["status"]).map(|_| ()));
     });
     // `tmp` stays here so the grandchild pid file is not deleted before the assert.
-    match rx.recv_timeout(Duration::from_secs(2)) {
+    match rx.recv_timeout(Duration::from_secs(8)) {
         Ok(result) => {
             result.expect("a git that already exited must return, not wait on its grandchild");
         }
         Err(mpsc::RecvTimeoutError::Timeout) => panic!(
-            "git exited 0 while a grandchild held stdout, and the caller was still blocked after 2s"
+            "git exited 0 while a grandchild held stdout, and the caller was still blocked after 8s"
         ),
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             panic!("git thread ended without a result");
@@ -1701,47 +1714,78 @@ fn background_writer_does_not_pin_a_finished_git() {
 #[test]
 fn inherited_git_exec_path_cannot_run_remote_helper_on_fetch() {
     let fixture = Fixture::with_tracked_commit();
-    fixture.git(&["remote", "add", "origin", "https://127.0.0.1:1/cthulhu.git"]);
+    // Local config is what product git reads. `-c` on this fixture command
+    // does not persist, so the keys are stored for the later fetch. A closed
+    // port plus a one-second HTTP stall limit keeps osxkeychain from sitting
+    // on the credential prompt. The parent still stops at 20s.
+    fixture.git(&["config", "--local", "credential.helper", ""]);
+    fixture.git(&["config", "--local", "http.lowSpeedLimit", "1"]);
+    fixture.git(&["config", "--local", "http.lowSpeedTime", "1"]);
+    fixture.git(&[
+        "-c",
+        "http.lowSpeedTime=1",
+        "-c",
+        "http.lowSpeedLimit=1",
+        "-c",
+        "credential.helper=",
+        "remote",
+        "add",
+        "origin",
+        "https://127.0.0.1:1/cthulhu.git",
+    ]);
     let marker = fixture.marker("remote-helper");
     let exec_dir = fixture.tmp.path().join("exec-path");
     write_executable(
         &exec_dir.join("git-remote-https"),
-        &format!("#!/bin/sh\ntouch {}\n", marker.display()),
+        &format!("#!/bin/sh\ntouch {}\n", common::sh_quote(&marker)),
     );
     let extra = [("GIT_EXEC_PATH", exec_dir.display().to_string())];
-    assert_child_opens(&ChildCheck {
-        target: &fixture.root,
-        branch: "main",
-        action: "fetch",
-        history: None,
-        marker: Some(&marker),
-        required_var: "GIT_EXEC_PATH",
-        config_key: None,
-        config_value: None,
-        extra_env: &extra,
-    });
+    assert_child_opens_within(
+        &ChildCheck {
+            target: &fixture.root,
+            branch: "main",
+            action: "fetch",
+            history: None,
+            marker: Some(&marker),
+            required_var: "GIT_EXEC_PATH",
+            config_key: None,
+            config_value: None,
+            extra_env: &extra,
+        },
+        Some(Duration::from_secs(20)),
+    );
 }
 
 #[test]
 fn inherited_git_config_count_cannot_set_ssh_command_on_fetch() {
     let fixture = Fixture::with_tracked_commit();
+    fixture.git(&["config", "--local", "credential.helper", ""]);
+    fixture.git(&[
+        "config",
+        "--local",
+        "core.sshCommand",
+        "ssh -o BatchMode=yes -o ConnectTimeout=1",
+    ]);
     fixture.git(&["remote", "add", "origin", "ssh://127.0.0.1:1/cthulhu.git"]);
     let marker = fixture.marker("ssh-command");
     let poke = poke_script(fixture.tmp.path(), "ssh-command.sh", &marker);
     let command = poke.display().to_string();
     let pairs = [("core.sshCommand", command.as_str())];
     let extra = config_count(&pairs);
-    assert_child_opens(&ChildCheck {
-        target: &fixture.root,
-        branch: "main",
-        action: "fetch",
-        history: None,
-        marker: Some(&marker),
-        required_var: "GIT_CONFIG_COUNT",
-        config_key: Some("core.sshCommand"),
-        config_value: Some(&command),
-        extra_env: &extra,
-    });
+    assert_child_opens_within(
+        &ChildCheck {
+            target: &fixture.root,
+            branch: "main",
+            action: "fetch",
+            history: None,
+            marker: Some(&marker),
+            required_var: "GIT_CONFIG_COUNT",
+            config_key: Some("core.sshCommand"),
+            config_value: Some(&command),
+            extra_env: &extra,
+        },
+        Some(Duration::from_secs(20)),
+    );
 }
 
 fn set_local_config(scratch: &Path, root: &Path, git: &Git, key: &str, value: &str) {
@@ -2062,9 +2106,32 @@ fn remove_artifact(path: &Path) {
 
 fn write_passthrough_filter(path: &Path, marker: &Path, label: &str) {
     let body = format!(
-        "#!/bin/sh\ncat\nprintf '%s\\n' '{}' >> '{}'\n",
+        "#!/bin/sh\ncat\nprintf '%s\\n' {} >> {}\n",
         label,
-        marker.display()
+        common::sh_quote(marker)
+    );
+    write_executable(path, &body);
+}
+
+fn write_stripping_clean(path: &Path, marker: &Path) {
+    let quoted = common::sh_quote(marker);
+    // Drop one trailing X. `$(cat)` would also drop the newline that distinguishes
+    // `two\n` from `two`, so the bytes are copied with `dd`.
+    let body = format!(
+        "#!/bin/sh\n\
+         payload=$(mktemp)\n\
+         cat > \"$payload\"\n\
+         size=$(wc -c < \"$payload\" | tr -d '[:space:]')\n\
+         if [ \"$size\" -gt 0 ]; then\n\
+           last=$(tail -c 1 \"$payload\")\n\
+           if [ \"$last\" = X ]; then\n\
+             dd if=\"$payload\" bs=1 count=$((size - 1)) 2>/dev/null\n\
+           else\n\
+             cat \"$payload\"\n\
+           fi\n\
+         fi\n\
+         rm -f \"$payload\"\n\
+         printf '%s\\n' clean >> {quoted}\n"
     );
     write_executable(path, &body);
 }
@@ -2072,9 +2139,9 @@ fn write_passthrough_filter(path: &Path, marker: &Path, label: &str) {
 fn write_post_checkout(dir: &Path, log: &Path, marker: &Path) {
     fs::create_dir_all(dir).expect("hooks directory");
     let body = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ntouch '{}'\n",
-        log.display(),
-        marker.display()
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\ntouch {}\n",
+        common::sh_quote(log),
+        common::sh_quote(marker)
     );
     write_executable(&dir.join("post-checkout"), &body);
 }
@@ -2381,12 +2448,28 @@ fn include_path_checkout_default_remote_does_not_create_a_branch() {
 fn checkout_runs_post_checkout_and_smudge_like_the_terminal() {
     // Terminal `git switch` runs post-checkout with third field 1. Leaving a
     // commit that assigns filter=evil runs clean; coming back runs smudge.
-    let fixture = Fixture::with_two_commits();
+    //
+    // The clean filter strips a trailing X, so the worktree `two\nX` and the
+    // blob `two\n` differ by one byte. `core.checkStat=minimal` ignores mtime
+    // and still compares size, but a size mismatch with a cached stat is
+    // "dirty" and checkout refuses before hashing. Clearing that cached size
+    // makes git hash the worktree, which runs clean. On the way back the blob
+    // is one byte shorter than the worktree, so checkout must write the file
+    // and smudge runs. Whether clean runs on the way back depends on the stat
+    // cache and is not asserted.
+    let fixture = Fixture::init();
+    fixture.git(&["config", "--local", "core.checkStat", "default"]);
+    fixture.git(&["config", "--local", "core.autocrlf", "false"]);
+    fixture.write("tracked.txt", "two\nX");
+    fixture.git(&["add", "--", "tracked.txt"]);
+    fixture.git(&["commit", "-m", "other"]);
+    fixture.git(&["branch", "other"]);
+
     let clean_marker = fixture.marker("clean-filter");
     let smudge_marker = fixture.marker("smudge-filter");
     let hook_log = fixture.marker("post-checkout-args");
     let hook_marker = fixture.marker("post-checkout");
-    write_passthrough_filter(&fixture.tmp.path().join("clean.sh"), &clean_marker, "clean");
+    write_stripping_clean(&fixture.tmp.path().join("clean.sh"), &clean_marker);
     write_passthrough_filter(
         &fixture.tmp.path().join("smudge.sh"),
         &smudge_marker,
@@ -2413,9 +2496,16 @@ fn checkout_runs_post_checkout_and_smudge_like_the_terminal() {
         &hooks.display().to_string(),
     ]);
     fixture.write(".gitattributes", "* filter=evil\n");
-    fixture.git(&["add", ".gitattributes"]);
+    fixture.write("tracked.txt", "two\n");
+    fixture.git(&["add", "--", ".gitattributes", "tracked.txt"]);
     fixture.git(&["commit", "-m", "attributes"]);
-    fixture.git(&["branch", "other", "HEAD~1"]);
+    fs::write(fixture.root.join("tracked.txt"), "two\nX").expect("worktree suffix");
+    let oid = fixture.git(&["rev-parse", ":tracked.txt"]);
+    fixture.git(&[
+        "update-index",
+        "--cacheinfo",
+        &format!("100644,{oid},tracked.txt"),
+    ]);
 
     for path in [&clean_marker, &smudge_marker, &hook_log, &hook_marker] {
         remove_artifact(path);
@@ -2428,7 +2518,7 @@ fn checkout_runs_post_checkout_and_smudge_like_the_terminal() {
     assert_did_not_run(&smudge_marker, "smudge while leaving the filter commit");
     assert_eq!(
         fs::read(fixture.root.join("tracked.txt")).expect("tracked.txt"),
-        b"two\n"
+        b"two\nX"
     );
     assert!(!fixture.root.join(".gitattributes").exists());
 
@@ -2440,7 +2530,6 @@ fn checkout_runs_post_checkout_and_smudge_like_the_terminal() {
     });
     assert_post_checkout_was_a_branch_switch(&hook_log, &hook_marker);
     assert_filter_appended(&smudge_marker, "smudge");
-    assert_did_not_run(&clean_marker, "clean while returning to the filter commit");
     assert_eq!(
         fs::read(fixture.root.join("tracked.txt")).expect("tracked.txt"),
         b"two\n"

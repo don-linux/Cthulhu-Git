@@ -16,6 +16,13 @@ use resvg::{tiny_skia, usvg};
 
 const ICON_SVG: &str = "assets/icon.svg";
 
+/// Host program name. The build script runs on the host, even when the
+/// target is Windows, so this is not `CARGO_CFG_TARGET_OS`.
+#[cfg(windows)]
+const GIT_PROGRAM: &str = "git.exe";
+#[cfg(not(windows))]
+const GIT_PROGRAM: &str = "git";
+
 /// The sizes Windows asks for across Explorer views, the taskbar and
 /// high-DPI scaling.
 const WINDOWS_ICON_SIZES: [u32; 8] = [16, 20, 24, 32, 40, 48, 64, 256];
@@ -23,12 +30,13 @@ const WINDOWS_ICON_SIZES: [u32; 8] = [16, 20, 24, 32, 40, 48, 64, 256];
 const UI_ICONS_DIR: &str = "assets/icons";
 
 /// Interface icons, by file name without `.svg`. Must match `src/ui/icons.rs`.
-const UI_ICONS: [&str; 14] = [
+const UI_ICONS: [&str; 15] = [
     "panel-left",
     "panel-right",
     "house",
     "git-branch",
     "terminal",
+    "type",
     "settings",
     "arrow-left",
     "cloud-download",
@@ -128,6 +136,11 @@ fn embed_windows_resources(tree: &usvg::Tree, out_dir: &Path) {
     let file = fs::File::create(&ico_path).expect("create cthulhu-git.ico");
     icon_dir.write(file).expect("write cthulhu-git.ico");
 
+    // The script is the icon and VERSIONINFO only. A longPathAware manifest
+    // in the same windres invocation is not optional in practice: if the
+    // resource compiler rejects the manifest, the icon and version info are
+    // dropped with it. The Windows release job requires both, so the manifest
+    // stays out.
     let rc_path = out_dir.join("cthulhu-git.rc");
     fs::write(&rc_path, resource_script(&ico_path)).expect("write cthulhu-git.rc");
     // A missing resource compiler only warns, so `cargo check --target
@@ -148,7 +161,7 @@ fn resource_script(ico_path: &Path) -> String {
     let numeric = ["MAJOR", "MINOR", "PATCH"]
         .map(|part| env::var(format!("CARGO_PKG_VERSION_{part}")).expect("version part"))
         .join(",");
-    let ico_path = ico_path.display().to_string().replace('\\', "\\\\");
+    let ico_path = windres_quoted(&ico_path.display().to_string());
     format!(
         r#"1 ICON "{ico_path}"
 
@@ -198,8 +211,13 @@ fn embed_source_revision() {
             }
         }
     }
-    let commit = git_line(&["rev-parse", "HEAD"]);
-    let date = git_line(&["log", "-1", "--format=%cs"]);
+    let git = git_executable();
+    let commit = git
+        .as_deref()
+        .and_then(|program| git_line(program, &["rev-parse", "HEAD"]));
+    let date = git
+        .as_deref()
+        .and_then(|program| git_line(program, &["log", "-1", "--format=%cs"]));
     println!(
         "cargo:rustc-env=CTHULHU_GIT_COMMIT={}",
         commit.map_or_else(|| "unknown".to_owned(), |value| sanitize_commit(&value))
@@ -210,8 +228,50 @@ fn embed_source_revision() {
     );
 }
 
-fn git_line(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
+/// windres strings are double-quoted. A quote or backslash in `OUT_DIR`
+/// would end the string early or escape the closing quote.
+fn windres_quoted(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for character in path.chars() {
+        if character == '\\' || character == '"' {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+/// Absolute `git` only. The build script's working directory is the crate
+/// root, so `Command::new("git")` would run a `git` planted next to
+/// `Cargo.toml`. Relative `PATH` entries are skipped for the same reason.
+/// No match still compiles: the embedded revision stays `unknown`.
+fn git_executable() -> Option<PathBuf> {
+    if let Some(path_var) = env::var_os("PATH") {
+        for entry in env::split_paths(&path_var) {
+            if !entry.is_absolute() {
+                continue;
+            }
+            let candidate = entry.join(GIT_PROGRAM);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    for fallback in [
+        "/usr/bin/git",
+        "/usr/local/bin/git",
+        "/opt/homebrew/bin/git",
+    ] {
+        let path = PathBuf::from(fallback);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn git_line(program: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }

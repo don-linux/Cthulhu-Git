@@ -5,7 +5,7 @@
 //! repository chrome is ready before the window appears; the history graph
 //! follows on the worker. A later open stays on a worker because the window
 //! is visible then. Settings are described in `docs/SETTINGS.md`, themes in
-//! `docs/THEMES.md`.
+//! `docs/THEMES.md`, bundled faces in `docs/FONTS.md`.
 
 #[cfg(test)]
 mod adversarial_tests;
@@ -36,7 +36,7 @@ use cthulhu_git::git::{
     self, Branch, CommitDetail, Git, GraphCandidate, GraphTip, Head, HistoryGraph, RepoInfo,
 };
 use cthulhu_git::github::{self as gh, GitHubRepo};
-use cthulhu_git::settings::{HistoryColumns, Settings};
+use cthulhu_git::settings::{HistoryColumns, Settings, SettingsError};
 use eframe::egui;
 
 use avatars::AvatarService;
@@ -89,8 +89,8 @@ pub enum Action {
     ToggleBranchesSidebar,
     ToggleDetailSidebar,
     ToggleTerminal,
+    SetUiFont(Option<String>),
     SetTerminalFont(Option<String>),
-    EnsureFontCatalog,
     /// `upstream` is `%(upstream:short)`, for example `origin/main`.
     Fetch(String),
     Pull,
@@ -124,6 +124,10 @@ pub struct CthulhuApp {
     settings: Settings,
     /// `None` when the OS reports no home folder; settings are then not saved.
     settings_path: Option<PathBuf>,
+    /// `save_settings` writes the file only when this is true. A missing file
+    /// still counts as loaded. A read or parse error does not, so the next
+    /// action cannot replace the user's file with defaults.
+    loaded_ok: bool,
     screen: Screen,
     opening: Option<Opening>,
     picker: Option<FolderPicker>,
@@ -155,19 +159,15 @@ fn avatar_cache_dir() -> Option<PathBuf> {
 impl CthulhuApp {
     pub fn new(ctx: &egui::Context, command_line: Option<PathBuf>) -> Self {
         let settings_path = Settings::default_path();
-        let mut error = None;
-        let settings = match settings_path.as_deref().map(Settings::load_from) {
-            Some(Ok(settings)) => settings,
-            Some(Err(load_error)) => {
-                error = Some(load_error.to_string());
-                Settings::default()
-            }
-            None => {
-                error = Some("No home folder was found, so settings will not be saved.".to_owned());
-                Settings::default()
-            }
-        };
+        let (settings, loaded_ok, error) =
+            loaded_settings(settings_path.as_deref().map(Settings::load_from));
         theme::apply(ctx, theme::resolve(settings.theme.as_deref()));
+        let mut fonts = fonts::FontService::default();
+        fonts.sync(
+            ctx,
+            settings.ui_font.as_deref(),
+            settings.terminal_font.as_deref(),
+        );
 
         let startup = command_line.or_else(|| settings.last_repository.clone());
         // Tests never reach the network.
@@ -184,13 +184,14 @@ impl CthulhuApp {
         let mut app = Self {
             settings,
             settings_path,
+            loaded_ok,
             screen: Screen::Home,
             opening: None,
             picker: None,
             error,
             opened_count: 0,
             settings_open: false,
-            fonts: fonts::FontService::default(),
+            fonts,
             font_preview: None,
             graph_load: None,
             graph_generation: 0,
@@ -373,7 +374,14 @@ impl CthulhuApp {
     }
 
     /// A failed save keeps the app running; the message joins any current error.
+    ///
+    /// A failed load leaves `loaded_ok` false. Writing then would replace the
+    /// file the user still has, including recents, the theme, and
+    /// `github_token_in_keyring`.
     fn save_settings(&mut self) {
+        if !should_persist(self.loaded_ok) {
+            return;
+        }
         let Some(path) = &self.settings_path else {
             return;
         };
@@ -395,6 +403,30 @@ impl CthulhuApp {
     }
 }
 
+/// Whether `save_settings` may replace the file at the real settings path.
+fn should_persist(loaded_ok: bool) -> bool {
+    loaded_ok
+}
+
+/// Settings kept after startup, and whether a later save may write them.
+///
+/// `None` is "no home folder". `Err` is a file that could not be read or
+/// parsed: the window shows the error and keeps the defaults in memory, and
+/// [`should_persist`] stays false so the file is left as it is.
+fn loaded_settings(
+    loaded: Option<Result<Settings, SettingsError>>,
+) -> (Settings, bool, Option<String>) {
+    match loaded {
+        Some(Ok(settings)) => (settings, true, None),
+        Some(Err(error)) => (Settings::default(), false, Some(error.to_string())),
+        None => (
+            Settings::default(),
+            false,
+            Some("No home folder was found, so settings will not be saved.".to_owned()),
+        ),
+    }
+}
+
 impl eframe::App for CthulhuApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.poll_opening(ui.ctx());
@@ -403,8 +435,11 @@ impl eframe::App for CthulhuApp {
         self.poll_picker(ui.ctx());
         self.poll_github(ui.ctx());
         self.avatars.poll(ui.ctx());
-        self.fonts
-            .sync(ui.ctx(), self.settings.terminal_font.as_deref());
+        self.fonts.sync(
+            ui.ctx(),
+            self.settings.ui_font.as_deref(),
+            self.settings.terminal_font.as_deref(),
+        );
         if self.settings_open {
             self.ensure_git_version(ui.ctx());
         }
@@ -440,8 +475,8 @@ impl eframe::App for CthulhuApp {
             };
             settings::show(
                 ui,
+                self.settings.ui_font.as_deref(),
                 self.settings.terminal_font.as_deref(),
-                &self.fonts,
                 &mut self.font_preview,
                 cwd.as_deref(),
                 &view,
@@ -519,12 +554,13 @@ impl eframe::App for CthulhuApp {
                     }
                     self.save_settings();
                 }
+                Action::SetUiFont(name) => {
+                    self.settings.set_ui_font(name);
+                    self.save_settings();
+                }
                 Action::SetTerminalFont(name) => {
                     self.settings.set_terminal_font(name);
                     self.save_settings();
-                }
-                Action::EnsureFontCatalog => {
-                    self.fonts.ensure(ui.ctx(), true);
                 }
                 Action::Fetch(upstream) => {
                     self.start_sync(ui.ctx(), SyncCommand::Fetch(upstream));
@@ -958,5 +994,138 @@ mod selection_tests {
             both.iter()
                 .any(|tip| tip.name == "feature" && !tip.principal && tip.current)
         );
+    }
+}
+
+#[cfg(test)]
+mod settings_load_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use cthulhu_git::settings::Settings;
+    use tempfile::TempDir;
+
+    use super::avatars::AvatarService;
+    use super::github_auth::GitHubAuth;
+    use super::{CthulhuApp, Screen, loaded_settings, should_persist};
+
+    fn app_for_save(
+        settings: Settings,
+        settings_path: Option<PathBuf>,
+        loaded_ok: bool,
+        error: Option<String>,
+    ) -> CthulhuApp {
+        CthulhuApp {
+            settings,
+            settings_path,
+            loaded_ok,
+            screen: Screen::Home,
+            opening: None,
+            picker: None,
+            error,
+            opened_count: 0,
+            settings_open: false,
+            fonts: super::fonts::FontService::default(),
+            font_preview: None,
+            graph_load: None,
+            graph_generation: 0,
+            sync_job: None,
+            avatars: AvatarService::disabled(),
+            github: GitHubAuth::default(),
+            git_version: None,
+            git_probe: None,
+        }
+    }
+
+    /// Makes `path` fail `Settings::load_from` and restores it on drop.
+    ///
+    /// Mode bits are restored only on Unix. Other platforms leave the field
+    /// unread: the load is pointed at a directory instead of a chmod'd file.
+    struct Unreadable<'a> {
+        #[cfg_attr(not(unix), expect(dead_code, reason = "mode restore is Unix-only"))]
+        path: &'a Path,
+    }
+
+    impl<'a> Unreadable<'a> {
+        fn block(path: &'a Path) -> Self {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = fs::metadata(path).expect("metadata").permissions();
+                permissions.set_mode(0o0);
+                fs::set_permissions(path, permissions).expect("chmod");
+            }
+            Self { path }
+        }
+    }
+
+    impl Drop for Unreadable<'_> {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = fs::metadata(self.path).expect("metadata").permissions();
+                permissions.set_mode(0o644);
+                fs::set_permissions(self.path, permissions).expect("restore mode");
+            }
+        }
+    }
+
+    #[test]
+    fn failed_load_never_overwrites_settings_file() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("settings.json");
+        let original = b"{\n  \"github_token_in_keyring\": true,\n  \"theme\": \"abyss\"\n}\n";
+        fs::write(&path, original).expect("write");
+
+        let load_path = blocked_load_path(&path, dir.path());
+        let _guard = Unreadable::block(&path);
+        let loaded = Settings::load_from(&load_path);
+        let (settings, loaded_ok, message) = loaded_settings(Some(loaded));
+        assert!(!loaded_ok);
+        assert!(message.is_some());
+        assert!(!should_persist(loaded_ok));
+
+        let mut app = app_for_save(settings, Some(path.clone()), loaded_ok, message.clone());
+        app.settings.theme = Some("ink".to_owned());
+        app.save_settings();
+        drop(_guard);
+
+        assert_eq!(fs::read(&path).expect("read"), original);
+        assert_eq!(app.error, message);
+    }
+
+    #[test]
+    fn load_failure_sets_loaded_ok_false() {
+        let dir = TempDir::new().expect("temp dir");
+        let missing = dir.path().join("missing.json");
+        let (_, loaded_ok, message) = loaded_settings(Some(Settings::load_from(&missing)));
+        assert!(loaded_ok);
+        assert!(message.is_none());
+        assert!(should_persist(loaded_ok));
+
+        let blocked = dir.path().join("not-a-file");
+        fs::create_dir(&blocked).expect("dir");
+        let (settings, loaded_ok, message) = loaded_settings(Some(Settings::load_from(&blocked)));
+        assert_eq!(settings, Settings::default());
+        assert!(!loaded_ok);
+        assert!(message.is_some());
+        assert!(!should_persist(false));
+
+        let (_, loaded_ok, message) = loaded_settings(None);
+        assert!(!loaded_ok);
+        assert!(message.is_some());
+    }
+
+    /// On Unix the settings file itself is unreadable. Elsewhere a directory
+    /// is not JSON, and the save still targets the original file.
+    #[cfg(unix)]
+    fn blocked_load_path(file: &Path, _dir: &Path) -> PathBuf {
+        file.to_path_buf()
+    }
+
+    #[cfg(not(unix))]
+    fn blocked_load_path(_file: &Path, dir: &Path) -> PathBuf {
+        dir.to_path_buf()
     }
 }

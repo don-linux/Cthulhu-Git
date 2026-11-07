@@ -103,7 +103,8 @@ Stored as JSON in the per-user config folder of each OS, resolved with the
 | Windows | `%APPDATA%\don-linux\cthulhu-git\config\settings.json` |
 
 It holds the theme, the last repository, the recent repositories, which
-sidebars are hidden, the terminal font, the history column widths, whether
+sidebars are hidden, the interface font, the terminal font, the history
+column widths, whether
 author avatars are downloaded, and whether a GitHub token sits in the system
 keychain (never the token itself). It is rewritten atomically on every change.
 How to add a setting: [docs/SETTINGS.md](docs/SETTINGS.md).

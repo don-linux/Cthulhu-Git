@@ -223,6 +223,9 @@ const DETAIL_FORMAT: &str =
 ///
 /// The record is not NUL-terminated. A NUL inside the message stays in
 /// `message` instead of cutting the record short.
+///
+/// `--no-textconv` and `--no-ext-diff` are set so a repository diff driver
+/// cannot run while the commit is only being displayed.
 pub fn latest_commit(
     git: &Git,
     root: &Path,
@@ -237,6 +240,8 @@ pub fn latest_commit(
         "-1",
         "--date=format-local:%Y-%m-%d %H:%M",
         DETAIL_FORMAT,
+        "--no-textconv",
+        "--no-ext-diff",
         "HEAD",
         "--",
     ];
@@ -353,6 +358,9 @@ const HOVER_FORMAT: &str =
 /// `-m --first-parent` makes a merge list what landed on the first parent, as
 /// a normal diff. A commit with one parent is unchanged. Tag lookup is a
 /// second local command; if it fails the commit is still returned.
+///
+/// `--no-textconv` and `--no-ext-diff` keep a repo-local `diff.<driver>`
+/// from executing when the hover opens.
 pub fn commit_hover(git: &Git, root: &Path, oid: &str) -> Result<CommitHover, GitError> {
     if !is_commit_oid(oid) {
         return Err(super::exec::rejected(
@@ -363,6 +371,8 @@ pub fn commit_hover(git: &Git, root: &Path, oid: &str) -> Result<CommitHover, Gi
     let args = [
         "show",
         "--no-color",
+        "--no-textconv",
+        "--no-ext-diff",
         "-m",
         "--first-parent",
         "--numstat",
@@ -568,6 +578,9 @@ const NOTICE_EMPTY: &str = "No line changes.";
 /// The patch of one path. `path` is the post-image path, or the removed path
 /// for a deletion. `:(literal)` keeps a path that starts with `:` from being
 /// read as pathspec magic.
+///
+/// `--no-textconv` and `--no-ext-diff` are required here: `git show -p`
+/// otherwise runs the repository's textconv and external diff commands.
 pub fn file_diff(git: &Git, root: &Path, oid: &str, path: &str) -> Result<FileDiff, GitError> {
     if !is_commit_oid(oid) {
         return Err(super::exec::rejected(
@@ -582,6 +595,8 @@ pub fn file_diff(git: &Git, root: &Path, oid: &str, path: &str) -> Result<FileDi
     let args = [
         "show",
         "--no-color",
+        "--no-textconv",
+        "--no-ext-diff",
         "--format=",
         "-m",
         "--first-parent",
@@ -729,6 +744,9 @@ pub fn short_oid(oid: &str) -> &str {
 ///
 /// `head` comes from [`super::inspect`]; an unborn branch has no commits, so
 /// git is not asked at all (it would fail instead of printing nothing).
+///
+/// `--no-textconv` and `--no-ext-diff` are set so a repository diff driver
+/// cannot run while the history list is displayed.
 pub fn history(git: &Git, root: &Path, head: &Head, limit: usize) -> Result<History, GitError> {
     if matches!(head, Head::Unborn(_)) || limit == 0 {
         return Ok(History::default());
@@ -746,6 +764,8 @@ pub fn history(git: &Git, root: &Path, head: &Head, limit: usize) -> Result<Hist
         "-z",
         "--format=%H%x1f%s",
         "--no-color",
+        "--no-textconv",
+        "--no-ext-diff",
         "HEAD",
         "--",
     ];
@@ -764,22 +784,37 @@ pub fn history(git: &Git, root: &Path, head: &Head, limit: usize) -> Result<Hist
 
 /// Parses `git log -z --format=%H%x1f%s`: NUL-terminated records of
 /// `<oid> 0x1f <subject>`.
+///
+/// `-z` ends a record on NUL, so a NUL inside the subject ends that subject.
+/// Bytes after it are another commit only when they contain a field
+/// separator. A tail with none is discarded; otherwise that one subject
+/// would reject every commit already parsed. A record that fails validation
+/// still rejects the whole log.
 pub(crate) fn parse_log(stdout: &[u8]) -> Option<Vec<Commit>> {
-    stdout
+    let mut commits = Vec::new();
+    for record in stdout
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
-        .map(|record| {
-            let separator = record.iter().position(|byte| *byte == FIELD_SEPARATOR)?;
-            let (oid, summary) = (&record[..separator], &record[separator + 1..]);
-            if oid.is_empty() || !oid.iter().all(u8::is_ascii_hexdigit) {
-                return None;
-            }
-            Some(Commit {
-                oid: String::from_utf8_lossy(oid).into_owned(),
-                summary: String::from_utf8_lossy(summary).into_owned(),
-            })
-        })
-        .collect()
+    {
+        match parse_log_record(record) {
+            Some(commit) => commits.push(commit),
+            None if commits.is_empty() || record.contains(&FIELD_SEPARATOR) => return None,
+            None => {}
+        }
+    }
+    Some(commits)
+}
+
+fn parse_log_record(record: &[u8]) -> Option<Commit> {
+    let separator = record.iter().position(|byte| *byte == FIELD_SEPARATOR)?;
+    let (oid, summary) = (&record[..separator], &record[separator + 1..]);
+    if oid.is_empty() || !oid.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    Some(Commit {
+        oid: String::from_utf8_lossy(oid).into_owned(),
+        summary: String::from_utf8_lossy(summary).into_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -838,6 +873,17 @@ mod tests {
     fn subject_may_contain_the_separator() {
         let commits = parse_log(&record(OID_A, b"a\x1fb")).expect("parsable");
         assert_eq!(commits[0].summary, "a\u{1f}b");
+    }
+
+    #[test]
+    fn nul_in_subject_keeps_the_prefix_and_the_commit() {
+        let mut stdout = OID_A.as_bytes().to_vec();
+        stdout.push(FIELD_SEPARATOR);
+        stdout.extend_from_slice(b"subject with NUL\0 and more\0");
+        let commits = parse_log(&stdout).expect("a NUL in the subject must not drop the history");
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].oid, OID_A);
+        assert_eq!(commits[0].summary, "subject with NUL");
     }
 
     #[test]
