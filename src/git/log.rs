@@ -784,22 +784,37 @@ pub fn history(git: &Git, root: &Path, head: &Head, limit: usize) -> Result<Hist
 
 /// Parses `git log -z --format=%H%x1f%s`: NUL-terminated records of
 /// `<oid> 0x1f <subject>`.
+///
+/// `-z` ends a record on NUL, so a NUL inside the subject ends that subject.
+/// Bytes after it are another commit only when they contain a field
+/// separator. A tail with none is discarded; otherwise that one subject
+/// would reject every commit already parsed. A record that fails validation
+/// still rejects the whole log.
 pub(crate) fn parse_log(stdout: &[u8]) -> Option<Vec<Commit>> {
-    stdout
+    let mut commits = Vec::new();
+    for record in stdout
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
-        .map(|record| {
-            let separator = record.iter().position(|byte| *byte == FIELD_SEPARATOR)?;
-            let (oid, summary) = (&record[..separator], &record[separator + 1..]);
-            if oid.is_empty() || !oid.iter().all(u8::is_ascii_hexdigit) {
-                return None;
-            }
-            Some(Commit {
-                oid: String::from_utf8_lossy(oid).into_owned(),
-                summary: String::from_utf8_lossy(summary).into_owned(),
-            })
-        })
-        .collect()
+    {
+        match parse_log_record(record) {
+            Some(commit) => commits.push(commit),
+            None if commits.is_empty() || record.contains(&FIELD_SEPARATOR) => return None,
+            None => {}
+        }
+    }
+    Some(commits)
+}
+
+fn parse_log_record(record: &[u8]) -> Option<Commit> {
+    let separator = record.iter().position(|byte| *byte == FIELD_SEPARATOR)?;
+    let (oid, summary) = (&record[..separator], &record[separator + 1..]);
+    if oid.is_empty() || !oid.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    Some(Commit {
+        oid: String::from_utf8_lossy(oid).into_owned(),
+        summary: String::from_utf8_lossy(summary).into_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -858,6 +873,17 @@ mod tests {
     fn subject_may_contain_the_separator() {
         let commits = parse_log(&record(OID_A, b"a\x1fb")).expect("parsable");
         assert_eq!(commits[0].summary, "a\u{1f}b");
+    }
+
+    #[test]
+    fn nul_in_subject_keeps_the_prefix_and_the_commit() {
+        let mut stdout = OID_A.as_bytes().to_vec();
+        stdout.push(FIELD_SEPARATOR);
+        stdout.extend_from_slice(b"subject with NUL\0 and more\0");
+        let commits = parse_log(&stdout).expect("a NUL in the subject must not drop the history");
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].oid, OID_A);
+        assert_eq!(commits[0].summary, "subject with NUL");
     }
 
     #[test]
