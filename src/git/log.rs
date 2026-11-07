@@ -223,6 +223,9 @@ const DETAIL_FORMAT: &str =
 ///
 /// The record is not NUL-terminated. A NUL inside the message stays in
 /// `message` instead of cutting the record short.
+///
+/// `--no-textconv` and `--no-ext-diff` are set so a repository diff driver
+/// cannot run while the commit is only being displayed.
 pub fn latest_commit(
     git: &Git,
     root: &Path,
@@ -237,6 +240,8 @@ pub fn latest_commit(
         "-1",
         "--date=format-local:%Y-%m-%d %H:%M",
         DETAIL_FORMAT,
+        "--no-textconv",
+        "--no-ext-diff",
         "HEAD",
         "--",
     ];
@@ -353,6 +358,9 @@ const HOVER_FORMAT: &str =
 /// `-m --first-parent` makes a merge list what landed on the first parent, as
 /// a normal diff. A commit with one parent is unchanged. Tag lookup is a
 /// second local command; if it fails the commit is still returned.
+///
+/// `--no-textconv` and `--no-ext-diff` keep a repo-local `diff.<driver>`
+/// from executing when the hover opens.
 pub fn commit_hover(git: &Git, root: &Path, oid: &str) -> Result<CommitHover, GitError> {
     if !is_commit_oid(oid) {
         return Err(super::exec::rejected(
@@ -363,6 +371,8 @@ pub fn commit_hover(git: &Git, root: &Path, oid: &str) -> Result<CommitHover, Gi
     let args = [
         "show",
         "--no-color",
+        "--no-textconv",
+        "--no-ext-diff",
         "-m",
         "--first-parent",
         "--numstat",
@@ -568,6 +578,9 @@ const NOTICE_EMPTY: &str = "No line changes.";
 /// The patch of one path. `path` is the post-image path, or the removed path
 /// for a deletion. `:(literal)` keeps a path that starts with `:` from being
 /// read as pathspec magic.
+///
+/// `--no-textconv` and `--no-ext-diff` are required here: `git show -p`
+/// otherwise runs the repository's textconv and external diff commands.
 pub fn file_diff(git: &Git, root: &Path, oid: &str, path: &str) -> Result<FileDiff, GitError> {
     if !is_commit_oid(oid) {
         return Err(super::exec::rejected(
@@ -582,6 +595,8 @@ pub fn file_diff(git: &Git, root: &Path, oid: &str, path: &str) -> Result<FileDi
     let args = [
         "show",
         "--no-color",
+        "--no-textconv",
+        "--no-ext-diff",
         "--format=",
         "-m",
         "--first-parent",
@@ -729,6 +744,9 @@ pub fn short_oid(oid: &str) -> &str {
 ///
 /// `head` comes from [`super::inspect`]; an unborn branch has no commits, so
 /// git is not asked at all (it would fail instead of printing nothing).
+///
+/// `--no-textconv` and `--no-ext-diff` are set so a repository diff driver
+/// cannot run while the history list is displayed.
 pub fn history(git: &Git, root: &Path, head: &Head, limit: usize) -> Result<History, GitError> {
     if matches!(head, Head::Unborn(_)) || limit == 0 {
         return Ok(History::default());
@@ -746,6 +764,8 @@ pub fn history(git: &Git, root: &Path, head: &Head, limit: usize) -> Result<Hist
         "-z",
         "--format=%H%x1f%s",
         "--no-color",
+        "--no-textconv",
+        "--no-ext-diff",
         "HEAD",
         "--",
     ];
