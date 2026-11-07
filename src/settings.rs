@@ -41,10 +41,14 @@ pub struct Settings {
     pub terminal_hidden: bool,
     /// Interface typeface. `None`, blank, or an unknown id keeps Ubuntu.
     /// An id from the bundled catalog, not a file path or a system family.
+    /// A value that is not a string is ignored, so the rest of the file loads.
+    #[serde(default, deserialize_with = "lenient_font")]
     pub ui_font: Option<String>,
     /// Font drawn in the terminal. `None`, blank, or an unknown id keeps
     /// Meslo LGS NF. `builtin` keeps the monospace shipped with the app.
     /// Any other value is an id from the bundled catalog, not a file path.
+    /// A value that is not a string is ignored, so the rest of the file loads.
+    #[serde(default, deserialize_with = "lenient_font")]
     pub terminal_font: Option<String>,
     /// Width of each commit history column. A value that is not an object
     /// keeps every default; a bad field keeps only its own default.
@@ -141,6 +145,19 @@ where
     Ok(number
         .and_then(|number| u16::try_from(number).ok())
         .unwrap_or(0))
+}
+
+/// A non-string is not a font id. `null` and any other JSON type become
+/// `None`, which is the same as a missing field.
+fn lenient_font<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(text) => Some(text),
+        _ => None,
+    })
 }
 
 fn lenient_columns<'de, D>(deserializer: D) -> Result<HistoryColumns, D::Error>
@@ -566,6 +583,36 @@ mod tests {
         assert_eq!(settings.ui_font, None);
         settings.set_ui_font(Some("  obel-mono  ".to_owned()));
         assert_eq!(settings.ui_font.as_deref(), Some("obel-mono"));
+    }
+
+    #[test]
+    fn bad_font_field_keeps_the_theme() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+
+        fs::write(&path, r#"{"ui_font": 1, "theme": "abyss"}"#).expect("write");
+        let loaded = Settings::load_from(&path).expect("load");
+        assert_eq!(loaded.theme.as_deref(), Some("abyss"));
+        assert_eq!(loaded.ui_font, None);
+
+        fs::write(
+            &path,
+            r#"{"terminal_font": [], "theme": "abyss", "recent_repositories": ["/src/rlyeh"]}"#,
+        )
+        .expect("write");
+        let loaded = Settings::load_from(&path).expect("load");
+        assert_eq!(loaded.theme.as_deref(), Some("abyss"));
+        assert_eq!(loaded.terminal_font, None);
+        assert_eq!(
+            loaded.recent_repositories,
+            vec![PathBuf::from("/src/rlyeh")]
+        );
+
+        fs::write(&path, r#"{"ui_font": "Comic Sans", "theme": "abyss"}"#).expect("write");
+        let loaded = Settings::load_from(&path).expect("load");
+        assert_eq!(loaded.ui_font.as_deref(), Some("Comic Sans"));
+        assert_eq!(loaded.theme.as_deref(), Some("abyss"));
     }
 
     #[test]
