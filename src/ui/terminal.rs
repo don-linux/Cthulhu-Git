@@ -256,13 +256,39 @@ fn ensure_cwd(path: &Path) -> Result<(), String> {
 /// chooses the same name and also sets `COLORTERM`, but it stores both on the
 /// whole process. `tty::Options.env` overrides them for the child only.
 fn shell_env() -> HashMap<String, String> {
+    shell_env_from(
+        alacritty_terminfo_installed(),
+        std::env::var("LANG").ok().as_deref(),
+        std::env::var("LC_ALL").ok().as_deref(),
+        std::env::var("LC_CTYPE").ok().as_deref(),
+    )
+}
+
+/// `TERM` and `COLORTERM` for the PTY child.
+///
+/// A Dock launch leaves `LANG`, `LC_ALL`, and `LC_CTYPE` unset, and the shell
+/// then treats the stream as ASCII. An existing locale is left alone so the
+/// child inherits it.
+fn shell_env_from(
+    alacritty_installed: bool,
+    lang: Option<&str>,
+    lc_all: Option<&str>,
+    lc_ctype: Option<&str>,
+) -> HashMap<String, String> {
     let mut env = HashMap::new();
-    env.insert(
-        "TERM".to_owned(),
-        term_name(alacritty_terminfo_installed()).to_owned(),
-    );
+    env.insert("TERM".to_owned(), term_name(alacritty_installed).to_owned());
     env.insert("COLORTERM".to_owned(), "truecolor".to_owned());
+    if locale_is_unset(lang, lc_all, lc_ctype) {
+        env.insert("LANG".to_owned(), "en_US.UTF-8".to_owned());
+    }
     env
+}
+
+fn locale_is_unset(lang: Option<&str>, lc_all: Option<&str>, lc_ctype: Option<&str>) -> bool {
+    fn blank(value: Option<&str>) -> bool {
+        value.is_none_or(|text| text.is_empty())
+    }
+    blank(lang) && blank(lc_all) && blank(lc_ctype)
 }
 
 /// `alacritty` when that terminfo entry is installed, otherwise `xterm-256color`.
@@ -2207,6 +2233,19 @@ END
         let size = window_size(&huge, 10.0);
         assert!(pty_size_is_safe(size), "{size:?}");
         assert!(size.cell_width < 1_000, "cell width was not clamped");
+    }
+
+    #[test]
+    fn dock_launch_shell_gets_utf8_locale() {
+        let env = shell_env_from(false, None, None, None);
+        assert_eq!(env.get("LANG").map(String::as_str), Some("en_US.UTF-8"));
+
+        let kept = shell_env_from(false, Some("fr_FR.UTF-8"), None, None);
+        assert_eq!(kept.get("LANG"), None);
+        let lc_all = shell_env_from(false, None, Some("C"), None);
+        assert_eq!(lc_all.get("LANG"), None);
+        let lc_ctype = shell_env_from(false, None, None, Some("en_US.UTF-8"));
+        assert_eq!(lc_ctype.get("LANG"), None);
     }
 
     #[cfg(unix)]
