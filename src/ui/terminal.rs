@@ -295,6 +295,9 @@ pub struct ShellSession {
     size: WindowSize,
     notices: Receiver<Notice>,
     anchor: Option<Point>,
+    /// Set once the PTY child has exited. A later `TIOCSWINSZ` on the hung-up
+    /// slave makes alacritty call `process::exit`.
+    child_exited: bool,
 }
 
 struct GridSize {
@@ -427,6 +430,7 @@ impl ShellSession {
             size,
             notices,
             anchor: None,
+            child_exited: false,
         })
     }
 
@@ -436,7 +440,10 @@ impl ShellSession {
             match self.notices.try_recv() {
                 Ok(Notice::Write(text)) => self.write(text.as_bytes()),
                 Ok(Notice::Copy(text)) => ctx.copy_text(text),
-                Ok(Notice::Exited) => exited = true,
+                Ok(Notice::Exited) => {
+                    self.child_exited = true;
+                    exited = true;
+                }
                 Ok(Notice::Color(index, format)) => {
                     let rgb = self.color_rgb(index);
                     self.write(format(rgb).as_bytes());
@@ -444,6 +451,7 @@ impl ShellSession {
                 Ok(Notice::Size(format)) => self.write(format(self.size).as_bytes()),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    self.child_exited = true;
                     exited = true;
                     break;
                 }
@@ -471,16 +479,22 @@ impl ShellSession {
     }
 
     fn resize(&mut self, metrics: &Metrics, pixels_per_point: f32) {
+        // `Msg::Resize` runs `TIOCSWINSZ` on the event-loop thread. alacritty
+        // exits the process when that ioctl fails: EINVAL for a 0-size, EIO
+        // after the slave hangs up. Compare cell pixels too, so a move
+        // between 1x and 2x still updates `ws_xpixel`.
+        if self.child_exited || !child_can_be_resized(self.pid) {
+            return;
+        }
         let size = window_size(metrics, pixels_per_point);
-        if size.num_cols == self.size.num_cols && size.num_lines == self.size.num_lines {
+        if !pty_size_is_safe(size) || same_window_size(self.size, size) {
             return;
         }
         self.size = size;
         self.term.lock().resize(GridSize {
-            columns: metrics.cols,
-            screen_lines: metrics.rows,
+            columns: usize::from(size.num_cols),
+            screen_lines: usize::from(size.num_lines),
         });
-        // `Msg::Resize` updates the PTY. The event loop does not resize `Term`.
         let _ = self.io.send(Msg::Resize(size));
     }
 }
@@ -490,23 +504,98 @@ fn spawn_error(error: &io::Error) -> String {
 }
 
 fn window_size(metrics: &Metrics, pixels_per_point: f32) -> WindowSize {
+    let num_lines = u16::try_from(metrics.rows).unwrap_or(u16::MAX).max(1);
+    let num_cols = u16::try_from(metrics.cols).unwrap_or(u16::MAX).max(1);
     WindowSize {
-        num_lines: u16::try_from(metrics.rows).unwrap_or(u16::MAX).max(1),
-        num_cols: u16::try_from(metrics.cols).unwrap_or(u16::MAX).max(1),
-        cell_width: px(metrics.cell_w * pixels_per_point),
-        cell_height: px(metrics.cell_h * pixels_per_point),
+        num_lines,
+        num_cols,
+        cell_width: clamp_cell_px(num_cols, px(metrics.cell_w * pixels_per_point)),
+        cell_height: clamp_cell_px(num_lines, px(metrics.cell_h * pixels_per_point)),
     }
 }
 
 fn px(points: f32) -> u16 {
+    // `as u16` turns NaN and infinities into 0. A zero cell size makes
+    // `TIOCSWINSZ` fail and alacritty exit the process.
+    if !points.is_finite() {
+        return 1;
+    }
     let pixels = points.round();
-    if pixels <= 1.0 {
+    if !pixels.is_finite() || pixels <= 1.0 {
         1
     } else if pixels >= f32::from(u16::MAX) {
         u16::MAX
     } else {
         pixels as u16
     }
+}
+
+/// `cols * cell_px` is stored in a `u16` by alacritty's `Winsize`. Clamp the
+/// product so it cannot wrap.
+fn clamp_cell_px(cells: u16, cell_px: u16) -> u16 {
+    let cells = u32::from(cells.max(1));
+    let max_cell = u16::try_from(u32::from(u16::MAX) / cells).unwrap_or(1);
+    cell_px.min(max_cell.max(1)).max(1)
+}
+
+fn same_window_size(left: WindowSize, right: WindowSize) -> bool {
+    left.num_cols == right.num_cols
+        && left.num_lines == right.num_lines
+        && left.cell_width == right.cell_width
+        && left.cell_height == right.cell_height
+}
+
+fn pty_size_is_safe(size: WindowSize) -> bool {
+    let cols = u32::from(size.num_cols);
+    let rows = u32::from(size.num_lines);
+    let width = u32::from(size.cell_width);
+    let height = u32::from(size.cell_height);
+    cols >= 1
+        && rows >= 1
+        && width >= 1
+        && height >= 1
+        && cols * width <= u32::from(u16::MAX)
+        && rows * height <= u32::from(u16::MAX)
+}
+
+fn child_can_be_resized(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        unix_child_is_alive(pid)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+#[cfg(unix)]
+fn unix_child_is_alive(pid: u32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_pid_is_alive(pid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        should_signal(pid)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pid_is_alive(pid: u32) -> bool {
+    let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((_, rest)) = text.rsplit_once(')') else {
+        return false;
+    };
+    let state = rest.split_whitespace().next().unwrap_or("");
+    // A zombie still owns the pid, but the slave has hung up.
+    !state.is_empty() && !matches!(state, "Z" | "X" | "x")
 }
 
 fn pty_pid(pty: &Pty) -> u32 {
@@ -1991,5 +2080,73 @@ END
                 .program,
             "/bin/sh"
         );
+    }
+
+    fn grid_metrics(cols: usize, rows: usize, cell_w: f32, cell_h: f32) -> Metrics {
+        Metrics {
+            cols,
+            rows,
+            cell_w,
+            cell_h,
+            font: FontId::monospace(14.0),
+        }
+    }
+
+    #[test]
+    fn window_size_never_reports_a_zero_grid() {
+        let metrics = grid_metrics(80, 24, 8.0, 16.0);
+        for scale in [0.0_f32, -1.0, 2.0, f32::NAN, f32::INFINITY] {
+            let size = window_size(&metrics, scale);
+            assert!((1..=u16::MAX).contains(&size.num_cols), "cols at {scale}");
+            assert!((1..=u16::MAX).contains(&size.num_lines), "rows at {scale}");
+            assert!(pty_size_is_safe(size), "unsafe size at {scale}: {size:?}");
+        }
+
+        let huge = grid_metrics(1_000, 400, 1_000.0, 1_000.0);
+        let size = window_size(&huge, 10.0);
+        assert!(pty_size_is_safe(size), "{size:?}");
+        assert!(size.cell_width < 1_000, "cell width was not clamped");
+    }
+
+    #[test]
+    fn retina_cell_pixels_are_rounded_points() {
+        let metrics = grid_metrics(80, 24, 8.4, 16.0);
+        let one = window_size(&metrics, 1.0);
+        let two = window_size(&metrics, 2.0);
+        assert_eq!(two.cell_width, 17);
+        assert_eq!(two.num_cols, one.num_cols);
+        assert_ne!(two.cell_width, one.cell_width);
+        assert!(!same_window_size(one, two));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resize_after_shell_exit_does_not_kill_the_app() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let ctx = egui::Context::default();
+        let metrics = test_metrics();
+        let mut session = match ShellSession::spawn(dir.path(), &ctx, &metrics) {
+            Ok(session) => session,
+            Err(error) => panic!("{error}"),
+        };
+        session.write(b"exit\n");
+        let started = std::time::Instant::now();
+        let mut saw_exit = false;
+        while started.elapsed() < Duration::from_secs(3) {
+            if session.poll(&ctx) || session.child_exited || !unix_child_is_alive(session.pid) {
+                saw_exit = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(saw_exit, "shell did not exit");
+        let pid = std::process::id();
+        let mut bigger = metrics.clone();
+        bigger.cols = 100;
+        bigger.rows = 40;
+        session.resize(&bigger, 2.0);
+        session.resize(&bigger, 1.0);
+        assert_eq!(std::process::id(), pid);
+        drop(session);
     }
 }
