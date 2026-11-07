@@ -50,6 +50,7 @@ fn inputs(path_dirs: &[&Path], fallbacks: Vec<PathBuf>) -> DiscoverInputs {
         path_var: Some(env::join_paths(path_dirs).expect("joinable PATH")),
         exe_name: "git",
         fallbacks,
+        skip_paths: Vec::new(),
     }
 }
 
@@ -201,6 +202,7 @@ fn simulated_windows_layout_uses_git_exe_and_fallbacks() {
         path_var: Some(env::join_paths([&path_dir]).expect("PATH")),
         exe_name: "git.exe",
         fallbacks: vec![program_files_git.clone()],
+        skip_paths: Vec::new(),
     };
     let git = discover_with(&inputs).expect("Git for Windows fallback");
     assert_eq!(git.path, program_files_git);

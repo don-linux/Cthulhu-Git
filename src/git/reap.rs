@@ -46,6 +46,16 @@ fn reap_unix(pid: u32) {
     if leader == rustix::process::getpgrp() {
         return;
     }
+    // `getpgid` succeeds when this pid has been recycled and returns the new
+    // process's group. That id is no longer the git group, so do not signal it.
+    // ESRCH is not that case: reap runs after the leader has exited, and
+    // grandchildren can still be in the group. A free pid makes `getpgid`
+    // return ESRCH; a recycled one makes it succeed.
+    if let Ok(pgid) = rustix::process::getpgid(Some(leader))
+        && pgid != leader
+    {
+        return;
+    }
     let _ = rustix::process::kill_process_group(leader, rustix::process::Signal::KILL);
 }
 
@@ -183,4 +193,30 @@ fn snapshot_ppids() -> HashMap<u32, u32> {
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn snapshot_ppids() -> HashMap<u32, u32> {
     HashMap::new()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn reap_returns_after_the_leader_has_exited() {
+        let mut child = std::process::Command::new("true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("true");
+        let pid = child.id();
+        child.wait().expect("reap true");
+
+        let raw = i32::try_from(pid).expect("pid fits in i32");
+        let parsed = rustix::process::Pid::from_raw(raw).expect("nonzero pid");
+        assert_eq!(
+            rustix::process::getpgid(Some(parsed)).expect_err("pid is gone"),
+            rustix::io::Errno::SRCH
+        );
+        // ESRCH must not skip the group signal: an exited leader can still
+        // have grandchildren. `kill_process_group` is a no-op when the group
+        // is already empty, which is this `true` process.
+        super::reap_process_tree(pid);
+    }
 }
