@@ -1038,7 +1038,11 @@ mod settings_load_tests {
     }
 
     /// Makes `path` fail `Settings::load_from` and restores it on drop.
+    ///
+    /// Mode bits are restored only on Unix. Other platforms leave the field
+    /// unread: the load is pointed at a directory instead of a chmod'd file.
     struct Unreadable<'a> {
+        #[cfg_attr(not(unix), expect(dead_code, reason = "mode restore is Unix-only"))]
         path: &'a Path,
     }
 
