@@ -1,8 +1,10 @@
 //! Interactive shell for the open repository.
 //!
 //! The PTY is `alacritty_terminal`, not `Git::run`. The child is not killed
-//! after 60 seconds. It does not inherit `GIT_*` (except ssh and askpass) or
-//! `GH_TOKEN` / `GITHUB_TOKEN`. It is given `TERM` and `COLORTERM` so `clear`
+//! after 60 seconds. On Unix it does not inherit `GIT_*` (except ssh and
+//! askpass) or `GH_TOKEN` / `GITHUB_TOKEN`. Windows ConPTY merges
+//! `Options.env` with the parent environment, so those names cannot be
+//! removed there. It is given `TERM` and `COLORTERM` so `clear`
 //! and Ctrl+L erase the screen. It starts the first time the strip is shown
 //! and dies with the [`OpenedRepo`](super::OpenedRepo).
 
@@ -24,7 +26,9 @@ use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config as TermConfig, RenderableCursor, Term, TermMode, color};
+use alacritty_terminal::term::{
+    Config as TermConfig, Osc52, RenderableCursor, Term, TermMode, color,
+};
 use alacritty_terminal::tty::{self, Pty};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use eframe::egui::{
@@ -58,10 +62,12 @@ pub struct ShellArgv {
 ///
 /// macOS is a login shell (`-l`) so `/etc/zprofile` and `~/.zprofile` run.
 /// Linux stays non-login, so an interactive bash still reads `~/.bashrc`.
-/// A relative, empty, or non-Unicode `SHELL` uses an absolute `passwd_shell`,
-/// then `/bin/sh`.
+/// A relative, empty, non-Unicode, missing, or non-executable `SHELL` uses
+/// an absolute executable `passwd_shell`. macOS then tries `/bin/zsh`.
+/// `/bin/sh` is the last resort.
 /// `unset` is applied with `/usr/bin/env -u`, which can remove names.
-/// `Options.env` can only add them.
+/// `Options.env` can only add them. On Windows that map is merged into the
+/// parent environment, so `unset` is not applied.
 pub fn shell_argv(
     host: HostOs,
     shell: Option<&OsStr>,
@@ -70,6 +76,7 @@ pub fn shell_argv(
 ) -> Result<ShellArgv, String> {
     let argv = bare_shell(host, shell, passwd_shell)?;
     if host == HostOs::Windows || unset.is_empty() {
+        // Windows `tty::Options.env` cannot drop inherited names.
         return Ok(argv);
     }
     let mut args = Vec::with_capacity(unset.len() * 2 + 2 + argv.args.len());
@@ -98,12 +105,16 @@ fn bare_shell(
     passwd_shell: Option<&str>,
 ) -> Result<ShellArgv, String> {
     if host == HostOs::Windows {
-        return Ok(ShellArgv {
-            program: "powershell.exe".to_owned(),
-            args: Vec::new(),
-        });
+        // `Command` searches the working directory before `PATH`. A bare
+        // `powershell.exe` would run a binary planted in the repository.
+        return windows_shell_argv(
+            std::env::var("ProgramFiles").ok().as_deref(),
+            std::env::var("SystemRoot").ok().as_deref(),
+            std::env::var("COMSPEC").ok().as_deref(),
+            |path| Path::new(path).is_file(),
+        );
     }
-    let program = chosen_unix_shell(shell, passwd_shell);
+    let program = chosen_unix_shell(host, shell, passwd_shell);
     let args = if host == HostOs::Macos {
         vec!["-l".to_owned()]
     } else {
@@ -112,18 +123,115 @@ fn bare_shell(
     Ok(ShellArgv { program, args })
 }
 
-fn chosen_unix_shell(shell: Option<&OsStr>, passwd_shell: Option<&str>) -> String {
-    if let Some(value) = shell
-        && !value.is_empty()
-        && let Some(text) = value.to_str()
-        && unix_shell_is_absolute(text)
-    {
-        return text.to_owned();
+fn chosen_unix_shell(host: HostOs, shell: Option<&OsStr>, passwd_shell: Option<&str>) -> String {
+    chosen_unix_shell_with(host, shell, passwd_shell, unix_shell_is_executable)
+}
+
+fn chosen_unix_shell_with(
+    host: HostOs,
+    shell: Option<&OsStr>,
+    passwd_shell: Option<&str>,
+    executable: impl Fn(&str) -> bool,
+) -> String {
+    let shell_text = shell.and_then(OsStr::to_str);
+    let candidates = [
+        shell_text,
+        passwd_shell,
+        (host == HostOs::Macos).then_some("/bin/zsh"),
+        Some("/bin/sh"),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if unix_shell_is_absolute(candidate) && executable(candidate) {
+            return candidate.to_owned();
+        }
     }
-    passwd_shell
-        .filter(|shell| !shell.is_empty() && unix_shell_is_absolute(shell))
-        .unwrap_or("/bin/sh")
-        .to_owned()
+    "/bin/sh".to_owned()
+}
+
+/// Absolute and executable. A missing path or a mode without an execute bit
+/// falls through so the PTY is not pointed at a file `execve` will reject.
+fn unix_shell_is_executable(path: &str) -> bool {
+    if !unix_shell_is_absolute(path) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        // Permission bits are a Unix property. Callers on this target still
+        // require an absolute path via [`unix_shell_is_absolute`].
+        let _ = path;
+        true
+    }
+}
+
+/// PowerShell, as a pure function of the Windows environment.
+///
+/// Order is `%ProgramFiles%\PowerShell\7\pwsh.exe`, then
+/// `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`.
+/// Relative paths are skipped. `COMSPEC` is not a candidate: a relative
+/// value would search the repository, and an absolute one is often `cmd.exe`.
+fn windows_shell_argv(
+    program_files: Option<&str>,
+    system_root: Option<&str>,
+    _comspec: Option<&str>,
+    exists: impl Fn(&str) -> bool,
+) -> Result<ShellArgv, String> {
+    let candidates = [
+        program_files.map(|root| windows_join(root, r"PowerShell\7\pwsh.exe")),
+        system_root
+            .map(|root| windows_join(root, r"System32\WindowsPowerShell\v1.0\powershell.exe")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if windows_path_is_absolute(&candidate) && exists(&candidate) {
+            return Ok(ShellArgv {
+                program: candidate,
+                args: vec!["-NoLogo".to_owned()],
+            });
+        }
+    }
+    Err("Could not find an absolute PowerShell.".to_owned())
+}
+
+fn windows_join(base: &str, child: &str) -> String {
+    let base = base.trim_end_matches(['\\', '/']);
+    format!("{base}\\{child}")
+}
+
+/// Drive path (`C:\...`) or UNC (`\\server\share`). `Path::is_absolute` is
+/// false for both when this code is tested on Unix.
+fn windows_path_is_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        return true;
+    }
+    bytes.len() >= 3 && bytes[0] == b'\\' && bytes[1] == b'\\'
+}
+
+#[cfg(any(windows, test))]
+fn windows_taskkill_path(
+    system_root: Option<&str>,
+    exists: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    let Some(root) = system_root.filter(|root| windows_path_is_absolute(root)) else {
+        return Err("SystemRoot is unset or not absolute.".to_owned());
+    };
+    let path = windows_join(root, r"System32\taskkill.exe");
+    if windows_path_is_absolute(&path) && exists(&path) {
+        Ok(path)
+    } else {
+        Err(format!("taskkill is not at {path}."))
+    }
 }
 
 /// Absolute Unix path. On Unix this is [`Path::is_absolute`].
@@ -219,13 +327,39 @@ fn ensure_cwd(path: &Path) -> Result<(), String> {
 /// chooses the same name and also sets `COLORTERM`, but it stores both on the
 /// whole process. `tty::Options.env` overrides them for the child only.
 fn shell_env() -> HashMap<String, String> {
+    shell_env_from(
+        alacritty_terminfo_installed(),
+        std::env::var("LANG").ok().as_deref(),
+        std::env::var("LC_ALL").ok().as_deref(),
+        std::env::var("LC_CTYPE").ok().as_deref(),
+    )
+}
+
+/// `TERM` and `COLORTERM` for the PTY child.
+///
+/// A Dock launch leaves `LANG`, `LC_ALL`, and `LC_CTYPE` unset, and the shell
+/// then treats the stream as ASCII. An existing locale is left alone so the
+/// child inherits it.
+fn shell_env_from(
+    alacritty_installed: bool,
+    lang: Option<&str>,
+    lc_all: Option<&str>,
+    lc_ctype: Option<&str>,
+) -> HashMap<String, String> {
     let mut env = HashMap::new();
-    env.insert(
-        "TERM".to_owned(),
-        term_name(alacritty_terminfo_installed()).to_owned(),
-    );
+    env.insert("TERM".to_owned(), term_name(alacritty_installed).to_owned());
     env.insert("COLORTERM".to_owned(), "truecolor".to_owned());
+    if locale_is_unset(lang, lc_all, lc_ctype) {
+        env.insert("LANG".to_owned(), "en_US.UTF-8".to_owned());
+    }
     env
+}
+
+fn locale_is_unset(lang: Option<&str>, lc_all: Option<&str>, lc_ctype: Option<&str>) -> bool {
+    fn blank(value: Option<&str>) -> bool {
+        value.is_none_or(|text| text.is_empty())
+    }
+    blank(lang) && blank(lc_all) && blank(lc_ctype)
 }
 
 /// `alacritty` when that terminfo entry is installed, otherwise `xterm-256color`.
@@ -295,6 +429,9 @@ pub struct ShellSession {
     size: WindowSize,
     notices: Receiver<Notice>,
     anchor: Option<Point>,
+    /// Set once the PTY child has exited. A later `TIOCSWINSZ` on the hung-up
+    /// slave makes alacritty call `process::exit`.
+    child_exited: bool,
 }
 
 struct GridSize {
@@ -394,7 +531,7 @@ impl ShellSession {
             screen_lines: metrics.rows,
         };
         let term = Arc::new(FairMutex::new(Term::new(
-            TermConfig::default(),
+            term_config(),
             &grid,
             bridge.clone(),
         )));
@@ -427,6 +564,7 @@ impl ShellSession {
             size,
             notices,
             anchor: None,
+            child_exited: false,
         })
     }
 
@@ -436,7 +574,10 @@ impl ShellSession {
             match self.notices.try_recv() {
                 Ok(Notice::Write(text)) => self.write(text.as_bytes()),
                 Ok(Notice::Copy(text)) => ctx.copy_text(text),
-                Ok(Notice::Exited) => exited = true,
+                Ok(Notice::Exited) => {
+                    self.child_exited = true;
+                    exited = true;
+                }
                 Ok(Notice::Color(index, format)) => {
                     let rgb = self.color_rgb(index);
                     self.write(format(rgb).as_bytes());
@@ -444,6 +585,7 @@ impl ShellSession {
                 Ok(Notice::Size(format)) => self.write(format(self.size).as_bytes()),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    self.child_exited = true;
                     exited = true;
                     break;
                 }
@@ -471,17 +613,31 @@ impl ShellSession {
     }
 
     fn resize(&mut self, metrics: &Metrics, pixels_per_point: f32) {
+        // `Msg::Resize` runs `TIOCSWINSZ` on the event-loop thread. alacritty
+        // exits the process when that ioctl fails: EINVAL for a 0-size, EIO
+        // after the slave hangs up. Compare cell pixels too, so a move
+        // between 1x and 2x still updates `ws_xpixel`.
+        if self.child_exited || !child_can_be_resized(self.pid) {
+            return;
+        }
         let size = window_size(metrics, pixels_per_point);
-        if size.num_cols == self.size.num_cols && size.num_lines == self.size.num_lines {
+        if !pty_size_is_safe(size) || same_window_size(self.size, size) {
             return;
         }
         self.size = size;
         self.term.lock().resize(GridSize {
-            columns: metrics.cols,
-            screen_lines: metrics.rows,
+            columns: usize::from(size.num_cols),
+            screen_lines: usize::from(size.num_lines),
         });
-        // `Msg::Resize` updates the PTY. The event loop does not resize `Term`.
         let _ = self.io.send(Msg::Resize(size));
+    }
+}
+
+/// OSC 52 is off. A program in the shell must not write the clipboard.
+fn term_config() -> TermConfig {
+    TermConfig {
+        osc52: Osc52::Disabled,
+        ..TermConfig::default()
     }
 }
 
@@ -490,23 +646,98 @@ fn spawn_error(error: &io::Error) -> String {
 }
 
 fn window_size(metrics: &Metrics, pixels_per_point: f32) -> WindowSize {
+    let num_lines = u16::try_from(metrics.rows).unwrap_or(u16::MAX).max(1);
+    let num_cols = u16::try_from(metrics.cols).unwrap_or(u16::MAX).max(1);
     WindowSize {
-        num_lines: u16::try_from(metrics.rows).unwrap_or(u16::MAX).max(1),
-        num_cols: u16::try_from(metrics.cols).unwrap_or(u16::MAX).max(1),
-        cell_width: px(metrics.cell_w * pixels_per_point),
-        cell_height: px(metrics.cell_h * pixels_per_point),
+        num_lines,
+        num_cols,
+        cell_width: clamp_cell_px(num_cols, px(metrics.cell_w * pixels_per_point)),
+        cell_height: clamp_cell_px(num_lines, px(metrics.cell_h * pixels_per_point)),
     }
 }
 
 fn px(points: f32) -> u16 {
+    // `as u16` turns NaN and infinities into 0. A zero cell size makes
+    // `TIOCSWINSZ` fail and alacritty exit the process.
+    if !points.is_finite() {
+        return 1;
+    }
     let pixels = points.round();
-    if pixels <= 1.0 {
+    if !pixels.is_finite() || pixels <= 1.0 {
         1
     } else if pixels >= f32::from(u16::MAX) {
         u16::MAX
     } else {
         pixels as u16
     }
+}
+
+/// `cols * cell_px` is stored in a `u16` by alacritty's `Winsize`. Clamp the
+/// product so it cannot wrap.
+fn clamp_cell_px(cells: u16, cell_px: u16) -> u16 {
+    let cells = u32::from(cells.max(1));
+    let max_cell = u16::try_from(u32::from(u16::MAX) / cells).unwrap_or(1);
+    cell_px.min(max_cell.max(1)).max(1)
+}
+
+fn same_window_size(left: WindowSize, right: WindowSize) -> bool {
+    left.num_cols == right.num_cols
+        && left.num_lines == right.num_lines
+        && left.cell_width == right.cell_width
+        && left.cell_height == right.cell_height
+}
+
+fn pty_size_is_safe(size: WindowSize) -> bool {
+    let cols = u32::from(size.num_cols);
+    let rows = u32::from(size.num_lines);
+    let width = u32::from(size.cell_width);
+    let height = u32::from(size.cell_height);
+    cols >= 1
+        && rows >= 1
+        && width >= 1
+        && height >= 1
+        && cols * width <= u32::from(u16::MAX)
+        && rows * height <= u32::from(u16::MAX)
+}
+
+fn child_can_be_resized(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        unix_child_is_alive(pid)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+#[cfg(unix)]
+fn unix_child_is_alive(pid: u32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_pid_is_alive(pid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        should_signal(pid)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pid_is_alive(pid: u32) -> bool {
+    let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((_, rest)) = text.rsplit_once(')') else {
+        return false;
+    };
+    let state = rest.split_whitespace().next().unwrap_or("");
+    // A zombie still owns the pid, but the slave has hung up.
+    !state.is_empty() && !matches!(state, "Z" | "X" | "x")
 }
 
 fn pty_pid(pty: &Pty) -> u32 {
@@ -568,7 +799,9 @@ fn stop_session(leader: u32) {
         }
     }
     #[cfg(windows)]
-    kill_process_tree(leader);
+    {
+        let _ = kill_process_tree(leader);
+    }
 }
 
 #[cfg(unix)]
@@ -674,16 +907,29 @@ fn processes_in_session(_session: i32) -> Vec<u32> {
 }
 
 #[cfg(windows)]
-fn kill_process_tree(pid: u32) {
+fn kill_process_tree(pid: u32) -> Result<(), String> {
     if pid <= 1 {
-        return;
+        return Ok(());
     }
-    let _ = std::process::Command::new("taskkill")
+    // A bare `taskkill` searches the working directory and flashes a console.
+    let program = windows_taskkill_path(std::env::var("SystemRoot").ok().as_deref(), |path| {
+        Path::new(path).is_file()
+    })?;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let status = std::process::Command::new(&program)
         .args(["/F", "/T", "/PID", &pid.to_string()])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map_err(|error| format!("Could not run {program}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("taskkill exited with {status}"))
+    }
 }
 
 pub fn focus_id(view_id: Id) -> Id {
@@ -1219,8 +1465,16 @@ fn sgr(button: u8, col: usize, row: usize, release: bool) -> Vec<u8> {
 fn handle_keys(ui: &mut Ui, session: &mut ShellSession) {
     let modifiers = ui.input(|input| input.modifiers);
     let mut events = ui.input_mut(|input| std::mem::take(&mut input.events));
+    // egui emits `Key` before `Text`. Option+key produces a composed
+    // character; writing ESC+letter as well would discard it.
+    let composed = events
+        .iter()
+        .any(|event| matches!(event, Event::Text(text) if option_text_is_composed(text)));
     let mut kept = Vec::new();
     for event in events.drain(..) {
+        if composed && alt_letter_key_is_redundant(&event) {
+            continue;
+        }
         if consumes(&event) {
             apply_key(ui.ctx(), session, event, modifiers);
         } else {
@@ -1241,8 +1495,8 @@ fn consumes(event: &Event) -> bool {
 fn apply_key(ctx: &egui::Context, session: &mut ShellSession, event: Event, modifiers: Modifiers) {
     match event {
         Event::Text(text) => {
-            if !modifiers.alt && !modifiers.ctrl {
-                session.write(text.as_bytes());
+            if let Some(bytes) = text_input_bytes(&text, modifiers) {
+                session.write(&bytes);
             }
         }
         Event::Paste(text) => session.write(&paste_bytes(&text, bracketed(session))),
@@ -1287,11 +1541,59 @@ fn copy_or_interrupt(ctx: &egui::Context, session: &mut ShellSession) {
 }
 
 fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
-    let mut payload = text.replace("\r\n", "\r").replace('\n', "\r");
+    // Bracketed paste ends at ESC [201~. A paste that contains that sequence
+    // is then typed as a command. C0 controls other than tab and newline are
+    // removed before the markers are added. CR is the newline the PTY uses.
+    let sanitized: String = text
+        .chars()
+        .filter(|ch| paste_char_is_allowed(*ch))
+        .collect();
+    let mut payload = sanitized.replace("\r\n", "\r").replace('\n', "\r");
     if bracketed {
         payload = format!("\x1b[200~{payload}\x1b[201~");
     }
     payload.into_bytes()
+}
+
+/// Bytes for `Event::Text`. Option's composed character is that text.
+/// A plain ASCII letter with Alt still belongs to the ESC+letter path.
+fn text_input_bytes(text: &str, modifiers: Modifiers) -> Option<Vec<u8>> {
+    if modifiers.ctrl || text.is_empty() {
+        return None;
+    }
+    if modifiers.alt && !option_text_is_composed(text) {
+        return None;
+    }
+    Some(text.as_bytes().to_vec())
+}
+
+fn option_text_is_composed(text: &str) -> bool {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(ch) if chars.next().is_none() && ch.is_ascii_alphabetic() => false,
+        Some(_) => true,
+        None => false,
+    }
+}
+
+fn alt_letter_key_is_redundant(event: &Event) -> bool {
+    match event {
+        Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } => modifiers.alt && !modifiers.ctrl && letter(*key).is_some(),
+        _ => false,
+    }
+}
+
+fn paste_char_is_allowed(ch: char) -> bool {
+    match u32::from(ch) {
+        0x09 | 0x0A | 0x0D => true,
+        code if code < 0x20 => false,
+        _ => true,
+    }
 }
 
 fn encode_key(session: &ShellSession, key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
@@ -1517,18 +1819,19 @@ mod tests {
 
     #[test]
     fn shell_argv_follows_shell_login_and_unset() {
-        let zsh = shell_argv(HostOs::Linux, Some(OsStr::new("/bin/zsh")), None, &[]).expect("zsh");
-        assert_eq!(zsh.program, "/bin/zsh");
-        assert!(zsh.args.is_empty());
+        let bash =
+            shell_argv(HostOs::Linux, Some(OsStr::new("/bin/bash")), None, &[]).expect("bash");
+        assert_eq!(bash.program, "/bin/bash");
+        assert!(bash.args.is_empty());
 
         let login =
-            shell_argv(HostOs::Macos, Some(OsStr::new("/bin/zsh")), None, &[]).expect("login");
-        assert_eq!(login.program, "/bin/zsh");
+            shell_argv(HostOs::Macos, Some(OsStr::new("/bin/bash")), None, &[]).expect("login");
+        assert_eq!(login.program, "/bin/bash");
         assert_eq!(login.args, ["-l"]);
 
         let scrubbed = shell_argv(
             HostOs::Macos,
-            Some(OsStr::new("/bin/zsh")),
+            Some(OsStr::new("/bin/bash")),
             None,
             &["GIT_DIR", "GH_TOKEN"],
         )
@@ -1536,7 +1839,7 @@ mod tests {
         assert_eq!(scrubbed.program, "/usr/bin/env");
         assert_eq!(
             scrubbed.args,
-            ["-u", "GIT_DIR", "-u", "GH_TOKEN", "--", "/bin/zsh", "-l"]
+            ["-u", "GIT_DIR", "-u", "GH_TOKEN", "--", "/bin/bash", "-l"]
         );
 
         let passwd =
@@ -1550,13 +1853,11 @@ mod tests {
 
         let windows = shell_argv(
             HostOs::Windows,
-            Some(OsStr::new("/bin/zsh")),
+            Some(OsStr::new("/bin/bash")),
             None,
             &["GIT_DIR"],
-        )
-        .expect("windows");
-        assert_eq!(windows.program, "powershell.exe");
-        assert!(windows.args.is_empty());
+        );
+        assert_windows_shell(windows);
     }
 
     #[test]
@@ -1599,17 +1900,18 @@ mod tests {
             );
         }
 
-        let zsh = shell_argv(HostOs::Linux, Some(OsStr::new("/bin/zsh")), None, &[]).expect("zsh");
-        assert_eq!(zsh.program, "/bin/zsh");
-        let wrapped_zsh = shell_argv(
+        let bash =
+            shell_argv(HostOs::Linux, Some(OsStr::new("/bin/bash")), None, &[]).expect("bash");
+        assert_eq!(bash.program, "/bin/bash");
+        let wrapped_bash = shell_argv(
             HostOs::Linux,
-            Some(OsStr::new("/bin/zsh")),
+            Some(OsStr::new("/bin/bash")),
             None,
             &["GIT_DIR"],
         )
-        .expect("wrapped zsh");
-        assert_eq!(wrapped_zsh.program, "/usr/bin/env");
-        assert_eq!(wrapped_zsh.args, ["-u", "GIT_DIR", "--", "/bin/zsh"]);
+        .expect("wrapped bash");
+        assert_eq!(wrapped_bash.program, "/usr/bin/env");
+        assert_eq!(wrapped_bash.args, ["-u", "GIT_DIR", "--", "/bin/bash"]);
 
         let passwd = shell_argv(
             HostOs::Linux,
@@ -1634,10 +1936,23 @@ mod tests {
             Some(OsStr::new("./sh")),
             None,
             &["GIT_DIR"],
-        )
-        .expect("windows");
-        assert_eq!(windows.program, "powershell.exe");
-        assert!(windows.args.is_empty());
+        );
+        assert_windows_shell(windows);
+    }
+
+    fn assert_windows_shell(argv: Result<ShellArgv, String>) {
+        match argv {
+            Ok(argv) => {
+                assert!(
+                    windows_path_is_absolute(&argv.program),
+                    "relative program {}",
+                    argv.program
+                );
+                assert_eq!(argv.args, ["-NoLogo"]);
+                assert_ne!(argv.program, "powershell.exe");
+            }
+            Err(error) => assert!(error.contains("PowerShell"), "{error}"),
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1991,5 +2306,267 @@ END
                 .program,
             "/bin/sh"
         );
+    }
+
+    fn grid_metrics(cols: usize, rows: usize, cell_w: f32, cell_h: f32) -> Metrics {
+        Metrics {
+            cols,
+            rows,
+            cell_w,
+            cell_h,
+            font: FontId::monospace(14.0),
+        }
+    }
+
+    #[test]
+    fn window_size_never_reports_a_zero_grid() {
+        let metrics = grid_metrics(80, 24, 8.0, 16.0);
+        for scale in [0.0_f32, -1.0, 2.0, f32::NAN, f32::INFINITY] {
+            let size = window_size(&metrics, scale);
+            assert!((1..=u16::MAX).contains(&size.num_cols), "cols at {scale}");
+            assert!((1..=u16::MAX).contains(&size.num_lines), "rows at {scale}");
+            assert!(pty_size_is_safe(size), "unsafe size at {scale}: {size:?}");
+        }
+
+        let huge = grid_metrics(1_000, 400, 1_000.0, 1_000.0);
+        let size = window_size(&huge, 10.0);
+        assert!(pty_size_is_safe(size), "{size:?}");
+        assert!(size.cell_width < 1_000, "cell width was not clamped");
+    }
+
+    #[test]
+    fn windows_shell_prefers_pwsh_then_windows_powershell() {
+        let pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe";
+        let powershell = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        let both = windows_shell_argv(
+            Some(r"C:\Program Files"),
+            Some(r"C:\Windows"),
+            Some(r".\powershell.exe"),
+            |path| path == pwsh || path == powershell,
+        )
+        .expect("pwsh");
+        assert_eq!(both.program, pwsh);
+        assert_eq!(both.args, ["-NoLogo"]);
+
+        let second = windows_shell_argv(
+            Some(r"C:\Program Files"),
+            Some(r"C:\Windows"),
+            Some(r"C:\Windows\System32\cmd.exe"),
+            |path| path == powershell,
+        )
+        .expect("powershell");
+        assert_eq!(second.program, powershell);
+        assert_eq!(second.args, ["-NoLogo"]);
+
+        let relative = windows_shell_argv(
+            Some(r"Program Files"),
+            Some("Windows"),
+            Some("powershell.exe"),
+            |_| true,
+        );
+        assert!(relative.is_err(), "{relative:?}");
+
+        let missing =
+            windows_shell_argv(Some(r"C:\Program Files"), Some(r"C:\Windows"), None, |_| {
+                false
+            });
+        assert!(missing.is_err(), "{missing:?}");
+    }
+
+    #[test]
+    fn windows_taskkill_requires_an_absolute_system_root() {
+        let present = |path: &str| path == r"C:\Windows\System32\taskkill.exe";
+        assert_eq!(
+            windows_taskkill_path(Some(r"C:\Windows"), present).expect("taskkill"),
+            r"C:\Windows\System32\taskkill.exe"
+        );
+        assert!(windows_taskkill_path(Some("Windows"), present).is_err());
+        assert!(windows_taskkill_path(None, present).is_err());
+        assert!(windows_taskkill_path(Some(r"C:\Windows"), |_| false).is_err());
+    }
+
+    #[test]
+    fn dock_launch_shell_gets_utf8_locale() {
+        let env = shell_env_from(false, None, None, None);
+        assert_eq!(env.get("LANG").map(String::as_str), Some("en_US.UTF-8"));
+
+        let kept = shell_env_from(false, Some("fr_FR.UTF-8"), None, None);
+        assert_eq!(kept.get("LANG"), None);
+        let lc_all = shell_env_from(false, None, Some("C"), None);
+        assert_eq!(lc_all.get("LANG"), None);
+        let lc_ctype = shell_env_from(false, None, None, Some("en_US.UTF-8"));
+        assert_eq!(lc_ctype.get("LANG"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_executable_absolute_shell_falls_through() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let locked = dir.path().join("locked-shell");
+        let next = dir.path().join("next-shell");
+        std::fs::write(&locked, "#!/bin/sh\n").expect("write locked");
+        std::fs::write(&next, "#!/bin/sh\n").expect("write next");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644))
+            .expect("mode 0644");
+        std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o755)).expect("mode 0755");
+        let locked = locked.to_str().expect("utf-8 locked path");
+        let next = next.to_str().expect("utf-8 next path");
+
+        let argv =
+            shell_argv(HostOs::Linux, Some(OsStr::new(locked)), Some(next), &[]).expect("argv");
+        assert_eq!(argv.program, next);
+        assert_ne!(argv.program, locked);
+
+        let macos = chosen_unix_shell_with(
+            HostOs::Macos,
+            Some(OsStr::new(locked)),
+            Some(locked),
+            |path| path == "/bin/zsh" || path == "/bin/sh",
+        );
+        assert_eq!(macos, "/bin/zsh");
+
+        let linux = chosen_unix_shell_with(
+            HostOs::Linux,
+            Some(OsStr::new("/no/such/shell")),
+            None,
+            |path| path == "/bin/sh",
+        );
+        assert_eq!(linux, "/bin/sh");
+    }
+
+    #[test]
+    fn option_text_is_the_composed_character() {
+        let bytes = text_input_bytes(
+            "å",
+            Modifiers {
+                alt: true,
+                ..Modifiers::NONE
+            },
+        )
+        .expect("composed text");
+        assert_eq!(bytes, "å".as_bytes());
+        assert!(!bytes.contains(&0x1b));
+        assert!(!bytes.windows(2).any(|pair| pair == [0x1b, b'a']));
+    }
+
+    #[test]
+    fn paste_bytes_rejects_bracketed_breakout() {
+        let bytes = paste_bytes("\x1b[201~touch pwned\r", true);
+        let open = b"\x1b[200~";
+        let close = b"\x1b[201~";
+        assert!(bytes.starts_with(open), "{bytes:?}");
+        assert!(bytes.ends_with(close), "{bytes:?}");
+        let payload = &bytes[open.len()..bytes.len() - close.len()];
+        assert!(!payload.contains(&0x1b), "{payload:?}");
+        let outside = [&bytes[..open.len()], &bytes[bytes.len() - close.len()..]];
+        for region in outside {
+            assert!(
+                !region
+                    .windows(b"touch pwned".len())
+                    .any(|window| window == b"touch pwned"),
+                "{region:?}"
+            );
+        }
+        // The command text stays inside the paste, where the terminal will not execute it.
+        assert!(
+            payload
+                .windows(b"touch pwned".len())
+                .any(|window| window == b"touch pwned")
+        );
+        assert!(payload.ends_with(b"\r"));
+
+        let kept = paste_bytes("a\tb\nc", false);
+        assert!(kept.contains(&b'\t'));
+        assert!(kept.contains(&b'\r'));
+        assert!(!kept.contains(&b'\n'));
+        assert!(!kept.contains(&0x1b));
+    }
+
+    #[test]
+    fn osc52_store_is_disabled() {
+        use std::sync::Mutex;
+
+        struct Clipboard(Arc<Mutex<Vec<String>>>);
+
+        impl EventListener for Clipboard {
+            fn send_event(&self, event: TermEvent) {
+                if let TermEvent::ClipboardStore(_, text) = event {
+                    self.0.lock().expect("clipboard").push(text);
+                }
+            }
+        }
+
+        let copies = Arc::new(Mutex::new(Vec::new()));
+        let grid = GridSize {
+            columns: 8,
+            screen_lines: 2,
+        };
+        let mut term = Term::new(term_config(), &grid, Clipboard(Arc::clone(&copies)));
+        let mut parser = alacritty_terminal::vte::ansi::Processor::<
+            alacritty_terminal::vte::ansi::StdSyncHandler,
+        >::new();
+        // "hi" is aGk= in standard base64.
+        parser.advance(&mut term, b"\x1b]52;c;aGk=\x07");
+        assert!(copies.lock().expect("clipboard").is_empty());
+        assert_eq!(term_config().osc52, Osc52::Disabled);
+
+        let accepted = Arc::new(Mutex::new(Vec::new()));
+        let mut copying = Term::new(
+            TermConfig {
+                osc52: Osc52::OnlyCopy,
+                ..term_config()
+            },
+            &grid,
+            Clipboard(Arc::clone(&accepted)),
+        );
+        let mut parser = alacritty_terminal::vte::ansi::Processor::<
+            alacritty_terminal::vte::ansi::StdSyncHandler,
+        >::new();
+        parser.advance(&mut copying, b"\x1b]52;c;aGk=\x07");
+        assert_eq!(accepted.lock().expect("clipboard").as_slice(), ["hi"]);
+    }
+
+    #[test]
+    fn retina_cell_pixels_are_rounded_points() {
+        let metrics = grid_metrics(80, 24, 8.4, 16.0);
+        let one = window_size(&metrics, 1.0);
+        let two = window_size(&metrics, 2.0);
+        assert_eq!(two.cell_width, 17);
+        assert_eq!(two.num_cols, one.num_cols);
+        assert_ne!(two.cell_width, one.cell_width);
+        assert!(!same_window_size(one, two));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resize_after_shell_exit_does_not_kill_the_app() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let ctx = egui::Context::default();
+        let metrics = test_metrics();
+        let mut session = match ShellSession::spawn(dir.path(), &ctx, &metrics) {
+            Ok(session) => session,
+            Err(error) => panic!("{error}"),
+        };
+        session.write(b"exit\n");
+        let started = std::time::Instant::now();
+        let mut saw_exit = false;
+        while started.elapsed() < Duration::from_secs(3) {
+            if session.poll(&ctx) || session.child_exited || !unix_child_is_alive(session.pid) {
+                saw_exit = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(saw_exit, "shell did not exit");
+        let pid = std::process::id();
+        let mut bigger = metrics.clone();
+        bigger.cols = 100;
+        bigger.rows = 40;
+        session.resize(&bigger, 2.0);
+        session.resize(&bigger, 1.0);
+        assert_eq!(std::process::id(), pid);
+        drop(session);
     }
 }
