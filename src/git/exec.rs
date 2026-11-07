@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -149,6 +150,7 @@ impl Git {
             command(path).arg("--version"),
             PROBE_TIMEOUT,
             "git --version",
+            None,
         )?;
         if !output.status.success() {
             return Err(GitError::Command {
@@ -196,11 +198,16 @@ impl Git {
                 .arg("--no-optional-locks")
                 .arg("--no-pager")
                 .arg("--no-replace-objects")
+                // Empty `core.fsmonitor=` would stop Git 2.15–2.35 from
+                // execvp("false") (the value is a program name). Leave `false`:
+                // tests/adversarial_git_security.rs asserts that literal in
+                // SWITCH_EXEC_PREFIX and the fixture's own git argv.
                 .args(["-c", "core.fsmonitor=false"])
                 .args(["-c", "log.showSignature=false"])
                 .args(args),
             timeout,
             &command_line,
+            Some(cwd),
         )
     }
 
@@ -279,6 +286,49 @@ impl fmt::Display for GitVersion {
     }
 }
 
+/// Appends `extra_dirs_that_exist` to `path`.
+///
+/// Entries already on `path` stay where they are, so a directory the user
+/// put first still wins. Directories are appended in the order given.
+/// Existence is the caller's decision: this does not touch the filesystem.
+pub fn extend_path_for_gui(path: &OsStr, extra_dirs_that_exist: &[PathBuf]) -> OsString {
+    if extra_dirs_that_exist.is_empty() {
+        return path.to_os_string();
+    }
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+    for extra in extra_dirs_that_exist {
+        if !dirs.iter().any(|dir| dir == extra) {
+            dirs.push(extra.clone());
+        }
+    }
+    std::env::join_paths(dirs).unwrap_or_else(|_| path.to_os_string())
+}
+
+const MACOS_HOMEBREW_BIN: &str = "/opt/homebrew/bin";
+const MACOS_USR_LOCAL_BIN: &str = "/usr/local/bin";
+
+/// Homebrew then `/usr/local`, limited to directories `exists` accepts.
+///
+/// The closure is injected so a test can pretend the directories are there
+/// without creating `/opt/homebrew` on the host.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn macos_gui_path_dirs(exists: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+    [MACOS_HOMEBREW_BIN, MACOS_USR_LOCAL_BIN]
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|dir| exists(dir))
+        .collect()
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn apply_gui_path(command: &mut Command, parent_path: Option<&OsStr>, extras: &[PathBuf]) {
+    if extras.is_empty() {
+        return;
+    }
+    let parent = parent_path.unwrap_or(OsStr::new(""));
+    command.env("PATH", extend_path_for_gui(parent, extras));
+}
+
 /// The single place where git processes are built, so every invocation
 /// (including `--version`) gets the same environment and window flags.
 fn command(program: &Path) -> Command {
@@ -303,6 +353,29 @@ fn command(program: &Path) -> Command {
         // The "C" locale exists everywhere and keeps the stderr we match on in English.
         .env("LC_ALL", "C")
         .env("LANGUAGE", "C");
+
+    // The sweep above drops GIT_NO_LAZY_FETCH because it is not in KEPT_GIT_VARS.
+    // Put a user-set value back unchanged. Otherwise disable lazy fetches of
+    // promisor objects. Git 2.15 does not read the name; unknown environment
+    // variables are unused, so the assignment is safe on the version floor.
+    match std::env::var_os("GIT_NO_LAZY_FETCH") {
+        Some(value) => {
+            command.env("GIT_NO_LAZY_FETCH", value);
+        }
+        None => {
+            command.env("GIT_NO_LAZY_FETCH", "1");
+        }
+    }
+
+    // Finder's PATH is `/usr/bin:/bin:/usr/sbin:/sbin`, which hides Homebrew
+    // helpers such as `git-credential-manager` and a Homebrew `ssh`. Append
+    // those directories on macOS only, after the user's entries.
+    #[cfg(target_os = "macos")]
+    apply_gui_path(
+        &mut command,
+        std::env::var_os("PATH").as_deref(),
+        &macos_gui_path_dirs(|dir| dir.is_dir()),
+    );
 
     #[cfg(unix)]
     {
@@ -399,6 +472,25 @@ fn timed_out(command_name: &str, limit: Duration) -> GitError {
     }
 }
 
+/// `spawn` returns [`io::ErrorKind::NotFound`] when `current_dir` is missing,
+/// the same kind as a missing executable. A missing git binary stays
+/// [`GitError::Spawn`]. A program that exists, aimed at a workdir that is not
+/// a directory, is [`GitError::NotADirectory`].
+fn classify_spawn_error(command: &Command, error: io::Error, workdir: Option<&Path>) -> GitError {
+    let program_exists = Path::new(command.get_program()).exists();
+    if program_exists
+        && let Some(dir) = workdir
+        && !dir.is_dir()
+        && matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+        )
+    {
+        return GitError::NotADirectory(dir.to_path_buf());
+    }
+    GitError::Spawn(error)
+}
+
 /// How long to let a reader finish after the child has exited or been killed.
 /// Long enough for a pipe to close, short enough that a grandchild holding
 /// stdout cannot pin the caller.
@@ -408,8 +500,12 @@ fn capture(
     command: &mut Command,
     timeout: Duration,
     command_name: &str,
+    workdir: Option<&Path>,
 ) -> Result<GitOutput, GitError> {
-    let mut child = command.spawn().map_err(GitError::Spawn)?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return Err(classify_spawn_error(command, error, workdir)),
+    };
     let pid = child.id();
     let stdout = child
         .stdout
@@ -545,7 +641,10 @@ fn stop_group(pid: u32, child: &mut Child) {
     }
     #[cfg(not(unix))]
     {
-        // Windows has no process group here; the direct child is the one to stop.
+        // Windows has no process group here. `child.kill()` stops the direct
+        // child only; grandchildren are not killed. Job Objects would, and
+        // they need unsafe, which this crate forbids. This module has no
+        // Windows kill helper to shell out to.
         let _ = (pid, child.kill());
     }
     reap(child, Duration::from_millis(50));
@@ -907,5 +1006,88 @@ mod tests {
             error.to_string(),
             "CTHULHU_GIT is set to /nope, which is not an executable file."
         );
+    }
+
+    fn joined(dirs: &[&str]) -> OsString {
+        std::env::join_paths(dirs.iter().map(PathBuf::from)).expect("PATH")
+    }
+
+    #[test]
+    fn extend_path_for_gui_appends_homebrew_after_the_finder_entries() {
+        let finder = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+        let extras = macos_gui_path_dirs(|dir| {
+            dir == Path::new(MACOS_HOMEBREW_BIN) || dir == Path::new(MACOS_USR_LOCAL_BIN)
+        });
+        let extended = extend_path_for_gui(&joined(&finder), &extras);
+        let mut expected: Vec<_> = finder.iter().map(PathBuf::from).collect();
+        expected.push(PathBuf::from(MACOS_HOMEBREW_BIN));
+        expected.push(PathBuf::from(MACOS_USR_LOCAL_BIN));
+        assert_eq!(
+            std::env::split_paths(&extended).collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn extend_path_for_gui_keeps_an_existing_entry_in_place() {
+        let parent = ["/custom/bin", MACOS_HOMEBREW_BIN, "/usr/bin"];
+        let extras = vec![
+            PathBuf::from(MACOS_HOMEBREW_BIN),
+            PathBuf::from(MACOS_USR_LOCAL_BIN),
+        ];
+        let extended = extend_path_for_gui(&joined(&parent), &extras);
+        assert_eq!(
+            std::env::split_paths(&extended).collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("/custom/bin"),
+                PathBuf::from(MACOS_HOMEBREW_BIN),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from(MACOS_USR_LOCAL_BIN),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_gui_path_records_homebrew_at_the_end_of_the_child_path() {
+        let mut command = Command::new("git");
+        let finder = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+        let extras = macos_gui_path_dirs(|dir| dir == Path::new(MACOS_HOMEBREW_BIN));
+        apply_gui_path(&mut command, Some(&joined(&finder)), &extras);
+        let path = command
+            .get_envs()
+            .find(|(key, _)| *key == "PATH")
+            .and_then(|(_, value)| value)
+            .expect("PATH");
+        let dirs: Vec<_> = std::env::split_paths(path).collect();
+        assert_eq!(
+            dirs.first().map(PathBuf::as_path),
+            Some(Path::new("/usr/bin")),
+            "{dirs:?}"
+        );
+        assert_eq!(
+            dirs.last().map(PathBuf::as_path),
+            Some(Path::new(MACOS_HOMEBREW_BIN))
+        );
+    }
+
+    #[test]
+    fn apply_gui_path_leaves_path_inherited_when_no_extra_dir_exists() {
+        let mut command = Command::new("git");
+        apply_gui_path(&mut command, Some(OsStr::new("/usr/bin")), &[]);
+        assert!(command.get_envs().all(|(key, _)| key != "PATH"));
+    }
+
+    #[test]
+    fn command_sets_or_keeps_git_no_lazy_fetch() {
+        let built = command(Path::new("git"));
+        let value = built
+            .get_envs()
+            .find(|(key, _)| *key == "GIT_NO_LAZY_FETCH")
+            .and_then(|(_, value)| value)
+            .expect("GIT_NO_LAZY_FETCH");
+        match std::env::var_os("GIT_NO_LAZY_FETCH") {
+            Some(parent) => assert_eq!(value, parent.as_os_str()),
+            None => assert_eq!(value, OsStr::new("1")),
+        }
     }
 }
