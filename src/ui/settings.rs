@@ -16,7 +16,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cthulhu_git::github::{ApiStatus, TOKEN_TEMPLATE_URL};
-use cthulhu_git::settings::HistoryColumns;
+use cthulhu_git::settings::{HistoryColumns, sanitize_font_name};
 use eframe::egui::{
     self, Align, Button, Color32, CursorIcon, FontId, Frame, Id, Key, Label, Layout, Margin,
     RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, Vec2,
@@ -320,9 +320,12 @@ fn terminal_page(ui: &mut Ui, palette: &Palette, saved: Option<&str>, actions: &
 }
 
 /// The saved string when it names nothing in `faces`.
-fn stale_font<'a>(saved: Option<&'a str>, faces: &[Face]) -> Option<&'a str> {
-    let name = saved.map(str::trim).filter(|text| !text.is_empty())?;
-    if fonts::face_by_id(faces, name).is_some() {
+///
+/// The label is the sanitized id. A newline or a name that sanitizes to
+/// nothing is not shown.
+fn stale_font(saved: Option<&str>, faces: &[Face]) -> Option<String> {
+    let name = sanitize_font_name(saved?)?;
+    if fonts::face_by_id(faces, &name).is_some() {
         None
     } else {
         Some(name)
@@ -330,9 +333,10 @@ fn stale_font<'a>(saved: Option<&'a str>, faces: &[Face]) -> Option<&'a str> {
 }
 
 /// Like [`stale_font`] for the terminal. `builtin` is a real choice.
-fn stale_terminal(saved: Option<&str>) -> Option<&str> {
-    let name = saved.map(str::trim).filter(|text| !text.is_empty())?;
-    if fonts::is_builtin_terminal(name) || fonts::face_by_id(fonts::TERMINAL_FACES, name).is_some()
+fn stale_terminal(saved: Option<&str>) -> Option<String> {
+    let name = sanitize_font_name(saved?)?;
+    if fonts::is_builtin_terminal(&name)
+        || fonts::face_by_id(fonts::TERMINAL_FACES, &name).is_some()
     {
         None
     } else {
@@ -346,8 +350,8 @@ fn store_font(
     actions: &mut Vec<Action>,
     make: impl Fn(Option<String>) -> Action,
 ) {
-    let current = saved.map(str::trim).filter(|text| !text.is_empty());
-    if current != next {
+    let current = saved.and_then(sanitize_font_name);
+    if current.as_deref() != next {
         actions.push(make(next.map(str::to_owned)));
     }
 }
@@ -1000,4 +1004,28 @@ fn card(ui: &mut Ui, palette: &Palette, add: impl FnOnce(&mut Ui)) {
             ui.spacing_mut().item_spacing.y = COLUMN_SPACING;
             add(ui);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fonts, stale_font, stale_terminal};
+
+    #[test]
+    fn font_warning_does_not_interpolate_unsanitized_text() {
+        let bidi = "\u{202E}JetBrains Mono";
+        let warning = stale_font(Some(bidi), fonts::UI_FACES).expect("warning");
+        assert_eq!(warning, "JetBrains Mono");
+        assert!(!warning.contains('\u{202E}'));
+
+        let huge = "x".repeat(100_000);
+        let warning = stale_font(Some(&huge), fonts::UI_FACES).expect("warning");
+        assert_eq!(warning, "x".repeat(128));
+        assert!(!warning.contains(&huge));
+
+        assert!(stale_font(Some("obel\nmono"), fonts::UI_FACES).is_none());
+        assert!(stale_terminal(Some("fira\ncode")).is_none());
+        let terminal = stale_terminal(Some("\u{202E}Fira Code")).expect("warning");
+        assert_eq!(terminal, "Fira Code");
+        assert!(!terminal.contains('\u{202E}'));
+    }
 }
