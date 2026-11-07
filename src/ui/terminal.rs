@@ -1386,11 +1386,26 @@ fn copy_or_interrupt(ctx: &egui::Context, session: &mut ShellSession) {
 }
 
 fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
-    let mut payload = text.replace("\r\n", "\r").replace('\n', "\r");
+    // Bracketed paste ends at ESC [201~. A paste that contains that sequence
+    // is then typed as a command. C0 controls other than tab and newline are
+    // removed before the markers are added. CR is the newline the PTY uses.
+    let sanitized: String = text
+        .chars()
+        .filter(|ch| paste_char_is_allowed(*ch))
+        .collect();
+    let mut payload = sanitized.replace("\r\n", "\r").replace('\n', "\r");
     if bracketed {
         payload = format!("\x1b[200~{payload}\x1b[201~");
     }
     payload.into_bytes()
+}
+
+fn paste_char_is_allowed(ch: char) -> bool {
+    match u32::from(ch) {
+        0x09 | 0x0A | 0x0D => true,
+        code if code < 0x20 => false,
+        _ => true,
+    }
 }
 
 fn encode_key(session: &ShellSession, key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
@@ -2116,6 +2131,39 @@ END
         let size = window_size(&huge, 10.0);
         assert!(pty_size_is_safe(size), "{size:?}");
         assert!(size.cell_width < 1_000, "cell width was not clamped");
+    }
+
+    #[test]
+    fn paste_bytes_rejects_bracketed_breakout() {
+        let bytes = paste_bytes("\x1b[201~touch pwned\r", true);
+        let open = b"\x1b[200~";
+        let close = b"\x1b[201~";
+        assert!(bytes.starts_with(open), "{bytes:?}");
+        assert!(bytes.ends_with(close), "{bytes:?}");
+        let payload = &bytes[open.len()..bytes.len() - close.len()];
+        assert!(!payload.contains(&0x1b), "{payload:?}");
+        let outside = [&bytes[..open.len()], &bytes[bytes.len() - close.len()..]];
+        for region in outside {
+            assert!(
+                !region
+                    .windows(b"touch pwned".len())
+                    .any(|window| window == b"touch pwned"),
+                "{region:?}"
+            );
+        }
+        // The command text stays inside the paste, where the terminal will not execute it.
+        assert!(
+            payload
+                .windows(b"touch pwned".len())
+                .any(|window| window == b"touch pwned")
+        );
+        assert!(payload.ends_with(b"\r"));
+
+        let kept = paste_bytes("a\tb\nc", false);
+        assert!(kept.contains(&b'\t'));
+        assert!(kept.contains(&b'\r'));
+        assert!(!kept.contains(&b'\n'));
+        assert!(!kept.contains(&0x1b));
     }
 
     #[test]
