@@ -1,5 +1,9 @@
 //! Read-only git commands must not run a repository diff driver.
 //!
+//! `many_branches_do_not_spawn_one_rev_list_each` records the process count
+//! `branches()` uses today. Collapsing that fan-out is not a small change, so
+//! the test locks the current count instead of a tighter bound.
+//!
 //! Fixture git is isolated from the runner's config. `Git::command` drops
 //! inherited `GIT_*` (except the SSH helpers), so those variables cannot
 //! carry isolation into the library. The hover test therefore re-execs with
@@ -9,11 +13,12 @@
 
 use std::env;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
-use cthulhu_git::git::{commit_hover, file_diff};
+use cthulhu_git::git::{DiscoverInputs, Head, branches, commit_hover, discover_with, file_diff};
 use tempfile::TempDir;
 
 const ISOLATED: &str = "CTHULHU_ADV_D_ISOLATED";
@@ -30,6 +35,74 @@ const CLEARED_ENV: &[&str] = &[
     "GIT_EXEC_PATH",
     "GIT_EXTERNAL_DIFF",
 ];
+
+/// One shared fake git. Sidecars next to the invoked symlink select the refs
+/// and the invocation log. A fresh executable per test races with `ETXTBSY`.
+const FAKE_GIT_SCRIPT: &str = r#"#!/bin/sh
+inv="$0.invocations"
+cmd=
+for arg in "$@"; do
+  case "$arg" in
+    --version) cmd=version; break ;;
+    for-each-ref) cmd=for-each-ref; break ;;
+    rev-list) cmd=rev-list; break ;;
+  esac
+done
+if [ -z "$cmd" ]; then
+  echo "unexpected fake git arguments: $*" >&2
+  exit 1
+fi
+printf '%s\n' "$cmd" >> "$inv"
+case "$cmd" in
+  version)
+    echo "git version 2.43.0"
+    ;;
+  for-each-ref)
+    cat "$0.refs"
+    ;;
+  rev-list)
+    echo 4
+    ;;
+esac
+exit 0
+"#;
+
+fn shared_script() -> &'static Path {
+    static SCRIPT_PATH: OnceLock<PathBuf> = OnceLock::new();
+    SCRIPT_PATH.get_or_init(|| {
+        let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cthulhu-adv-d-fake-git.sh");
+        fs::write(&path, FAKE_GIT_SCRIPT).expect("write shared fake git");
+        let mut permissions = fs::metadata(&path)
+            .expect("fake git metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod fake git");
+        path
+    })
+}
+
+fn sidecar(link: &Path, suffix: &str) -> PathBuf {
+    let mut name = link.file_name().expect("fake git name").to_os_string();
+    name.push(suffix);
+    link.with_file_name(name)
+}
+
+fn link_fake(dir: &Path, name: &str) -> PathBuf {
+    fs::create_dir_all(dir).expect("fake git dir");
+    let path = dir.join(name);
+    symlink(shared_script(), &path).expect("symlink fake git");
+    path
+}
+
+fn probe_fake(path: &Path) -> cthulhu_git::git::Git {
+    let inputs = DiscoverInputs {
+        override_path: Some(path.to_path_buf().into()),
+        path_var: None,
+        exe_name: "git",
+        fallbacks: Vec::new(),
+    };
+    discover_with(&inputs).unwrap_or_else(|error| panic!("probe fake git: {error}"))
+}
 
 fn write_executable(path: &Path, body: &str) {
     if let Some(parent) = path.parent() {
@@ -172,5 +245,58 @@ fn child_hover_and_file_diff_do_not_run_textconv() {
     assert!(
         diff.lines.iter().any(|line| line.text == "hello"),
         "file diff did not contain the committed line: {diff:?}"
+    );
+}
+
+const MANY_BRANCHES: usize = 30;
+
+/// Characterization. `branches()` runs one `for-each-ref` and then one
+/// `rev-list --count` per local branch, so thirty branches spawn 31
+/// processes. `rev-list --count` on many tips is one union, and walking
+/// `rev-list --all` in process would replace the counter and can exceed the
+/// 8 MiB output cap. The assertion is the current cost, not a tighter bound.
+#[test]
+fn many_branches_do_not_spawn_one_rev_list_each() {
+    let tmp = TempDir::new().expect("temp");
+    let link = link_fake(tmp.path(), "fake-git");
+    let mut refs = Vec::new();
+    for index in 0..MANY_BRANCHES {
+        let name = format!("b{index:02}");
+        let oid = format!("{:040x}", index + 1);
+        refs.extend(name.as_bytes());
+        refs.push(0x1f);
+        refs.extend(oid.as_bytes());
+        refs.extend_from_slice(b"\x1f\x1f\x1f1700000000\n");
+    }
+    fs::write(sidecar(&link, ".refs"), refs).expect("refs sidecar");
+    let invocations = sidecar(&link, ".invocations");
+    fs::write(&invocations, "").expect("truncate invocations");
+
+    let git = probe_fake(&link);
+    fs::write(&invocations, "").expect("drop the version probe");
+    let root = tmp.path().join("repo");
+    fs::create_dir(&root).expect("repo dir");
+
+    let listed = branches(&git, &root, &Head::Branch("b00".to_owned())).expect("branches");
+    assert_eq!(listed.len(), MANY_BRANCHES);
+    assert!(listed.iter().all(|branch| branch.commit_count == 4));
+
+    let log = fs::read_to_string(&invocations).expect("read invocations");
+    let commands: Vec<&str> = log.lines().filter(|line| !line.is_empty()).collect();
+    let rev_lists = commands.iter().filter(|line| **line == "rev-list").count();
+    let for_each = commands
+        .iter()
+        .filter(|line| **line == "for-each-ref")
+        .count();
+    assert_eq!(for_each, 1, "invocations: {commands:?}");
+    // Characterization, not the desired bound. See MANY_BRANCHES.
+    assert_eq!(
+        rev_lists, MANY_BRANCHES,
+        "one rev-list --count per branch is still the implementation; invocations: {commands:?}"
+    );
+    assert_eq!(
+        commands.len(),
+        1 + MANY_BRANCHES,
+        "invocations: {commands:?}"
     );
 }
