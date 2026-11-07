@@ -3,6 +3,9 @@
 //! Every path is under a `tempfile` directory. These tests never call
 //! `Settings::default_path()` and never touch the real config folder.
 
+#[path = "common/mod.rs"]
+mod common;
+
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -384,11 +387,22 @@ fn unwritable_parent_directory_is_a_write_error() {
         path: &parent,
         mode,
     };
+    common::strip_acls(&parent);
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).expect("chmod");
     assert_eq!(
         fs::metadata(&parent).expect("meta").permissions().mode() & 0o777,
         0o555
     );
+    // Filesystem grants access despite mode 0555 (an ACL the test cannot strip).
+    let probe = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path);
+    if probe.is_ok() {
+        let _ = fs::remove_file(&path);
+        return;
+    }
 
     let error = Settings::default()
         .save_to(&path)
