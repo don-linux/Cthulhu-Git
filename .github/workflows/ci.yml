@@ -62,9 +62,7 @@ jobs:
   test:
     name: cargo test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # Temporary flake hunt: the macOS Test step runs cargo test three times.
-    # Restore timeout-minutes: 30 when that loop is removed.
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -92,16 +90,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           cargo clippy --locked --all-targets -- -D warnings
-          # Temporary: repeat the macOS suite to surface flakes. The Apple git
-          # step below stays a single run. Remove this loop after CI is green.
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            for i in 1 2 3; do
-              echo "cargo test --locked (macOS pass ${i}/3)"
-              cargo test --locked
-            done
-          else
-            cargo test --locked
-          fi
+          cargo test --locked
       # Finder launches apps with /usr/bin:/bin:/usr/sbin:/sbin, so this step
       # runs against Apple's git. The runner's rustup may come from Homebrew,
       # whose bin directory also holds a newer git, so only the toolchain's own
