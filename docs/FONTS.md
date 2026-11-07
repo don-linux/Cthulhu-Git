@@ -20,8 +20,8 @@ settings.json "terminal_font": "meslo-lgs-nf"
 ```
 
 Hashes and diffs stay on the built-in monospace. Choosing Obel Mono for the
-interface does not change them, and choosing Meslo for the terminal does not
-change the interface.
+interface or the terminal does not change them. Choosing it for the terminal
+does not change the interface, and the other way around.
 
 egui treats strong text as a brighter color, not a heavier weight, so only
 the Regular cut of each family is bundled.
@@ -53,6 +53,7 @@ the Regular cut of each family is bundled.
 
 | Id | Name | File | License |
 | -- | ---- | ---- | ------- |
+| `obel-mono` | Obel Mono | same file as the interface face | SIL OFL 1.1 |
 | `meslo-lgs-nf` | Meslo LGS NF | `assets/fonts/meslo-lgs-nf/MesloLGS-NF-Regular.ttf` | Apache 2.0 |
 | `departure-mono` | Departure Mono | `assets/fonts/departure-mono/DepartureMono-Regular.otf` | SIL OFL 1.1 |
 
@@ -64,5 +65,6 @@ pixels sit on the grid. Meslo LGS NF is the face that includes prompt icons.
 1. Put the unmodified Regular file and its license text in a new directory
    under `assets/fonts/<id>/`. Do not rename the font inside the file.
 2. Add a `Face` to `UI_FACES` or `TERMINAL_FACES` in `src/ui/fonts.rs`.
-   The `id` is what settings store. It must not appear in the other catalog.
+   The `id` is what settings store. A monospaced face that is already bundled
+   may use that same id in the other catalog; share one `include_bytes!`.
 3. Add a row to the table above.

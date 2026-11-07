@@ -977,7 +977,7 @@ fn appearance_and_terminal_offer_different_bundled_faces() {
     );
 
     click_label(&mut harness, "Terminal");
-    for name in ["Built-in", "Meslo LGS NF", "Departure Mono"] {
+    for name in ["Built-in", "Obel Mono", "Meslo LGS NF", "Departure Mono"] {
         harness.get_by_label(name);
     }
     assert!(

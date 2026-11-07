@@ -21,6 +21,9 @@ pub const DEFAULT_UI_ID: &str = "ubuntu-sans";
 /// Departure Mono is a pixel face. 11pt lands on its grid.
 const DEPARTURE_SIZE: f32 = 11.0;
 
+/// One copy of the file. Appearance and Terminal both offer this face.
+const OBEL_MONO: &[u8] = include_bytes!("../../assets/fonts/obel-mono/ObelMono-Regular.ttf");
+
 /// One face compiled into the app.
 pub struct Face {
     pub id: &'static str,
@@ -44,7 +47,7 @@ pub const UI_FACES: &[Face] = &[
         id: "obel-mono",
         name: "Obel Mono",
         note: "Monospace",
-        bytes: include_bytes!("../../assets/fonts/obel-mono/ObelMono-Regular.ttf"),
+        bytes: OBEL_MONO,
         terminal_size: None,
     },
     Face {
@@ -65,6 +68,13 @@ pub const UI_FACES: &[Face] = &[
 
 /// Terminal faces, in the order the Terminal page lists them.
 pub const TERMINAL_FACES: &[Face] = &[
+    Face {
+        id: "obel-mono",
+        name: "Obel Mono",
+        note: "Monospace",
+        bytes: OBEL_MONO,
+        terminal_size: None,
+    },
     Face {
         id: "meslo-lgs-nf",
         name: "Meslo LGS NF",
@@ -257,6 +267,10 @@ fn definitions(ui_id: &str, terminal_id: Option<&str>) -> FontDefinitions {
         .unwrap_or_default();
 
     for face in UI_FACES.iter().chain(TERMINAL_FACES) {
+        // Obel Mono is listed for the interface and the terminal. One id, one face.
+        if fonts.font_data.contains_key(face.id) {
+            continue;
+        }
         fonts.font_data.insert(
             face.id.to_owned(),
             Arc::new(FontData::from_static(face.bytes)),
@@ -304,14 +318,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalogs_are_disjoint_and_the_default_is_an_interface_face() {
+    fn obel_mono_is_shared_and_other_faces_stay_in_one_catalog() {
         assert!(face_by_id(UI_FACES, DEFAULT_UI_ID).is_some());
+        let interface = face_by_id(UI_FACES, "obel-mono").expect("interface");
+        let terminal = face_by_id(TERMINAL_FACES, "obel-mono").expect("terminal");
+        assert_eq!(interface.bytes.as_ptr(), terminal.bytes.as_ptr());
         for face in UI_FACES {
-            assert!(face_by_id(TERMINAL_FACES, face.id).is_none(), "{}", face.id);
             assert!(face.bytes.len() > 4, "{}", face.id);
+            if face.id == "obel-mono" {
+                continue;
+            }
+            assert!(face_by_id(TERMINAL_FACES, face.id).is_none(), "{}", face.id);
         }
         for face in TERMINAL_FACES {
-            assert!(face_by_id(UI_FACES, face.id).is_none(), "{}", face.id);
+            if face.id != "obel-mono" {
+                assert!(face_by_id(UI_FACES, face.id).is_none(), "{}", face.id);
+            }
             let tag = &face.bytes[..4];
             assert!(
                 tag == b"\0\x01\0\0" || tag == b"OTTO" || tag == b"true",
