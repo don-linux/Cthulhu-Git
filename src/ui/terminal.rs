@@ -1318,8 +1318,16 @@ fn sgr(button: u8, col: usize, row: usize, release: bool) -> Vec<u8> {
 fn handle_keys(ui: &mut Ui, session: &mut ShellSession) {
     let modifiers = ui.input(|input| input.modifiers);
     let mut events = ui.input_mut(|input| std::mem::take(&mut input.events));
+    // egui emits `Key` before `Text`. Option+key produces a composed
+    // character; writing ESC+letter as well would discard it.
+    let composed = events
+        .iter()
+        .any(|event| matches!(event, Event::Text(text) if option_text_is_composed(text)));
     let mut kept = Vec::new();
     for event in events.drain(..) {
+        if composed && alt_letter_key_is_redundant(&event) {
+            continue;
+        }
         if consumes(&event) {
             apply_key(ui.ctx(), session, event, modifiers);
         } else {
@@ -1340,8 +1348,8 @@ fn consumes(event: &Event) -> bool {
 fn apply_key(ctx: &egui::Context, session: &mut ShellSession, event: Event, modifiers: Modifiers) {
     match event {
         Event::Text(text) => {
-            if !modifiers.alt && !modifiers.ctrl {
-                session.write(text.as_bytes());
+            if let Some(bytes) = text_input_bytes(&text, modifiers) {
+                session.write(&bytes);
             }
         }
         Event::Paste(text) => session.write(&paste_bytes(&text, bracketed(session))),
@@ -1398,6 +1406,39 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
         payload = format!("\x1b[200~{payload}\x1b[201~");
     }
     payload.into_bytes()
+}
+
+/// Bytes for `Event::Text`. Option's composed character is that text.
+/// A plain ASCII letter with Alt still belongs to the ESC+letter path.
+fn text_input_bytes(text: &str, modifiers: Modifiers) -> Option<Vec<u8>> {
+    if modifiers.ctrl || text.is_empty() {
+        return None;
+    }
+    if modifiers.alt && !option_text_is_composed(text) {
+        return None;
+    }
+    Some(text.as_bytes().to_vec())
+}
+
+fn option_text_is_composed(text: &str) -> bool {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(ch) if chars.next().is_none() && ch.is_ascii_alphabetic() => false,
+        Some(_) => true,
+        None => false,
+    }
+}
+
+fn alt_letter_key_is_redundant(event: &Event) -> bool {
+    match event {
+        Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } => modifiers.alt && !modifiers.ctrl && letter(*key).is_some(),
+        _ => false,
+    }
 }
 
 fn paste_char_is_allowed(ch: char) -> bool {
@@ -2131,6 +2172,21 @@ END
         let size = window_size(&huge, 10.0);
         assert!(pty_size_is_safe(size), "{size:?}");
         assert!(size.cell_width < 1_000, "cell width was not clamped");
+    }
+
+    #[test]
+    fn option_text_is_the_composed_character() {
+        let bytes = text_input_bytes(
+            "å",
+            Modifiers {
+                alt: true,
+                ..Modifiers::NONE
+            },
+        )
+        .expect("composed text");
+        assert_eq!(bytes, "å".as_bytes());
+        assert!(!bytes.contains(&0x1b));
+        assert!(!bytes.windows(2).any(|pair| pair == [0x1b, b'a']));
     }
 
     #[test]
