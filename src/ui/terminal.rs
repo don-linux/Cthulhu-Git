@@ -1,8 +1,10 @@
 //! Interactive shell for the open repository.
 //!
 //! The PTY is `alacritty_terminal`, not `Git::run`. The child is not killed
-//! after 60 seconds. It does not inherit `GIT_*` (except ssh and askpass) or
-//! `GH_TOKEN` / `GITHUB_TOKEN`. It is given `TERM` and `COLORTERM` so `clear`
+//! after 60 seconds. On Unix it does not inherit `GIT_*` (except ssh and
+//! askpass) or `GH_TOKEN` / `GITHUB_TOKEN`. Windows ConPTY merges
+//! `Options.env` with the parent environment, so those names cannot be
+//! removed there. It is given `TERM` and `COLORTERM` so `clear`
 //! and Ctrl+L erase the screen. It starts the first time the strip is shown
 //! and dies with the [`OpenedRepo`](super::OpenedRepo).
 
@@ -64,7 +66,8 @@ pub struct ShellArgv {
 /// an absolute executable `passwd_shell`. macOS then tries `/bin/zsh`.
 /// `/bin/sh` is the last resort.
 /// `unset` is applied with `/usr/bin/env -u`, which can remove names.
-/// `Options.env` can only add them.
+/// `Options.env` can only add them. On Windows that map is merged into the
+/// parent environment, so `unset` is not applied.
 pub fn shell_argv(
     host: HostOs,
     shell: Option<&OsStr>,
@@ -73,6 +76,7 @@ pub fn shell_argv(
 ) -> Result<ShellArgv, String> {
     let argv = bare_shell(host, shell, passwd_shell)?;
     if host == HostOs::Windows || unset.is_empty() {
+        // Windows `tty::Options.env` cannot drop inherited names.
         return Ok(argv);
     }
     let mut args = Vec::with_capacity(unset.len() * 2 + 2 + argv.args.len());
@@ -101,10 +105,14 @@ fn bare_shell(
     passwd_shell: Option<&str>,
 ) -> Result<ShellArgv, String> {
     if host == HostOs::Windows {
-        return Ok(ShellArgv {
-            program: "powershell.exe".to_owned(),
-            args: Vec::new(),
-        });
+        // `Command` searches the working directory before `PATH`. A bare
+        // `powershell.exe` would run a binary planted in the repository.
+        return windows_shell_argv(
+            std::env::var("ProgramFiles").ok().as_deref(),
+            std::env::var("SystemRoot").ok().as_deref(),
+            std::env::var("COMSPEC").ok().as_deref(),
+            |path| Path::new(path).is_file(),
+        );
     }
     let program = chosen_unix_shell(host, shell, passwd_shell);
     let args = if host == HostOs::Macos {
@@ -160,6 +168,69 @@ fn unix_shell_is_executable(path: &str) -> bool {
         // require an absolute path via [`unix_shell_is_absolute`].
         let _ = path;
         true
+    }
+}
+
+/// PowerShell, as a pure function of the Windows environment.
+///
+/// Order is `%ProgramFiles%\PowerShell\7\pwsh.exe`, then
+/// `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`.
+/// Relative paths are skipped. `COMSPEC` is not a candidate: a relative
+/// value would search the repository, and an absolute one is often `cmd.exe`.
+fn windows_shell_argv(
+    program_files: Option<&str>,
+    system_root: Option<&str>,
+    _comspec: Option<&str>,
+    exists: impl Fn(&str) -> bool,
+) -> Result<ShellArgv, String> {
+    let candidates = [
+        program_files.map(|root| windows_join(root, r"PowerShell\7\pwsh.exe")),
+        system_root
+            .map(|root| windows_join(root, r"System32\WindowsPowerShell\v1.0\powershell.exe")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if windows_path_is_absolute(&candidate) && exists(&candidate) {
+            return Ok(ShellArgv {
+                program: candidate,
+                args: vec!["-NoLogo".to_owned()],
+            });
+        }
+    }
+    Err("Could not find an absolute PowerShell.".to_owned())
+}
+
+fn windows_join(base: &str, child: &str) -> String {
+    let base = base.trim_end_matches(['\\', '/']);
+    format!("{base}\\{child}")
+}
+
+/// Drive path (`C:\...`) or UNC (`\\server\share`). `Path::is_absolute` is
+/// false for both when this code is tested on Unix.
+fn windows_path_is_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        return true;
+    }
+    bytes.len() >= 3 && bytes[0] == b'\\' && bytes[1] == b'\\'
+}
+
+#[cfg(any(windows, test))]
+fn windows_taskkill_path(
+    system_root: Option<&str>,
+    exists: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    let Some(root) = system_root.filter(|root| windows_path_is_absolute(root)) else {
+        return Err("SystemRoot is unset or not absolute.".to_owned());
+    };
+    let path = windows_join(root, r"System32\taskkill.exe");
+    if windows_path_is_absolute(&path) && exists(&path) {
+        Ok(path)
+    } else {
+        Err(format!("taskkill is not at {path}."))
     }
 }
 
@@ -728,7 +799,9 @@ fn stop_session(leader: u32) {
         }
     }
     #[cfg(windows)]
-    kill_process_tree(leader);
+    {
+        let _ = kill_process_tree(leader);
+    }
 }
 
 #[cfg(unix)]
@@ -834,16 +907,29 @@ fn processes_in_session(_session: i32) -> Vec<u32> {
 }
 
 #[cfg(windows)]
-fn kill_process_tree(pid: u32) {
+fn kill_process_tree(pid: u32) -> Result<(), String> {
     if pid <= 1 {
-        return;
+        return Ok(());
     }
-    let _ = std::process::Command::new("taskkill")
+    // A bare `taskkill` searches the working directory and flashes a console.
+    let program = windows_taskkill_path(std::env::var("SystemRoot").ok().as_deref(), |path| {
+        Path::new(path).is_file()
+    })?;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let status = std::process::Command::new(&program)
         .args(["/F", "/T", "/PID", &pid.to_string()])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map_err(|error| format!("Could not run {program}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("taskkill exited with {status}"))
+    }
 }
 
 pub fn focus_id(view_id: Id) -> Id {
@@ -1733,9 +1819,10 @@ mod tests {
 
     #[test]
     fn shell_argv_follows_shell_login_and_unset() {
-        let zsh = shell_argv(HostOs::Linux, Some(OsStr::new("/bin/bash")), None, &[]).expect("zsh");
-        assert_eq!(zsh.program, "/bin/bash");
-        assert!(zsh.args.is_empty());
+        let bash =
+            shell_argv(HostOs::Linux, Some(OsStr::new("/bin/bash")), None, &[]).expect("bash");
+        assert_eq!(bash.program, "/bin/bash");
+        assert!(bash.args.is_empty());
 
         let login =
             shell_argv(HostOs::Macos, Some(OsStr::new("/bin/bash")), None, &[]).expect("login");
@@ -1769,10 +1856,8 @@ mod tests {
             Some(OsStr::new("/bin/bash")),
             None,
             &["GIT_DIR"],
-        )
-        .expect("windows");
-        assert_eq!(windows.program, "powershell.exe");
-        assert!(windows.args.is_empty());
+        );
+        assert_windows_shell(windows);
     }
 
     #[test]
@@ -1815,17 +1900,18 @@ mod tests {
             );
         }
 
-        let zsh = shell_argv(HostOs::Linux, Some(OsStr::new("/bin/bash")), None, &[]).expect("zsh");
-        assert_eq!(zsh.program, "/bin/bash");
-        let wrapped_zsh = shell_argv(
+        let bash =
+            shell_argv(HostOs::Linux, Some(OsStr::new("/bin/bash")), None, &[]).expect("bash");
+        assert_eq!(bash.program, "/bin/bash");
+        let wrapped_bash = shell_argv(
             HostOs::Linux,
             Some(OsStr::new("/bin/bash")),
             None,
             &["GIT_DIR"],
         )
-        .expect("wrapped zsh");
-        assert_eq!(wrapped_zsh.program, "/usr/bin/env");
-        assert_eq!(wrapped_zsh.args, ["-u", "GIT_DIR", "--", "/bin/bash"]);
+        .expect("wrapped bash");
+        assert_eq!(wrapped_bash.program, "/usr/bin/env");
+        assert_eq!(wrapped_bash.args, ["-u", "GIT_DIR", "--", "/bin/bash"]);
 
         let passwd = shell_argv(
             HostOs::Linux,
@@ -1850,10 +1936,23 @@ mod tests {
             Some(OsStr::new("./sh")),
             None,
             &["GIT_DIR"],
-        )
-        .expect("windows");
-        assert_eq!(windows.program, "powershell.exe");
-        assert!(windows.args.is_empty());
+        );
+        assert_windows_shell(windows);
+    }
+
+    fn assert_windows_shell(argv: Result<ShellArgv, String>) {
+        match argv {
+            Ok(argv) => {
+                assert!(
+                    windows_path_is_absolute(&argv.program),
+                    "relative program {}",
+                    argv.program
+                );
+                assert_eq!(argv.args, ["-NoLogo"]);
+                assert_ne!(argv.program, "powershell.exe");
+            }
+            Err(error) => assert!(error.contains("PowerShell"), "{error}"),
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2233,6 +2332,57 @@ END
         let size = window_size(&huge, 10.0);
         assert!(pty_size_is_safe(size), "{size:?}");
         assert!(size.cell_width < 1_000, "cell width was not clamped");
+    }
+
+    #[test]
+    fn windows_shell_prefers_pwsh_then_windows_powershell() {
+        let pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe";
+        let powershell = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        let both = windows_shell_argv(
+            Some(r"C:\Program Files"),
+            Some(r"C:\Windows"),
+            Some(r".\powershell.exe"),
+            |path| path == pwsh || path == powershell,
+        )
+        .expect("pwsh");
+        assert_eq!(both.program, pwsh);
+        assert_eq!(both.args, ["-NoLogo"]);
+
+        let second = windows_shell_argv(
+            Some(r"C:\Program Files"),
+            Some(r"C:\Windows"),
+            Some(r"C:\Windows\System32\cmd.exe"),
+            |path| path == powershell,
+        )
+        .expect("powershell");
+        assert_eq!(second.program, powershell);
+        assert_eq!(second.args, ["-NoLogo"]);
+
+        let relative = windows_shell_argv(
+            Some(r"Program Files"),
+            Some("Windows"),
+            Some("powershell.exe"),
+            |_| true,
+        );
+        assert!(relative.is_err(), "{relative:?}");
+
+        let missing =
+            windows_shell_argv(Some(r"C:\Program Files"), Some(r"C:\Windows"), None, |_| {
+                false
+            });
+        assert!(missing.is_err(), "{missing:?}");
+    }
+
+    #[test]
+    fn windows_taskkill_requires_an_absolute_system_root() {
+        let present = |path: &str| path == r"C:\Windows\System32\taskkill.exe";
+        assert_eq!(
+            windows_taskkill_path(Some(r"C:\Windows"), present).expect("taskkill"),
+            r"C:\Windows\System32\taskkill.exe"
+        );
+        assert!(windows_taskkill_path(Some("Windows"), present).is_err());
+        assert!(windows_taskkill_path(None, present).is_err());
+        assert!(windows_taskkill_path(Some(r"C:\Windows"), |_| false).is_err());
     }
 
     #[test]
