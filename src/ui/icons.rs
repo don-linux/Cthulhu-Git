@@ -1,6 +1,9 @@
 //! Lucide interface icons (`assets/icons/`, ISC license). `build.rs` renders
 //! each SVG white; drawing tints it with a palette color, so the icons follow
 //! the theme.
+//!
+//! [`app_logo`] is the application mark from the same build, in color. It is
+//! not one of the tinted interface icons.
 
 use eframe::egui::{
     Button, Color32, ColorImage, Context, CursorIcon, Frame, Id, Image, Painter, Pos2, Rect,
@@ -233,6 +236,37 @@ fn hover_tip_frame(ui: &Ui) -> Frame {
     // `Frame::popup` fills with `window_fill`, and this theme sets that to the
     // same surface as the bars. The field background keeps the label separate.
     Frame::popup(ui.style()).fill(ui.visuals().extreme_bg_color)
+}
+
+/// Shared by the home screen and About, so the icon is uploaded once.
+const LOGO_TEXTURE_ID: &str = "cthulhu-git-about-logo";
+
+/// Draws the application icon at `size` points on a side, unchanged.
+pub fn app_logo(ui: &mut Ui, size: f32) -> Response {
+    let texture = logo_texture(ui.ctx());
+    ui.add(
+        Image::new(&texture)
+            .fit_to_exact_size(Vec2::splat(size))
+            .alt_text("Cthulhu-Git logo"),
+    )
+}
+
+/// Uploaded once and kept for the life of the context, same as the interface icons.
+fn logo_texture(ctx: &Context) -> TextureHandle {
+    let id = Id::new(LOGO_TEXTURE_ID);
+    if let Some(texture) = ctx.data(|data| data.get_temp(id)) {
+        return texture;
+    }
+    let rgba = image::load_from_memory(include_bytes!(concat!(env!("OUT_DIR"), "/icon-256.png")))
+        .expect("icon-256.png rendered by build.rs")
+        .into_rgba8();
+    let image = ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    );
+    let texture = ctx.load_texture(LOGO_TEXTURE_ID, image, TextureOptions::LINEAR);
+    ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+    texture
 }
 
 #[cfg(test)]

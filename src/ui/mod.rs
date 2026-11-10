@@ -28,8 +28,9 @@ mod terminal;
 pub mod theme;
 mod widgets;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
 use cthulhu_git::git::{
@@ -120,6 +121,17 @@ struct Opening {
     receiver: Receiver<OpenResult>,
 }
 
+/// One home-screen scan. Dropping it disconnects the worker, which stops
+/// after the git command it is already in.
+struct GlanceScan {
+    receiver: Receiver<GlanceMsg>,
+}
+
+struct GlanceMsg {
+    path: PathBuf,
+    glance: home::Glance,
+}
+
 pub struct CthulhuApp {
     settings: Settings,
     /// `None` when the OS reports no home folder; settings are then not saved.
@@ -148,6 +160,14 @@ pub struct CthulhuApp {
     /// `git --version` for the About page. `None` until Settings has asked.
     git_version: Option<String>,
     git_probe: Option<Receiver<String>>,
+    /// Branch and latest commit for the recent list. Missing means the scan
+    /// has not reported that path yet.
+    glances: HashMap<PathBuf, home::Glance>,
+    /// Paths the current or previous home scan was started with, in order.
+    glance_paths: Vec<PathBuf>,
+    glance_scan: Option<GlanceScan>,
+    /// The previous frame was Home. Returning to it scans again.
+    was_home: bool,
 }
 
 /// Downloaded avatars, beside the settings in the per-user cache folder.
@@ -200,6 +220,10 @@ impl CthulhuApp {
             github,
             git_version: None,
             git_probe: None,
+            glances: HashMap::new(),
+            glance_paths: Vec::new(),
+            glance_scan: None,
+            was_home: false,
         };
         if let Some(path) = startup {
             // The window stays hidden until the first frame is painted.
@@ -245,6 +269,64 @@ impl CthulhuApp {
         };
         self.git_version = Some(text);
         self.git_probe = None;
+    }
+
+    /// Starts a scan when Home appears or the recent list changes. Repos are
+    /// read one after another on one thread, and each result repaints.
+    fn sync_glances(&mut self, ctx: &egui::Context) {
+        self.poll_glances();
+        let on_home = matches!(self.screen, Screen::Home);
+        let entered = on_home && !self.was_home;
+        self.was_home = on_home;
+        if !on_home {
+            return;
+        }
+        if !entered && self.settings.recent_repositories == self.glance_paths {
+            return;
+        }
+        self.start_glance(ctx);
+    }
+
+    fn start_glance(&mut self, ctx: &egui::Context) {
+        let paths = self.settings.recent_repositories.clone();
+        self.glances.clear();
+        self.glance_paths.clone_from(&paths);
+        // Drop the previous receiver before the new thread starts, so the old
+        // worker notices and does not keep reading after the list changed.
+        self.glance_scan = None;
+        if paths.is_empty() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        thread::spawn(move || scan_glances(paths, sender, ctx));
+        self.glance_scan = Some(GlanceScan { receiver });
+    }
+
+    fn poll_glances(&mut self) {
+        let Some(scan) = &self.glance_scan else {
+            return;
+        };
+        let mut incoming = Vec::new();
+        let mut disconnected = false;
+        loop {
+            match scan.receiver.try_recv() {
+                Ok(msg) => incoming.push(msg),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if disconnected {
+            self.glance_scan = None;
+        }
+        for msg in incoming {
+            if self.glance_paths.iter().any(|path| path == &msg.path) {
+                self.glances.insert(msg.path, msg.glance);
+            }
+        }
     }
 
     fn poll_github(&mut self, ctx: &egui::Context) {
@@ -444,6 +526,7 @@ impl eframe::App for CthulhuApp {
             self.ensure_git_version(ui.ctx());
         }
         self.poll_git_version();
+        self.sync_glances(ui.ctx());
 
         let syncing = self.sync_for_open_repo();
         let history_loading = self.history_loading();
@@ -488,6 +571,7 @@ impl eframe::App for CthulhuApp {
                     ui,
                     &home::HomeState {
                         recent: &self.settings.recent_repositories,
+                        glances: &self.glances,
                         busy: self.opening.is_some() || self.picker.is_some(),
                         opening: self.opening.as_ref().map(|opening| opening.path.as_path()),
                         error: self.error.as_deref(),
@@ -595,6 +679,25 @@ struct Refreshed {
     latest: Option<CommitDetail>,
     detached_oid: Option<String>,
     github: Option<GitHubRepo>,
+}
+
+/// One repository at a time. A dropped receiver stops the loop; the git
+/// command already running is left to finish under its own time limit.
+fn scan_glances(paths: Vec<PathBuf>, sender: Sender<GlanceMsg>, ctx: egui::Context) {
+    let git = Git::discover().ok();
+    for path in paths {
+        let glance = match &git {
+            Some(git) => match git::glance(git, &path) {
+                Ok(ready) => home::Glance::Ready(ready),
+                Err(_) => home::Glance::Unreadable,
+            },
+            None => home::Glance::Unreadable,
+        };
+        if sender.send(GlanceMsg { path, glance }).is_err() {
+            break;
+        }
+        ctx.request_repaint();
+    }
 }
 
 /// Repository chrome. The history graph is not built here, so a log failure
@@ -1034,6 +1137,10 @@ mod settings_load_tests {
             github: GitHubAuth::default(),
             git_version: None,
             git_probe: None,
+            glances: std::collections::HashMap::new(),
+            glance_paths: Vec::new(),
+            glance_scan: None,
+            was_home: false,
         }
     }
 

@@ -4,13 +4,17 @@
 use std::time::Duration;
 
 use eframe::egui::{
-    self, Align2, Button, Context, CursorIcon, Frame, Id, Margin, Order, Response, RichText, Sense,
-    Stroke, Ui, UiBuilder, Vec2,
+    self, Align2, Button, Context, CursorIcon, Frame, Id, Margin, Order, Response, RichText,
+    Stroke, Ui, Vec2,
 };
 
+use super::icons::{self, Icon};
 use super::theme;
 
 pub const CORNER_RADIUS: u8 = 6;
+
+/// Shared by [`primary_button`] and [`secondary_button`] so a pair lines up.
+const ACTION_BUTTON: Vec2 = Vec2::new(240.0, 40.0);
 
 /// Lays out `add_contents` in a column at most `max_width` wide, centered
 /// horizontally in the available space.
@@ -42,7 +46,28 @@ pub fn primary_button(ui: &mut Ui, text: &str, enabled: bool) -> Response {
     )
     .fill(palette.accent)
     .corner_radius(CORNER_RADIUS)
-    .min_size(Vec2::new(220.0, 40.0));
+    .min_size(ACTION_BUTTON);
+    ui.add_enabled(enabled, button)
+        .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// A surface button with a border. Same size as [`primary_button`]. The theme's
+/// hover colors show through because the fill is not forced to the accent.
+/// `icon` sits in front of `text`.
+pub fn secondary_button(ui: &mut Ui, text: &str, icon: Option<Icon>, enabled: bool) -> Response {
+    let palette = theme::current(ui.ctx()).palette;
+    let tint = if enabled {
+        palette.text
+    } else {
+        palette.text_muted
+    };
+    let label = RichText::new(text).size(16.0).color(tint);
+    let button = match icon {
+        Some(icon) => Button::image_and_text(icons::tinted(ui, icon, tint), label),
+        None => Button::new(label),
+    }
+    .corner_radius(CORNER_RADIUS)
+    .min_size(ACTION_BUTTON);
     ui.add_enabled(enabled, button)
         .on_hover_cursor(CursorIcon::PointingHand)
 }
@@ -58,54 +83,6 @@ pub fn error_banner(ui: &mut Ui, message: &str) {
             ui.set_width(ui.available_width());
             ui.label(RichText::new(message).color(palette.error));
         });
-}
-
-/// A full-width clickable row with a title and a muted second line.
-pub fn list_row(ui: &mut Ui, title: &str, detail: &str, enabled: bool) -> Response {
-    let palette = theme::current(ui.ctx()).palette;
-    let mut builder = UiBuilder::new().id_salt(detail).sense(Sense::click());
-    if !enabled {
-        builder = builder.disabled();
-    }
-    let response = ui
-        .scope_builder(builder, |ui| {
-            let hovered = enabled && ui.response().hovered();
-            Frame::new()
-                .fill(if hovered {
-                    palette.surface_hover
-                } else {
-                    palette.surface
-                })
-                .stroke(Stroke::new(
-                    1.0,
-                    if hovered {
-                        palette.accent
-                    } else {
-                        palette.border
-                    },
-                ))
-                .corner_radius(CORNER_RADIUS)
-                .inner_margin(Margin::symmetric(14, 10))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.add(
-                        egui::Label::new(RichText::new(title).strong().color(palette.text))
-                            .selectable(false)
-                            .truncate(),
-                    );
-                    ui.add(
-                        egui::Label::new(RichText::new(detail).small().color(palette.text_muted))
-                            .selectable(false)
-                            .truncate(),
-                    );
-                });
-        })
-        .response;
-    if enabled {
-        response.on_hover_cursor(CursorIcon::PointingHand)
-    } else {
-        response
-    }
 }
 
 /// How long the "copied" notice stays up. A later copy starts the wait over.

@@ -515,36 +515,9 @@ fn about_page(ui: &mut Ui, palette: &Palette, about: &AboutInfo) {
 const ABOUT_LOGO: f32 = 128.0;
 
 fn about_logo(ui: &mut Ui) {
-    let texture = logo_texture(ui.ctx());
     ui.vertical_centered(|ui| {
-        ui.add(
-            egui::Image::new(&texture)
-                .fit_to_exact_size(Vec2::splat(ABOUT_LOGO))
-                .alt_text("Cthulhu-Git logo"),
-        );
+        icons::app_logo(ui, ABOUT_LOGO);
     });
-}
-
-/// Uploaded once and kept for the life of the context, same as the interface icons.
-fn logo_texture(ctx: &egui::Context) -> egui::TextureHandle {
-    let id = Id::new("cthulhu-git-about-logo");
-    if let Some(texture) = ctx.data(|data| data.get_temp(id)) {
-        return texture;
-    }
-    let rgba = image::load_from_memory(include_bytes!(concat!(env!("OUT_DIR"), "/icon-256.png")))
-        .expect("icon-256.png rendered by build.rs")
-        .into_rgba8();
-    let image = egui::ColorImage::from_rgba_unmultiplied(
-        [rgba.width() as usize, rgba.height() as usize],
-        rgba.as_raw(),
-    );
-    let texture = ctx.load_texture(
-        "cthulhu-git-about-logo",
-        image,
-        egui::TextureOptions::LINEAR,
-    );
-    ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
-    texture
 }
 
 fn about_row(ui: &mut Ui, palette: &Palette, label: &str, value: &str, monospace: bool) {

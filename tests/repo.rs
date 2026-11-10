@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cthulhu_git::git::{
-    CommitFile, CommitStats, DiffKind, Git, GitError, GraphCandidate, GraphTip, Head, History,
-    Person, Remote, RepoInfo, SHORT_OID_LEN, Upstream, branch_graph, branches, commit_hover,
-    file_diff, graph_tips, head_commit_oid, history, inspect, latest_commit, pull_ff_only, remotes,
+    CommitFile, CommitStats, DiffKind, Divergence, Git, GitError, GraphCandidate, GraphTip, Head,
+    History, Person, Remote, RepoInfo, SHORT_OID_LEN, Upstream, branch_graph, branches,
+    commit_hover, file_diff, glance, graph_tips, head_commit_oid, history, inspect, latest_commit,
+    pull_ff_only, remotes,
 };
 use tempfile::TempDir;
 
@@ -804,4 +805,60 @@ fn child_inspects_target_from_env() {
     let info = inspect(&git, Path::new(&target)).expect("inspect target");
     assert_eq!(info.root, dunce::canonicalize(&target).expect("canonical"));
     assert_eq!(info.head, Head::Branch("feature/necronomicon".to_owned()));
+}
+
+#[test]
+fn glance_reads_the_branch_the_subject_and_the_divergence() {
+    let repo = Fixture::init();
+    repo.commit("base");
+    repo.git(&["checkout", "-b", "feature"]);
+    repo.commit("feature work");
+    repo.git(&["checkout", "main"]);
+    repo.commit("main tip");
+    repo.git(&["checkout", "feature"]);
+    repo.git(&["branch", "--set-upstream-to=main"]);
+
+    let glance = glance(&repo.git, &repo.root).expect("glance");
+    assert_eq!(glance.head, Head::Branch("feature".to_owned()));
+    let latest = glance.latest.expect("commit");
+    assert_eq!(latest.subject, "feature work");
+    assert!(
+        is_local_stamp(&latest.when),
+        "when {:?} is not YYYY-MM-DD HH:MM",
+        latest.when
+    );
+    assert_eq!(
+        glance.upstream,
+        Some(Divergence {
+            ahead: 1,
+            behind: 1
+        })
+    );
+}
+
+#[test]
+fn glance_on_an_unborn_branch_has_no_commit_or_upstream() {
+    let repo = Fixture::init();
+    let glance = glance(&repo.git, &repo.root).expect("glance");
+    assert_eq!(glance.head, Head::Unborn("main".to_owned()));
+    assert!(glance.latest.is_none());
+    assert!(glance.upstream.is_none());
+}
+
+#[test]
+fn glance_without_an_upstream_leaves_that_line_empty() {
+    let repo = Fixture::with_commit();
+    let glance = glance(&repo.git, &repo.root).expect("glance");
+    assert_eq!(glance.head, Head::Branch("main".to_owned()));
+    assert_eq!(glance.latest.expect("commit").subject, "Awaken");
+    assert!(glance.upstream.is_none());
+}
+
+fn is_local_stamp(stamp: &str) -> bool {
+    let bytes = stamp.as_bytes();
+    bytes.len() == 16
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b' '
+        && bytes[13] == b':'
 }

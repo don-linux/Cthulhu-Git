@@ -18,7 +18,7 @@ mod harness;
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 #[cfg(unix)]
 use std::ffi::OsStr;
 use std::fs;
@@ -35,8 +35,8 @@ use std::thread;
 use std::time::Duration;
 
 use cthulhu_git::git::{
-    Branch, Commit, CommitDetail, GraphCommit, GraphTip, Head, Person, RepoInfo, Upstream,
-    layout_graph,
+    Branch, Commit, CommitDetail, CommitGlance, Divergence, GraphCommit, GraphTip, Head, Person,
+    RepoGlance, RepoInfo, Upstream, layout_graph,
 };
 use cthulhu_git::github::ApiStatus;
 use cthulhu_git::settings::{HistoryColumns, Settings};
@@ -47,7 +47,7 @@ use tempfile::TempDir;
 
 use super::avatars::AvatarService;
 use super::github_auth::GitHubAuth;
-use super::home::{self, HomeState};
+use super::home::{self, Glance, HomeState};
 use super::hover::HoverCache;
 use super::repo_view;
 use super::settings::{self, AboutInfo, SettingsView};
@@ -1249,10 +1249,12 @@ fn adversarial_long_recent_name_stays_in_layout() {
     let name = "N".repeat(400);
     let recent = vec![PathBuf::from("/repos").join(&name)];
     let harness = ui_harness(|ui| {
+        let glances = HashMap::new();
         let _ = home::show(
             ui,
             &HomeState {
                 recent: &recent,
+                glances: &glances,
                 busy: false,
                 opening: None,
                 error: None,
@@ -1261,6 +1263,278 @@ fn adversarial_long_recent_name_stays_in_layout() {
     });
     assert_text(&harness, &name);
     assert_text(&harness, "Recent repositories");
+}
+
+#[test]
+fn the_home_screen_shows_the_version_browses_and_opens_settings() {
+    let recent = Rc::new(vec![PathBuf::from("/repos/rlyeh")]);
+    let recent_ui = Rc::clone(&recent);
+    let busy = Rc::new(RefCell::new(false));
+    let busy_ui = Rc::clone(&busy);
+    let actions: Rc<RefCell<Option<Action>>> = Rc::new(RefCell::new(None));
+    let actions_ui = Rc::clone(&actions);
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(1100.0, 720.0))
+        .with_pixels_per_point(PIXELS_PER_POINT)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), theme::DEFAULT_THEME);
+            let glances = HashMap::new();
+            let produced = home::show(
+                ui,
+                &HomeState {
+                    recent: recent_ui.as_slice(),
+                    glances: &glances,
+                    busy: *busy_ui.borrow(),
+                    opening: None,
+                    error: None,
+                },
+            );
+            *actions_ui.borrow_mut() = produced;
+        });
+
+    // The brand column centers itself from the previous frame's height.
+    harness.step();
+    assert_text(&harness, env!("CARGO_PKG_VERSION"));
+    assert_text(&harness, "Recent repositories");
+    assert_text(&harness, "rlyeh");
+
+    click_labeled(&harness, "Open repository…");
+    harness.step();
+    assert_eq!(home_action(&actions), "Browse");
+
+    click_labeled(&harness, "Settings");
+    harness.step();
+    assert_eq!(home_action(&actions), "OpenSettings");
+
+    {
+        let row = harness
+            .query_all_by_label_contains("/repos/rlyeh")
+            .next()
+            .expect("recent path");
+        row.click();
+    }
+    harness.step();
+    assert_eq!(home_action(&actions), "Open(/repos/rlyeh)");
+
+    *busy.borrow_mut() = true;
+    harness.step();
+    {
+        let open = buttons_labeled(&harness, "Open repository…");
+        assert_eq!(open.len(), 1, "open button\n{}", button_dump(&harness));
+        assert!(open[0].accesskit_node().is_disabled());
+    }
+    {
+        let settings = buttons_labeled(&harness, "Settings");
+        assert_eq!(
+            settings.len(),
+            1,
+            "settings button\n{}",
+            button_dump(&harness)
+        );
+        assert!(!settings[0].accesskit_node().is_disabled());
+    }
+
+    click_labeled(&harness, "Open repository…");
+    harness.step();
+    assert!(
+        actions.borrow().is_none(),
+        "busy open click emitted {}",
+        home_action(&actions)
+    );
+
+    click_labeled(&harness, "Settings");
+    harness.step();
+    assert_eq!(home_action(&actions), "OpenSettings");
+}
+
+#[test]
+fn recent_cards_keep_the_same_size() {
+    let long = PathBuf::from("/repos").join("N".repeat(400));
+    let short = PathBuf::from("/repos/rlyeh");
+    let pair = card_rects(&[long, short.clone()]);
+    let solo = card_rects(&[short]);
+    assert_eq!(pair.len(), 2, "two recents");
+    assert_eq!(solo.len(), 1, "one recent");
+    for rect in pair.iter().chain(&solo) {
+        let size = rect.size();
+        assert!(
+            (size.x - 300.0).abs() <= 1.0 && (size.y - 168.0).abs() <= 1.0,
+            "card is {size:?}, expected 300×168"
+        );
+    }
+    let size = pair[0].size();
+    assert!(
+        (pair[1].size() - size).length() <= 1.0 && (solo[0].size() - size).length() <= 1.0,
+        "cards differ: {:?} {:?} {:?}",
+        pair[0].size(),
+        pair[1].size(),
+        solo[0].size()
+    );
+    assert!(
+        pair[1].min.x + 1.0 >= pair[0].max.x && (pair[1].min.y - pair[0].min.y).abs() <= 1.0,
+        "second card is not beside the first: {:?} {:?}",
+        pair[0],
+        pair[1]
+    );
+
+    let wrapped = card_rects(&[
+        PathBuf::from("/repos/rlyeh"),
+        PathBuf::from("/repos/innsmouth"),
+        PathBuf::from("/repos/kadath"),
+    ]);
+    assert_eq!(wrapped.len(), 3, "three recents");
+    assert!(
+        (wrapped[0].min.y - wrapped[1].min.y).abs() <= 1.0,
+        "first row should share a top: {:?}",
+        wrapped
+    );
+    assert!(
+        wrapped[2].min.y + 1.0 >= wrapped[0].max.y,
+        "third card did not wrap onto the next row: {:?}",
+        wrapped
+    );
+    assert!(
+        (wrapped[2].size() - wrapped[0].size()).length() <= 1.0,
+        "wrapped card changed size: {:?} vs {:?}",
+        wrapped[2].size(),
+        wrapped[0].size()
+    );
+}
+
+#[test]
+fn a_card_shows_the_branch_the_commit_and_the_upstream() {
+    let ready = PathBuf::from("/repos/rlyeh");
+    let missing = PathBuf::from("/repos/innsmouth");
+    let pending = PathBuf::from("/repos/kadath");
+    let mut glances = HashMap::new();
+    glances.insert(
+        ready.clone(),
+        Glance::Ready(RepoGlance {
+            head: Head::Branch("main".to_owned()),
+            latest: Some(CommitGlance {
+                subject: "Awaken".to_owned(),
+                when: "2026-11-10 01:23".to_owned(),
+            }),
+            upstream: Some(Divergence {
+                ahead: 2,
+                behind: 1,
+            }),
+        }),
+    );
+    glances.insert(missing.clone(), Glance::Unreadable);
+    let recent = vec![ready, missing, pending];
+    let harness = Harness::builder()
+        .with_size(egui::Vec2::new(1200.0, 800.0))
+        .with_pixels_per_point(PIXELS_PER_POINT)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), theme::DEFAULT_THEME);
+            let _ = home::show(
+                ui,
+                &HomeState {
+                    recent: &recent,
+                    glances: &glances,
+                    busy: false,
+                    opening: None,
+                    error: None,
+                },
+            );
+        });
+
+    assert_text(&harness, "rlyeh");
+    assert_text(&harness, "innsmouth");
+    assert_text(&harness, "kadath");
+    assert_text(&harness, "main");
+    assert_text(&harness, "Awaken");
+    assert_text(&harness, "2026-11-10 01:23");
+    assert_text(&harness, "2 ahead, 1 behind");
+    assert_text(&harness, "Can't read this repository");
+    let ready_card = buttons_labeled(&harness, "/repos/rlyeh")
+        .into_iter()
+        .next()
+        .expect("ready card")
+        .rect();
+    for label in ["main", "Awaken", "2026-11-10 01:23", "2 ahead, 1 behind"] {
+        let line = label_rect(&harness, label);
+        assert!(
+            ready_card.contains_rect(line),
+            "{label} {line:?} is outside {ready_card:?}"
+        );
+    }
+    let missing_card = buttons_labeled(&harness, "/repos/innsmouth")
+        .into_iter()
+        .next()
+        .expect("unreadable card")
+        .rect();
+    let unread = label_rect(&harness, "Can't read this repository");
+    assert!(
+        missing_card.contains_rect(unread),
+        "unreadable line {unread:?} is outside {missing_card:?}"
+    );
+    assert_eq!(
+        count_exact(&harness, "…"),
+        4,
+        "pending card\n{}",
+        visible_text(&harness)
+    );
+}
+
+fn card_rects(recent: &[PathBuf]) -> Vec<egui::Rect> {
+    let owned = recent.to_vec();
+    let shown = owned.clone();
+    let harness = Harness::builder()
+        .with_size(egui::Vec2::new(1200.0, 800.0))
+        .with_pixels_per_point(PIXELS_PER_POINT)
+        .build_ui(move |ui| {
+            theme::apply(ui.ctx(), theme::DEFAULT_THEME);
+            let glances = HashMap::new();
+            let _ = home::show(
+                ui,
+                &HomeState {
+                    recent: &shown,
+                    glances: &glances,
+                    busy: false,
+                    opening: None,
+                    error: None,
+                },
+            );
+        });
+    owned
+        .iter()
+        .map(|path| {
+            let label = path.display().to_string();
+            buttons_labeled(&harness, &label)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("missing card {label}\n{}", button_dump(&harness)))
+                .rect()
+        })
+        .collect()
+}
+
+fn count_exact<State>(harness: &Harness<'_, State>, exact: &str) -> usize {
+    harness
+        .query_all_by_role(Role::Label)
+        .filter(|node| node.value().as_deref() == Some(exact))
+        .count()
+}
+
+fn home_action(actions: &RefCell<Option<Action>>) -> String {
+    actions
+        .borrow()
+        .as_ref()
+        .map(describe_action)
+        .unwrap_or_else(|| "None".to_owned())
+}
+
+fn click_labeled<State>(harness: &Harness<'_, State>, label: &str) {
+    let buttons = buttons_labeled(harness, label);
+    assert_eq!(
+        buttons.len(),
+        1,
+        "expected one {label:?} button\n{}",
+        button_dump(harness)
+    );
+    buttons[0].click();
 }
 
 const HISTORY_TITLES: [&str; 5] = ["Branch", "Graph", "Commit Hash", "Commit Message", "Author"];

@@ -39,11 +39,14 @@ CTHULHU_GIT=/opt/git/bin/git cargo run -- ~/src/project
 
 ## What the window shows
 
-**Home screen.** An **Open repository…** button that opens the system folder
-dialog (File Explorer on Windows, Finder on macOS, the desktop's own dialog
-through the XDG Desktop Portal on Linux), and the ten most recent
-repositories. Any folder inside a repository works; its root is what gets
-remembered.
+**Home screen.** The logo, the version and **Settings** sit with **Open
+repository…**, which opens the system folder dialog (File Explorer on
+Windows, Finder on macOS, the desktop's own dialog through the XDG Desktop
+Portal on Linux). The ten most recent repositories sit in a grid of
+fixed-size cards, newest first. A card shows the folder name, the path, the
+current branch, whether that branch is ahead of or behind its upstream, and
+the subject and time of the latest commit. Any folder inside a repository
+works; its root is what gets remembered.
 
 **Repository view.**
 

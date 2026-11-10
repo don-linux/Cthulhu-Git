@@ -8,6 +8,7 @@
 mod branches;
 mod discover;
 mod exec;
+mod glance;
 mod graph;
 mod log;
 mod reap;
@@ -26,6 +27,7 @@ pub use exec::{
     Git, GitError, GitOutput, GitVersion, MIN_GIT_VERSION, extend_path_for_gui,
     inherited_git_var_is_cleared,
 };
+pub use glance::{CommitGlance, Divergence, RepoGlance, glance};
 pub use graph::{
     GraphBranch, GraphCandidate, GraphCommit, GraphRow, GraphTip, GraphTrace, HistoryGraph,
     LANE_COLORS, branch_graph, graph_tips, head_commit_oid, layout_graph, painted_lane_color,
