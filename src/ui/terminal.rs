@@ -12,6 +12,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -25,7 +26,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{
     Config as TermConfig, Osc52, RenderableCursor, Term, TermMode, color,
 };
@@ -970,15 +971,105 @@ fn adopt_starting(terminal: &mut Option<Terminal>) {
     }
 }
 
-/// Screen the settings preview keeps. The widget draws one line; a one-row
-/// PTY scrolls the prompt off that line and leaves the cursor.
-const PREVIEW_SCREEN_HEIGHT: f32 = 240.0;
+/// Rows the settings preview keeps on the PTY. The widget draws only the
+/// prompt block. A short screen scrolls a multi-line prompt away before it
+/// can be measured, and a pixel height shrinks to a handful of rows when the
+/// terminal face is large.
+const PREVIEW_SCREEN_ROWS: usize = 32;
+
+/// Most lines the settings preview draws. A longer block keeps the rows
+/// nearest the cursor, so a noisy startup file does not take the page.
+const PREVIEW_MAX_LINES: usize = 8;
+
+/// Rows the settings preview should reserve for the current prompt.
+///
+/// One row until the shell is on screen. A live shell reports the prompt
+/// block that ends at the cursor.
+pub fn preview_line_count(terminal: &Option<Terminal>) -> usize {
+    let Some(Terminal::Live(session)) = terminal else {
+        return 1;
+    };
+    let term = session.term.lock();
+    prompt_span(&term).len().max(1)
+}
+
+/// Screen rows of the prompt block, ending at the cursor.
+///
+/// A blank row ends the walk upward. Starship prints one before the prompt,
+/// and a shell leaves one after command output. That blank stays out of the
+/// preview. A block longer than [`PREVIEW_MAX_LINES`] keeps the rows nearest
+/// the cursor.
+fn prompt_span<T: EventListener>(term: &Term<T>) -> Range<usize> {
+    let rows = term.screen_lines();
+    if rows == 0 {
+        return 0..1;
+    }
+    let content = term.renderable_content();
+    let offset = content.display_offset as i32;
+    let cursor_line = content.cursor.point.line.0;
+    let mut filled = vec![false; rows];
+    for indexed in content.display_iter {
+        if indexed
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            continue;
+        }
+        let row = indexed.point.line.0 + offset;
+        if row < 0 || row >= rows as i32 {
+            continue;
+        }
+        if cell_holds_prompt(indexed.cell) {
+            filled[row as usize] = true;
+        }
+    }
+    let cursor_row = (cursor_line + offset).clamp(0, rows as i32 - 1) as usize;
+    prompt_rows(&filled, cursor_row, PREVIEW_MAX_LINES)
+}
+
+/// A cell the preview treats as prompt content.
+///
+/// A colored or inverse space still counts. Powerline prompts pad with those.
+fn cell_holds_prompt(cell: &Cell) -> bool {
+    if cell.flags.contains(Flags::HIDDEN) {
+        return false;
+    }
+    if cell.flags.contains(Flags::INVERSE) || cell.c != ' ' {
+        return true;
+    }
+    if cell.zerowidth().is_some_and(|extra| !extra.is_empty()) {
+        return true;
+    }
+    !matches!(cell.bg, Color::Named(NamedColor::Background))
+}
+
+/// `filled[row]` is set when that screen row has prompt content.
+///
+/// The range always includes `cursor_row`. It walks up through filled rows
+/// and stops at the first blank. `max_lines` keeps the end nearest the cursor.
+fn prompt_rows(filled: &[bool], cursor_row: usize, max_lines: usize) -> Range<usize> {
+    if filled.is_empty() {
+        return 0..1;
+    }
+    let cursor = cursor_row.min(filled.len() - 1);
+    let max_lines = max_lines.max(1);
+    let mut start = cursor;
+    while start > 0 && filled[start - 1] {
+        start -= 1;
+    }
+    let shown = cursor + 1 - start;
+    if shown > max_lines {
+        start = cursor + 1 - max_lines;
+    }
+    start..cursor + 1
+}
 
 /// Paint the strip and, the first time, start the shell.
 ///
 /// When `interactive` is false the shell still runs, so the prompt uses the
-/// current face, but pointer and keyboard are ignored. The widget is clipped
-/// to one line. The PTY stays [`PREVIEW_SCREEN_HEIGHT`] tall.
+/// current face, but pointer and keyboard are ignored. The widget shows the
+/// prompt block. The PTY stays [`PREVIEW_SCREEN_ROWS`] tall so that block is
+/// not scrolled away.
 pub fn show(
     ui: &mut Ui,
     terminal: &mut Option<Terminal>,
@@ -988,15 +1079,10 @@ pub fn show(
     interactive: bool,
 ) {
     let visible = ui.available_rect_before_wrap();
-    let grid = if interactive {
-        visible
-    } else {
-        Rect::from_min_size(
-            visible.min,
-            Vec2::new(visible.width().max(1.0), PREVIEW_SCREEN_HEIGHT),
-        )
-    };
-    let metrics = metrics(ui, grid);
+    let mut metrics = metrics(ui, visible);
+    if !interactive {
+        metrics.rows = PREVIEW_SCREEN_ROWS;
+    }
     let painter = ui.painter().with_clip_rect(visible);
     painter.rect_filled(visible, 0.0, palette.background);
 
@@ -1026,6 +1112,7 @@ pub fn show(
             restart = exited_prompt(ui, visible, message, palette, interactive);
         }
         Some(Terminal::Live(session)) => {
+            let mut origin = visible;
             if interactive {
                 let response = ui.interact(visible, focus_id(view_id), Sense::click_and_drag());
                 let response = response.on_hover_cursor(CursorIcon::Text);
@@ -1040,8 +1127,27 @@ pub fn show(
                 }
             } else {
                 session.resize(&metrics, ui.pixels_per_point());
+                let span = {
+                    let term = session.term.lock();
+                    prompt_span(&term)
+                };
+                origin = Rect::from_min_size(
+                    Pos2::new(
+                        visible.min.x,
+                        visible.min.y - span.start as f32 * metrics.cell_h,
+                    ),
+                    Vec2::new(
+                        visible.width().max(1.0),
+                        metrics.rows as f32 * metrics.cell_h,
+                    ),
+                );
+                // A column change reflows the prompt after the box was sized.
+                let reserved = visible.height() / metrics.cell_h;
+                if (reserved - span.len() as f32).abs() > 0.5 {
+                    ui.ctx().request_repaint();
+                }
             }
-            paint(&painter, session, visible, &metrics, palette);
+            paint(&painter, session, origin, &metrics, palette);
         }
         Some(Terminal::Starting(_)) | None => {}
     }
@@ -2568,5 +2674,63 @@ END
         session.resize(&bigger, 1.0);
         assert_eq!(std::process::id(), pid);
         drop(session);
+    }
+
+    fn prompt_on_screen(columns: usize, screen_lines: usize, bytes: &[u8]) -> Range<usize> {
+        let grid = GridSize {
+            columns,
+            screen_lines,
+        };
+        let mut term = Term::new(
+            term_config(),
+            &grid,
+            alacritty_terminal::event::VoidListener,
+        );
+        let mut parser = alacritty_terminal::vte::ansi::Processor::<
+            alacritty_terminal::vte::ansi::StdSyncHandler,
+        >::new();
+        parser.advance(&mut term, bytes);
+        prompt_span(&term)
+    }
+
+    #[test]
+    fn prompt_span_keeps_a_one_line_prompt() {
+        assert_eq!(prompt_on_screen(40, 16, b"$ "), 0..1);
+    }
+
+    #[test]
+    fn prompt_span_skips_the_blank_line_above_a_two_line_prompt() {
+        let bytes = b"\r\n~/repo on main\r\n> ";
+        assert_eq!(prompt_on_screen(40, 16, bytes), 1..3);
+    }
+
+    #[test]
+    fn prompt_span_counts_a_colored_space() {
+        let bytes = b"\x1b[41m \x1b[0m\r\n>";
+        assert_eq!(prompt_on_screen(40, 16, bytes), 0..2);
+    }
+
+    #[test]
+    fn prompt_span_counts_an_inverse_space() {
+        let bytes = b"\x1b[7m \x1b[0m\r\n>";
+        assert_eq!(prompt_on_screen(40, 16, bytes), 0..2);
+    }
+
+    #[test]
+    fn prompt_span_keeps_the_rows_nearest_the_cursor() {
+        let mut bytes = Vec::new();
+        for row in 0..10 {
+            if row > 0 {
+                bytes.extend_from_slice(b"\r\n");
+            }
+            bytes.push(b'x');
+        }
+        assert_eq!(prompt_on_screen(8, 16, &bytes), 2..10);
+    }
+
+    #[test]
+    fn prompt_span_stops_at_a_blank_line_above_the_prompt() {
+        let bytes = b"hello\r\n\r\n$ ";
+        assert_eq!(prompt_on_screen(40, 16, bytes), 2..3);
     }
 }

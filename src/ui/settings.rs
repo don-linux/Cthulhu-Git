@@ -6,7 +6,7 @@
 //! Appearance chooses the interface typeface. Terminal chooses the typeface
 //! of the terminal only. Both lists are the faces compiled into the app.
 //!
-//! The Terminal page draws one prompt line in the chosen font. That shell
+//! The Terminal page draws the shell prompt in the chosen font. That shell
 //! ignores pointer and keyboard, and it is not the repository terminal.
 //!
 //! The History page turns author avatars on or off. The GitHub Auth page
@@ -36,8 +36,6 @@ const UI_SAMPLE: &str = "The quick brown fox jumps over the lazy dog.";
 const TERMINAL_SAMPLE: &str = "main  21de8d4a3b7c  Rise from the sea";
 /// Space above and below the prompt, inside the preview border.
 const PREVIEW_PAD: f32 = 8.0;
-/// Scales the one-line preview so the prompt is not flush with the border.
-const PREVIEW_HEIGHT_SCALE: f32 = 1.05;
 const PAGE_TOP: f32 = 40.0;
 /// Added under the last block. The column already keeps `COLUMN_SPACING` in the cursor.
 const PAGE_END: f32 = 32.0;
@@ -801,16 +799,15 @@ fn github_page(ui: &mut Ui, palette: &Palette, github: &mut GitHubAuth, api: &Ap
     });
 }
 
-/// One prompt line, clipped out of a normal-sized shell. A one-row PTY scrolls
-/// the prompt away. The shell measures the terminal font each frame, so a new
-/// family shows up here without touching the repository session. Pointer and
-/// keyboard are ignored.
+/// The prompt block, clipped out of a wide shell. The PTY is many rows tall
+/// so a multi-line prompt is not scrolled away; the box grows to the block
+/// that ends at the cursor. The shell measures the terminal font each frame,
+/// so a new family shows up here without touching the repository session.
+/// Pointer and keyboard are ignored.
 fn shell_preview(ui: &mut Ui, palette: &Palette, preview: &mut Option<Terminal>, cwd: &Path) {
     let row = terminal_row_height(ui);
-    let size = Vec2::new(
-        ui.available_width(),
-        (row + PREVIEW_PAD * 2.0) * PREVIEW_HEIGHT_SCALE,
-    );
+    let lines = terminal::preview_line_count(preview) as f32;
+    let size = Vec2::new(ui.available_width(), row * lines + PREVIEW_PAD * 2.0);
     let drawn = ui.allocate_ui(size, |ui| {
         ui.set_min_size(size);
         let outer = ui.max_rect();
