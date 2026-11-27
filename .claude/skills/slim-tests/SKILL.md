@@ -25,11 +25,14 @@ Mutants of process-kill code can signal every process of the user and end
 the desktop session. `.cargo/mutants.toml` excludes `src/git/reap.rs` and the
 terminal's session kill; keep any new kill path out of mutation runs the same
 way. On Linux, also run each test binary in its own PID namespace, so a mutant
-that kills "everything" only reaches its own test:
+that kills "everything" only reaches its own test. `--new-session` gives the
+binary a process group inside the namespace; without it `getpgrp()` is 0 and
+the reap tests fail:
 
 ```bash
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="bwrap --die-with-parent \
-  --unshare-pid --dev-bind / / --proc /proc" cargo mutants -f <file> ...
+  --unshare-pid --new-session --dev-bind / / --proc /proc" \
+  cargo mutants -f <file> ...
 ```
 
 cargo-mutants copies the tree to `$TMPDIR`. Keep that directory outside any
