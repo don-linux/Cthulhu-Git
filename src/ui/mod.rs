@@ -177,9 +177,35 @@ fn avatar_cache_dir() -> Option<PathBuf> {
         .map(|dirs| dirs.cache_dir().join("avatars"))
 }
 
+/// What the app takes from the machine when it starts. [`Startup::system`] is
+/// the user's; tests point it at their own files.
+pub struct Startup {
+    /// A folder named on the command line. It wins over the last repository.
+    pub command_line: Option<PathBuf>,
+    /// Where settings are read and saved. `None` when there is no home folder.
+    pub settings_path: Option<PathBuf>,
+    /// Builds the avatar service once the settings say whether avatars are on.
+    pub avatars: fn(enabled: bool) -> AvatarService,
+}
+
+impl Startup {
+    /// The user's settings file and avatars from the network.
+    pub fn system(command_line: Option<PathBuf>) -> Self {
+        Self {
+            command_line,
+            settings_path: Settings::default_path(),
+            avatars: |enabled| AvatarService::new(avatar_cache_dir(), enabled),
+        }
+    }
+}
+
 impl CthulhuApp {
-    pub fn new(ctx: &egui::Context, command_line: Option<PathBuf>) -> Self {
-        let settings_path = Settings::default_path();
+    pub fn new(ctx: &egui::Context, startup: Startup) -> Self {
+        let Startup {
+            command_line,
+            settings_path,
+            avatars,
+        } = startup;
         let (settings, loaded_ok, error) =
             loaded_settings(settings_path.as_deref().map(Settings::load_from));
         theme::apply(ctx, theme::resolve(settings.theme.as_deref()));
@@ -190,13 +216,8 @@ impl CthulhuApp {
             settings.terminal_font.as_deref(),
         );
 
-        let startup = command_line.or_else(|| settings.last_repository.clone());
-        // Tests never reach the network.
-        let avatars = if cfg!(test) {
-            AvatarService::disabled()
-        } else {
-            AvatarService::new(avatar_cache_dir(), settings.author_avatars)
-        };
+        let first_open = command_line.or_else(|| settings.last_repository.clone());
+        let avatars = avatars(settings.author_avatars);
         let mut github = GitHubAuth::default();
         // Only a user who saved a token ever reaches the keychain.
         if settings.github_token_in_keyring {
@@ -226,7 +247,7 @@ impl CthulhuApp {
             glance_scan: None,
             was_home: false,
         };
-        if let Some(path) = startup {
+        if let Some(path) = first_open {
             // The window stays hidden until the first frame is painted.
             // Finishing this open here means that frame is the repository
             // chrome, or the home screen with the error. The history graph
@@ -403,8 +424,10 @@ impl CthulhuApp {
                     branches: refreshed
                         .branches
                         .into_iter()
+                        // Only the current branch starts checked, so the graph
+                        // is one line until the user marks more.
                         .map(|branch| ListedBranch {
-                            checked: checked_when_opened(&branch),
+                            checked: branch.current,
                             branch,
                         })
                         .collect(),
@@ -462,7 +485,7 @@ impl CthulhuApp {
     /// file the user still has, including recents, the theme, and
     /// `github_token_in_keyring`.
     fn save_settings(&mut self) {
-        if !should_persist(self.loaded_ok) {
+        if !self.loaded_ok {
             return;
         }
         let Some(path) = &self.settings_path else {
@@ -486,16 +509,11 @@ impl CthulhuApp {
     }
 }
 
-/// Whether `save_settings` may replace the file at the real settings path.
-fn should_persist(loaded_ok: bool) -> bool {
-    loaded_ok
-}
-
 /// Settings kept after startup, and whether a later save may write them.
 ///
 /// `None` is "no home folder". `Err` is a file that could not be read or
 /// parsed: the window shows the error and keeps the defaults in memory, and
-/// [`should_persist`] stays false so the file is left as it is.
+/// `loaded_ok` stays false so the file is left as it is.
 fn loaded_settings(
     loaded: Option<Result<Settings, SettingsError>>,
 ) -> (Settings, bool, Option<String>) {
@@ -759,14 +777,6 @@ fn run_sync(root: &Path, command: SyncCommand) -> Result<Refreshed, String> {
         }
     }
     reload_repo(&git, root)
-}
-
-/// The branch that is checked the first time a repository opens.
-///
-/// Every other branch starts off, so the graph is one line until the user
-/// marks more. A branch that appears later, after fetch or pull, stays off too.
-fn checked_when_opened(branch: &Branch) -> bool {
-    branch.current
 }
 
 /// Keeps the sidebar checkboxes. A branch that was not in the list yet stays
@@ -1051,7 +1061,7 @@ fn reload_graph(root: &Path, tips: &[GraphTip]) -> Result<HistoryGraph, String> 
 
 #[cfg(test)]
 mod selection_tests {
-    use super::{ListedBranch, checked_when_opened, selected_tips};
+    use super::{ListedBranch, selected_tips};
     use cthulhu_git::git::{Branch, Upstream};
 
     fn branch(name: &str, current: bool) -> Branch {
@@ -1070,12 +1080,6 @@ mod selection_tests {
             branch: branch(name, current),
             checked,
         }
-    }
-
-    #[test]
-    fn opening_checks_only_the_current_branch() {
-        assert!(checked_when_opened(&branch("feature", true)));
-        assert!(!checked_when_opened(&branch("main", false)));
     }
 
     #[test]
@@ -1111,7 +1115,7 @@ mod settings_load_tests {
 
     use super::avatars::AvatarService;
     use super::github_auth::GitHubAuth;
-    use super::{CthulhuApp, Screen, loaded_settings, should_persist};
+    use super::{CthulhuApp, Screen, loaded_settings};
 
     fn app_for_save(
         settings: Settings,
@@ -1192,7 +1196,6 @@ mod settings_load_tests {
         let (settings, loaded_ok, message) = loaded_settings(Some(loaded));
         assert!(!loaded_ok);
         assert!(message.is_some());
-        assert!(!should_persist(loaded_ok));
 
         let mut app = app_for_save(settings, Some(path.clone()), loaded_ok, message.clone());
         app.settings.theme = Some("ink".to_owned());
@@ -1210,7 +1213,6 @@ mod settings_load_tests {
         let (_, loaded_ok, message) = loaded_settings(Some(Settings::load_from(&missing)));
         assert!(loaded_ok);
         assert!(message.is_none());
-        assert!(should_persist(loaded_ok));
 
         let blocked = dir.path().join("not-a-file");
         fs::create_dir(&blocked).expect("dir");
@@ -1218,7 +1220,6 @@ mod settings_load_tests {
         assert_eq!(settings, Settings::default());
         assert!(!loaded_ok);
         assert!(message.is_some());
-        assert!(!should_persist(false));
 
         let (_, loaded_ok, message) = loaded_settings(None);
         assert!(!loaded_ok);

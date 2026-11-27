@@ -37,7 +37,10 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Cthulhu Git",
         options,
-        Box::new(move |cc| Ok(Box::new(ui::CthulhuApp::new(&cc.egui_ctx, command_line)))),
+        Box::new(move |cc| {
+            let startup = ui::Startup::system(command_line);
+            Ok(Box::new(ui::CthulhuApp::new(&cc.egui_ctx, startup)))
+        }),
     )
 }
 

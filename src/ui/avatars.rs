@@ -16,8 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cthulhu_git::git::Person;
 use cthulhu_git::github::{
-    ApiStatus, AvatarQuery, AvatarResolver, FetchError, HttpError, HttpResponse, MAX_BODY,
-    RepoContext, Token, Transport, UreqTransport, fetch_image, sha256_hex,
+    ApiStatus, AvatarQuery, AvatarResolver, FetchError, MAX_BODY, RepoContext, Token, Transport,
+    UreqTransport, fetch_image, sha256_hex,
 };
 use eframe::egui::epaint::RectShape;
 use eframe::egui::{
@@ -97,11 +97,6 @@ impl AvatarService {
             cache_dir.map(|dir| DiskCache { dir }),
             enabled,
         )
-    }
-
-    /// Never fetches and draws initials only. For tests and when avatars are off.
-    pub fn disabled() -> Self {
-        Self::with_transport(Arc::new(Offline), None, false)
     }
 
     fn with_transport(
@@ -484,12 +479,29 @@ fn fresh(path: &std::path::Path, ttl: Duration) -> bool {
         .is_some_and(|age| age < ttl)
 }
 
-/// Refuses every request.
-struct Offline;
+/// An avatar service for tests anywhere in the app.
+#[cfg(test)]
+mod offline {
+    use std::sync::Arc;
 
-impl Transport for Offline {
-    fn get_once(&self, _: &str, _: &[(&str, String)]) -> Result<HttpResponse, HttpError> {
-        Err(HttpError::NotAllowed)
+    use cthulhu_git::github::{HttpError, HttpResponse, Transport};
+
+    use super::AvatarService;
+
+    /// Refuses every request.
+    pub(super) struct Offline;
+
+    impl Transport for Offline {
+        fn get_once(&self, _: &str, _: &[(&str, String)]) -> Result<HttpResponse, HttpError> {
+            Err(HttpError::NotAllowed)
+        }
+    }
+
+    impl AvatarService {
+        /// Never fetches and draws initials only, even if a test turns avatars on.
+        pub fn disabled() -> Self {
+            Self::with_transport(Arc::new(Offline), None, false)
+        }
     }
 }
 
@@ -588,6 +600,9 @@ pub fn paint_avatar(
 
 #[cfg(test)]
 mod tests {
+    use cthulhu_git::github::{HttpError, HttpResponse};
+
+    use super::offline::Offline;
     use super::*;
 
     fn person(name: &str, email: &str) -> Person {
