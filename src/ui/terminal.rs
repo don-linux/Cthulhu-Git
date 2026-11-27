@@ -924,20 +924,14 @@ fn prompt_rows(filled: &[bool], cursor_row: usize, max_lines: usize) -> Range<us
 }
 
 /// Paints the strip and, the first time, starts the shell. The strip takes
-/// the pointer and, once clicked, the keyboard. `interactive` false draws
-/// [`show_preview`] instead, for callers that still pass the flag.
+/// the pointer and, once clicked, the keyboard.
 pub fn show(
     ui: &mut Ui,
     terminal: &mut Option<Terminal>,
     cwd: &Path,
     view_id: Id,
     palette: &Palette,
-    interactive: bool,
 ) {
-    if !interactive {
-        show_preview(ui, terminal, cwd, palette);
-        return;
-    }
     let visible = ui.available_rect_before_wrap();
     let metrics = metrics(ui, visible);
     let painter = start(ui, terminal, cwd, visible, &metrics, palette);
@@ -2496,7 +2490,7 @@ END
                 move |ui, terminal: &mut Option<Terminal>| {
                     let _ = ui.button("Above");
                     let palette = super::super::theme::DEFAULT_THEME.palette;
-                    show(ui, terminal, &cwd, view_id, &palette, true);
+                    show(ui, terminal, &cwd, view_id, &palette);
                 },
                 None,
             );

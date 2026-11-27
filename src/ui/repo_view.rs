@@ -187,7 +187,6 @@ fn detail_column(
             &repo.info.root,
             repo.view_id,
             palette,
-            true,
         );
     });
 }
