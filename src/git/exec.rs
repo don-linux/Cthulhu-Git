@@ -1132,30 +1132,14 @@ mod tests {
             "log.showSignature=false",
         ];
         let cwd = Path::new("repo");
-        // `switch_branch` runs through `Git::run`. A branch named like an
-        // option stays one argument after `--`, behind the prefix.
-        for case in [
-            "-switch",
-            "--upload-pack=evil",
-            "--force",
-            "-f",
-            "--detach",
-            "--orphan",
-            "--guess",
-            "-B",
-        ] {
-            let request = crate::git::sync::switch_request((2, 43, 0), case)
-                .unwrap_or_else(|| panic!("{case:?}"));
-            let mut command = Command::new("git");
-            harden(&mut command, cwd, &request.args());
-            let expected: Vec<&OsStr> = PREFIX
-                .into_iter()
-                .chain(["switch", "--no-guess", "--", case])
-                .map(OsStr::new)
-                .collect();
-            assert_eq!(command.get_args().collect::<Vec<_>>(), expected, "{case:?}");
-            assert_eq!(command.get_current_dir(), Some(cwd), "{case:?}");
-        }
+        // The caller's argv follows the prefix untouched, so an option-shaped
+        // branch after `--` (see `switch_request_table`) stays an operand.
+        let args = ["switch", "--no-guess", "--", "-f"];
+        let mut command = Command::new("git");
+        harden(&mut command, cwd, &args);
+        let expected: Vec<&OsStr> = PREFIX.into_iter().chain(args).map(OsStr::new).collect();
+        assert_eq!(command.get_args().collect::<Vec<_>>(), expected);
+        assert_eq!(command.get_current_dir(), Some(cwd));
     }
 
     #[test]

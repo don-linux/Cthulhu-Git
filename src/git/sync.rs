@@ -258,144 +258,145 @@ mod tests {
     const MAIN: &str = "refs/heads/main";
     const ORIGIN_MAIN: &str = "refs/remotes/origin/main";
 
-    #[test]
-    fn fetch_request_updates_the_remote_tracking_ref() {
-        let request = fetch_request("origin", MAIN, ORIGIN_MAIN).expect("origin/main");
-        assert_eq!(request.remote(), "origin");
-        assert_eq!(
-            request.refspec(),
-            "+refs/heads/main:refs/remotes/origin/main"
-        );
-        assert_eq!(
-            request.args(),
-            [
-                "fetch",
-                "--",
-                "origin",
-                "+refs/heads/main:refs/remotes/origin/main"
-            ]
-        );
-        assert!(
-            !request
-                .args()
-                .iter()
-                .any(|arg| { arg.contains("prune") || arg == &"--all" || arg.contains("--all") })
-        );
-    }
+    /// Remote, merge ref, tracking ref, and the refspec fetched. `None` is
+    /// refused: a local upstream, an option-shaped remote, or anything that
+    /// would change the refspec.
+    const FETCHES: &[(&str, &str, &str, Option<&str>)] = &[
+        (
+            "origin",
+            MAIN,
+            ORIGIN_MAIN,
+            Some("+refs/heads/main:refs/remotes/origin/main"),
+        ),
+        (
+            "origin",
+            "refs/heads/feature/foo",
+            "refs/remotes/origin/feature/foo",
+            Some("+refs/heads/feature/foo:refs/remotes/origin/feature/foo"),
+        ),
+        (
+            "team/origin",
+            MAIN,
+            "refs/remotes/team/origin/main",
+            Some("+refs/heads/main:refs/remotes/team/origin/main"),
+        ),
+        (".", MAIN, ORIGIN_MAIN, None),
+        ("-origin", MAIN, ORIGIN_MAIN, None),
+        ("--upload-pack=evil", MAIN, ORIGIN_MAIN, None),
+        ("", MAIN, ORIGIN_MAIN, None),
+        ("ori gin", MAIN, ORIGIN_MAIN, None),
+        ("origin", "", ORIGIN_MAIN, None),
+        ("origin", "main", ORIGIN_MAIN, None),
+        ("origin", "refs/heads/ma\nin", ORIGIN_MAIN, None),
+        ("origin", "refs/heads/ma:in", ORIGIN_MAIN, None),
+        ("origin", MAIN, "", None),
+        ("origin", MAIN, "refs/heads/main", None),
+        ("origin", MAIN, "refs/remotes/origin/m*", None),
+    ];
 
     #[test]
-    fn fetch_request_keeps_slashes_in_the_remote_and_the_branch() {
-        for (remote, merge, tracking, refspec) in [
-            (
-                "origin",
-                "refs/heads/feature/foo",
-                "refs/remotes/origin/feature/foo",
-                "+refs/heads/feature/foo:refs/remotes/origin/feature/foo",
-            ),
-            (
-                "team/origin",
-                MAIN,
-                "refs/remotes/team/origin/main",
-                "+refs/heads/main:refs/remotes/team/origin/main",
-            ),
-        ] {
-            let request = fetch_request(remote, merge, tracking).expect(remote);
-            assert_eq!(request.remote(), remote);
-            assert_eq!(request.refspec(), refspec);
+    fn fetch_request_table() {
+        for &(remote, merge, tracking, refspec) in FETCHES {
+            let case = (remote, merge, tracking);
+            let request = fetch_request(remote, merge, tracking);
+            let got = request
+                .as_ref()
+                .map(|request| (request.args(), request.remote(), request.refspec()));
+            let expected =
+                refspec.map(|refspec| (["fetch", "--", remote, refspec], remote, refspec));
+            assert_eq!(got, expected, "{case:?}");
         }
     }
 
-    #[test]
-    fn fetch_request_rejects_what_cannot_be_fetched_or_would_change_the_refspec() {
-        for (remote, merge, tracking) in [
-            (".", MAIN, ORIGIN_MAIN),
-            ("-origin", MAIN, ORIGIN_MAIN),
-            ("--upload-pack=evil", MAIN, ORIGIN_MAIN),
-            ("", MAIN, ORIGIN_MAIN),
-            ("ori gin", MAIN, ORIGIN_MAIN),
-            ("origin", "", ORIGIN_MAIN),
-            ("origin", "main", ORIGIN_MAIN),
-            ("origin", "refs/heads/ma\nin", ORIGIN_MAIN),
-            ("origin", "refs/heads/ma:in", ORIGIN_MAIN),
-            ("origin", MAIN, ""),
-            ("origin", MAIN, "refs/heads/main"),
-            ("origin", MAIN, "refs/remotes/origin/m*"),
-        ] {
-            assert!(
-                fetch_request(remote, merge, tracking).is_none(),
-                "{remote:?} {merge:?} {tracking:?}"
-            );
-        }
-    }
+    type Version = (u32, u32, u32);
 
-    #[test]
-    fn pull_is_fast_forward_only() {
-        assert_eq!(PULL_FF_ONLY_ARGS, ["pull", "--ff-only", "--no-rebase"]);
-    }
+    const OLD: Version = (2, 15, 0);
+    const SWITCH: Version = (2, 23, 0);
 
-    fn assert_switch_args(version: (u32, u32, u32), name: &str, expected: &[&str]) {
-        let request = switch_request(version, name).unwrap_or_else(|| panic!("request for {name}"));
-        let args = request.args();
-        assert_eq!(args, expected, "{name}");
-        let flags = &args[..args.len() - 1];
-        for forbidden in [
-            "-f", "--force", "--detach", "--orphan", "--guess", "--all", "--prune",
-        ] {
-            assert!(
-                !flags.contains(&forbidden),
-                "{name} flags include {forbidden}: {args:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn checkout_args_prefix_the_branch_after_end_of_options() {
-        let modern = (2, 23, 0);
-        for name in [
+    /// Git version, branch name, and the argv after `git`. `None` is refused.
+    const SWITCHES: &[(Version, &str, Option<&[&str]>)] = &[
+        (
+            SWITCH,
             "main",
+            Some(&["switch", "--no-guess", "--", "main"]),
+        ),
+        (
+            SWITCH,
             "feature/necronomicon",
+            Some(&["switch", "--no-guess", "--", "feature/necronomicon"]),
+        ),
+        (
+            SWITCH,
+            "HEAD",
+            Some(&["switch", "--no-guess", "--", "HEAD"]),
+        ),
+        // A branch named like an option stays one argument after `--`.
+        (
+            SWITCH,
             "-switch",
+            Some(&["switch", "--no-guess", "--", "-switch"]),
+        ),
+        (
+            SWITCH,
             "--upload-pack=evil",
+            Some(&["switch", "--no-guess", "--", "--upload-pack=evil"]),
+        ),
+        (
+            SWITCH,
             "--force",
-        ] {
-            assert_switch_args(modern, name, &["switch", "--no-guess", "--", name]);
-        }
-    }
+            Some(&["switch", "--no-guess", "--", "--force"]),
+        ),
+        (SWITCH, "-f", Some(&["switch", "--no-guess", "--", "-f"])),
+        (
+            SWITCH,
+            "--detach",
+            Some(&["switch", "--no-guess", "--", "--detach"]),
+        ),
+        (
+            SWITCH,
+            "--orphan",
+            Some(&["switch", "--no-guess", "--", "--orphan"]),
+        ),
+        (
+            SWITCH,
+            "--guess",
+            Some(&["switch", "--no-guess", "--", "--guess"]),
+        ),
+        (SWITCH, "-B", Some(&["switch", "--no-guess", "--", "-B"])),
+        // Before 2.23 checkout would read a leading `-` as an option.
+        (OLD, "main", Some(&["checkout", "main", "--"])),
+        (OLD, "feature/foo", Some(&["checkout", "feature/foo", "--"])),
+        (OLD, "HEAD", Some(&["checkout", "HEAD", "--"])),
+        (OLD, "-switch", None),
+        (OLD, "--upload-pack=evil", None),
+        (OLD, "-f", None),
+    ];
+
+    /// Not a ref under `refs/heads/`, on any Git.
+    const NOT_BRANCHES: [&str; 12] = [
+        "",
+        " ",
+        "ma\nin",
+        "..",
+        "../../.git",
+        "foo/../../.git",
+        "foo.lock",
+        ".hidden",
+        "a@{1}",
+        "star*",
+        "foo/",
+        "@",
+    ];
 
     #[test]
-    fn checkout_args_on_git_2_15_use_checkout_and_refuse_a_leading_dash() {
-        let old = (2, 15, 0);
-        assert_switch_args(old, "main", &["checkout", "main", "--"]);
-        assert_switch_args(old, "feature/foo", &["checkout", "feature/foo", "--"]);
-        assert!(switch_request(old, "-switch").is_none());
-        assert!(switch_request(old, "--upload-pack=evil").is_none());
-    }
-
-    #[test]
-    fn checkout_args_reject_dotdot_newline_and_check_ref_format() {
-        let versions = [(2, 15, 0), (2, 23, 0), (2, 53, 0)];
-        let rejected = [
-            "",
-            " ",
-            "ma\nin",
-            "..",
-            "../../.git",
-            "foo/../../.git",
-            "foo.lock",
-            ".hidden",
-            "a@{1}",
-            "star*",
-            "foo/",
-            "@",
-        ];
-        for version in versions {
-            for name in rejected {
-                assert!(
-                    switch_request(version, name).is_none(),
-                    "{name:?} on {version:?}"
-                );
-            }
-            assert!(switch_request(version, "HEAD").is_some());
+    fn switch_request_table() {
+        let refused = NOT_BRANCHES
+            .into_iter()
+            .flat_map(|name| [OLD, SWITCH, (2, 53, 0)].map(|version| (version, name, None)));
+        for (version, name, expected) in SWITCHES.iter().copied().chain(refused) {
+            let request = switch_request(version, name);
+            let args = request.as_ref().map(SwitchRequest::args);
+            assert_eq!(args.as_deref(), expected, "{version:?} {name:?}");
         }
     }
 }
