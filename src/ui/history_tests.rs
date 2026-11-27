@@ -1708,21 +1708,24 @@ fn selected_commit_shows_the_hover_details() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    repo.hover.store_ready(CommitHover {
-        oid: newer.clone(),
-        author: person("Ada Lovelace", "ada@example.invalid"),
-        co_authors: vec![person("Grace Hopper", "grace@example.invalid")],
-        authored_unix: now,
-        authored_at: "2024-05-01 09:30".to_owned(),
-        message: "newer estuary note\n\nFixes #12".to_owned(),
-        files: Vec::new(),
-        stats: Some(CommitStats {
-            files: 2,
-            insertions: 4,
-            deletions: 1,
-        }),
-        tags: Vec::new(),
-    });
+    repo.hover.store_ready(
+        newer.clone(),
+        CommitHover {
+            oid: newer.clone(),
+            author: person("Ada Lovelace", "ada@example.invalid"),
+            co_authors: vec![person("Grace Hopper", "grace@example.invalid")],
+            authored_unix: now,
+            authored_at: "2024-05-01 09:30".to_owned(),
+            message: "newer estuary note\n\nFixes #12".to_owned(),
+            files: Vec::new(),
+            stats: Some(CommitStats {
+                files: 2,
+                insertions: 4,
+                deletions: 1,
+            }),
+            tags: Vec::new(),
+        },
+    );
     let mut harness = pick_harness(repo, true);
     pick_hash(&mut harness, &newer[..SHORT_OID_LEN]);
     settle(&mut harness);
@@ -1859,29 +1862,34 @@ fn clicking_the_author_card_hash_copies_it() {
 fn view_changes_shows_tags_and_a_colored_diff() {
     let mut repo = one_commit("field notes from the estuary");
     let oid = repo.latest.as_ref().expect("commit").oid.clone();
-    repo.hover.store_ready(CommitHover {
-        oid: oid.clone(),
-        author: person("Ada Lovelace", "ada@example.invalid"),
-        co_authors: vec![person("Grace Hopper", "grace@example.invalid")],
-        authored_unix: 1_700_000_000,
-        authored_at: "2024-05-01 09:30".to_owned(),
-        message: "field notes from the estuary".to_owned(),
-        files: vec![CommitFile {
-            path: "notes/seal.txt".to_owned(),
-            previous: None,
-            insertions: Some(1),
-            deletions: Some(1),
-        }],
-        stats: Some(CommitStats {
-            files: 1,
-            insertions: 1,
-            deletions: 1,
-        }),
-        tags: vec!["v1,0".to_owned()],
-    });
+    repo.hover.store_ready(
+        oid.clone(),
+        CommitHover {
+            oid: oid.clone(),
+            author: person("Ada Lovelace", "ada@example.invalid"),
+            co_authors: vec![person("Grace Hopper", "grace@example.invalid")],
+            authored_unix: 1_700_000_000,
+            authored_at: "2024-05-01 09:30".to_owned(),
+            message: "field notes from the estuary".to_owned(),
+            files: vec![CommitFile {
+                path: "notes/seal.txt".to_owned(),
+                previous: None,
+                insertions: Some(1),
+                deletions: Some(1),
+            }],
+            stats: Some(CommitStats {
+                files: 1,
+                insertions: 1,
+                deletions: 1,
+            }),
+            tags: vec!["v1,0".to_owned()],
+        },
+    );
     repo.diffs.store_ready(
-        &oid,
-        "notes/seal.txt",
+        super::changes::DiffKey {
+            oid: oid.clone(),
+            path: "notes/seal.txt".to_owned(),
+        },
         FileDiff {
             notice: None,
             columns: "vault door opens".chars().count(),

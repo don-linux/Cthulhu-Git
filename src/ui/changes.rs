@@ -4,170 +4,71 @@
 //! -p` of the file that was clicked, so a large commit does not pull every
 //! diff up front. egui draws only the visible lines.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
+use std::path::Path;
 
-use cthulhu_git::git::{self, CommitFile, DiffKind, DiffLine, FileDiff, Git};
+use cthulhu_git::git::{self, CommitFile, DiffKind, DiffLine, FileDiff, Git, GitError};
 use eframe::egui::{
     self, Align, Color32, CursorIcon, FontId, Frame, Label, Layout, Margin, RichText, ScrollArea,
     Sense, Stroke, TextStyle, Ui, Vec2,
     text::{LayoutJob, TextFormat},
 };
 
+use super::async_cache::{AsyncCache, Cached, GitRead};
 use super::theme::Palette;
 use super::widgets;
 
 const LIST_WIDTH: f32 = 280.0;
 const MODAL_BACKDROP_ALPHA: u8 = 160;
-/// Patches kept after the modal closes, so returning to a file does not ask git again.
-const MAX_ENTRIES: usize = 256;
 
-enum State {
-    Loading,
-    Ready(Box<FileDiff>),
-    Failed(String),
+/// One file of one commit.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct DiffKey {
+    pub oid: String,
+    /// [`CommitFile::diff_path`].
+    pub path: String,
 }
 
-enum CachedPatch<'a> {
-    Pending,
-    Ready(&'a FileDiff),
-    Failed(&'a str),
-}
+impl GitRead<FileDiff> for DiffKey {
+    const LOST: &'static str = "The diff stopped unexpectedly.";
 
-struct Inflight {
-    oid: String,
-    path: String,
-    receiver: Receiver<Result<FileDiff, String>>,
-}
-
-/// Patches already read, and the one `git show -p` in flight.
-#[derive(Default)]
-pub struct DiffCache {
-    entries: HashMap<(String, String), State>,
-    order: Vec<(String, String)>,
-    inflight: Option<Inflight>,
-    /// Asked for while another read was running. Only the newest is kept.
-    wanted: Option<(String, String)>,
-}
-
-impl DiffCache {
-    pub fn poll(&mut self, ctx: &egui::Context, git: &Git, root: &Path) {
-        if let Some(inflight) = &self.inflight {
-            let result = match inflight.receiver.try_recv() {
-                Ok(result) => Some(result),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => {
-                    Some(Err("The diff stopped unexpectedly.".to_owned()))
-                }
-            };
-            if let Some(result) = result {
-                let state = match result {
-                    Ok(diff) => State::Ready(Box::new(diff)),
-                    Err(message) => State::Failed(message),
-                };
-                let key = (inflight.oid.clone(), inflight.path.clone());
-                self.inflight = None;
-                self.insert(key, state);
-            }
-        }
-        if self.inflight.is_none()
-            && let Some((oid, path)) = self.wanted.take()
-        {
-            self.start(ctx, git, root, oid, path);
-        }
-    }
-
-    fn insert(&mut self, key: (String, String), state: State) {
-        if !self.entries.contains_key(&key) {
-            self.order.push(key.clone());
-        }
-        self.entries.insert(key, state);
-        while self.order.len() > MAX_ENTRIES {
-            let old = self.order.remove(0);
-            self.entries.remove(&old);
-        }
-    }
-
-    /// Starts a read unless this file is already stored or in flight.
-    pub fn request(&mut self, oid: &str, path: &str) {
-        let key = (oid.to_owned(), path.to_owned());
-        let busy = self
-            .inflight
-            .as_ref()
-            .is_some_and(|inflight| inflight.oid == oid && inflight.path == path);
-        if self.entries.contains_key(&key) || busy {
-            return;
-        }
-        self.wanted = Some(key);
-    }
-
-    fn start(&mut self, ctx: &egui::Context, git: &Git, root: &Path, oid: String, path: String) {
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
-        let root: PathBuf = root.to_path_buf();
-        let worker_oid = oid.clone();
-        let worker_path = path.clone();
-        let git = git.clone();
-        thread::spawn(move || {
-            let result = git::file_diff(&git, &root, &worker_oid, &worker_path)
-                .map_err(|error| error.to_string());
-            let _ = sender.send(result);
-            ctx.request_repaint();
-        });
-        self.entries
-            .insert((oid.clone(), path.clone()), State::Loading);
-        self.inflight = Some(Inflight {
-            oid,
-            path,
-            receiver,
-        });
-    }
-
-    fn cached(&self, oid: &str, path: &str) -> Option<CachedPatch<'_>> {
-        self.entries
-            .get(&(oid.to_owned(), path.to_owned()))
-            .map(|state| match state {
-                State::Loading => CachedPatch::Pending,
-                State::Ready(diff) => CachedPatch::Ready(diff),
-                State::Failed(message) => CachedPatch::Failed(message),
-            })
-    }
-
-    /// Stores a finished patch so a test can draw the diff without `git show`.
-    #[cfg(test)]
-    pub(super) fn store_ready(&mut self, oid: &str, path: &str, diff: FileDiff) {
-        self.insert(
-            (oid.to_owned(), path.to_owned()),
-            State::Ready(Box::new(diff)),
-        );
+    fn read(&self, git: &Git, root: &Path) -> Result<FileDiff, GitError> {
+        git::file_diff(git, root, &self.oid, &self.path)
     }
 }
+
+/// Patches already read, kept after the modal closes so returning to a file
+/// does not ask git again, and the one `git show -p` in flight.
+pub type DiffCache = AsyncCache<DiffKey, FileDiff>;
 
 /// The commit whose files the modal is showing.
 pub struct Changes {
     pub oid: String,
     files: Vec<CommitFile>,
     selected: usize,
+    /// The selected file's patch, built when the selection changes instead
+    /// of every frame. `None` without files.
+    key: Option<DiffKey>,
 }
 
 impl Changes {
     pub fn new(oid: String, files: Vec<CommitFile>) -> Self {
-        Self {
+        let mut changes = Self {
             oid,
             files,
             selected: 0,
-        }
-    }
-
-    fn selected_file(&self) -> Option<&CommitFile> {
-        self.files.get(self.selected)
+            key: None,
+        };
+        changes.select(0);
+        changes
     }
 
     fn select(&mut self, index: usize) {
-        if index < self.files.len() {
+        if let Some(file) = self.files.get(index) {
             self.selected = index;
+            self.key = Some(DiffKey {
+                oid: self.oid.clone(),
+                path: file.diff_path().to_owned(),
+            });
         }
     }
 }
@@ -181,11 +82,8 @@ pub fn show(
     root: &Path,
     palette: &Palette,
 ) -> bool {
-    if let Some(path) = changes
-        .selected_file()
-        .map(|file| file.diff_path().to_owned())
-    {
-        diffs.request(&changes.oid, &path);
+    if let Some(key) = &changes.key {
+        diffs.request(key);
     }
     diffs.poll(ctx, git, root);
 
@@ -317,7 +215,7 @@ fn diff_pane(ui: &mut Ui, changes: &Changes, diffs: &DiffCache, palette: &Palett
     ui.vertical(|ui| {
         ui.set_height(height);
         ui.set_width(ui.available_width());
-        let Some(file) = changes.selected_file() else {
+        let (Some(file), Some(key)) = (changes.files.get(changes.selected), &changes.key) else {
             ui.label(RichText::new("No files.").color(palette.text_muted));
             return;
         };
@@ -331,12 +229,12 @@ fn diff_pane(ui: &mut Ui, changes: &Changes, diffs: &DiffCache, palette: &Palett
                 .selectable(false),
         );
         ui.add_space(6.0);
-        match diffs.cached(&changes.oid, file.diff_path()) {
-            Some(CachedPatch::Ready(diff)) => paint_diff(ui, diff, palette),
-            Some(CachedPatch::Failed(message)) => {
+        match diffs.cached(key) {
+            Some(Cached::Ready(diff)) => paint_diff(ui, diff, palette),
+            Some(Cached::Failed(message)) => {
                 ui.label(RichText::new(message).color(palette.error));
             }
-            Some(CachedPatch::Pending) | None => {
+            Some(Cached::Pending) | None => {
                 ui.label(RichText::new("Loading…").color(palette.text_muted));
             }
         }

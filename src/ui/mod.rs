@@ -9,6 +9,7 @@
 
 #[cfg(test)]
 mod adversarial_tests;
+mod async_cache;
 mod avatars;
 mod changes;
 mod folder_picker;

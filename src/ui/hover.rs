@@ -5,18 +5,16 @@
 //! The details come from one `git show` per commit, run on a worker thread
 //! the first time that commit's card opens.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cthulhu_git::git::{self, CommitHover, CommitStats, Git, GraphBranch, GraphRow, Person};
-use cthulhu_git::github::{GitHubRepo, RepoContext};
-use eframe::egui::{
-    self, Context, CursorIcon, FontSelection, Label, RichText, Sense, Ui, Vec2, WidgetText,
+use cthulhu_git::git::{
+    self, CommitHover, CommitStats, Git, GitError, GraphBranch, GraphRow, Person,
 };
+use cthulhu_git::github::{GitHubRepo, RepoContext};
+use eframe::egui::{self, CursorIcon, FontSelection, Label, RichText, Sense, Ui, Vec2, WidgetText};
 
+use super::async_cache::{AsyncCache, Cached, GitRead};
 use super::avatars::{self, AvatarService};
 use super::theme::Palette;
 use super::widgets;
@@ -24,113 +22,18 @@ use super::widgets;
 const CARD_WIDTH: f32 = 440.0;
 const AUTHOR_AVATAR: f32 = 40.0;
 const CO_AUTHOR_AVATAR: f32 = 22.0;
-/// Hovered commits whose details are kept, so the cache cannot grow without bound.
-const MAX_ENTRIES: usize = 256;
 
-enum State {
-    Loading,
-    Ready(Box<CommitHover>),
-    Failed(String),
-}
+/// Details already read, by commit hash, and the one `git show` in flight.
+pub type HoverCache = AsyncCache<String, CommitHover>;
 
 /// What [`HoverCache::cached`] found for one commit.
-pub(super) enum CachedCommit<'a> {
-    Pending,
-    Ready(&'a CommitHover),
-    Failed(&'a str),
-}
+pub(super) type CachedCommit<'a> = Cached<'a, CommitHover>;
 
-/// Details already read, and the one `git show` in flight.
-#[derive(Default)]
-pub struct HoverCache {
-    entries: HashMap<String, State>,
-    order: Vec<String>,
-    inflight: Option<(String, Receiver<Result<CommitHover, String>>)>,
-    /// Asked for while another read was running. Only the newest is kept.
-    wanted: Option<String>,
-}
+impl GitRead<CommitHover> for String {
+    const LOST: &'static str = "The commit details stopped unexpectedly.";
 
-impl HoverCache {
-    /// Collects a finished read and starts the next one.
-    pub fn poll(&mut self, ctx: &Context, git: &Git, root: &Path) {
-        if let Some((oid, receiver)) = &self.inflight {
-            let result = match receiver.try_recv() {
-                Ok(result) => Some(result),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => {
-                    Some(Err("The commit details stopped unexpectedly.".to_owned()))
-                }
-            };
-            if let Some(result) = result {
-                let state = match result {
-                    Ok(hover) => State::Ready(Box::new(hover)),
-                    Err(message) => State::Failed(message),
-                };
-                let oid = oid.clone();
-                self.inflight = None;
-                self.insert(oid, state);
-            }
-        }
-        if self.inflight.is_none()
-            && let Some(oid) = self.wanted.take()
-        {
-            self.start(ctx, git, root, oid);
-        }
-    }
-
-    fn insert(&mut self, oid: String, state: State) {
-        if !self.entries.contains_key(&oid) {
-            self.order.push(oid.clone());
-        }
-        self.entries.insert(oid, state);
-        while self.order.len() > MAX_ENTRIES {
-            let old = self.order.remove(0);
-            self.entries.remove(&old);
-        }
-    }
-
-    /// Starts a read unless this commit is already stored or in flight.
-    pub(super) fn request(&mut self, oid: &str) {
-        let busy_with_it = self
-            .inflight
-            .as_ref()
-            .is_some_and(|(inflight, _)| inflight == oid);
-        if self.entries.contains_key(oid) || busy_with_it {
-            return;
-        }
-        self.wanted = Some(oid.to_owned());
-    }
-
-    fn start(&mut self, ctx: &Context, git: &Git, root: &Path, oid: String) {
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
-        let root: PathBuf = root.to_path_buf();
-        let worker_oid = oid.clone();
-        let git = git.clone();
-        thread::spawn(move || {
-            let result =
-                git::commit_hover(&git, &root, &worker_oid).map_err(|error| error.to_string());
-            let _ = sender.send(result);
-            ctx.request_repaint();
-        });
-        self.entries.insert(oid.clone(), State::Loading);
-        self.inflight = Some((oid, receiver));
-    }
-
-    /// The read for `oid`, when one has been asked for.
-    pub(super) fn cached(&self, oid: &str) -> Option<CachedCommit<'_>> {
-        self.entries.get(oid).map(|state| match state {
-            State::Loading => CachedCommit::Pending,
-            State::Ready(hover) => CachedCommit::Ready(hover),
-            State::Failed(message) => CachedCommit::Failed(message),
-        })
-    }
-
-    /// Stores a finished read so a test can draw the sidebar without `git show`.
-    #[cfg(test)]
-    pub(super) fn store_ready(&mut self, hover: CommitHover) {
-        let oid = hover.oid.clone();
-        self.insert(oid, State::Ready(Box::new(hover)));
+    fn read(&self, git: &Git, root: &Path) -> Result<CommitHover, GitError> {
+        git::commit_hover(git, root, self)
     }
 }
 
@@ -190,13 +93,14 @@ fn card(
     avatars: &mut AvatarService,
     context: &CardContext<'_>,
 ) {
-    cache.request(&row.oid);
+    cache.request(row.oid.as_str());
     let palette = context.palette;
     ui.set_max_width(CARD_WIDTH);
     ui.spacing_mut().item_spacing.y = 6.0;
-    let detail = match cache.entries.get(&row.oid) {
-        Some(State::Ready(hover)) => Some(hover.as_ref()),
-        _ => None,
+    let (detail, failed) = match cache.cached(row.oid.as_str()) {
+        Some(CachedCommit::Ready(hover)) => (Some(hover), None),
+        Some(CachedCommit::Failed(message)) => (None, Some(message)),
+        Some(CachedCommit::Pending) | None => (None, None),
     };
     let author = detail.map_or(&row.author, |hover| &hover.author);
     let co_authors = detail.map_or(row.co_authors.as_slice(), |hover| &hover.co_authors);
@@ -209,7 +113,7 @@ fn card(
                 ui.label(RichText::new(&author.name).strong().color(palette.text));
                 email_link(ui, &author.email, palette);
             });
-            match (detail, cache.entries.get(&row.oid)) {
+            match (detail, failed) {
                 (Some(hover), _) => {
                     let when = relative_time(now_unix(), hover.authored_unix);
                     ui.label(
@@ -217,7 +121,7 @@ fn card(
                             .color(palette.text_muted),
                     );
                 }
-                (None, Some(State::Failed(message))) => {
+                (None, Some(message)) => {
                     ui.label(RichText::new(message).color(palette.error));
                 }
                 _ => {
@@ -611,12 +515,15 @@ pub(crate) fn relative_time(now: i64, then: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use cthulhu_git::settings::HistoryColumns;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
     use proptest::prelude::*;
 
     use super::*;
+    use crate::ui::async_cache::MAX_ENTRIES;
     use crate::ui::repo_view::{self, ViewState};
     use crate::ui::test_support::{
         absent_git, commit, opened, painted_texts, proptest_config, tree_text,
@@ -821,36 +728,32 @@ mod tests {
         }
     }
 
+    /// Every read goes through a worker; git is installed nowhere, so each
+    /// one fails at once. A commit asked for again, as the one on screen is
+    /// every frame, stays; the one asked for longest ago leaves.
     #[test]
-    fn the_cache_forgets_the_oldest_commits() {
+    fn the_cache_forgets_the_commit_asked_for_longest_ago() {
+        let ctx = egui::Context::default();
+        let git = absent_git();
         let mut cache = HoverCache::default();
-        for index in 0..MAX_ENTRIES + 10 {
-            cache.insert(format!("{index:040x}"), State::Failed(String::new()));
+        let oid = |index: usize| format!("{index:040x}");
+        for index in 0..=MAX_ENTRIES {
+            let wanted = oid(index);
+            cache.request(wanted.as_str());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while matches!(cache.cached(&wanted), None | Some(CachedCommit::Pending)) {
+                assert!(Instant::now() < deadline, "{wanted} never read");
+                cache.poll(&ctx, &git, Path::new("/repos"));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            cache.request(oid(0).as_str());
         }
-        assert_eq!(cache.entries.len(), MAX_ENTRIES);
-        assert!(!cache.entries.contains_key(&format!("{:040x}", 0)));
-        assert!(
-            cache
-                .entries
-                .contains_key(&format!("{:040x}", MAX_ENTRIES + 9))
-        );
-    }
-
-    #[test]
-    fn only_the_newest_request_waits_while_one_is_running() {
-        let mut cache = HoverCache::default();
-        let (_sender, receiver) = mpsc::channel();
-        cache.inflight = Some(("a".repeat(40), receiver));
-        cache.request(&"a".repeat(40));
-        assert_eq!(cache.wanted, None);
-        cache.request(&"b".repeat(40));
-        cache.request(&"c".repeat(40));
-        assert_eq!(cache.wanted, Some("c".repeat(40)));
-        // A poll while the read runs keeps it and starts nothing.
-        cache.poll(&Context::default(), &absent_git(), Path::new("/repos"));
-        let running = cache.inflight.as_ref().map(|(oid, _)| oid.as_str());
-        assert_eq!(running, Some("a".repeat(40).as_str()));
-        assert_eq!(cache.wanted, Some("c".repeat(40)));
+        let kept: Vec<usize> = (0..=MAX_ENTRIES)
+            .filter(|index| cache.cached(&oid(*index)).is_some())
+            .collect();
+        assert_eq!(kept.len(), MAX_ENTRIES, "{kept:?}");
+        assert!(!kept.contains(&1), "the oldest read is still kept");
+        assert!(kept.contains(&0), "the commit on screen was dropped");
     }
 
     /// The message cell opens no card. The author cell opens one that names
