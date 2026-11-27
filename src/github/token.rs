@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 const KEYRING_SERVICE: &str = "io.github.don-linux.cthulhu-git";
 const KEYRING_USER: &str = "github.com";
@@ -21,13 +21,14 @@ const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// chosen (GitHub's documented template parameters).
 pub const TOKEN_TEMPLATE_URL: &str = "https://github.com/settings/personal-access-tokens/new?name=Cthulhu+Git&description=Read-only+access+for+Cthulhu+Git&expires_in=90&contents=read";
 
-/// A GitHub token. `Debug` does not print it.
+/// A GitHub token. `Debug` does not print it, and its memory is wiped when
+/// it is dropped.
 #[derive(Clone, PartialEq, Eq)]
-pub struct Token(String);
+pub struct Token(Zeroizing<String>);
 
 impl Token {
     pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+        Self(Zeroizing::new(value.into()))
     }
 
     /// Trims pasted text. Refuses anything that cannot be a token: too short
@@ -38,7 +39,7 @@ impl Token {
             && value
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
-        plausible.then(|| Self(value.to_owned()))
+        plausible.then(|| Self(Zeroizing::new(value.to_owned())))
     }
 
     pub fn expose(&self) -> &str {
@@ -49,12 +50,6 @@ impl Token {
 impl fmt::Debug for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Token(…)")
-    }
-}
-
-impl Drop for Token {
-    fn drop(&mut self) {
-        self.0.zeroize();
     }
 }
 
@@ -317,14 +312,12 @@ pub fn delete_token() -> Result<(), TokenStoreError> {
 }
 
 /// `GH_TOKEN`, then `GITHUB_TOKEN`, the names GitHub CLI reads.
+///
+/// The copy read here is not wiped: the environment holds the same value for
+/// the life of the process.
 pub fn token_from_env() -> Option<(&'static str, Token)> {
     ["GH_TOKEN", "GITHUB_TOKEN"].into_iter().find_map(|name| {
-        let Ok(raw) = std::env::var(name) else {
-            return None;
-        };
-        // `Zeroizing` clears the environment value on both the parse failure
-        // and the success path. `Token` keeps its own copy.
-        let value = Zeroizing::new(raw);
+        let value = std::env::var(name).ok()?;
         Token::parse(&value).map(|token| (name, token))
     })
 }
@@ -338,23 +331,21 @@ pub fn gh_cli_token() -> Result<Token, String> {
         .map(PathBuf::from);
     let gh = find_gh(path_var.as_deref(), home.as_deref())
         .ok_or_else(|| "GitHub CLI (gh) was not found.".to_owned())?;
-    let output = run_with_timeout(
+    let (signed_in, stdout) = run_with_timeout(
         Command::new(&gh)
             .args(["auth", "token", "--hostname", "github.com"])
             .env("GH_PROMPT_DISABLED", "1")
             .env("NO_COLOR", "1"),
         GH_TIMEOUT,
     )?;
-    let mut bytes = output.1;
-    let signed_in = output.0;
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    let token = Token::parse(&text);
-    text.zeroize();
-    bytes.zeroize();
     if !signed_in {
         return Err("GitHub CLI is not signed in to github.com (run `gh auth login`).".to_owned());
     }
-    token.ok_or_else(|| "GitHub CLI did not print a token.".to_owned())
+    // Parsed in place, without a copy: text that is not UTF-8 is no token.
+    std::str::from_utf8(&stdout)
+        .ok()
+        .and_then(Token::parse)
+        .ok_or_else(|| "GitHub CLI did not print a token.".to_owned())
 }
 
 fn gh_name() -> &'static str {
@@ -406,7 +397,11 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 /// `(success, stdout)`. The child is killed when it runs past `timeout`.
-fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<(bool, Vec<u8>), String> {
+/// Stdout may hold a token, so it is wiped wherever it is dropped.
+fn run_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<(bool, Zeroizing<Vec<u8>>), String> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -424,9 +419,8 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<(bool, V
         .stdout
         .take()
         .ok_or_else(|| "GitHub CLI output was not captured.".to_owned())?;
-    // `Zeroizing` clears the buffer if the caller times out and drops the
-    // receiver, and if `send` fails because that receiver is already gone.
-    // Joining the reader would wait on a grandchild that still holds the pipe.
+    // Joining the reader would wait on a grandchild that still holds the
+    // pipe. A buffer sent after the caller gave up is wiped with the channel.
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut bytes = Zeroizing::new(Vec::new());
@@ -447,12 +441,8 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<(bool, V
             Err(error) => return Err(format!("GitHub CLI failed: {error}")),
         }
     };
-    let mut stdout = receiver
-        .recv()
-        .unwrap_or_else(|_| Zeroizing::new(Vec::new()));
-    // Move the bytes out. `stdout`'s drop still wipes the wrapper; `gh_cli_token`
-    // wipes this copy after parsing.
-    Ok((success, std::mem::take(&mut *stdout)))
+    let stdout = receiver.recv().unwrap_or_default();
+    Ok((success, stdout))
 }
 
 #[cfg(test)]
@@ -562,7 +552,7 @@ mod tests {
         )
         .expect("ran");
         assert!(ok);
-        assert_eq!(out, b"ghp_abcdefghijklmnopqrstuvwxyz");
+        assert_eq!(*out, b"ghp_abcdefghijklmnopqrstuvwxyz");
     }
 
     fn parsed_token(value: &str) -> Token {
