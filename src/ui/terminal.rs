@@ -10,6 +10,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::ops::Range;
@@ -44,19 +45,38 @@ const TERMINAL_MIN_HEIGHT: f32 = 80.0;
 const SPLITTER_HEIGHT: f32 = 6.0;
 const INITIAL_FRACTION: f32 = 0.40;
 
-/// Which OS the shell choice is for. Tests pass each; the app passes its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HostOs {
-    Linux,
-    Macos,
-    Windows,
-}
-
 /// Program and arguments for the PTY child.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShellArgv {
-    pub program: String,
-    pub args: Vec<String>,
+struct ShellArgv {
+    program: String,
+    args: Vec<String>,
+}
+
+/// The shell for the PTY, from this process's environment.
+#[cfg(unix)]
+fn shell() -> Result<ShellArgv, String> {
+    let unset = vars_to_unset(std::env::vars_os());
+    let unset: Vec<&str> = unset.iter().map(String::as_str).collect();
+    Ok(shell_argv(
+        std::env::var_os("SHELL").as_deref(),
+        passwd_shell().as_deref(),
+        &unset,
+    ))
+}
+
+/// PowerShell, quoted for ConPTY. ConPTY merges `Options.env` into the
+/// parent environment, so no inherited name can be removed here.
+#[cfg(windows)]
+fn shell() -> Result<ShellArgv, String> {
+    let argv = windows_shell_argv(
+        std::env::var("ProgramFiles").ok().as_deref(),
+        std::env::var("SystemRoot").ok().as_deref(),
+        |path| Path::new(path).is_file(),
+    )?;
+    Ok(ShellArgv {
+        program: conpty_program(&argv.program),
+        args: argv.args,
+    })
 }
 
 /// Argv for the embedded shell.
@@ -67,121 +87,61 @@ pub struct ShellArgv {
 /// an absolute executable `passwd_shell`. macOS then tries `/bin/zsh`.
 /// `/bin/sh` is the last resort.
 /// `unset` is applied with `/usr/bin/env -u`, which can remove names.
-/// `Options.env` can only add them. On Windows that map is merged into the
-/// parent environment, so `unset` is not applied.
-pub fn shell_argv(
-    host: HostOs,
-    shell: Option<&OsStr>,
-    passwd_shell: Option<&str>,
-    unset: &[&str],
-) -> Result<ShellArgv, String> {
-    let argv = bare_shell(host, shell, passwd_shell)?;
-    if host == HostOs::Windows || unset.is_empty() {
-        // Windows `tty::Options.env` cannot drop inherited names.
-        return Ok(argv);
-    }
-    let mut args = Vec::with_capacity(unset.len() * 2 + 2 + argv.args.len());
-    for name in unset {
-        if !env_name_is_safe(name) {
-            continue;
-        }
-        args.push("-u".to_owned());
-        args.push((*name).to_owned());
-    }
+/// `Options.env` can only add them.
+#[cfg(unix)]
+fn shell_argv(shell: Option<&OsStr>, passwd_shell: Option<&str>, unset: &[&str]) -> ShellArgv {
+    let program = [
+        shell.and_then(OsStr::to_str),
+        passwd_shell,
+        cfg!(target_os = "macos").then_some("/bin/zsh"),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|candidate| Path::new(candidate).is_absolute() && is_executable(candidate))
+    .unwrap_or("/bin/sh")
+    .to_owned();
+    let login = cfg!(target_os = "macos").then(|| "-l".to_owned());
+    let mut args: Vec<String> = unset
+        .iter()
+        .filter(|name| env_name_is_safe(name))
+        .flat_map(|name| ["-u".to_owned(), (*name).to_owned()])
+        .collect();
     if args.is_empty() {
-        return Ok(argv);
+        return ShellArgv {
+            program,
+            args: login.into_iter().collect(),
+        };
     }
     args.push("--".to_owned());
-    args.push(argv.program);
-    args.extend(argv.args);
-    Ok(ShellArgv {
+    args.push(program);
+    args.extend(login);
+    ShellArgv {
         program: "/usr/bin/env".to_owned(),
         args,
-    })
+    }
 }
 
-fn bare_shell(
-    host: HostOs,
-    shell: Option<&OsStr>,
-    passwd_shell: Option<&str>,
-) -> Result<ShellArgv, String> {
-    if host == HostOs::Windows {
-        // `Command` searches the working directory before `PATH`. A bare
-        // `powershell.exe` would run a binary planted in the repository.
-        return windows_shell_argv(
-            std::env::var("ProgramFiles").ok().as_deref(),
-            std::env::var("SystemRoot").ok().as_deref(),
-            std::env::var("COMSPEC").ok().as_deref(),
-            |path| Path::new(path).is_file(),
-        );
-    }
-    let program = chosen_unix_shell(host, shell, passwd_shell);
-    let args = if host == HostOs::Macos {
-        vec!["-l".to_owned()]
-    } else {
-        Vec::new()
-    };
-    Ok(ShellArgv { program, args })
-}
-
-fn chosen_unix_shell(host: HostOs, shell: Option<&OsStr>, passwd_shell: Option<&str>) -> String {
-    chosen_unix_shell_with(host, shell, passwd_shell, unix_shell_is_executable)
-}
-
-fn chosen_unix_shell_with(
-    host: HostOs,
-    shell: Option<&OsStr>,
-    passwd_shell: Option<&str>,
-    executable: impl Fn(&str) -> bool,
-) -> String {
-    let shell_text = shell.and_then(OsStr::to_str);
-    let candidates = [
-        shell_text,
-        passwd_shell,
-        (host == HostOs::Macos).then_some("/bin/zsh"),
-        Some("/bin/sh"),
-    ];
-    for candidate in candidates.into_iter().flatten() {
-        if unix_shell_is_absolute(candidate) && executable(candidate) {
-            return candidate.to_owned();
-        }
-    }
-    "/bin/sh".to_owned()
-}
-
-/// Absolute and executable. A missing path or a mode without an execute bit
-/// falls through so the PTY is not pointed at a file `execve` will reject.
-fn unix_shell_is_executable(path: &str) -> bool {
-    if !unix_shell_is_absolute(path) {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let Ok(meta) = std::fs::metadata(path) else {
-            return false;
-        };
-        meta.is_file() && meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        // Permission bits are a Unix property. Callers on this target still
-        // require an absolute path via [`unix_shell_is_absolute`].
-        let _ = path;
-        true
-    }
+/// A file with an execute bit. A missing path or a mode without one falls
+/// through, so the PTY is not pointed at a file `execve` will reject.
+#[cfg(unix)]
+fn is_executable(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 /// PowerShell, as a pure function of the Windows environment.
 ///
-/// Order is `%ProgramFiles%\PowerShell\7\pwsh.exe`, then
+/// `Command` searches the working directory before `PATH`, so a bare
+/// `powershell.exe` would run a binary planted in the repository. Order is
+/// `%ProgramFiles%\PowerShell\7\pwsh.exe`, then
 /// `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`.
 /// Relative paths are skipped. `COMSPEC` is not a candidate: a relative
 /// value would search the repository, and an absolute one is often `cmd.exe`.
+#[cfg(any(windows, test))]
 fn windows_shell_argv(
     program_files: Option<&str>,
     system_root: Option<&str>,
-    _comspec: Option<&str>,
     exists: impl Fn(&str) -> bool,
 ) -> Result<ShellArgv, String> {
     let candidates = [
@@ -203,10 +163,12 @@ fn windows_shell_argv(
 /// alacritty builds the ConPTY command line by pasting the program in
 /// unquoted, and `CreateProcessW` then splits `C:\Program Files\...` at the
 /// space and tries `C:\Program.exe` first. Windows paths cannot contain `"`.
+#[cfg(any(windows, test))]
 fn conpty_program(path: &str) -> String {
     format!("\"{path}\"")
 }
 
+#[cfg(any(windows, test))]
 fn windows_join(base: &str, child: &str) -> String {
     let base = base.trim_end_matches(['\\', '/']);
     format!("{base}\\{child}")
@@ -214,6 +176,7 @@ fn windows_join(base: &str, child: &str) -> String {
 
 /// Drive path (`C:\...`) or UNC (`\\server\share`). `Path::is_absolute` is
 /// false for both when this code is tested on Unix.
+#[cfg(any(windows, test))]
 fn windows_path_is_absolute(path: &str) -> bool {
     let bytes = path.as_bytes();
     if bytes.len() >= 3
@@ -242,18 +205,7 @@ fn windows_taskkill_path(
     }
 }
 
-/// Absolute Unix path. On Unix this is [`Path::is_absolute`].
-///
-/// The Linux shell choice is also unit-tested on Windows, where `Path` does
-/// not treat `/bin/sh` as absolute.
-fn unix_shell_is_absolute(text: &str) -> bool {
-    if cfg!(unix) {
-        Path::new(text).is_absolute()
-    } else {
-        text.starts_with('/')
-    }
-}
-
+#[cfg(unix)]
 fn env_name_is_safe(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -261,19 +213,10 @@ fn env_name_is_safe(name: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-fn this_host() -> HostOs {
-    if cfg!(windows) {
-        HostOs::Windows
-    } else if cfg!(target_os = "macos") {
-        HostOs::Macos
-    } else {
-        HostOs::Linux
-    }
-}
-
 /// Inherited names the shell must not see: what git commands scrub, plus the
 /// GitHub token variables. A name that is not Unicode is skipped, as the git
 /// scrub does; a value that is not Unicode does not matter.
+#[cfg(unix)]
 fn vars_to_unset(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<String> {
     let mut names: Vec<String> = vars
         .into_iter()
@@ -306,11 +249,6 @@ fn passwd_shell() -> Option<String> {
             return Some(shell.to_owned());
         }
     }
-    None
-}
-
-#[cfg(not(unix))]
-fn passwd_shell() -> Option<String> {
     None
 }
 
@@ -485,21 +423,9 @@ impl ShellSession {
             &grid,
             bridge.clone(),
         )));
-        let unset = vars_to_unset(std::env::vars_os());
-        let unset_refs: Vec<&str> = unset.iter().map(String::as_str).collect();
-        let argv = shell_argv(
-            this_host(),
-            std::env::var_os("SHELL").as_deref(),
-            passwd_shell().as_deref(),
-            &unset_refs,
-        )?;
-        let program = if cfg!(windows) {
-            conpty_program(&argv.program)
-        } else {
-            argv.program
-        };
+        let argv = shell()?;
         let options = tty::Options {
-            shell: Some(tty::Shell::new(program, argv.args)),
+            shell: Some(tty::Shell::new(argv.program, argv.args)),
             working_directory: Some(cwd.to_path_buf()),
             env: shell_env(
                 std::env::var("LANG").ok().as_deref(),
@@ -1916,26 +1842,32 @@ fn clamp_fraction(fraction: f32, usable: f32) -> f32 {
 mod tests {
     use super::*;
 
+    /// What runs when neither `SHELL` nor the passwd shell can.
+    #[cfg(unix)]
+    const FALLBACK: &str = if cfg!(target_os = "macos") {
+        "/bin/zsh"
+    } else {
+        "/bin/sh"
+    };
+
     /// Program, then arguments.
-    fn argv(
-        host: HostOs,
-        shell: Option<&OsStr>,
-        passwd: Option<&str>,
-        unset: &[&str],
-    ) -> Vec<String> {
-        let argv = shell_argv(host, shell, passwd, unset).expect("argv");
+    #[cfg(unix)]
+    fn argv(shell: Option<&OsStr>, passwd: Option<&str>, unset: &[&str]) -> Vec<String> {
+        let argv = shell_argv(shell, passwd, unset);
         std::iter::once(argv.program).chain(argv.args).collect()
     }
 
-    /// macOS logs in, Linux does not. Names are unset through `env -u`, and
-    /// an unsafe name is skipped. A relative `SHELL` is never run: an
-    /// absolute passwd shell comes next, then `/bin/sh`.
+    /// Names are unset through `env -u`, and an unsafe name is skipped. A
+    /// relative `SHELL` is never run: an absolute passwd shell comes next,
+    /// then the fallback. macOS logs in (`-l`), Linux does not.
+    #[cfg(unix)]
     #[test]
     fn shell_argv_runs_an_absolute_shell_without_the_unset_names() {
-        // Case, host, `SHELL`, passwd shell, names to unset, program then arguments.
+        use std::os::unix::ffi::OsStrExt;
+
+        // Case, `SHELL`, passwd shell, names to unset, program then arguments.
         type Row = (
             &'static str,
-            HostOs,
             Option<&'static str>,
             Option<&'static str>,
             &'static [&'static str],
@@ -1944,69 +1876,35 @@ mod tests {
         const ENV: &str = "/usr/bin/env";
         #[rustfmt::skip]
         const SHELLS: &[Row] = &[
-            ("bash", HostOs::Linux, Some("/bin/bash"), None, &[], &["/bin/bash"]),
-            ("login", HostOs::Macos, Some("/bin/bash"), None, &[], &["/bin/bash", "-l"]),
-            ("scrubbed login", HostOs::Macos, Some("/bin/bash"), None, &["GIT_DIR", "GH_TOKEN"],
-                &[ENV, "-u", "GIT_DIR", "-u", "GH_TOKEN", "--", "/bin/bash", "-l"]),
-            ("scrubbed bash", HostOs::Linux, Some("/bin/bash"), None, &["GIT_DIR"],
-                &[ENV, "-u", "GIT_DIR", "--", "/bin/bash"]),
-            ("passwd shell", HostOs::Linux, None, Some("/bin/bash"), &["GIT_EXEC_PATH"],
+            ("bash", Some("/bin/bash"), None, &[], &["/bin/bash"]),
+            ("scrubbed", Some("/bin/bash"), None, &["GIT_DIR", "GH_TOKEN"],
+                &[ENV, "-u", "GIT_DIR", "-u", "GH_TOKEN", "--", "/bin/bash"]),
+            ("passwd shell", None, Some("/bin/bash"), &["GIT_EXEC_PATH"],
                 &[ENV, "-u", "GIT_EXEC_PATH", "--", "/bin/bash"]),
-            ("empty SHELL", HostOs::Linux, Some(""), None, &[], &["/bin/sh"]),
-            ("unsafe name", HostOs::Linux, Some("/bin/sh"), None,
+            ("empty SHELL", Some(""), None, &[], &[FALLBACK]),
+            ("unsafe name", Some("/bin/sh"), None,
                 &["GIT_DIR;touch /tmp/x", "GH_TOKEN"], &[ENV, "-u", "GH_TOKEN", "--", "/bin/sh"]),
-            ("relative SHELL", HostOs::Linux, Some("./sh"), Some("/bin/bash"), &[], &["/bin/bash"]),
-            ("relative passwd", HostOs::Linux, Some("bash"), Some("bin/zsh"), &[], &["/bin/sh"]),
+            ("relative SHELL", Some("./sh"), Some("/bin/bash"), &[], &["/bin/bash"]),
+            ("relative passwd", Some("bash"), Some("bin/zsh"), &[], &[FALLBACK]),
+            ("parent SHELL", Some("../sh"), None, &["GIT_DIR"], &[ENV, "-u", "GIT_DIR", "--", FALLBACK]),
         ];
-        for &(case, host, shell, passwd, unset, expected) in SHELLS {
+        let login: &[&str] = if cfg!(target_os = "macos") {
+            &["-l"]
+        } else {
+            &[]
+        };
+        for &(case, shell, passwd, unset, expected) in SHELLS {
             assert_eq!(
-                argv(host, shell.map(OsStr::new), passwd, unset),
-                expected,
+                argv(shell.map(OsStr::new), passwd, unset),
+                [expected, login].concat(),
                 "{case}"
             );
         }
-        for relative in ["./sh", "bash", "bin/zsh", "../sh"] {
-            let shell = Some(OsStr::new(relative));
-            assert_eq!(
-                argv(HostOs::Linux, shell, None, &[]),
-                ["/bin/sh"],
-                "{relative}"
-            );
-            assert_eq!(
-                argv(HostOs::Linux, shell, None, &["GIT_DIR"]),
-                [ENV, "-u", "GIT_DIR", "--", "/bin/sh"],
-                "{relative} with a name to unset"
-            );
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            let raw = Some(OsStr::from_bytes(b"\xff"));
-            assert_eq!(
-                argv(HostOs::Linux, raw, None, &[]),
-                ["/bin/sh"],
-                "non-Unicode SHELL"
-            );
-        }
-        for shell in ["/bin/bash", "./sh"] {
-            let windows = shell_argv(HostOs::Windows, Some(OsStr::new(shell)), None, &["GIT_DIR"]);
-            assert_windows_shell(windows);
-        }
-    }
-
-    fn assert_windows_shell(argv: Result<ShellArgv, String>) {
-        match argv {
-            Ok(argv) => {
-                assert!(
-                    windows_path_is_absolute(&argv.program),
-                    "relative program {}",
-                    argv.program
-                );
-                assert_eq!(argv.args, ["-NoLogo"]);
-                assert_ne!(argv.program, "powershell.exe");
-            }
-            Err(error) => assert!(error.contains("PowerShell"), "{error}"),
-        }
+        assert_eq!(
+            argv(Some(OsStr::from_bytes(b"\xff")), None, &[]),
+            [&[FALLBACK], login].concat(),
+            "non-Unicode SHELL"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2454,12 +2352,9 @@ END
     fn windows_shell_prefers_pwsh_then_windows_powershell() {
         let pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe";
         let powershell = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
-        let both = windows_shell_argv(
-            Some(r"C:\Program Files"),
-            Some(r"C:\Windows"),
-            Some(r".\powershell.exe"),
-            |path| path == pwsh || path == powershell,
-        )
+        let both = windows_shell_argv(Some(r"C:\Program Files"), Some(r"C:\Windows"), |path| {
+            path == pwsh || path == powershell
+        })
         .expect("pwsh");
         assert_eq!(both.program, pwsh);
         assert_eq!(both.args, ["-NoLogo"]);
@@ -2468,28 +2363,17 @@ END
             r#""C:\Program Files\PowerShell\7\pwsh.exe""#
         );
 
-        let second = windows_shell_argv(
-            Some(r"C:\Program Files"),
-            Some(r"C:\Windows"),
-            Some(r"C:\Windows\System32\cmd.exe"),
-            |path| path == powershell,
-        )
+        let second = windows_shell_argv(Some(r"C:\Program Files"), Some(r"C:\Windows"), |path| {
+            path == powershell
+        })
         .expect("powershell");
         assert_eq!(second.program, powershell);
         assert_eq!(second.args, ["-NoLogo"]);
 
-        let relative = windows_shell_argv(
-            Some(r"Program Files"),
-            Some("Windows"),
-            Some("powershell.exe"),
-            |_| true,
-        );
+        let relative = windows_shell_argv(Some(r"Program Files"), Some("Windows"), |_| true);
         assert!(relative.is_err(), "{relative:?}");
 
-        let missing =
-            windows_shell_argv(Some(r"C:\Program Files"), Some(r"C:\Windows"), None, |_| {
-                false
-            });
+        let missing = windows_shell_argv(Some(r"C:\Program Files"), Some(r"C:\Windows"), |_| false);
         assert!(missing.is_err(), "{missing:?}");
     }
 
@@ -2520,27 +2404,10 @@ END
         std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o755)).expect("mode 0755");
         let locked = locked.to_str().expect("utf-8 locked path");
         let next = next.to_str().expect("utf-8 next path");
-
-        let argv =
-            shell_argv(HostOs::Linux, Some(OsStr::new(locked)), Some(next), &[]).expect("argv");
-        assert_eq!(argv.program, next);
-        assert_ne!(argv.program, locked);
-
-        let macos = chosen_unix_shell_with(
-            HostOs::Macos,
-            Some(OsStr::new(locked)),
-            Some(locked),
-            |path| path == "/bin/zsh" || path == "/bin/sh",
-        );
-        assert_eq!(macos, "/bin/zsh");
-
-        let linux = chosen_unix_shell_with(
-            HostOs::Linux,
-            Some(OsStr::new("/no/such/shell")),
-            None,
-            |path| path == "/bin/sh",
-        );
-        assert_eq!(linux, "/bin/sh");
+        for (passwd, program) in [(next, next), (locked, FALLBACK)] {
+            let argv = shell_argv(Some(OsStr::new(locked)), Some(passwd), &[]);
+            assert_eq!(argv.program, program, "passwd shell {passwd}");
+        }
     }
 
     #[test]
