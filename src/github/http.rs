@@ -104,6 +104,10 @@ pub trait Transport: Send + Sync {
     fn get_once(&self, url: &str, headers: &[(&str, String)]) -> Result<HttpResponse, HttpError>;
 }
 
+/// ureq's own request log redacts the `Authorization` header, but ureq-proto
+/// logs every byte of the request head, the token included, at TRACE (its
+/// `Writer` hex dump, `src/util.rs` in 0.7). The app installs no logger. One
+/// added later must keep the `ureq` and `ureq_proto` targets below TRACE.
 pub struct UreqTransport {
     agent: ureq::Agent,
 }
