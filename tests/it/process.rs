@@ -18,33 +18,59 @@ use crate::support::{
 };
 use crate::support::{git_at, write_executable};
 #[cfg(unix)]
-use cthulhu_git::git::{DiscoverInputs, Git, discover_with, inspect};
+use cthulhu_git::git::{
+    DiscoverInputs, Git, GraphTip, branch_graph, discover_with, inspect, switch_branch,
+};
 
 #[cfg(unix)]
 fn temp() -> TempDir {
     TempDir::with_prefix("cthulhu-process-").expect("temp dir")
 }
 
+/// How each case reaches git, so the same fake is met through different
+/// entry points.
+#[cfg(unix)]
+type Call = fn(&Git, &Path) -> Result<(), GitError>;
+
+#[cfg(unix)]
+fn read_graph(git: &Git, root: &Path) -> Result<(), GitError> {
+    let tip = GraphTip {
+        name: "main".to_owned(),
+        oid: "a".repeat(40),
+        color: 0,
+        principal: true,
+        current: true,
+    };
+    branch_graph(git, root, &[tip], 10).map(drop)
+}
+
 /// A `--version` that never answers is killed, with what it started, after
-/// the 250 ms probe limit.
+/// the 250 ms probe limit, and the search moves on to the next candidate.
 #[cfg(unix)]
 #[test]
-fn a_hung_version_probe_is_killed() {
-    let case = "sleeping override";
-    let tmp = temp();
-    let hung = fake_git(&tmp.path().join("hung/git"), "sleep", "");
-    let inputs = DiscoverInputs {
-        override_path: Some(hung.clone().into()),
-        path_var: None,
-        exe_name: "git",
-        fallbacks: Vec::new(),
-        skip_paths: Vec::new(),
-    };
-    let found = within(case, Duration::from_secs(5), move || {
-        discover_with(&inputs).map(|git| git.path)
-    });
-    assert!(found.is_err(), "{case:?}: {found:?}");
-    assert_pid_dead(case, &sidecar(&hung, ".pid"));
+fn a_hung_version_probe_is_killed_and_skipped() {
+    for (case, pinned) in [("sleeping override", true), ("sleeping PATH entry", false)] {
+        let tmp = temp();
+        let hung = fake_git(&tmp.path().join("hung/git"), "sleep", "");
+        let fast = fake_git(&tmp.path().join("fast/git"), "2.43.0", "");
+        let dirs = [&hung, &fast].map(|git| git.parent().expect("dir").to_path_buf());
+        let inputs = DiscoverInputs {
+            override_path: pinned.then(|| hung.clone().into()),
+            path_var: Some(std::env::join_paths(dirs).expect("PATH")),
+            exe_name: "git",
+            fallbacks: Vec::new(),
+            skip_paths: Vec::new(),
+        };
+        let found = within(case, Duration::from_secs(5), move || {
+            discover_with(&inputs).map(|git| git.path)
+        });
+        if pinned {
+            assert!(found.is_err(), "{case:?}: {found:?}");
+        } else {
+            assert_eq!(found.ok(), Some(fast), "{case:?}");
+        }
+        assert_pid_dead(case, &sidecar(&hung, ".pid"));
+    }
 }
 
 /// A command past its limit is `TimedOut`, and its process group is gone,
@@ -52,15 +78,31 @@ fn a_hung_version_probe_is_killed() {
 #[cfg(unix)]
 #[test]
 fn timeout_kills_the_process_group() {
-    type Call = fn(&Git, &Path) -> Result<(), GitError>;
     // (case, fake mode, limit in ms, call, start of the timed-out command)
-    let cases: [(&str, &str, u64, Call, &str); 1] = [(
-        "setsid grandchild",
-        "setsid",
-        2000,
-        |git, root| inspect(git, root).map(drop),
-        "git rev-parse --is-bare-repository",
-    )];
+    let cases: [(&str, &str, u64, Call, &str); 3] = [
+        (
+            "history log",
+            "slow",
+            500,
+            read_graph,
+            "git log --date-order",
+        ),
+        (
+            "switch",
+            "slow",
+            500,
+            |git, root| switch_branch(git, root, "main"),
+            "git switch --no-guess -- main",
+        ),
+        // Long enough for the re-exec'd sleeper to call setsid first.
+        (
+            "setsid grandchild",
+            "setsid",
+            2000,
+            |git, root| inspect(git, root).map(drop),
+            "git rev-parse --is-bare-repository",
+        ),
+    ];
     for (case, mode, limit, call, command_start) in cases {
         let tmp = temp();
         let fake = fake_git(&tmp.path().join("git"), "2.43.0", mode);
@@ -82,6 +124,51 @@ fn timeout_kills_the_process_group() {
         }
         assert_pid_dead(case, &sidecar(&fake, ".pid"));
     }
+}
+
+/// Output past the 8 MiB cap is refused before it is used, from a path
+/// (`rev-parse`) or from the history log, and the writer is stopped.
+#[cfg(unix)]
+#[test]
+fn output_past_the_cap_is_refused() {
+    let cases: [(&str, Call, &str); 2] = [
+        (
+            "repository root",
+            |git, root| inspect(git, root).map(drop),
+            "git rev-parse",
+        ),
+        ("history log", read_graph, "git log --date-order"),
+    ];
+    for (case, call, command_start) in cases {
+        let tmp = temp();
+        let fake = fake_git(&tmp.path().join("git"), "2.43.0", "bomb");
+        let git = git_at(fake.clone());
+        let root = tmp.path().to_path_buf();
+        match within(case, Duration::from_secs(5), move || call(&git, &root)) {
+            Err(GitError::OutputLimit { command }) => {
+                assert!(command.starts_with(command_start), "{case:?}: {command}");
+            }
+            other => panic!("{case:?}: expected OutputLimit, got {other:?}"),
+        }
+        assert_pid_dead(case, &sidecar(&fake, ".pid"));
+    }
+}
+
+/// Git exits while a grandchild still holds its stdout. The call returns
+/// git's result instead of waiting for the grandchild, which is then stopped.
+#[cfg(unix)]
+#[test]
+fn background_writer_does_not_pin_a_finished_git() {
+    let case = "detached writer";
+    let tmp = temp();
+    let fake = fake_git(&tmp.path().join("git"), "2.43.0", "writer");
+    let git = git_at(fake.clone());
+    let cwd = tmp.path().to_path_buf();
+    let result = within(case, Duration::from_secs(8), move || {
+        git.run(&cwd, &["status"]).map(drop)
+    });
+    result.expect("a git that already exited must return");
+    assert_pid_dead(case, &sidecar(&fake, ".pid"));
 }
 
 #[cfg(unix)]

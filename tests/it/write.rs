@@ -3,7 +3,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use cthulhu_git::git::{GitError, Head, branches, latest_commit, pull_ff_only, switch_branch};
+use cthulhu_git::git::{
+    GitError, Head, branches, fetch, latest_commit, pull_ff_only, switch_branch,
+};
 
 use crate::support::{Repo, git_at, sh_quote, write_executable};
 
@@ -24,6 +26,19 @@ fn diverged() -> Repo {
 
 fn read(repo: &Repo, name: &str) -> String {
     fs::read_to_string(repo.root.join(name)).expect(name)
+}
+
+/// A post-checkout hook that logs its third argument, 1 for a branch switch.
+/// It goes through the local `core.hooksPath`, which a user's global one
+/// cannot replace.
+fn log_post_checkout(repo: &Repo, log: &Path) {
+    let hooks = repo.tmp.path().join("hooks");
+    let body = format!(
+        "#!/bin/sh\necho \"post-checkout $3\" >> {}\n",
+        sh_quote(log)
+    );
+    write_executable(&hooks.join("post-checkout"), &body);
+    repo.git(&["config", "core.hooksPath", hooks.to_str().expect("utf-8")]);
 }
 
 /// After a switch to `name`, HEAD is attached to it, it is the one current
@@ -167,16 +182,14 @@ fn switch_refuses_and_leaves_the_repository_unchanged() {
             "other",
             |repo| {
                 repo.write("a.txt", "dirty");
-                let marker = repo.tmp.path().join("post-checkout-ran");
-                let hook = format!("#!/bin/sh\ntouch {}\n", sh_quote(&marker));
-                write_executable(&repo.root.join(".git/hooks/post-checkout"), &hook);
+                log_post_checkout(repo, &repo.tmp.path().join("ran.log"));
                 repo.root.clone()
             },
             Some("would be overwritten"),
             |repo, _| {
                 assert_eq!(read(repo, "a.txt"), "dirty");
                 assert_eq!(repo.git(&["diff", "--cached", "--", "a.txt"]), "");
-                assert!(!repo.tmp.path().join("post-checkout-ran").exists());
+                assert!(!repo.tmp.path().join("ran.log").exists(), "a hook ran");
             },
         ),
         (
@@ -362,6 +375,58 @@ fn pull_ff_only_never_rebases() {
     pull_ff_only(&origin.git, &clone).expect("fast-forward");
     assert_eq!(
         origin.git_in(&clone, &["rev-parse", "HEAD"]),
+        origin.git(&["rev-parse", "main"])
+    );
+}
+
+/// A switch runs the repository's filters and hooks as `git switch` in a
+/// terminal does: smudge for the file it writes, then post-checkout.
+#[cfg(unix)]
+#[test]
+fn switch_runs_post_checkout_and_smudge_like_the_terminal() {
+    let repo = diverged();
+    let log = repo.tmp.path().join("ran.log");
+    log_post_checkout(&repo, &log);
+    let smudge = repo.tmp.path().join("smudge.sh");
+    let body = format!("#!/bin/sh\necho smudge >> {}\ncat\n", sh_quote(&log));
+    write_executable(&smudge, &body);
+    repo.git(&[
+        "config",
+        "filter.evil.smudge",
+        smudge.to_str().expect("utf-8"),
+    ]);
+    repo.write(".git/info/attributes", "a.txt filter=evil\n");
+
+    switch_branch(&repo.git, &repo.root, "other").expect("switch");
+    assert_eq!(read(&repo, "a.txt"), "other");
+    assert_eq!(
+        fs::read_to_string(&log).expect("log"),
+        "smudge\npost-checkout 1\n"
+    );
+}
+
+/// Fetch updates the tracking ref git itself maps the upstream to: the
+/// remote's name has a `/`, and git's upstream is the first `merge` value.
+#[test]
+fn fetch_updates_the_tracking_ref_git_names_as_upstream() {
+    let origin = Repo::init("origin");
+    origin.commit("base");
+    origin.git(&["branch", "other"]);
+    let clone = origin.tmp.path().join("clone");
+    let source = origin.root.to_str().expect("utf-8");
+    origin.git(&["clone", "--", source, clone.to_str().expect("utf-8")]);
+    // Split at its first `/`, `team/origin/main` would name a remote `team`.
+    origin.git_in(&clone, &["remote", "rename", "origin", "team/origin"]);
+    // `config --get` would read the last value instead.
+    origin.git_in(
+        &clone,
+        &["config", "--add", "branch.main.merge", "refs/heads/other"],
+    );
+    origin.commit("origin ahead");
+
+    fetch(&origin.git, &clone, "main").expect("fetch");
+    assert_eq!(
+        origin.git_in(&clone, &["rev-parse", "refs/remotes/team/origin/main"]),
         origin.git(&["rev-parse", "main"])
     );
 }
