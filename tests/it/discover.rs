@@ -163,8 +163,12 @@ fn discovery_takes_the_first_supported_git() {
             }
             // The message names the variable the user has to fix.
             (Err(error @ GitError::BadOverride(_)), Expected::BadOverride) => {
+                // The prefix ends at the space, so a renamed variable cannot
+                // hide behind a shared prefix such as `CTHULHU`.
                 assert!(
-                    error.to_string().starts_with(OVERRIDE_VAR),
+                    error
+                        .to_string()
+                        .starts_with(&format!("{OVERRIDE_VAR} is set to ")),
                     "{name:?}: {error}"
                 );
             }

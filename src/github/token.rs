@@ -486,6 +486,10 @@ mod tests {
                 Some("github_pat_11ABCDEFG0123456789_abcdef"),
             ),
             (format!(" \t{shortest}\n"), Some(shortest.as_str())),
+            (
+                "ghs_dash-and_underscore-01".to_owned(),
+                Some("ghs_dash-and_underscore-01"),
+            ),
             (longest.clone(), Some(longest.as_str())),
             ("a".repeat(19), None),
             ("a".repeat(256), None),

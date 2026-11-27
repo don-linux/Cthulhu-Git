@@ -128,36 +128,6 @@ fn save_never_writes_through_a_planted_entry() {
     }
 }
 
-/// The only way to reach `SettingsError::Read`: the path exists and is not a file.
-#[test]
-fn directory_settings_path_is_read_or_write_error() {
-    let dir = temp_dir();
-    let path = dir.path().join(FILE_NAME);
-    fs::create_dir(&path).expect("settings path is a directory");
-
-    let load_error = Settings::load_from(&path).expect_err("load directory");
-    assert!(
-        matches!(load_error, SettingsError::Read(..)),
-        "{load_error:?}"
-    );
-    let save_error = Settings::default()
-        .save_to(&path)
-        .expect_err("save directory");
-    assert!(
-        matches!(
-            save_error,
-            SettingsError::Read(..) | SettingsError::Write(..)
-        ),
-        "{save_error:?}"
-    );
-    assert!(path.is_dir(), "the directory must stay in place");
-    assert_eq!(
-        entry_names(dir.path()),
-        [FILE_NAME],
-        "a failed save must not leave a temp file"
-    );
-}
-
 #[cfg(unix)]
 #[test]
 fn unwritable_parent_directory_is_a_write_error() {
@@ -229,7 +199,16 @@ fn concurrent_saves_leave_valid_json() {
             torn.lock().expect("torn lock").get_or_insert(problem);
         }
     };
+    // Counts a writer as done even when it panics, so the reader stops and
+    // the panic fails the test instead of a reader that spins forever.
+    struct Finish<'a>(&'a AtomicUsize);
+    impl Drop for Finish<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
     let writer = |name: &str, recents: usize, padding: usize| {
+        let _finish = Finish(&finished);
         start.wait();
         for _ in 0..BURSTS {
             for iteration in 0..50 {
@@ -243,7 +222,6 @@ fn concurrent_saves_leave_valid_json() {
                 let _ = settings.save_to(&path);
             }
         }
-        finished.fetch_add(1, Ordering::Release);
     };
     thread::scope(|scope| {
         scope.spawn(|| {

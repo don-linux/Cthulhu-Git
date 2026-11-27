@@ -592,6 +592,8 @@ fn many_branches_spawn_at_most_one_git_per_branch() {
     assert_eq!(listed.len(), BRANCHES);
     assert!(listed.iter().all(|branch| branch.commit_count == 4));
     let calls = fs::read_to_string(sidecar(&fake, ".calls")).expect("calls");
+    let listings = calls.lines().filter(|call| *call == "for-each-ref").count();
+    assert_eq!(listings, 1, "{calls}");
     assert!(
         calls.lines().count() <= 1 + BRANCHES,
         "{} git processes for {BRANCHES} branches",

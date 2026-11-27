@@ -211,18 +211,9 @@ fn switch_refuses_and_leaves_the_repository_unchanged() {
                 bare
             },
             Some("must be run in a work tree"),
-            |case, _, bare| {
-                let mut entries: Vec<_> = fs::read_dir(bare)
-                    .expect("bare dir")
-                    .map(|entry| entry.expect("entry").file_name())
-                    .collect();
-                entries.sort();
-                assert!(
-                    !entries
-                        .iter()
-                        .any(|name| name == "index" || name == "a.txt"),
-                    "{case:?}: a checkout landed in it: {entries:?}"
-                );
+            |case, repo, bare| {
+                let head = repo.git_in(bare, &["symbolic-ref", "--quiet", "HEAD"]);
+                assert_eq!(head, "refs/heads/main", "{case:?}");
             },
         ),
         // `checkout.defaultRemote` from an included file must not make the
@@ -263,6 +254,7 @@ fn switch_refuses_and_leaves_the_repository_unchanged() {
         let repo = diverged();
         let root = setup(&repo);
         let head = repo.git_in(&root, &["rev-parse", "HEAD"]);
+        let files = file_tree(repo.tmp.path());
 
         let error = switch_branch(&repo.git, &root, name).expect_err(case);
         if let Some(expected) = stderr {
@@ -282,8 +274,29 @@ fn switch_refuses_and_leaves_the_repository_unchanged() {
             "{case:?}"
         );
         assert_eq!(repo.git_in(&root, &["rev-parse", "HEAD"]), head, "{case:?}");
+        // Covers every directory of the row, so a checkout that lands next
+        // to a bare repository or in a subfolder is caught too.
+        assert_eq!(file_tree(repo.tmp.path()), files, "{case:?}");
         check(case, &repo, &root);
     }
+}
+
+/// Every path under `dir`, relative and sorted.
+fn file_tree(dir: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in fs::read_dir(&next).expect("read dir") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if entry.file_type().expect("file type").is_dir() {
+                pending.push(path.clone());
+            }
+            paths.push(path.strip_prefix(dir).expect("under dir").to_path_buf());
+        }
+    }
+    paths.sort();
+    paths
 }
 
 /// Pull is a fast-forward or nothing, whatever the repository asks for. Each
@@ -371,6 +384,26 @@ fn pull_ff_only_never_rebases() {
         origin.git_in(&clone, &["rev-parse", "HEAD"]),
         origin.git(&["rev-parse", "main"])
     );
+
+    // From Git 2.34 `--ff-only` alone wins, so the rows above pass on a
+    // current git either way. 2.15 through 2.33 rebase unless `--no-rebase`
+    // is on the command line, so check what reaches git.
+    #[cfg(unix)]
+    {
+        use crate::support::{fake_git, sidecar};
+
+        let recorder = fake_git(&origin.tmp.path().join("bin/git"), "2.33.0", "argv");
+        pull_ff_only(&git_at(recorder.clone()), &clone).expect("the recorder succeeds");
+        let argv = fs::read(sidecar(&recorder, ".argv")).expect("git ran");
+        let argv = String::from_utf8(argv).expect("utf-8 argv");
+        let args: Vec<&str> = argv.split('\0').collect();
+        let pull = args.iter().position(|arg| *arg == "pull").expect("a pull");
+        assert_eq!(
+            args[pull..],
+            ["pull", "--ff-only", "--no-rebase", ""],
+            "{argv:?}"
+        );
+    }
 }
 
 /// A switch runs the repository's filters and hooks as `git switch` in a

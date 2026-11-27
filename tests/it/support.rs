@@ -302,8 +302,10 @@ case $mode in
   fail) cat "$0.stderr" >&2; exit 128 ;;
   argv) printf '%s\0' "$@" > "$0.argv" ;;
   branches)
-    echo >> "$0.calls"
-    case "$*" in *for-each-ref*) cat "$0.refs" ;; *) echo 4 ;; esac ;;
+    case "$*" in
+      *for-each-ref*) echo for-each-ref >> "$0.calls"; cat "$0.refs" ;;
+      *) echo other >> "$0.calls"; echo 4 ;;
+    esac ;;
   *) echo "unexpected fake git arguments: $*" >&2; exit 1 ;;
 esac
 "#;
