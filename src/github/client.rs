@@ -239,87 +239,211 @@ pub fn fetch_image(transport: &dyn Transport, url: &str) -> Result<Vec<u8>, Fetc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::FakeTransport;
+    use crate::test_support::{FakeTransport, NOW};
 
-    const NOW: u64 = 1_800_000_000;
-
-    fn response(status: u16, headers: &[(&str, &str)]) -> HttpResponse {
-        HttpResponse {
-            status,
-            headers: headers
-                .iter()
-                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-                .collect(),
-            body: Vec::new(),
+    const fn limit(limit: Option<u32>, remaining: Option<u32>, reset_at: Option<u64>) -> RateLimit {
+        RateLimit {
+            limit,
+            remaining,
+            reset_at,
         }
     }
 
+    const fn paused(until: Option<u64>) -> Result<RateLimit, ApiError> {
+        Err(ApiError::RateLimited { until })
+    }
+
+    /// Status, headers, body, and what `check` makes of the response.
+    type Check = (
+        u16,
+        &'static [(&'static str, &'static str)],
+        &'static str,
+        Result<RateLimit, ApiError>,
+    );
+
+    const CHECKS: &[Check] = &[
+        (
+            200,
+            &[
+                ("x-ratelimit-limit", "60"),
+                ("x-ratelimit-remaining", "59"),
+                ("x-ratelimit-reset", "1800000100"),
+            ],
+            "",
+            Ok(limit(Some(60), Some(59), Some(1_800_000_100))),
+        ),
+        (401, &[], "", Err(ApiError::Unauthorized)),
+        (404, &[], "", Err(ApiError::NotFound)),
+        (409, &[], "", Err(ApiError::NotFound)),
+        (422, &[], "", Err(ApiError::UnknownCommit)),
+        (500, &[], "", Err(ApiError::Status(500))),
+        (403, &[], "", Err(ApiError::Forbidden)),
+        // The primary limit waits for its reset, even with a Retry-After.
+        (
+            403,
+            &[
+                ("x-ratelimit-remaining", "0"),
+                ("x-ratelimit-reset", "1800003600"),
+            ],
+            "",
+            paused(Some(1_800_003_600)),
+        ),
+        (
+            403,
+            &[
+                ("X-RateLimit-Remaining", "0"),
+                ("X-RateLimit-Reset", "1800003600"),
+                ("Retry-After", "5"),
+            ],
+            "",
+            paused(Some(1_800_003_600)),
+        ),
+        (
+            403,
+            &[
+                ("x-ratelimit-remaining", "0"),
+                ("x-ratelimit-reset", "later"),
+                ("retry-after", "1.5"),
+            ],
+            "",
+            paused(None),
+        ),
+        // A secondary limit waits Retry-After seconds, or a minute.
+        (403, &[("retry-after", "30")], "", paused(Some(NOW + 30))),
+        (
+            403,
+            &[("x-ratelimit-remaining", "5"), ("retry-after", " 15 ")],
+            "",
+            paused(Some(NOW + 15)),
+        ),
+        (
+            429,
+            &[("x-ratelimit-remaining", "0"), ("retry-after", "30")],
+            "",
+            paused(Some(NOW + 30)),
+        ),
+        (429, &[], "", paused(Some(NOW + 60))),
+        (
+            429,
+            &[("x-ratelimit-remaining", ""), ("retry-after", "-3")],
+            "",
+            paused(Some(NOW + 60)),
+        ),
+        (
+            403,
+            &[("retry-after", "Wed, 21 Oct 2026 18:00:00 GMT")],
+            r#"{"message": "You have exceeded a secondary rate limit. Please wait a few minutes."}"#,
+            paused(Some(NOW + 60)),
+        ),
+        // A 403 without a usable limit is a refusal, not a pause.
+        (
+            403,
+            &[("x-ratelimit-remaining", "nope"), ("retry-after", "soon")],
+            "",
+            Err(ApiError::Forbidden),
+        ),
+        (
+            403,
+            &[
+                ("x-ratelimit-remaining", "10"),
+                ("x-ratelimit-remaining", "0"),
+            ],
+            "",
+            Err(ApiError::Forbidden),
+        ),
+        (
+            403,
+            &[
+                ("x-ratelimit-remaining", "4294967296"),
+                ("x-ratelimit-reset", "1800003600"),
+            ],
+            "",
+            Err(ApiError::Forbidden),
+        ),
+        // Counters are trimmed u32s; anything else is unknown.
+        (
+            200,
+            &[
+                ("x-ratelimit-limit", " 60 "),
+                ("x-ratelimit-remaining", "-1"),
+                ("x-ratelimit-reset", "1800000100"),
+            ],
+            "",
+            Ok(limit(Some(60), None, Some(1_800_000_100))),
+        ),
+        (
+            200,
+            &[("x-ratelimit-remaining", "4294967295")],
+            "",
+            Ok(limit(None, Some(u32::MAX), None)),
+        ),
+        (
+            200,
+            &[
+                ("x-ratelimit-limit", "4294967296"),
+                ("x-ratelimit-remaining", "4294967296"),
+            ],
+            "",
+            Ok(limit(None, None, None)),
+        ),
+        (
+            200,
+            &[("x-ratelimit-remaining", "+12")],
+            "",
+            Ok(limit(None, Some(12), None)),
+        ),
+        (
+            200,
+            &[("x-ratelimit-remaining", "0x10")],
+            "",
+            Ok(limit(None, None, None)),
+        ),
+        (
+            200,
+            &[("x-ratelimit-remaining", "1e2")],
+            "",
+            Ok(limit(None, None, None)),
+        ),
+        (
+            200,
+            &[("x-ratelimit-remaining", "1_0")],
+            "",
+            Ok(limit(None, None, None)),
+        ),
+        (
+            200,
+            &[("x-ratelimit-remaining", "  ")],
+            "",
+            Ok(limit(None, None, None)),
+        ),
+        (
+            200,
+            &[("x-ratelimit-remaining", "zero")],
+            "",
+            Ok(limit(None, None, None)),
+        ),
+    ];
+
     #[test]
-    fn statuses_map_to_the_documented_meanings() {
-        assert_eq!(
-            check(
-                &response(
-                    200,
-                    &[
-                        ("x-ratelimit-limit", "60"),
-                        ("x-ratelimit-remaining", "59"),
-                        ("x-ratelimit-reset", "1800000100"),
-                    ]
-                ),
-                NOW
-            ),
-            Ok(RateLimit {
-                limit: Some(60),
-                remaining: Some(59),
-                reset_at: Some(1_800_000_100),
-            })
-        );
-        assert_eq!(check(&response(401, &[]), NOW), Err(ApiError::Unauthorized));
-        assert_eq!(
-            check(
-                &response(
-                    403,
-                    &[
-                        ("x-ratelimit-remaining", "0"),
-                        ("x-ratelimit-reset", "1800003600")
-                    ]
-                ),
-                NOW
-            ),
-            Err(ApiError::RateLimited {
-                until: Some(1_800_003_600)
-            })
-        );
-        assert_eq!(
-            check(&response(403, &[("retry-after", "30")]), NOW),
-            Err(ApiError::RateLimited {
-                until: Some(NOW + 30)
-            })
-        );
-        assert_eq!(
-            check(&response(429, &[]), NOW),
-            Err(ApiError::RateLimited {
-                until: Some(NOW + 60)
-            })
-        );
-        assert_eq!(check(&response(403, &[]), NOW), Err(ApiError::Forbidden));
-        let mut secondary = response(403, &[("retry-after", "Wed, 21 Oct 2026 18:00:00 GMT")]);
-        secondary.body =
-            br#"{"message": "You have exceeded a secondary rate limit. Please wait a few minutes."}"#
-                .to_vec();
-        assert_eq!(
-            check(&secondary, NOW),
-            Err(ApiError::RateLimited {
-                until: Some(NOW + 60)
-            })
-        );
-        assert_eq!(check(&response(404, &[]), NOW), Err(ApiError::NotFound));
-        assert_eq!(check(&response(409, &[]), NOW), Err(ApiError::NotFound));
-        assert_eq!(
-            check(&response(422, &[]), NOW),
-            Err(ApiError::UnknownCommit)
-        );
-        assert_eq!(check(&response(500, &[]), NOW), Err(ApiError::Status(500)));
+    fn check_table() {
+        for (status, headers, body, expected) in CHECKS {
+            let response = HttpResponse {
+                status: *status,
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+                body: body.as_bytes().to_vec(),
+            };
+            assert_eq!(check(&response, NOW), *expected, "{status} {headers:?}");
+        }
+    }
+
+    fn account(email: &str, avatar_url: Option<&str>) -> CommitAccount {
+        CommitAccount {
+            email: email.to_owned(),
+            avatar_url: avatar_url.map(str::to_owned),
+        }
     }
 
     #[test]
@@ -329,9 +453,17 @@ mod tests {
                                     "committer": {"email": "noreply@github.com"}},
            "author": {"login": "don-linux", "avatar_url": "https://avatars.githubusercontent.com/u/194445529?v=4"},
            "committer": {"login": "web-flow", "avatar_url": "https://avatars.githubusercontent.com/u/19864447?v=4"}},
-          {"sha": "bbb", "commit": {"author": {"email": "ghost@example.com"}, "committer": null},
-           "author": null, "committer": null},
-          {"sha": "ccc", "commit": {"author": {"email": ""}, "committer": {}}, "author": {}, "committer": {}}
+          {"sha": "bbb", "commit": {"author": {"email": "  Ghost@Example.COM\n"}, "committer": null},
+           "author": {"avatar_url": ""}, "committer": null},
+          {"sha": "ccc", "commit": {"author": {"email": ""}, "committer": {"email": null}},
+           "author": {}, "committer": {"avatar_url": null}},
+          {"sha": "ddd", "commit": {"author": {"name": "No Email"}, "committer": {"email": "Keep@Example.com"}},
+           "author": {"avatar_url": "https://avatars.githubusercontent.com/u/1"},
+           "committer": {"avatar_url": "https://avatars.githubusercontent.com/u/9?v=4"}},
+          {"sha": "eee", "extra": [1, 2], "files": [{"filename": "a"}],
+           "commit": {"author": {"email": "plain@example.com", "date": "now"}, "committer": null},
+           "author": {"login": "p", "avatar_url": "https://avatars.githubusercontent.com/u/2"}},
+          {"sha": "fff", "commit": {"author": null, "committer": null}, "author": null, "committer": null}
         ]"#;
         let accounts = parse_commit_accounts(body).expect("parsable");
         assert_eq!(
@@ -339,26 +471,60 @@ mod tests {
             [
                 (
                     "aaa".to_owned(),
-                    CommitAccount {
-                        email: "fernando@example.com".to_owned(),
-                        avatar_url: Some(
-                            "https://avatars.githubusercontent.com/u/194445529?v=4".to_owned()
-                        ),
-                    }
+                    account(
+                        "fernando@example.com",
+                        Some("https://avatars.githubusercontent.com/u/194445529?v=4")
+                    )
                 ),
+                ("bbb".to_owned(), account("ghost@example.com", None)),
                 (
-                    "bbb".to_owned(),
-                    CommitAccount {
-                        email: "ghost@example.com".to_owned(),
-                        avatar_url: None,
-                    }
+                    "eee".to_owned(),
+                    account(
+                        "plain@example.com",
+                        Some("https://avatars.githubusercontent.com/u/2")
+                    )
                 ),
             ]
         );
-        assert_eq!(accounts.committers.len(), 1);
-        assert_eq!(accounts.committers[0].email, "noreply@github.com");
-        assert!(parse_commit_accounts(b"{\"message\": \"Not Found\"}").is_none());
-        assert!(parse_commit_accounts(b"not json").is_none());
+        assert_eq!(
+            accounts.committers,
+            [
+                account(
+                    "noreply@github.com",
+                    Some("https://avatars.githubusercontent.com/u/19864447?v=4")
+                ),
+                account(
+                    "keep@example.com",
+                    Some("https://avatars.githubusercontent.com/u/9?v=4")
+                ),
+            ]
+        );
+
+        let long = "a".repeat(20_000);
+        let body =
+            format!(r#"[{{"sha":"ggg","commit":{{"author":{{"email":"{long}@Example.com"}}}}}}]"#);
+        let accounts = parse_commit_accounts(body.as_bytes()).expect("long email");
+        assert_eq!(accounts.authors[0].1.email, format!("{long}@example.com"));
+
+        let empty = parse_commit_accounts(b"[]").expect("empty array");
+        assert!(empty.authors.is_empty() && empty.committers.is_empty());
+        for body in [
+            &b"null"[..],
+            b"{}",
+            b"\"[]\"",
+            b"0",
+            b"false",
+            b"",
+            b"[{]",
+            b"not json",
+            br#"{"message":"Not Found"}"#,
+            br#"[{"commit":{"author":{"email":"a@b.co"}}}]"#,
+            br#"[{"sha":null,"commit":{"author":{"email":"a@b.co"}}}]"#,
+            b"[null]",
+            br#"[{"sha":"abc","commit":null}]"#,
+        ] {
+            assert!(parse_commit_accounts(body).is_none(), "{body:?}");
+        }
     }
 
     #[test]
