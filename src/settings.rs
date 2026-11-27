@@ -195,8 +195,7 @@ impl Settings {
     ///
     /// `None` when the OS reports no home folder.
     pub fn default_path() -> Option<PathBuf> {
-        directories::ProjectDirs::from("io.github", "don-linux", "cthulhu-git")
-            .map(|dirs| dirs.config_dir().join(FILE_NAME))
+        project_dirs().map(|dirs| dirs.config_dir().join(FILE_NAME))
     }
 
     /// A missing file gives the defaults; an unreadable or invalid one is an
@@ -326,6 +325,13 @@ fn has_interior_newline(name: &str) -> bool {
 
 fn is_bidi_control(ch: char) -> bool {
     matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// The per-user folders the OS assigns to the app: the config folder holds
+/// [`Settings::default_path`], the cache folder the downloaded avatars.
+/// `None` when the OS reports no home folder.
+pub fn project_dirs() -> Option<directories::ProjectDirs> {
+    directories::ProjectDirs::from("io.github", "don-linux", "cthulhu-git")
 }
 
 /// Replaces `path` with `bytes`, creating its folder. The bytes go to a temp

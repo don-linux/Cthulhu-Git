@@ -31,7 +31,7 @@ of writing through it). On Unix the file is private to the user (mode 0600).
 | File | Symbol | What it controls |
 | ---- | ------ | ---------------- |
 | `src/settings.rs` | `Settings` | The saved fields (serde, `#[serde(default)]`) |
-| `src/settings.rs` | `Settings::default_path` | Per-OS location (via `directories::ProjectDirs`) |
+| `src/settings.rs` | `Settings::default_path`, `project_dirs` | Per-OS location; `project_dirs` is the app's `directories::ProjectDirs` (config and cache folders) |
 | `src/settings.rs` | `Settings::load_from` | Reads the file; a missing one gives the defaults |
 | `src/settings.rs` | `Settings::from_json` | Parses the bytes: skips a UTF-8 BOM, dedupes and caps recents, sanitizes font ids |
 | `src/settings.rs` | `Settings::save_to` | Writes `to_json` with `write_atomic` |
