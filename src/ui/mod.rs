@@ -637,6 +637,7 @@ impl eframe::App for CthulhuApp {
 
         for action in actions {
             match action {
+                // The folder dialog needs the window's frame.
                 Action::Browse => {
                     if self.picker.is_none() && self.opening.is_none() {
                         self.error = None;
@@ -644,70 +645,81 @@ impl eframe::App for CthulhuApp {
                             Some(FolderPicker::open(ui.ctx(), frame, self.browse_start()));
                     }
                 }
-                Action::Open(path) => {
-                    self.error = None;
-                    self.open(ui.ctx(), path);
-                }
-                Action::Home => {
-                    self.error = None;
-                    self.settings_open = false;
-                    self.font_preview = None;
-                    self.screen = Screen::Home;
-                }
-                Action::OpenSettings => {
-                    self.settings_open = true;
-                }
-                Action::CloseSettings => {
-                    self.settings_open = false;
-                    self.font_preview = None;
-                }
-                Action::ToggleBranchesSidebar => {
-                    self.settings.history_sidebar_hidden = !self.settings.history_sidebar_hidden;
-                    self.save_settings();
-                }
-                Action::ToggleDetailSidebar => {
-                    self.settings.detail_sidebar_hidden = !self.settings.detail_sidebar_hidden;
-                    self.save_settings();
-                }
-                Action::ToggleTerminal => {
-                    self.settings.terminal_hidden = !self.settings.terminal_hidden;
-                    if !self.settings.terminal_hidden {
-                        self.settings.detail_sidebar_hidden = false;
-                    }
-                    self.save_settings();
-                }
-                Action::SetUiFont(name) => {
-                    self.settings.set_ui_font(name);
-                    self.save_settings();
-                }
-                Action::SetTerminalFont(name) => {
-                    self.settings.set_terminal_font(name);
-                    self.save_settings();
-                }
-                Action::Fetch(branch) => {
-                    self.start_sync(ui.ctx(), SyncCommand::Fetch(branch));
-                }
-                Action::Pull => {
-                    self.start_sync(ui.ctx(), SyncCommand::Pull);
-                }
-                Action::Checkout(name) => {
-                    self.start_sync(ui.ctx(), SyncCommand::Checkout(name));
-                }
-                Action::SetHistoryColumns(columns) => {
-                    let columns = columns.normalized();
-                    if self.settings.history_columns != columns {
-                        self.settings.history_columns = columns;
-                        self.save_settings();
-                    }
-                }
-                Action::SetAuthorAvatars(on) => {
-                    self.settings.author_avatars = on;
-                    self.avatars.set_enabled(on);
-                    self.save_settings();
-                }
+                action => self.apply_action(ui.ctx(), action),
             }
         }
         self.sync_graph(ui.ctx());
+    }
+}
+
+impl CthulhuApp {
+    /// Every action except [`Action::Browse`], which [`eframe::App::ui`] handles
+    /// because it needs the frame.
+    fn apply_action(&mut self, ctx: &egui::Context, action: Action) {
+        match action {
+            Action::Browse => {}
+            Action::Open(path) => {
+                self.error = None;
+                self.open(ctx, path);
+            }
+            Action::Home => {
+                self.error = None;
+                self.settings_open = false;
+                self.font_preview = None;
+                self.screen = Screen::Home;
+            }
+            Action::OpenSettings => {
+                self.settings_open = true;
+            }
+            Action::CloseSettings => {
+                self.settings_open = false;
+                self.font_preview = None;
+            }
+            Action::ToggleBranchesSidebar => {
+                self.settings.history_sidebar_hidden = !self.settings.history_sidebar_hidden;
+                self.save_settings();
+            }
+            Action::ToggleDetailSidebar => {
+                self.settings.detail_sidebar_hidden = !self.settings.detail_sidebar_hidden;
+                self.save_settings();
+            }
+            Action::ToggleTerminal => {
+                self.settings.terminal_hidden = !self.settings.terminal_hidden;
+                if !self.settings.terminal_hidden {
+                    self.settings.detail_sidebar_hidden = false;
+                }
+                self.save_settings();
+            }
+            Action::SetUiFont(name) => {
+                self.settings.set_ui_font(name);
+                self.save_settings();
+            }
+            Action::SetTerminalFont(name) => {
+                self.settings.set_terminal_font(name);
+                self.save_settings();
+            }
+            Action::Fetch(branch) => {
+                self.start_sync(ctx, SyncCommand::Fetch(branch));
+            }
+            Action::Pull => {
+                self.start_sync(ctx, SyncCommand::Pull);
+            }
+            Action::Checkout(name) => {
+                self.start_sync(ctx, SyncCommand::Checkout(name));
+            }
+            Action::SetHistoryColumns(columns) => {
+                let columns = columns.normalized();
+                if self.settings.history_columns != columns {
+                    self.settings.history_columns = columns;
+                    self.save_settings();
+                }
+            }
+            Action::SetAuthorAvatars(on) => {
+                self.settings.author_avatars = on;
+                self.avatars.set_enabled(on);
+                self.save_settings();
+            }
+        }
     }
 }
 
