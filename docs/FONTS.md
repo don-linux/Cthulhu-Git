@@ -42,9 +42,10 @@ the Regular cut of each family is bundled.
 | `src/ui/fonts.rs` | `DEFAULT_UI_ID` | Ubuntu |
 | `src/ui/fonts.rs` | `DEFAULT_TERMINAL_ID` | Meslo LGS NF |
 | `src/ui/fonts.rs` | `BUILTIN_TERMINAL_ID` | `builtin`, the monospace shipped with egui |
-| `src/ui/fonts.rs` | `FontService::sync` | Installs both choices with one `set_fonts` |
+| `src/ui/fonts.rs` | `FontService::sync` | Installs both choices with one `set_fonts`, only when either changed |
+| `src/ui/fonts.rs` | `terminal_font_id`, `preview_font` | Read the faces egui has loaded, so the terminal grid and the specimens never draw a family that is not there yet |
 | `src/ui/settings.rs` | Appearance page | Interface choice |
-| `src/ui/settings.rs` | Terminal page | Terminal choice, plus the one-line preview |
+| `src/ui/settings.rs` | Terminal page | Terminal choice, plus a preview of the shell prompt in that face |
 | `src/settings.rs` | `ui_font`, `terminal_font` | Saved ids |
 
 ## Interface
