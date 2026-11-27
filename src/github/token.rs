@@ -331,21 +331,13 @@ pub fn gh_cli_token() -> Result<Token, String> {
         .map(PathBuf::from);
     let gh = find_gh(path_var.as_deref(), home.as_deref())
         .ok_or_else(|| "GitHub CLI (gh) was not found.".to_owned())?;
-    let (signed_in, stdout) = run_with_timeout(
+    run_gh(
         Command::new(&gh)
             .args(["auth", "token", "--hostname", "github.com"])
             .env("GH_PROMPT_DISABLED", "1")
             .env("NO_COLOR", "1"),
         GH_TIMEOUT,
-    )?;
-    if !signed_in {
-        return Err("GitHub CLI is not signed in to github.com (run `gh auth login`).".to_owned());
-    }
-    // Parsed in place, without a copy: text that is not UTF-8 is no token.
-    std::str::from_utf8(&stdout)
-        .ok()
-        .and_then(Token::parse)
-        .ok_or_else(|| "GitHub CLI did not print a token.".to_owned())
+    )
 }
 
 fn gh_name() -> &'static str {
@@ -396,12 +388,10 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-/// `(success, stdout)`. The child is killed when it runs past `timeout`.
-/// Stdout may hold a token, so it is wiped wherever it is dropped.
-fn run_with_timeout(
-    command: &mut Command,
-    timeout: Duration,
-) -> Result<(bool, Zeroizing<Vec<u8>>), String> {
+/// Runs `gh auth token` and reads the token it prints. The child is killed
+/// when it runs past `timeout`. Its output may hold a token, so it is wiped
+/// wherever it is dropped.
+fn run_gh(command: &mut Command, timeout: Duration) -> Result<Token, String> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -442,7 +432,14 @@ fn run_with_timeout(
         }
     };
     let stdout = receiver.recv().unwrap_or_default();
-    Ok((success, stdout))
+    if !success {
+        return Err("GitHub CLI is not signed in to github.com (run `gh auth login`).".to_owned());
+    }
+    // Parsed in place, without a copy: text that is not UTF-8 is no token.
+    std::str::from_utf8(&stdout)
+        .ok()
+        .and_then(Token::parse)
+        .ok_or_else(|| "GitHub CLI did not print a token.".to_owned())
 }
 
 #[cfg(test)]
@@ -537,22 +534,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_hung_child_is_killed_after_the_timeout() {
+    fn run_gh_kills_a_hung_child_and_reads_only_a_signed_in_token() {
         let started = Instant::now();
-        let result = run_with_timeout(
+        let result = run_gh(
             Command::new("/bin/sh").args(["-c", "sleep 5"]),
             Duration::from_millis(100),
         );
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(3));
 
-        let (ok, out) = run_with_timeout(
-            Command::new("/bin/sh").args(["-c", "printf ghp_abcdefghijklmnopqrstuvwxyz"]),
-            Duration::from_secs(5),
-        )
-        .expect("ran");
-        assert!(ok);
-        assert_eq!(*out, b"ghp_abcdefghijklmnopqrstuvwxyz");
+        // Only a gh that exits signed in hands over the token it printed.
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz";
+        for (exit, expected) in [(0, Some(token)), (1, None)] {
+            let script = format!("printf {token}; exit {exit}");
+            let got = run_gh(
+                Command::new("/bin/sh").args(["-c", &script]),
+                Duration::from_secs(5),
+            );
+            assert_eq!(got.as_ref().ok().map(Token::expose), expected, "{script}");
+        }
     }
 
     fn parsed_token(value: &str) -> Token {
