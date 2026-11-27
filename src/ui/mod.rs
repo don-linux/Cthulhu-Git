@@ -92,7 +92,7 @@ pub enum Action {
     ToggleTerminal,
     SetUiFont(Option<String>),
     SetTerminalFont(Option<String>),
-    /// `upstream` is `%(upstream:short)`, for example `origin/main`.
+    /// The local branch whose upstream is fetched.
     Fetch(String),
     Pull,
     /// Local branch to check out. The name is the short ref, unchanged.
@@ -646,8 +646,8 @@ impl eframe::App for CthulhuApp {
                     self.settings.set_terminal_font(name);
                     self.save_settings();
                 }
-                Action::Fetch(upstream) => {
-                    self.start_sync(ui.ctx(), SyncCommand::Fetch(upstream));
+                Action::Fetch(branch) => {
+                    self.start_sync(ui.ctx(), SyncCommand::Fetch(branch));
                 }
                 Action::Pull => {
                     self.start_sync(ui.ctx(), SyncCommand::Pull);
@@ -747,8 +747,8 @@ struct SyncJob {
 fn run_sync(root: &Path, command: SyncCommand) -> Result<Refreshed, String> {
     let git = Git::discover().map_err(|error| error.to_string())?;
     match &command {
-        SyncCommand::Fetch(upstream) => {
-            git::fetch(&git, root, upstream).map_err(|error| error.to_string())?;
+        SyncCommand::Fetch(branch) => {
+            git::fetch(&git, root, branch).map_err(|error| error.to_string())?;
         }
         SyncCommand::Pull => {
             git::pull_ff_only(&git, root).map_err(|error| error.to_string())?;

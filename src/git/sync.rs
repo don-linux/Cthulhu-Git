@@ -42,28 +42,30 @@ impl FetchRequest {
     }
 }
 
-/// Builds the fetch for `%(upstream:short)`, such as `origin/main`.
+/// Builds the fetch from the branch's upstream configuration: the remote
+/// (`branch.<name>.remote`), the ref on that remote (`branch.<name>.merge`), and
+/// the remote-tracking ref git maps it to (`%(upstream)`).
 ///
-/// The remote is the part before the first `/`. The refspec writes that remote
-/// branch into its remote-tracking ref, with `+`, so a rewritten upstream still
-/// updates. A plain `git fetch origin main` would only fill `FETCH_HEAD`.
+/// `%(upstream:short)` cannot be split into remote and branch: a remote may be
+/// called `team/origin`. The refspec writes the remote ref into its tracking
+/// ref with `+`, so a rewritten upstream still updates. A plain
+/// `git fetch origin main` would only fill `FETCH_HEAD`.
 ///
-/// `None` when the name is empty, has no remote, starts like an option, or
-/// contains a character that would change the refspec.
-pub fn fetch_request(upstream_short: &str) -> Option<FetchRequest> {
-    if upstream_short.is_empty()
-        || upstream_short.chars().any(refspec_forbidden)
-        || upstream_short.split('/').any(str::is_empty)
-    {
-        return None;
-    }
-    let (remote, branch) = upstream_short.split_once('/')?;
-    if remote.starts_with('-') {
-        return None;
-    }
-    Some(FetchRequest {
+/// `None` for a local upstream (`.`), a remote that starts like an option, a
+/// merge ref outside `refs/`, a tracking ref outside `refs/remotes/`, or a
+/// character that would change the refspec.
+pub fn fetch_request(remote: &str, merge: &str, tracking: &str) -> Option<FetchRequest> {
+    let plain = |text: &str| !text.is_empty() && !text.chars().any(refspec_forbidden);
+    let usable = remote != "."
+        && !remote.starts_with('-')
+        && plain(remote)
+        && merge.starts_with("refs/")
+        && plain(merge)
+        && tracking.starts_with("refs/remotes/")
+        && plain(tracking);
+    usable.then(|| FetchRequest {
         remote: remote.to_owned(),
-        refspec: format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}"),
+        refspec: format!("+{merge}:{tracking}"),
     })
 }
 
@@ -74,13 +76,41 @@ fn refspec_forbidden(ch: char) -> bool {
         || matches!(ch, ':' | '?' | '*' | '[' | '\\' | '^' | '~')
 }
 
-/// Fetches the upstream named by `upstream_short` into its remote-tracking ref.
-pub fn fetch(git: &Git, root: &Path, upstream_short: &str) -> Result<(), GitError> {
-    let request = fetch_request(upstream_short)
-        .ok_or_else(|| rejected("git fetch", "the upstream name cannot be fetched"))?;
+/// Fetches the upstream of local `branch` into its remote-tracking ref.
+pub fn fetch(git: &Git, root: &Path, branch: &str) -> Result<(), GitError> {
+    let remote = config_value(git, root, &format!("branch.{branch}.remote"))?;
+    let merge = config_value(git, root, &format!("branch.{branch}.merge"))?;
+    let tracking = git.require_ok(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(upstream)",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    let tracking = String::from_utf8_lossy(&tracking.stdout);
+    let request = remote
+        .zip(merge)
+        .and_then(|(remote, merge)| fetch_request(&remote, &merge, tracking.trim_end()))
+        .ok_or_else(|| {
+            rejected(
+                "git fetch",
+                "the branch has no upstream that can be fetched",
+            )
+        })?;
     let args = request.args();
     git.require_ok_for(root, &args, NETWORK_TIMEOUT)?;
     Ok(())
+}
+
+/// `git config --get <key>`, or `None` when the key is not set.
+fn config_value(git: &Git, root: &Path, key: &str) -> Result<Option<String>, GitError> {
+    let output = git.run(root, &["config", "--get", key])?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let value = String::from_utf8_lossy(&output.stdout);
+    Ok(Some(value.trim_end_matches(['\n', '\r']).to_owned()))
 }
 
 /// Fast-forwards the current branch to its upstream. Anything else is an error
@@ -210,9 +240,12 @@ fn ref_char_forbidden(ch: char) -> bool {
 mod tests {
     use super::*;
 
+    const MAIN: &str = "refs/heads/main";
+    const ORIGIN_MAIN: &str = "refs/remotes/origin/main";
+
     #[test]
     fn fetch_request_updates_the_remote_tracking_ref() {
-        let request = fetch_request("origin/main").expect("origin/main");
+        let request = fetch_request("origin", MAIN, ORIGIN_MAIN).expect("origin/main");
         assert_eq!(request.remote(), "origin");
         assert_eq!(
             request.refspec(),
@@ -236,30 +269,48 @@ mod tests {
     }
 
     #[test]
-    fn fetch_request_keeps_slashes_inside_the_branch() {
-        let request = fetch_request("origin/feature/foo").expect("nested branch");
-        assert_eq!(request.remote(), "origin");
-        assert_eq!(
-            request.refspec(),
-            "+refs/heads/feature/foo:refs/remotes/origin/feature/foo"
-        );
+    fn fetch_request_keeps_slashes_in_the_remote_and_the_branch() {
+        for (remote, merge, tracking, refspec) in [
+            (
+                "origin",
+                "refs/heads/feature/foo",
+                "refs/remotes/origin/feature/foo",
+                "+refs/heads/feature/foo:refs/remotes/origin/feature/foo",
+            ),
+            (
+                "team/origin",
+                MAIN,
+                "refs/remotes/team/origin/main",
+                "+refs/heads/main:refs/remotes/team/origin/main",
+            ),
+        ] {
+            let request = fetch_request(remote, merge, tracking).expect(remote);
+            assert_eq!(request.remote(), remote);
+            assert_eq!(request.refspec(), refspec);
+        }
     }
 
     #[test]
-    fn fetch_request_rejects_a_remote_that_looks_like_an_option() {
-        assert!(fetch_request("-origin/main").is_none());
-        assert!(fetch_request("--upload-pack=evil/main").is_none());
-    }
-
-    #[test]
-    fn fetch_request_rejects_a_missing_slash_and_control_characters() {
-        assert!(fetch_request("origin").is_none());
-        assert!(fetch_request("").is_none());
-        assert!(fetch_request("origin/").is_none());
-        assert!(fetch_request("/main").is_none());
-        assert!(fetch_request("origin/ma\nin").is_none());
-        assert!(fetch_request("ori gin/main").is_none());
-        assert!(fetch_request("origin/ma:in").is_none());
+    fn fetch_request_rejects_what_cannot_be_fetched_or_would_change_the_refspec() {
+        for (remote, merge, tracking) in [
+            (".", MAIN, ORIGIN_MAIN),
+            ("-origin", MAIN, ORIGIN_MAIN),
+            ("--upload-pack=evil", MAIN, ORIGIN_MAIN),
+            ("", MAIN, ORIGIN_MAIN),
+            ("ori gin", MAIN, ORIGIN_MAIN),
+            ("origin", "", ORIGIN_MAIN),
+            ("origin", "main", ORIGIN_MAIN),
+            ("origin", "refs/heads/ma\nin", ORIGIN_MAIN),
+            ("origin", "refs/heads/ma:in", ORIGIN_MAIN),
+            ("origin", MAIN, ""),
+            ("origin", MAIN, "refs/heads/main"),
+            ("origin", MAIN, "refs/remotes/origin/m*"),
+        ] {
+            assert!(
+                fetch_request(remote, merge, tracking).is_none(),
+                "{remote:?} {merge:?} {tracking:?}"
+            );
+        }
     }
 
     #[test]

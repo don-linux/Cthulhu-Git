@@ -1733,6 +1733,7 @@ fn inherited_git_exec_path_cannot_run_remote_helper_on_fetch() {
         "origin",
         "https://127.0.0.1:1/cthulhu.git",
     ]);
+    track_origin_main(&fixture);
     let marker = fixture.marker("remote-helper");
     let exec_dir = fixture.tmp.path().join("exec-path");
     write_executable(
@@ -1767,6 +1768,7 @@ fn inherited_git_config_count_cannot_set_ssh_command_on_fetch() {
         "ssh -o BatchMode=yes -o ConnectTimeout=1",
     ]);
     fixture.git(&["remote", "add", "origin", "ssh://127.0.0.1:1/cthulhu.git"]);
+    track_origin_main(&fixture);
     let marker = fixture.marker("ssh-command");
     let poke = poke_script(fixture.tmp.path(), "ssh-command.sh", &marker);
     let command = poke.display().to_string();
@@ -1786,6 +1788,13 @@ fn inherited_git_config_count_cannot_set_ssh_command_on_fetch() {
         },
         Some(Duration::from_secs(20)),
     );
+}
+
+/// Fetch reads the upstream from `branch.main.*`, so `main` has to track the
+/// remote for the fetch to reach git at all.
+fn track_origin_main(fixture: &Fixture) {
+    fixture.git(&["config", "--local", "branch.main.remote", "origin"]);
+    fixture.git(&["config", "--local", "branch.main.merge", "refs/heads/main"]);
 }
 
 fn set_local_config(scratch: &Path, root: &Path, git: &Git, key: &str, value: &str) {
@@ -1902,6 +1911,39 @@ fn pull_ff_only_fast_forwards_when_pull_rebase_is_false_and_behind_upstream() {
 }
 
 #[test]
+fn fetch_updates_the_tracking_ref_of_a_remote_with_a_slash() {
+    let origin = Fixture::init();
+    origin.write("tracked.txt", "base\n");
+    origin.git(&["add", "tracked.txt"]);
+    origin.git(&["commit", "-m", "base"]);
+    let local_tmp = TempDir::with_prefix("cthulhu-adv-fetch-").expect("local temp");
+    let local_root = local_tmp.path().join("clone");
+    let origin_path = fs::canonicalize(&origin.root).expect("origin path");
+    let run = |root: &Path, args: &[&str]| repo_git(&origin.git, local_tmp.path(), root, args);
+    run(
+        local_tmp.path(),
+        &[
+            "clone",
+            "--",
+            origin_path.to_str().expect("utf8"),
+            local_root.to_str().expect("utf8"),
+        ],
+    );
+    // `%(upstream:short)` is now `team/origin/main`: splitting it at the first
+    // `/` would fetch from a remote called `team`.
+    run(&local_root, &["remote", "rename", "origin", "team/origin"]);
+    origin.write("tracked.txt", "origin ahead\n");
+    origin.git(&["add", "tracked.txt"]);
+    origin.git(&["commit", "-m", "origin ahead"]);
+
+    fetch(&origin.git, &local_root, "main").expect("fetch");
+    assert_eq!(
+        run(&local_root, &["rev-parse", "refs/remotes/team/origin/main"]),
+        origin.git(&["rev-parse", "main"])
+    );
+}
+
+#[test]
 #[ignore = "spawned with a hostile environment by the inherited-env tests"]
 fn child_opens_repo_despite_hostile_environment() {
     let Ok(target) = env::var(CHILD_TARGET) else {
@@ -1935,8 +1977,13 @@ fn child_opens_repo_despite_hostile_environment() {
     }
 
     if action == "fetch" {
-        // Network failure is fine. The marker is the assertion that matters.
-        let _ = fetch(&git, Path::new(&target), "origin/main");
+        // Network failure is fine. The marker is the assertion that matters,
+        // and it only means something if git was actually run.
+        let result = fetch(&git, Path::new(&target), "main");
+        assert!(
+            !matches!(result, Err(GitError::Rejected { .. })),
+            "fetch never reached git: {result:?}"
+        );
         if let Ok(marker) = env::var(CHILD_MARKER) {
             assert!(
                 !Path::new(&marker).exists(),

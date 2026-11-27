@@ -124,7 +124,7 @@ pub fn show(
                             "Switching…",
                         ),
                         None => (
-                            offer.fetch_upstream.is_some(),
+                            offer.fetch_branch.is_some(),
                             offer.pull,
                             offer.fetch_hover,
                             offer.pull_hover,
@@ -170,9 +170,9 @@ pub fn show(
                                 palette.text,
                                 palette.text_muted,
                                 fetch_hover,
-                            ) && let Some(upstream) = offer.fetch_upstream.clone()
+                            ) && let Some(branch) = offer.fetch_branch.clone()
                             {
-                                actions.push(Action::Fetch(upstream));
+                                actions.push(Action::Fetch(branch));
                             }
                             if sync_labeled(
                                 ui,
@@ -901,7 +901,8 @@ fn place_sidebar_text(ui: &mut Ui, text: impl Into<WidgetText>, clickable: bool)
 }
 
 struct SyncOffer {
-    fetch_upstream: Option<String>,
+    /// The local branch whose upstream Fetch updates.
+    fetch_branch: Option<String>,
     pull: bool,
     fetch_hover: &'static str,
     pull_hover: &'static str,
@@ -909,7 +910,7 @@ struct SyncOffer {
 
 fn unavailable(fetch_hover: &'static str, pull_hover: &'static str) -> SyncOffer {
     SyncOffer {
-        fetch_upstream: None,
+        fetch_branch: None,
         pull: false,
         fetch_hover,
         pull_hover,
@@ -932,32 +933,18 @@ fn sync_offer(head: &Head, branches: &[ListedBranch]) -> SyncOffer {
         );
     };
     match &listed.branch.upstream {
-        Upstream::Tracking { name, .. } => {
-            let fetchable = cthulhu_git::git::fetch_request(name).is_some();
-            SyncOffer {
-                fetch_upstream: fetchable.then_some(name.clone()),
-                pull: true,
-                fetch_hover: if fetchable {
-                    "Fetch current branch"
-                } else {
-                    "This branch has no upstream."
-                },
-                pull_hover: "Pull current branch (fast-forward only)",
-            }
-        }
-        Upstream::Gone { name } => {
-            let fetchable = cthulhu_git::git::fetch_request(name).is_some();
-            SyncOffer {
-                fetch_upstream: fetchable.then_some(name.clone()),
-                pull: false,
-                fetch_hover: if fetchable {
-                    "Fetch current branch"
-                } else {
-                    "This branch has no upstream."
-                },
-                pull_hover: "The upstream branch is gone.",
-            }
-        }
+        Upstream::Tracking { .. } => SyncOffer {
+            fetch_branch: Some(name.clone()),
+            pull: true,
+            fetch_hover: "Fetch current branch",
+            pull_hover: "Pull current branch (fast-forward only)",
+        },
+        Upstream::Gone { .. } => SyncOffer {
+            fetch_branch: Some(name.clone()),
+            pull: false,
+            fetch_hover: "Fetch current branch",
+            pull_hover: "The upstream branch is gone.",
+        },
         Upstream::None => unavailable(
             "This branch has no upstream.",
             "Pull needs a branch with an upstream.",
@@ -1132,7 +1119,7 @@ mod tests {
                 behind: 1,
             })],
         );
-        assert_eq!(offer.fetch_upstream.as_deref(), Some("origin/main"));
+        assert_eq!(offer.fetch_branch.as_deref(), Some("main"));
         assert!(offer.pull);
         assert_eq!(offer.fetch_hover, "Fetch current branch");
         assert_eq!(offer.pull_hover, "Pull current branch (fast-forward only)");
@@ -1146,7 +1133,7 @@ mod tests {
                 name: "origin/main".to_owned(),
             })],
         );
-        assert_eq!(offer.fetch_upstream.as_deref(), Some("origin/main"));
+        assert_eq!(offer.fetch_branch.as_deref(), Some("main"));
         assert!(!offer.pull);
         assert_eq!(offer.pull_hover, "The upstream branch is gone.");
     }
@@ -1154,7 +1141,7 @@ mod tests {
     #[test]
     fn sync_offer_disables_both_without_an_upstream_or_a_branch() {
         let none = sync_offer(&Head::Branch("main".to_owned()), &[listed(Upstream::None)]);
-        assert!(none.fetch_upstream.is_none());
+        assert!(none.fetch_branch.is_none());
         assert!(!none.pull);
 
         let detached = sync_offer(
@@ -1163,7 +1150,7 @@ mod tests {
             },
             &[],
         );
-        assert!(detached.fetch_upstream.is_none());
+        assert!(detached.fetch_branch.is_none());
         assert!(!detached.pull);
         assert_eq!(
             detached.fetch_hover,

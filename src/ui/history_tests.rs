@@ -590,7 +590,7 @@ fn action_name(action: &Action) -> String {
         Action::ToggleTerminal => "ToggleTerminal".to_owned(),
         Action::SetUiFont(font) => format!("SetUiFont({font:?})"),
         Action::SetTerminalFont(font) => format!("SetTerminalFont({font:?})"),
-        Action::Fetch(upstream) => format!("Fetch({upstream})"),
+        Action::Fetch(branch) => format!("Fetch({branch})"),
         Action::Pull => "Pull".to_owned(),
         Action::Checkout(name) => format!("Checkout({name})"),
         Action::SetHistoryColumns(columns) => format!("SetHistoryColumns({columns:?})"),
