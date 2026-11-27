@@ -4,9 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use cthulhu_git::git::{
-    GitError, GraphTip, Head, SHORT_OID_LEN, branch_graph, head_commit_oid, inspect,
-};
+use cthulhu_git::git::{GitError, GraphTip, Head, SHORT_OID_LEN, branch_graph, inspect};
 
 use crate::support::{Repo, graph, summaries};
 
@@ -135,6 +133,13 @@ fn opening_a_path_finds_its_repository_head_and_graph() {
             let root = repo.root.clone();
             (repo, root.clone(), Opens::NotARepository(root))
         }),
+        // `git branch HEAD` is refused; `refs/heads/HEAD` is still a branch.
+        ("a branch named HEAD", || {
+            let repo = awaken("cthulhu-demo");
+            repo.git(&["update-ref", "refs/heads/HEAD", "HEAD"]);
+            repo.git(&["symbolic-ref", "HEAD", "refs/heads/HEAD"]);
+            on(repo, branch("HEAD"), vec!["Awaken"])
+        }),
         ("a shallow clone", || {
             let repo = Repo::init("full");
             repo.commit("first");
@@ -212,31 +217,6 @@ fn opening_a_path_finds_its_repository_head_and_graph() {
     }
 }
 
-/// `git branch HEAD` is refused; `refs/heads/HEAD` is still a branch. The
-/// branch list cannot read it (`%(refname:short)` prints `heads/HEAD`), so the
-/// graph is read from HEAD's commit alone.
-#[test]
-fn a_branch_named_head_opens() {
-    let repo = awaken("cthulhu-demo");
-    repo.git(&["update-ref", "refs/heads/HEAD", "HEAD"]);
-    repo.git(&["symbolic-ref", "HEAD", "refs/heads/HEAD"]);
-    let info = repo.info();
-    assert_eq!(info.head, branch("HEAD"));
-    let oid = head_commit_oid(&repo.git, &info.root).expect("head oid");
-    let graph = branch_graph(&repo.git, &info.root, &[head_tip(oid)], 10).expect("graph");
-    assert_eq!(summaries(&graph), ["Awaken"]);
-}
-
-fn head_tip(oid: String) -> GraphTip {
-    GraphTip {
-        name: "HEAD".to_owned(),
-        oid,
-        color: 0,
-        principal: true,
-        current: true,
-    }
-}
-
 #[cfg(unix)]
 fn unix_name(name: &'static [u8]) -> (Repo, PathBuf, Opens) {
     use std::os::unix::ffi::OsStrExt;
@@ -294,8 +274,14 @@ fn detached_head_opens_when_the_history_walk_fails() {
     };
     assert_eq!(info.head, detached);
 
-    let error =
-        branch_graph(&repo.git, &info.root, &[head_tip(tip)], 10).expect_err("missing parent");
+    let tips = [GraphTip {
+        name: "HEAD".to_owned(),
+        oid: tip,
+        color: 0,
+        principal: true,
+        current: true,
+    }];
+    let error = branch_graph(&repo.git, &info.root, &tips, 10).expect_err("missing parent");
     assert!(
         matches!(error, GitError::Command { .. } | GitError::Rejected { .. }),
         "a graph failure is not about the open: {error:?}"

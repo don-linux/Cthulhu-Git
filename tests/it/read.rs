@@ -303,9 +303,19 @@ fn commit_hover_reads_a_root_commit_a_merge_and_an_annotated_tag() {
     let info = repo.info();
     let root = repo.git(&["rev-parse", "HEAD"]);
     repo.git(&["tag", "-a", "v1,0", "-m", "annotated", &root]);
+    // A tag and a branch that share a name are each listed by that name.
+    repo.git(&["tag", "v1", &root]);
+    repo.git(&["branch", "v1"]);
+    let graph = repo.graph(10).expect("graph");
+    let labels: Vec<&str> = graph.rows[0]
+        .branches
+        .iter()
+        .map(|tip| tip.name.as_str())
+        .collect();
+    assert_eq!(labels, ["main", "v1"]);
 
     let hover = commit_hover(&repo.git, &info.root, &root).expect("root");
-    assert_eq!(hover.tags, ["v1,0".to_owned()]);
+    assert_eq!(hover.tags, ["v1", "v1,0"]);
     assert_eq!(
         hover.files,
         [CommitFile {
