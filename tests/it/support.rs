@@ -299,6 +299,11 @@ case $mode in
   setsid) CTHULHU_HARNESS_SETSID_PIDFILE="$0.pid" @TEST_EXE@ --exact process::harness_setsid_sleeper --include-ignored --test-threads=1 ;;
   # Exits while a grandchild keeps stdout open.
   writer) sleep 30 & echo $! > "$0.pid" ;;
+  # Exits once a grandchild that left the process group holds stdout.
+  setsid-writer)
+    CTHULHU_HARNESS_SETSID_PIDFILE="$0.pid" @TEST_EXE@ --exact process::harness_setsid_sleeper --include-ignored --test-threads=1 &
+    i=0
+    while [ ! -s "$0.pid" ] && [ $i -lt 500 ]; do sleep 0.01; i=$((i + 1)); done ;;
   fail) cat "$0.stderr" >&2; exit 128 ;;
   argv) printf '%s\0' "$@" > "$0.argv" ;;
   branches)
