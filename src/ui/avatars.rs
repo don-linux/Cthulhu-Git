@@ -488,8 +488,8 @@ fn fresh(path: &std::path::Path, ttl: Duration) -> bool {
 struct Offline;
 
 impl Transport for Offline {
-    fn get_once(&self, url: &str, _: &[(&str, String)]) -> Result<HttpResponse, HttpError> {
-        Err(HttpError::NotAllowed(url.to_owned()))
+    fn get_once(&self, _: &str, _: &[(&str, String)]) -> Result<HttpResponse, HttpError> {
+        Err(HttpError::NotAllowed)
     }
 }
 
@@ -737,7 +737,7 @@ mod tests {
                     body: self.picture.clone(),
                 });
             }
-            Err(HttpError::NotAllowed(url.to_owned()))
+            Err(HttpError::NotAllowed)
         }
     }
 

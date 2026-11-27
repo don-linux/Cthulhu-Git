@@ -186,7 +186,7 @@ fn allowed_host_rejects_tricky_urls() {
                 assert!(ALLOWED.contains(&host.as_str()), "{url} reached {host}");
                 assert_eq!(Some(host.as_str()), expect, "{url}");
             }
-            Err(HttpError::NotAllowed(_)) => assert_eq!(expect, None, "{url} was refused"),
+            Err(HttpError::NotAllowed) => assert_eq!(expect, None, "{url} was refused"),
             Err(other) => panic!("{url} -> {other}"),
         }
 
@@ -332,12 +332,16 @@ fn http_downgrade_and_foreign_redirects_are_not_requested() {
             "https://api.github.com.evil.example/x",
         ),
         ("https://github.com/start", " https://evil.example/x"),
+        (
+            "https://api.github.com/start",
+            "https://user:pass@evil example/?access_token=pass",
+        ),
     ];
     for (start, location) in cases {
         let fake = script(&[(start, 302, &[("Location", location)], b"")]);
         let error = get(&fake, start, Some(&secret)).expect_err(location);
         assert!(
-            matches!(error, HttpError::NotAllowed(_)),
+            matches!(error, HttpError::NotAllowed) && !error.to_string().contains("pass"),
             "{location} -> {error}"
         );
         assert_eq!(fake.urls(), vec![(*start).to_owned()], "{location}");
@@ -355,7 +359,7 @@ fn http_downgrade_and_foreign_redirects_are_not_requested() {
     )]);
     assert!(matches!(
         get(&conflicting, "https://api.github.com/start", Some(&secret)),
-        Err(HttpError::NotAllowed(_))
+        Err(HttpError::NotAllowed)
     ));
     assert_eq!(
         conflicting.urls(),

@@ -45,8 +45,10 @@ impl HttpResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpError {
-    /// Not HTTPS, a host outside [`ALLOWED_HOSTS`], or a URL with credentials or a port.
-    NotAllowed(String),
+    /// Not HTTPS, a host outside [`ALLOWED_HOSTS`], or a URL with credentials or a
+    /// port. It does not carry the URL: the message reaches the UI, and a refused
+    /// URL may hold credentials or a token in its query.
+    NotAllowed,
     TooManyRedirects,
     TimedOut,
     Connect,
@@ -59,8 +61,8 @@ pub enum HttpError {
 impl std::fmt::Display for HttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotAllowed(url) => {
-                write!(f, "refused to request {}", url_without_credentials(url))
+            Self::NotAllowed => {
+                f.write_str("refused to request a URL outside GitHub's HTTPS hosts")
             }
             Self::TooManyRedirects => f.write_str("too many redirects"),
             Self::TimedOut => f.write_str("the request timed out"),
@@ -73,32 +75,6 @@ impl std::fmt::Display for HttpError {
 }
 
 impl std::error::Error for HttpError {}
-
-/// Omits userinfo from a URL string for error messages.
-fn url_without_credentials(url: &str) -> String {
-    let uri: Uri = match url.parse() {
-        Ok(uri) => uri,
-        Err(_) => return url.to_owned(),
-    };
-    let Some(authority) = uri.authority() else {
-        return url.to_owned();
-    };
-    if !authority.as_str().contains('@') {
-        return url.to_owned();
-    }
-    let scheme = uri.scheme_str().unwrap_or("https");
-    let host = authority.host();
-    let port = authority
-        .port()
-        .map(|port| format!(":{port}"))
-        .unwrap_or_default();
-    let path = uri.path();
-    let query = uri
-        .query()
-        .map(|query| format!("?{query}"))
-        .unwrap_or_default();
-    format!("{scheme}://{host}{port}{path}{query}")
-}
 
 fn classify_ureq(error: ureq::Error) -> HttpError {
     match error {
@@ -239,20 +215,19 @@ pub fn get(
 /// The lowercase host of an HTTPS URL on the default port, without
 /// credentials, when it is one of [`ALLOWED_HOSTS`].
 pub fn allowed_host(url: &str) -> Result<String, HttpError> {
-    let refuse = || HttpError::NotAllowed(url.to_owned());
-    let uri: Uri = url.parse().map_err(|_| refuse())?;
+    let uri: Uri = url.parse().map_err(|_| HttpError::NotAllowed)?;
     if uri.scheme_str() != Some("https") {
-        return Err(refuse());
+        return Err(HttpError::NotAllowed);
     }
-    let authority = uri.authority().ok_or_else(refuse)?;
+    let authority = uri.authority().ok_or(HttpError::NotAllowed)?;
     if authority.as_str().contains('@') || authority.port().is_some() {
-        return Err(refuse());
+        return Err(HttpError::NotAllowed);
     }
     let host = authority.host().to_ascii_lowercase();
     if ALLOWED_HOSTS.contains(&host.as_str()) {
         Ok(host)
     } else {
-        Err(refuse())
+        Err(HttpError::NotAllowed)
     }
 }
 
@@ -264,7 +239,7 @@ fn resolve_location(host: &str, location: &str) -> Result<String, HttpError> {
     } else if location.starts_with('/') {
         Ok(format!("https://{host}{location}"))
     } else {
-        Err(HttpError::NotAllowed(location.to_owned()))
+        Err(HttpError::NotAllowed)
     }
 }
 
@@ -379,7 +354,7 @@ mod tests {
             "not a url",
         ] {
             assert!(
-                matches!(allowed_host(refused), Err(HttpError::NotAllowed(_))),
+                matches!(allowed_host(refused), Err(HttpError::NotAllowed)),
                 "{refused}"
             );
         }
@@ -450,7 +425,7 @@ mod tests {
         );
         assert!(matches!(
             get(&fake, "https://github.com/leak.png", None),
-            Err(HttpError::NotAllowed(_))
+            Err(HttpError::NotAllowed)
         ));
         assert!(!fake.urls().iter().any(|url| url.contains("evil")));
 
