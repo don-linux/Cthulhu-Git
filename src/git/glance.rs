@@ -168,62 +168,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn commit_glance_keeps_a_separator_inside_the_subject() {
-        let mut stdout = b"2026-11-10 01:23\x1fAwaken\x1fthe sleeper".to_vec();
-        stdout.push(b'\n');
-        assert_eq!(
-            parse_commit_glance(&stdout),
-            Some(CommitGlance {
-                when: "2026-11-10 01:23".to_owned(),
-                subject: "Awaken\u{1f}the sleeper".to_owned(),
-            })
-        );
+    fn commit_glance_table() {
+        for (stdout, expected) in [
+            // The subject may hold the separator, or be empty.
+            (
+                &b"2026-11-10 01:23\x1fAwaken\x1fthe sleeper\n"[..],
+                Some(("2026-11-10 01:23", "Awaken\u{1f}the sleeper")),
+            ),
+            (b"2026-11-10 01:23\x1f\n", Some(("2026-11-10 01:23", ""))),
+            (b"2026-11-10 01:23\n", None),
+            (b"\x1fAwaken\n", None),
+            (b"yesterday\x1fAwaken\n", None),
+            (b"", None),
+        ] {
+            let expected = expected.map(|(when, subject)| CommitGlance {
+                when: when.to_owned(),
+                subject: subject.to_owned(),
+            });
+            assert_eq!(parse_commit_glance(stdout), expected, "{stdout:?}");
+        }
     }
 
     #[test]
-    fn commit_glance_allows_an_empty_subject() {
-        assert_eq!(
-            parse_commit_glance(b"2026-11-10 01:23\x1f\n"),
-            Some(CommitGlance {
-                when: "2026-11-10 01:23".to_owned(),
-                subject: String::new(),
-            })
-        );
-    }
-
-    #[test]
-    fn commit_glance_rejects_a_missing_separator_or_date() {
-        assert_eq!(parse_commit_glance(b"2026-11-10 01:23\n"), None);
-        assert_eq!(parse_commit_glance(b"\x1fAwaken\n"), None);
-        assert_eq!(parse_commit_glance(b"yesterday\x1fAwaken\n"), None);
-        assert_eq!(parse_commit_glance(b""), None);
-    }
-
-    #[test]
-    fn divergence_parses_ahead_and_behind() {
-        assert_eq!(
-            parse_divergence(b"2\t1\n"),
-            Some(Divergence {
-                ahead: 2,
-                behind: 1
-            })
-        );
-        assert_eq!(
-            parse_divergence(b"0\t0"),
-            Some(Divergence {
-                ahead: 0,
-                behind: 0
-            })
-        );
-    }
-
-    #[test]
-    fn divergence_rejects_malformed_counts() {
-        assert_eq!(parse_divergence(b""), None);
-        assert_eq!(parse_divergence(b"2\n"), None);
-        assert_eq!(parse_divergence(b"2\t1\t0\n"), None);
-        assert_eq!(parse_divergence(b"2\t-1\n"), None);
-        assert_eq!(parse_divergence(b"ahead\t1\n"), None);
-        assert_eq!(parse_divergence(b"1\t2\nextra\n"), None);
+    fn divergence_table() {
+        for (stdout, expected) in [
+            (&b"2\t1\n"[..], Some((2, 1))),
+            (b"0\t0", Some((0, 0))),
+            (b"", None),
+            (b"2\n", None),
+            (b"2\t1\t0\n", None),
+            (b"2\t-1\n", None),
+            (b"ahead\t1\n", None),
+            (b"1\t2\nextra\n", None),
+        ] {
+            let expected = expected.map(|(ahead, behind)| Divergence { ahead, behind });
+            assert_eq!(parse_divergence(stdout), expected, "{stdout:?}");
+        }
     }
 }
