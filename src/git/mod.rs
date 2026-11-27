@@ -34,4 +34,4 @@ pub use log::{
 pub use reap::reap_process_tree;
 pub use remotes::{Remote, remotes};
 pub use repo::{Head, RepoInfo, inspect};
-pub use sync::{fetch, fetch_request, pull_ff_only, switch_branch, switch_request};
+pub use sync::{fetch, pull_ff_only, switch_branch};

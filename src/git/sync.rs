@@ -20,31 +20,11 @@ const NETWORK_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 /// so a divergence is an error and not a merge commit.
 const PULL_FF_ONLY_ARGS: &[&str] = &["pull", "--ff-only", "--no-rebase"];
 
-/// One `git fetch -- <remote> <refspec>` for the current branch's upstream.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FetchRequest {
-    remote: String,
-    refspec: String,
-}
-
-impl FetchRequest {
-    pub fn remote(&self) -> &str {
-        &self.remote
-    }
-
-    pub fn refspec(&self) -> &str {
-        &self.refspec
-    }
-
-    /// Argv after `git`. `--` keeps a strange remote from being read as an option.
-    pub fn args(&self) -> [&str; 4] {
-        ["fetch", "--", &self.remote, &self.refspec]
-    }
-}
-
-/// Builds the fetch from the branch's upstream configuration: the remote
-/// (`branch.<name>.remote`), the ref on that remote (`branch.<name>.merge`), and
-/// the remote-tracking ref git maps it to (`%(upstream)`).
+/// `git fetch -- <remote> <refspec>` (argv after `git`) for the branch's
+/// upstream configuration: the remote (`branch.<name>.remote`), the ref on
+/// that remote (`branch.<name>.merge`), and the remote-tracking ref git maps
+/// it to (`%(upstream)`). `--` keeps a strange remote from being read as an
+/// option.
 ///
 /// `%(upstream:short)` cannot be split into remote and branch: a remote may be
 /// called `team/origin`. The refspec writes the remote ref into its tracking
@@ -54,8 +34,8 @@ impl FetchRequest {
 /// `None` for a local upstream (`.`), a remote that starts like an option, a
 /// merge ref outside `refs/`, a tracking ref outside `refs/remotes/`, or a
 /// character that would change the refspec.
-pub fn fetch_request(remote: &str, merge: &str, tracking: &str) -> Option<FetchRequest> {
-    let plain = |text: &str| !text.is_empty() && !text.chars().any(refspec_forbidden);
+fn fetch_args(remote: &str, merge: &str, tracking: &str) -> Option<[String; 4]> {
+    let plain = |text: &str| !text.is_empty() && !text.chars().any(ref_char_forbidden);
     let usable = remote != "."
         && !remote.starts_with('-')
         && plain(remote)
@@ -63,17 +43,14 @@ pub fn fetch_request(remote: &str, merge: &str, tracking: &str) -> Option<FetchR
         && plain(merge)
         && tracking.starts_with("refs/remotes/")
         && plain(tracking);
-    usable.then(|| FetchRequest {
-        remote: remote.to_owned(),
-        refspec: format!("+{merge}:{tracking}"),
+    usable.then(|| {
+        [
+            "fetch".to_owned(),
+            "--".to_owned(),
+            remote.to_owned(),
+            format!("+{merge}:{tracking}"),
+        ]
     })
-}
-
-/// ASCII controls, whitespace, and the characters git treats specially in a refspec.
-fn refspec_forbidden(ch: char) -> bool {
-    ch.is_ascii_control()
-        || ch.is_whitespace()
-        || matches!(ch, ':' | '?' | '*' | '[' | '\\' | '^' | '~')
 }
 
 /// Fetches the upstream of local `branch` into its remote-tracking ref.
@@ -93,17 +70,16 @@ pub fn fetch(git: &Git, root: &Path, branch: &str) -> Result<(), GitError> {
         ],
     )?;
     let tracking = String::from_utf8_lossy(&tracking.stdout);
-    let request = remote
+    let args = remote
         .zip(merge)
-        .and_then(|(remote, merge)| fetch_request(&remote, &merge, tracking.trim_end()))
+        .and_then(|(remote, merge)| fetch_args(&remote, &merge, tracking.trim_end()))
         .ok_or_else(|| {
             rejected(
                 "git fetch",
                 "the branch has no upstream that can be fetched",
             )
         })?;
-    let args = request.args();
-    git.require_ok_for(root, &args, NETWORK_TIMEOUT)?;
+    git.require_ok_for(root, &args.each_ref().map(String::as_str), NETWORK_TIMEOUT)?;
     Ok(())
 }
 
@@ -152,20 +128,15 @@ enum SwitchKind {
 /// worktree lock. `git switch --no-guess -- <name>` stays attached, refuses a
 /// branch checked out elsewhere, and does not create a branch from
 /// `checkout.defaultRemote`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SwitchRequest {
+struct SwitchRequest {
     name: String,
     kind: SwitchKind,
 }
 
 impl SwitchRequest {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     /// Argv after `git`. The branch is one argument after `--` on Git 2.23+,
     /// so a name such as `-switch` is not an option.
-    pub fn args(&self) -> Vec<&str> {
+    fn args(&self) -> Vec<&str> {
         match self.kind {
             SwitchKind::Switch => vec!["switch", "--no-guess", "--", self.name.as_str()],
             SwitchKind::Checkout => vec!["checkout", self.name.as_str(), "--"],
@@ -177,7 +148,7 @@ impl SwitchRequest {
 ///
 /// `None` when the name cannot be a ref under `refs/heads/`, and, on Git older
 /// than 2.23, when the name starts with `-` (checkout would read it as an option).
-pub fn switch_request(version: (u32, u32, u32), name: &str) -> Option<SwitchRequest> {
+fn switch_request(version: (u32, u32, u32), name: &str) -> Option<SwitchRequest> {
     if !branch_name_is_switchable(name) {
         return None;
     }
@@ -245,6 +216,8 @@ fn branch_name_is_switchable(name: &str) -> bool {
     })
 }
 
+/// ASCII controls, whitespace, and the characters git treats specially in a
+/// ref name or a refspec.
 fn ref_char_forbidden(ch: char) -> bool {
     ch.is_ascii_control()
         || ch.is_whitespace()
@@ -295,16 +268,12 @@ mod tests {
     ];
 
     #[test]
-    fn fetch_request_table() {
+    fn fetch_args_table() {
         for &(remote, merge, tracking, refspec) in FETCHES {
             let case = (remote, merge, tracking);
-            let request = fetch_request(remote, merge, tracking);
-            let got = request
-                .as_ref()
-                .map(|request| (request.args(), request.remote(), request.refspec()));
             let expected =
-                refspec.map(|refspec| (["fetch", "--", remote, refspec], remote, refspec));
-            assert_eq!(got, expected, "{case:?}");
+                refspec.map(|refspec| ["fetch", "--", remote, refspec].map(str::to_owned));
+            assert_eq!(fetch_args(remote, merge, tracking), expected, "{case:?}");
         }
     }
 
