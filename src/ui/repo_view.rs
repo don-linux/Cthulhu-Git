@@ -63,7 +63,6 @@ pub fn show(
     let mut branches_open = state.branches_open;
     let mut detail_open = state.detail_open;
     let mut terminal_open = state.terminal_open;
-    let syncing = state.syncing;
     let sidebar_default =
         (ui.available_width() * SIDEBAR_DEFAULT_SHARE).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
     // Replies from the shell have to land even while the strip is hidden.
@@ -71,132 +70,22 @@ pub fn show(
 
     // Top and bottom bars come first so they span the whole window width.
     egui::Panel::top("repo-top-bar")
-        .frame(bar_frame(&palette))
+        .frame(widgets::bar_frame(&palette))
         .show(ui, |ui| {
             top_bar(ui, repo, &palette, &mut branches_open, &mut detail_open);
         });
 
     egui::Panel::bottom("repo-bottom-bar")
-        .frame(bar_frame(&palette))
+        .frame(widgets::bar_frame(&palette))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if icons::icon_button(ui, Icon::House, palette.text, "Open another repository")
-                    .clicked()
-                {
-                    actions.push(Action::Home);
-                }
-                let folder_tint = if state.busy {
-                    palette.text_muted
-                } else {
-                    palette.text
-                };
-                if icons::icon_button_enabled(
-                    ui,
-                    Icon::Folder,
-                    folder_tint,
-                    "Open a folder",
-                    !state.busy,
-                )
-                .clicked()
-                {
-                    actions.push(Action::Browse);
-                }
-                if icons::icon_button(ui, Icon::Settings, palette.text, "Settings").clicked() {
-                    actions.push(Action::OpenSettings);
-                }
-                ui.separator();
-                let (branch_label, branch_color) = branch_text(&repo.info.head, &palette);
-                let offer = sync_offer(&repo.info.head, &repo.branches);
-                let (fetch_on, pull_on, fetch_hover, pull_hover, branch_on, branch_hover) =
-                    match syncing {
-                        Some(SyncKind::Fetch) => {
-                            (false, false, "Fetching…", "Fetching…", false, "Fetching…")
-                        }
-                        Some(SyncKind::Pull) => {
-                            (false, false, "Pulling…", "Pulling…", false, "Pulling…")
-                        }
-                        Some(SyncKind::Checkout) => (
-                            false,
-                            false,
-                            "Switching…",
-                            "Switching…",
-                            false,
-                            "Switching…",
-                        ),
-                        None => (
-                            offer.fetch_branch.is_some(),
-                            offer.pull,
-                            offer.fetch_hover,
-                            offer.pull_hover,
-                            true,
-                            "Switch branch",
-                        ),
-                    };
-                let (terminal_tint, terminal_hover) = if terminal_open {
-                    (palette.accent, "Hide terminal")
-                } else {
-                    (palette.text_muted, "Show terminal")
-                };
-                // The name truncates before fetch and pull, so a long branch
-                // cannot push those buttons off the bar. The terminal stays
-                // at the right end, and the spare width sits between them.
-                let terminal_toggle = ui
-                    .with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let toggle =
-                            icons::icon_button(ui, Icon::Terminal, terminal_tint, terminal_hover);
-                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                            let reserve = sync_control_width(ui, "Fetch")
-                                + sync_control_width(ui, "Pull")
-                                + ui.spacing().item_spacing.x;
-                            let max_name = (ui.available_width() - reserve).max(0.0);
-                            ui.scope(|ui| {
-                                ui.set_max_width(max_name);
-                                if let Some(name) = branch_menu(
-                                    ui,
-                                    repo,
-                                    branch_label,
-                                    branch_color,
-                                    branch_on,
-                                    branch_hover,
-                                ) {
-                                    actions.push(Action::Checkout(name));
-                                }
-                            });
-                            if sync_labeled(
-                                ui,
-                                Icon::CloudDownload,
-                                "Fetch",
-                                fetch_on,
-                                palette.text,
-                                palette.text_muted,
-                                fetch_hover,
-                            ) && let Some(branch) = offer.fetch_branch.clone()
-                            {
-                                actions.push(Action::Fetch(branch));
-                            }
-                            if sync_labeled(
-                                ui,
-                                Icon::ArrowDownToLine,
-                                "Pull",
-                                pull_on,
-                                palette.text,
-                                palette.text_muted,
-                                pull_hover,
-                            ) {
-                                actions.push(Action::Pull);
-                            }
-                        });
-                        toggle
-                    })
-                    .inner;
-                if terminal_toggle.clicked() {
-                    terminal_open = !terminal_open;
-                    // The strip lives in the right sidebar, so showing it opens that too.
-                    if terminal_open {
-                        detail_open = true;
-                    }
-                }
-            });
+            bottom_bar(
+                ui,
+                repo,
+                state,
+                &palette,
+                (&mut terminal_open, &mut detail_open),
+                &mut actions,
+            );
         });
 
     let side = side_frame(&palette);
@@ -315,11 +204,102 @@ fn detail_column(
     });
 }
 
-fn bar_frame(palette: &Palette) -> Frame {
-    Frame::new()
-        .fill(palette.surface)
-        .stroke(Stroke::new(1.0, palette.border))
-        .inner_margin(Margin::symmetric(12, 6))
+/// Home, the folder dialog and Settings; the current branch, whose menu
+/// switches to another; Fetch and Pull; the terminal toggle at the right end.
+/// `panels` is (terminal open, detail open).
+fn bottom_bar(
+    ui: &mut Ui,
+    repo: &OpenedRepo,
+    state: &ViewState<'_>,
+    palette: &Palette,
+    panels: (&mut bool, &mut bool),
+    actions: &mut Vec<Action>,
+) {
+    let (terminal_open, detail_open) = panels;
+    ui.horizontal(|ui| {
+        widgets::home_and_folder(ui, state.busy, actions);
+        if icons::icon_button(ui, Icon::Settings, palette.text, "Settings").clicked() {
+            actions.push(Action::OpenSettings);
+        }
+        ui.separator();
+        let (branch_label, branch_color) = branch_text(&repo.info.head, palette);
+        let offer = match state.syncing {
+            Some(kind) => unavailable(kind.progress_label(), kind.progress_label()),
+            None => sync_offer(&repo.info.head, &repo.branches),
+        };
+        let branch_hover = state
+            .syncing
+            .map_or("Switch branch", SyncKind::progress_label);
+        let (terminal_tint, terminal_hover) = if *terminal_open {
+            (palette.accent, "Hide terminal")
+        } else {
+            (palette.text_muted, "Show terminal")
+        };
+        // The name truncates before fetch and pull, so a long branch
+        // cannot push those buttons off the bar. The terminal stays
+        // at the right end, and the spare width sits between them.
+        let terminal_toggle = ui
+            .with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let toggle = icons::icon_button(ui, Icon::Terminal, terminal_tint, terminal_hover);
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    let reserve = icons::icon_text_button_width(ui, "Fetch")
+                        + icons::icon_text_button_width(ui, "Pull")
+                        + ui.spacing().item_spacing.x;
+                    let max_name = (ui.available_width() - reserve).max(0.0);
+                    ui.scope(|ui| {
+                        ui.set_max_width(max_name);
+                        let enabled = state.syncing.is_none();
+                        if let Some(name) =
+                            branch_menu(ui, repo, branch_label, branch_color, enabled, branch_hover)
+                        {
+                            actions.push(Action::Checkout(name));
+                        }
+                    });
+                    let fetch = offer.fetch_branch.is_some();
+                    if sync_labeled(
+                        ui,
+                        palette,
+                        Icon::CloudDownload,
+                        "Fetch",
+                        fetch,
+                        offer.fetch_hover,
+                    ) && let Some(branch) = offer.fetch_branch.clone()
+                    {
+                        actions.push(Action::Fetch(branch));
+                    }
+                    if sync_labeled(
+                        ui,
+                        palette,
+                        Icon::ArrowDownToLine,
+                        "Pull",
+                        offer.pull,
+                        offer.pull_hover,
+                    ) {
+                        actions.push(Action::Pull);
+                    }
+                });
+                toggle
+            })
+            .inner;
+        if terminal_toggle.clicked() {
+            *terminal_open = !*terminal_open;
+            // The strip lives in the right sidebar, so showing it opens that too.
+            if *terminal_open {
+                *detail_open = true;
+            }
+        }
+    });
+}
+
+impl SyncKind {
+    /// What the bar says while this runs, on every control it turns off.
+    fn progress_label(self) -> &'static str {
+        match self {
+            Self::Fetch => "Fetching…",
+            Self::Pull => "Pulling…",
+            Self::Checkout => "Switching…",
+        }
+    }
 }
 
 fn side_frame(palette: &Palette) -> Frame {
@@ -504,16 +484,11 @@ fn detail_panel(
     ui.add(Label::new(RichText::new(title).strong()).truncate());
     ui.add_space(6.0);
 
-    if selected.is_none() && repo.latest.is_none() {
+    let Some(shown) = shown_oid(ui.ctx(), repo) else {
         ui.label(RichText::new("No commits yet.").weak());
         return;
-    }
-    if let Some(oid) = selected
-        .as_deref()
-        .or(repo.latest.as_ref().map(|commit| commit.oid.as_str()))
-    {
-        repo.hover.request(oid);
-    }
+    };
+    repo.hover.request(&shown);
 
     let open_changes = ScrollArea::vertical()
         .id_salt(repo.view_id.with("detail"))
@@ -527,24 +502,29 @@ fn detail_panel(
         })
         .inner;
     if open_changes
-        && let Some(oid) = selected
-            .as_deref()
-            .or(repo.latest.as_ref().map(|commit| commit.oid.as_str()))
-        && let Some(CachedCommit::Ready(hover)) = repo.hover.cached(oid)
+        && let Some(CachedCommit::Ready(hover)) = repo.hover.cached(&shown)
         && !hover.files.is_empty()
     {
-        repo.changes = Some(changes::Changes::new(oid.to_owned(), hover.files.clone()));
+        let files = hover.files.clone();
+        repo.changes = Some(changes::Changes::new(shown, files));
     }
+}
+
+/// The commit in the sidebar: the one chosen in the history, else the
+/// latest. A click in the history changes it within the frame, so it is
+/// read where it is needed.
+fn shown_oid(ctx: &egui::Context, repo: &OpenedRepo) -> Option<String> {
+    history::selected_commit(ctx, repo.view_id)
+        .or_else(|| repo.latest.as_ref().map(|commit| commit.oid.clone()))
 }
 
 /// Drops the diff modal when the sidebar moves to a different commit.
 fn close_changes_for_other_commit(ctx: &egui::Context, repo: &mut OpenedRepo) {
-    let shown = history::selected_commit(ctx, repo.view_id)
-        .or_else(|| repo.latest.as_ref().map(|commit| commit.oid.clone()));
+    let shown = shown_oid(ctx, repo);
     if repo
         .changes
         .as_ref()
-        .is_some_and(|changes| Some(changes.oid.as_str()) != shown.as_deref())
+        .is_some_and(|changes| Some(&changes.oid) != shown.as_ref())
     {
         repo.changes = None;
     }
@@ -957,22 +937,20 @@ fn sync_offer(head: &Head, branches: &[ListedBranch]) -> SyncOffer {
     }
 }
 
-/// Width of an icon-and-word control, so the branch name stops before it.
-fn sync_control_width(ui: &Ui, text: &str) -> f32 {
-    icons::icon_text_button_width(ui, text)
-}
-
 /// Icon and word, one click. Dimmed, and not clickable, when the action cannot run.
 fn sync_labeled(
     ui: &mut Ui,
+    palette: &Palette,
     icon: Icon,
     word: &str,
     enabled: bool,
-    tint: Color32,
-    muted: Color32,
     hover: &str,
 ) -> bool {
-    let color = if enabled { tint } else { muted };
+    let color = if enabled {
+        palette.text
+    } else {
+        palette.text_muted
+    };
     icons::icon_text_button(ui, icon, word, color, hover, enabled).clicked()
 }
 

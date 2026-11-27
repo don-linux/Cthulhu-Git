@@ -141,33 +141,13 @@ pub fn show(
         .unwrap_or(Page::Appearance);
 
     egui::Panel::top("settings-top-bar")
-        .frame(bar_frame(&palette))
+        .frame(widgets::bar_frame(&palette))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 if icons::icon_button(ui, Icon::ArrowLeft, palette.text, "Back").clicked() {
                     actions.push(Action::CloseSettings);
                 }
-                if icons::icon_button(ui, Icon::House, palette.text, "Open another repository")
-                    .clicked()
-                {
-                    actions.push(Action::Home);
-                }
-                let folder_tint = if view_state.busy {
-                    palette.text_muted
-                } else {
-                    palette.text
-                };
-                if icons::icon_button_enabled(
-                    ui,
-                    Icon::Folder,
-                    folder_tint,
-                    "Open a folder",
-                    !view_state.busy,
-                )
-                .clicked()
-                {
-                    actions.push(Action::Browse);
-                }
+                widgets::home_and_folder(ui, view_state.busy, &mut actions);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(RichText::new("Settings").size(BAR_TITLE_SIZE).strong());
                 });
@@ -752,14 +732,6 @@ fn nav_button(ui: &mut Ui, label: &str, icon: Icon, selected: bool) -> egui::Res
 
 fn page_id() -> Id {
     Id::unique("settings-page")
-}
-
-/// Same chrome as the repository bars.
-fn bar_frame(palette: &Palette) -> Frame {
-    Frame::new()
-        .fill(palette.surface)
-        .stroke(Stroke::new(1.0, palette.border))
-        .inner_margin(Margin::symmetric(12, 6))
 }
 
 fn nav_frame(palette: &Palette) -> Frame {
