@@ -9,7 +9,7 @@ Fetch and fast-forward pull are available. There is no commit, push, stage or di
 
 ## Requirements
 
-- [rustup](https://rustup.rs). The toolchain is pinned to Rust **1.98.1** in
+- [rustup](https://rustup.rs). The toolchain is pinned to Rust **1.100.0** in
   `rust-toolchain.toml`, so the first `cargo` command installs it automatically.
 - Git **2.15 or newer** on the machine (the app never bundles Git).
 - Linux only: the usual libraries for an OpenGL window on X11 or Wayland.
