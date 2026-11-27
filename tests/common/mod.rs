@@ -10,7 +10,7 @@
 
 #![allow(dead_code)]
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -313,7 +313,7 @@ pub fn become_setsid_sleeper(pid_file: &Path) {
         std::process::exit(1);
     }
     let pid = std::process::id();
-    let mut file = match File::create(pid_file) {
+    let mut file = match fs::File::create(pid_file) {
         Ok(file) => file,
         Err(error) => {
             eprintln!("pid file {}: {error}", pid_file.display());
