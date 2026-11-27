@@ -188,8 +188,12 @@ fn concurrent_saves_leave_valid_json() {
                 Some(format!("{} recents", settings.recent_repositories.len()))
             }
             Ok(_) => None,
+            // Windows refuses to open a file while a rename replaces it
+            // (ERROR_ACCESS_DENIED), the case Go's cmd/internal/robustio
+            // retries. That is a failed open, not a torn file.
             Err(SettingsError::Read(_, error))
-                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::Interrupted) =>
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::Interrupted)
+                    || (cfg!(windows) && error.kind() == ErrorKind::PermissionDenied) =>
             {
                 None
             }
