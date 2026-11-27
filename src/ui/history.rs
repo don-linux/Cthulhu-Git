@@ -1483,138 +1483,123 @@ fn chip_fill(palette: &Palette, color: usize, current: bool, lit: bool) -> Color
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
+    /// Width of the hash sample the rows below are computed with.
     const HASH_TEXT: f32 = 100.0;
 
-    fn mins(lanes: usize) -> [f32; 5] {
-        column_mins(HASH_TEXT, lanes)
+    fn columns([branch, graph, hash, message, author]: [u16; 5]) -> HistoryColumns {
+        HistoryColumns {
+            branch,
+            graph,
+            hash,
+            message,
+            author,
+        }
     }
 
-    fn widths(layout: &ColumnLayout) -> [f32; 5] {
-        layout.width
+    proptest! {
+        #![proptest_config(crate::ui::test_support::proptest_config())]
+
+        /// Each column is its share of the panel, or its minimum when that is
+        /// larger, laid end to end. The lanes fit in the graph column, and
+        /// changing one share never moves another column.
+        #[test]
+        fn each_column_is_its_share_or_its_minimum(
+            panel in -10.0_f32..4000.0,
+            shares in proptest::array::uniform5(HistoryColumns::RANGE),
+            lanes in 0_usize..64,
+            hash in 0.0_f32..400.0,
+            changed in 0_usize..5,
+            value in HistoryColumns::RANGE,
+        ) {
+            let mins = column_mins(hash, lanes);
+            let layout = layout_columns(panel, &columns(shares), mins, lanes);
+            let mut x = 0.0;
+            for column in Column::ALL {
+                let index = column.index();
+                let share = panel.max(0.0) * f32::from(shares[index]) / 1000.0;
+                let (width, min) = (layout.width[index], mins[index]);
+                let case = format!("{column:?} is {width}, share {share}, minimum {min}");
+                prop_assert_eq!(layout.left[index], x, "{} starts off its neighbor", case);
+                prop_assert!(width >= min && width >= share, "{case}");
+                prop_assert!(width == share || width == min, "{case}");
+                x += width;
+            }
+            prop_assert_eq!(layout.content_width, x.max(panel.max(0.0)));
+            let room = layout.width[Column::Graph.index()] - 2.0 * CELL_PAD;
+            let lane = layout.lane_width;
+            prop_assert!((LANE_MIN..=LANE_MAX).contains(&lane), "lane width {lane}");
+            let lanes_width = lanes.max(1) as f32 * lane;
+            prop_assert!(lanes_width <= room + 0.01, "{lanes} lanes of {lane} in {room}");
+
+            let mut moved = columns(shares);
+            Column::ALL[changed].set(&mut moved, value);
+            let after = layout_columns(panel, &moved, mins, lanes);
+            for column in Column::ALL.into_iter().filter(|column| column.index() != changed) {
+                let index = column.index();
+                prop_assert_eq!(after.width[index], layout.width[index], "{:?} moved", column);
+            }
+        }
     }
 
+    /// (panel, shares, lanes, the columns' sum, lane width). The defaults fill
+    /// a wide panel exactly. Shares of 20 leave most of a wide panel free. A
+    /// narrow panel keeps every minimum and scrolls. Forty lanes shrink to the
+    /// narrowest lane, one grows to the widest. No panel at all still lays out
+    /// every minimum.
     #[test]
-    fn the_defaults_fill_a_wide_panel_exactly() {
-        let layout = layout_columns(2000.0, &HistoryColumns::default(), mins(1), 1);
-        let sum: f32 = layout.width.iter().sum();
-        assert!((sum - 2000.0).abs() < 0.01, "sum {sum}");
-        assert!((layout.content_width - 2000.0).abs() < 0.01);
-        for index in 1..5 {
+    fn layouts_at_the_edges() {
+        let defaults = HistoryColumns::default();
+        for (panel, shares, lanes, sum, lane_width) in [
+            (2000.0, defaults, 1, 2000.0, LANE_MAX),
+            (4000.0, columns([20; 5]), 1, 816.0, LANE_MAX),
+            (196.0, defaults, 2, 780.0, LANE_MIN),
+            (600.0, defaults, 40, 1312.0, LANE_MIN),
+            (0.0, defaults, 0, 766.0, LANE_MIN),
+            (-5.0, defaults, 0, 766.0, LANE_MIN),
+        ] {
+            let case = format!("panel {panel}, {lanes} lanes, {shares:?}");
+            let layout = layout_columns(panel, &shares, column_mins(HASH_TEXT, lanes), lanes);
+            let total: f32 = layout.width.iter().sum();
             assert!(
-                (layout.left[index] - (layout.left[index - 1] + layout.width[index - 1])).abs()
-                    < 0.01
+                (total - sum).abs() < 0.01,
+                "{case}: columns add up to {total}"
+            );
+            assert!(
+                (layout.content_width - total.max(panel)).abs() < 0.01,
+                "{case}: content is {}",
+                layout.content_width
+            );
+            assert_eq!(layout.lane_width, lane_width, "{case}");
+        }
+    }
+
+    /// (dragged width, minimum, panel, stored share).
+    #[test]
+    fn a_dragged_width_is_stored_as_a_share_of_the_panel() {
+        for (width, min, panel, stored) in [
+            (500.0, 0.0, 1000.0, 500),
+            (1.0, 0.0, 1000.0, 20),
+            (5000.0, 0.0, 1000.0, 1000),
+            (500.0, 0.0, 0.0, 20),
+            (f32::NAN, 0.0, 1000.0, 20),
+            (600.0, MESSAGE_MIN, 1000.0, 600),
+            // On a panel that fits the minimum, the saved share is the one on screen.
+            (MESSAGE_MIN, MESSAGE_MIN, 1660.0, 169),
+            // A 260-point panel cannot hold the 280-point message minimum.
+            // Saving 280/260 as 1000 would make the column fill a wider
+            // window later.
+            (MESSAGE_MIN, MESSAGE_MIN, 260.0, 20),
+        ] {
+            assert_eq!(
+                share_for(width, min, panel),
+                stored,
+                "{width} of a {panel} panel, minimum {min}"
             );
         }
-    }
-
-    #[test]
-    fn changing_one_column_never_changes_another() {
-        let base = HistoryColumns::default();
-        for panel in [300.0, 900.0, 1600.0, 3000.0] {
-            let before = layout_columns(panel, &base, mins(3), 3);
-            for column in Column::ALL {
-                for value in [20, 50, 400, 1000] {
-                    let mut changed = base;
-                    column.set(&mut changed, value);
-                    let after = layout_columns(panel, &changed, mins(3), 3);
-                    for other in Column::ALL.into_iter().filter(|other| *other != column) {
-                        assert_eq!(
-                            widths(&before)[other.index()],
-                            widths(&after)[other.index()],
-                            "{column:?}={value} moved {other:?} at {panel}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn a_narrow_panel_scrolls_instead_of_squeezing() {
-        let layout = layout_columns(196.0, &HistoryColumns::default(), mins(2), 2);
-        for (index, (width, floor)) in layout.width.iter().zip(mins(2)).enumerate() {
-            assert!(width + 0.01 >= floor, "column {index}");
-        }
-        let sum: f32 = layout.width.iter().sum();
-        assert!(layout.content_width > 196.0);
-        assert!((layout.content_width - sum).abs() < 0.01);
-    }
-
-    #[test]
-    fn narrow_columns_leave_free_space_on_the_right() {
-        let small = HistoryColumns {
-            branch: 20,
-            graph: 20,
-            hash: 20,
-            message: 20,
-            author: 20,
-        };
-        let layout = layout_columns(4000.0, &small, mins(1), 1);
-        let sum: f32 = layout.width.iter().sum();
-        assert!(sum < 4000.0);
-        assert!((layout.content_width - 4000.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn the_graph_minimum_comes_from_its_own_lanes() {
-        let many = layout_columns(600.0, &HistoryColumns::default(), mins(40), 40);
-        let graph = many.width[Column::Graph.index()];
-        assert!(graph + 0.01 >= 40.0 * LANE_MIN + 2.0 * CELL_PAD);
-        assert!((many.lane_width - LANE_MIN).abs() < 0.01);
-        let one = layout_columns(2000.0, &HistoryColumns::default(), mins(1), 1);
-        assert!((one.lane_width - LANE_MAX).abs() < 0.01);
-        assert!(one.width[Column::Graph.index()] > LANE_MAX + 2.0 * CELL_PAD);
-    }
-
-    #[test]
-    fn layout_survives_zero_and_odd_inputs() {
-        for panel in [0.0, -5.0, f32::MIN_POSITIVE] {
-            let layout = layout_columns(panel, &HistoryColumns::default(), mins(0), 0);
-            for value in layout.width.iter().chain(&layout.left) {
-                assert!(value.is_finite() && *value >= 0.0);
-            }
-            assert!(layout.lane_width >= LANE_MIN);
-        }
-    }
-
-    #[test]
-    fn dragged_widths_become_shares_of_the_panel() {
-        assert_eq!(per_mille_for(500.0, 1000.0), 500);
-        assert_eq!(per_mille_for(1.0, 1000.0), 20);
-        assert_eq!(per_mille_for(5000.0, 1000.0), 1000);
-        assert_eq!(per_mille_for(500.0, 0.0), 20);
-        assert_eq!(per_mille_for(f32::NAN, 1000.0), 20);
-    }
-
-    #[test]
-    fn a_column_dragged_to_its_minimum_stores_the_smallest_share() {
-        // A 260-point panel cannot hold the 280-point message minimum. Saving
-        // 280/260 as 1000 would make the column fill a wider window later.
-        assert_eq!(share_for(280.0, MESSAGE_MIN, 260.0), 20);
-        let later = layout_columns(
-            2000.0,
-            &HistoryColumns {
-                message: share_for(280.0, MESSAGE_MIN, 260.0),
-                ..HistoryColumns::default()
-            },
-            mins(1),
-            1,
-        );
-        assert!((later.width[Column::Message.index()] - MESSAGE_MIN).abs() < 0.01);
-        assert_eq!(share_for(600.0, MESSAGE_MIN, 1000.0), 600);
-        // On a panel that fits the minimum, the saved share is the one on screen.
-        assert_eq!(share_for(MESSAGE_MIN, MESSAGE_MIN, 1660.0), 169);
-    }
-
-    #[test]
-    fn titles_read_in_the_requested_order() {
-        let titles: Vec<_> = Column::ALL.iter().map(|column| column.title()).collect();
-        assert_eq!(
-            titles,
-            ["Branch", "Graph", "Commit Hash", "Commit Message", "Author"]
-        );
     }
 
     #[test]
