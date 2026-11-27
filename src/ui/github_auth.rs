@@ -325,10 +325,19 @@ mod tests {
             let mut auth = GitHubAuth {
                 token: Some(token()),
                 stored: Stored::Keychain,
-                task: Some(Task::ready(outcome)),
                 ..GitHubAuth::default()
             };
-            let changes = auth.poll(&ctx);
+            auth.run(&ctx, move || outcome);
+            let changes = (0..500)
+                .find_map(|_| {
+                    let changes = auth.poll(&ctx);
+                    let running = auth.busy();
+                    if running {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    (!running).then_some(changes)
+                })
+                .expect("the worker answered");
             assert_eq!(changes, [Change::Token(handed_on)], "{case}");
             assert_eq!(auth.stored(), stored, "{case}");
             let Some(Notice::Error(text)) = auth.notice() else {

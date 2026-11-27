@@ -983,11 +983,20 @@ mod tests {
         }
         let masked = "\u{2022}".repeat(FAKE_TOKEN.len());
         assert_eq!(shown, masked, "password display");
-        for page in ["GitHub Auth", "History", "About"] {
+        // (page, a section title or subtitle it shows)
+        for (page, shown) in [
+            ("GitHub Auth", "2. Paste it here"),
+            (
+                "History",
+                "Author pictures and the width of the history columns.",
+            ),
+            ("About", "Copy version info"),
+        ] {
             if page != "GitHub Auth" {
                 click(&mut harness, page);
             }
             let tree = tree_text(&harness);
+            assert!(tree.contains(shown), "{page}: no {shown:?}");
             assert!(
                 !tree.contains(FAKE_TOKEN),
                 "{page}: token in the accessibility tree"

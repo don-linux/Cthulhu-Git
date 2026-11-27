@@ -400,6 +400,12 @@ fn browse_is_disabled_while_busy() {
             Action::OpenSettings,
         ),
         ("settings", "Open a folder", "Back", Action::CloseSettings),
+        (
+            "repository",
+            "Open a folder",
+            "Show terminal",
+            Action::ToggleTerminal,
+        ),
     ];
     for (screen, browse, other, other_action) in cases {
         let busy = Rc::new(Cell::new(false));
@@ -424,6 +430,9 @@ fn browse_is_disabled_while_busy() {
 
         busy.set(true);
         harness.step();
+        if screen == "home" {
+            assert_shows(&harness, "Waiting for the folder dialog…", screen);
+        }
         let button = harness.get_by_role_and_label(Role::Button, browse);
         assert!(button.accesskit_node().is_disabled(), "{screen}");
         button.click();
@@ -649,6 +658,10 @@ fn hostile_names_keep_the_bottom_bar_in_order_and_in_the_window() {
                 })
                 .collect();
             assert!(!on_bar.is_empty(), "{case}: the branch name is not painted");
+            if fits {
+                let cut = on_bar.iter().any(|(_, galley)| galley.elided);
+                assert!(!cut, "{case}: the name is cut though it fits");
+            }
             for (rect, _) in &on_bar {
                 assert!(
                     rect.right() <= fetch.left() + 1.0,
@@ -725,6 +738,15 @@ fn the_branch_menu_checks_out_only_another_branch() {
             "{case}: the branch button reads {label:?}"
         );
         let branch_button = harness.get_by_role_and_label(Role::Button, &label);
+        // A screen reader hears what is running; a disabled button shows no tip.
+        let described = match syncing {
+            None => "Switch branch",
+            Some(SyncKind::Fetch) => "Fetching…",
+            Some(SyncKind::Pull) => "Pulling…",
+            Some(SyncKind::Checkout) => "Switching…",
+        };
+        let description = branch_button.accesskit_node().description();
+        assert_eq!(description.as_deref(), Some(described), "{case}");
         let disabled = branch_button.accesskit_node().is_disabled();
         assert_eq!(
             disabled,

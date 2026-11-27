@@ -108,7 +108,7 @@ pub enum Action {
 }
 
 /// A fetch, pull, or branch switch running against the open repository.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncKind {
     Fetch,
     Pull,
@@ -986,18 +986,22 @@ mod tests {
     use std::io;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
-    use cthulhu_git::git::{Git, GitError, HistoryGraph};
+    use cthulhu_git::git::{Git, GitError, Head, HistoryGraph, RepoInfo};
     use cthulhu_git::settings::HistoryColumns;
     use eframe::egui;
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::avatars::AvatarService;
+    use super::home::Glance;
     use super::task::Task;
     use super::test_support::{absent_git, commit, listed, opened};
     use super::{
-        Action, CthulhuApp, GitFinder, GraphLoad, Opening, Screen, Startup, selected_tips,
+        Action, CthulhuApp, GitFinder, GraphLoad, Opening, Refreshed, Screen, Startup, SyncJob,
+        SyncKind, selected_tips,
     };
 
     /// The app as it starts on `settings_path`, with a git that is installed nowhere.
@@ -1158,22 +1162,146 @@ mod tests {
         }
     }
 
-    /// An open waits for its worker. A worker that dies is an error on Home.
+    /// The folder chosen in the dialog opens, and an open waits for its
+    /// worker. Either one keeps the app busy. A worker that dies is an error
+    /// on Home.
     #[test]
     fn an_open_waits_for_its_worker() {
         let ctx = egui::Context::default();
         let mut app = app(&ctx, None);
-        let (task, sender) = Task::pending();
         let path = PathBuf::from("/repos/slow");
+        app.picker = Some(Task::ready(Some(path.clone())));
+        assert!(app.busy(), "the dialog is open");
+        app.poll_picker(&ctx);
+        let opened = app.opening.as_ref().map(|opening| &opening.path);
+        assert_eq!(opened, Some(&path), "the chosen folder");
+        assert!(app.picker.is_none(), "the dialog is still open");
+        let (task, sender) = Task::pending();
         app.opening = Some(Opening { path, task });
         app.poll_opening(&ctx);
         assert!(app.opening.is_some(), "the open ended before its worker");
+        assert!(app.busy(), "opening");
         drop(sender);
         app.poll_opening(&ctx);
         assert!(app.opening.is_none(), "a dead worker left the open running");
         let error = app.error.as_deref();
         assert_eq!(error, Some("Opening stopped unexpectedly. Try again."));
         assert!(matches!(app.screen, Screen::Home(_)));
+    }
+
+    /// The About page's git version and the recent cards' facts come from
+    /// workers.
+    #[test]
+    fn workers_fill_the_about_page_and_the_recent_cards() {
+        let ctx = egui::Context::default();
+        let dir = TempDir::new().expect("temp dir");
+        let settings = dir.path().join("settings.json");
+        let gone = dir.path().join("gone");
+        let seed = json!({ "recent_repositories": [gone] }).to_string();
+        fs::write(&settings, seed).expect("seed settings");
+        let mut app = app(&ctx, Some(settings));
+        app.ensure_git_version(&ctx);
+        let reported = (0..500).any(|_| {
+            app.poll_git_version();
+            let Screen::Home(scan) = &mut app.screen else {
+                return false;
+            };
+            scan.poll();
+            let done = app.git_version.is_some() && scan.glances.contains_key(&gone);
+            if !done {
+                thread::sleep(Duration::from_millis(10));
+            }
+            done
+        });
+        assert!(reported, "the workers never reported");
+        assert_eq!(app.git_version.as_deref(), Some("2.43.0"));
+        let Screen::Home(scan) = &app.screen else {
+            panic!("not on Home");
+        };
+        assert!(matches!(scan.glances.get(&gone), Some(Glance::Unreadable)));
+    }
+
+    /// How a sync worker ends.
+    #[derive(Debug, Clone, Copy)]
+    enum Answer {
+        /// The repository, reloaded with this current branch.
+        Current(&'static str),
+        Fails,
+        Dies,
+    }
+
+    /// Each open has its own view and starts reading its history at once, so
+    /// its first frame says the history is loading. One sync runs at a time;
+    /// its result reloads the branches, and only a switch checks the new
+    /// current branch.
+    #[test]
+    fn an_opened_repository_reads_its_history_and_takes_sync_results() {
+        const REFUSED: &str = "`git pull` failed (rejected): refused";
+        const STOPPED: &str = "The Git command stopped unexpectedly. Try again.";
+        // (the job, how it ends, the error shown, `feature` checked after)
+        const CASES: [(SyncKind, Answer, Option<&str>, bool); 4] = [
+            (SyncKind::Checkout, Answer::Current("feature"), None, true),
+            (SyncKind::Fetch, Answer::Current("feature"), None, false),
+            (SyncKind::Pull, Answer::Fails, Some(REFUSED), false),
+            (SyncKind::Pull, Answer::Dies, Some(STOPPED), false),
+        ];
+        let refreshed = |current: &str| Refreshed {
+            git: absent_git(),
+            info: RepoInfo {
+                root: PathBuf::from("/repos/sync"),
+                name: "sync".to_owned(),
+                head: Head::Branch(current.to_owned()),
+            },
+            branches: ["main", "feature"]
+                .map(|name| listed(name, name == current).branch)
+                .into(),
+            latest: None,
+            detached_oid: None,
+            github: None,
+        };
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx, None);
+        let mut views = Vec::new();
+        for (kind, answer, error, checked) in CASES {
+            let case = format!("{kind:?} that {answer:?}");
+            app.finish_open(&ctx, PathBuf::from("/repos/sync"), Ok(refreshed("main")));
+            assert!(app.history_loading(), "{case}: no history read at first");
+            app.apply_action(&ctx, Action::Checkout("feature".to_owned()));
+            app.apply_action(&ctx, Action::Pull);
+            assert_eq!(app.sync_for_open_repo(), Some(SyncKind::Checkout), "{case}");
+            let (task, sender) = Task::pending();
+            let _ = match answer {
+                Answer::Current(name) => sender.send(Ok(refreshed(name))),
+                Answer::Fails => sender.send(Err(GitError::Rejected {
+                    command: "git pull".to_owned(),
+                    reason: "refused".to_owned(),
+                })),
+                Answer::Dies => Ok(()),
+            };
+            drop(sender);
+            let Screen::Repo { repo, sync, .. } = &mut app.screen else {
+                panic!("{case}: not opened: {:?}", app.error);
+            };
+            views.push(repo.view_id);
+            *sync = Some(SyncJob { kind, task });
+            app.poll_sync();
+            assert_eq!(app.sync_for_open_repo(), None, "{case}");
+            assert_eq!(app.error.as_deref(), error, "{case}");
+            let Screen::Repo { repo, .. } = &app.screen else {
+                panic!("{case}: not on the repository");
+            };
+            let feature = repo
+                .branches
+                .iter()
+                .find(|listed| listed.branch.name == "feature");
+            assert_eq!(
+                feature.map(|listed| listed.checked),
+                Some(checked),
+                "{case}"
+            );
+        }
+        views.dedup();
+        assert_eq!(views.len(), CASES.len(), "opens share a view");
     }
 
     /// What happens on screen while the history worker reads the graph.
