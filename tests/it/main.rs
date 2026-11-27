@@ -7,6 +7,11 @@
 
 #[cfg(unix)]
 mod discover;
+#[cfg(unix)]
+mod hardening;
+mod open;
 mod process;
+mod read;
 mod settings;
 mod support;
+mod write;

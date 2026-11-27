@@ -124,11 +124,15 @@ impl Repo {
     /// `git init -b main`. The app's git reads `~/.gitconfig`, so the local
     /// config pins what a user's file could change under a test.
     pub fn init(name: impl AsRef<OsStr>) -> Self {
-        let repo = Self::new(name);
-        repo.git(&["init", "-b", "main"]);
-        repo.git(&["config", "--local", "core.autocrlf", "false"]);
-        repo.git(&["config", "--local", "commit.gpgsign", "false"]);
-        repo
+        Self::new(name).initialized(&[])
+    }
+
+    /// `git init -b main` with `extra` options, such as `--bare`.
+    pub fn initialized(self, extra: &[&str]) -> Self {
+        self.git(&[&["init", "-b", "main"], extra].concat());
+        self.git(&["config", "--local", "core.autocrlf", "false"]);
+        self.git(&["config", "--local", "commit.gpgsign", "false"]);
+        self
     }
 
     /// A git command in `cwd` with [`isolate`] applied.
@@ -147,10 +151,7 @@ impl Repo {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        String::from_utf8(output.stdout)
-            .expect("utf8")
-            .trim()
-            .to_owned()
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
     pub fn git(&self, args: &[&str]) -> String {
@@ -161,21 +162,27 @@ impl Repo {
         self.git(&["commit", "--allow-empty", "-m", message]);
     }
 
-    /// Commits at a fixed author and committer time, so `--date-order` is fixed.
-    pub fn commit_at(&self, message: &str, unix: i64) {
+    /// A git command at a fixed author and committer time, so `--date-order`
+    /// is fixed.
+    pub fn git_dated(&self, unix: i64, args: &[&str]) -> String {
         let date = format!("{unix} +0000");
         let output = self
             .command(&self.root)
             .env("GIT_AUTHOR_DATE", &date)
             .env("GIT_COMMITTER_DATE", &date)
-            .args(["commit", "--allow-empty", "-m", message])
+            .args(args)
             .output()
-            .expect("commit");
+            .expect("run git");
         assert!(
             output.status.success(),
-            "commit {message:?} failed: {}",
+            "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    pub fn commit_at(&self, message: &str, unix: i64) {
+        self.git_dated(unix, &["commit", "--allow-empty", "-m", message]);
     }
 
     /// Writes `object` with `hash-object --literally`, which keeps bytes
