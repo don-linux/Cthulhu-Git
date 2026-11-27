@@ -89,7 +89,7 @@ fn mentions_rate_limit(body: &[u8]) -> bool {
 
 /// The GitHub account behind one commit address, as the API reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommitAccount {
+pub(crate) struct CommitAccount {
     /// Normalized with [`email_key`].
     pub email: String,
     /// `None` when GitHub links no account to that address.
@@ -97,7 +97,7 @@ pub struct CommitAccount {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommitAccounts {
+pub(crate) struct CommitAccounts {
     /// Oid of each listed commit, newest first, with its author's account.
     pub authors: Vec<(String, CommitAccount)>,
     /// Committers too, so a maintainer who only merges is known.
@@ -158,7 +158,7 @@ pub(crate) fn parse_commit_accounts(body: &[u8]) -> Option<CommitAccounts> {
 /// `GET /repos/{owner}/{repo}/commits?per_page=N[&sha=…]`. The list endpoint
 /// is used instead of `/commits/{ref}` because that one also returns every
 /// changed file.
-pub fn commit_accounts(
+pub(crate) fn commit_accounts(
     transport: &dyn Transport,
     token: Option<&Token>,
     repo: &GitHubRepo,

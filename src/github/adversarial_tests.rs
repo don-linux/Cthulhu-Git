@@ -9,7 +9,7 @@ use std::sync::Arc;
 use proptest::prelude::*;
 use proptest::string::string_regex;
 
-use super::client::{FetchError, fetch_image};
+use super::client::{FetchError, commit_accounts, fetch_image};
 use super::http::{allowed_host, get};
 use super::*;
 use crate::test_support::{
@@ -39,14 +39,12 @@ fn hostile_author_avatar_urls_never_leave_the_allowlist() {
             &[("x-ratelimit-remaining", "50")],
             format!("[{}]", commit_json(&sha, &emails[0], Some(avatar))).as_bytes(),
         );
-        let urls = resolver(&fake).candidates(
-            &AvatarQuery {
-                emails: &emails,
-                repo: Some(&context),
-                authored: Some(&sha),
-            },
-            NOW,
-        );
+        let query = AvatarQuery {
+            emails: &emails,
+            repo: Some(&context),
+            authored: Some(&sha),
+        };
+        let urls = resolver(&fake).resolve(&query, NOW).urls;
         assert!(!urls.is_empty(), "{avatar}");
         for url in &urls {
             if let Err(FetchError::Failed(message)) = fetch_image(fake.as_ref(), url) {
@@ -66,7 +64,7 @@ fn hostile_author_avatar_urls_never_leave_the_allowlist() {
 /// the token into its message, even when a URL or a body holds it.
 #[test]
 fn errors_never_show_the_token() {
-    let token = Token::new(SECRET);
+    let token = Token::parse(SECRET).expect("token");
     let fake = FakeTransport::default();
     let leaky = format!("https://evil.example/?access_token={SECRET}");
     fake.reply(
@@ -121,7 +119,7 @@ proptest! {
     #[test]
     fn get_does_not_authorize_a_random_url(url in arb_urlish()) {
         let fake = FakeTransport::default();
-        let token = Token::new(SECRET);
+        let token = Token::parse(SECRET).expect("token");
         let _ = get(&fake, &url, Some(&token));
         let expected = format!("Bearer {SECRET}");
         for (requested, headers) in fake.requests.lock().expect("requests").iter() {

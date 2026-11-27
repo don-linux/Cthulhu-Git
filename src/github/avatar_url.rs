@@ -4,7 +4,7 @@
 use sha2::{Digest, Sha256};
 
 /// Pixels asked for. Twice the 40-point hover avatar, so it stays sharp at 2x.
-pub const AVATAR_PX: u32 = 96;
+const AVATAR_PX: u32 = 96;
 
 const NOREPLY_DOMAIN: &str = "@users.noreply.github.com";
 

@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn debug_never_prints_the_token() {
-        let token = Token::new("ghp_supersecretvalue1234567890");
+        let token = parsed_token("ghp_supersecretvalue1234567890");
         assert_eq!(format!("{token:?}"), "Token(…)");
         assert!(!format!("{:?}", Some(token)).contains("supersecret"));
     }

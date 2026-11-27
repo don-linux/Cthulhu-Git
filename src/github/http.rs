@@ -10,7 +10,7 @@ use ureq::http::Uri;
 
 use super::token::Token;
 
-pub const USER_AGENT: &str = concat!("cthulhu-git/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("cthulhu-git/", env!("CARGO_PKG_VERSION"));
 /// Avatars are a few kilobytes and a page of 100 commits well under a megabyte.
 pub const MAX_BODY: u64 = 2 * 1024 * 1024;
 pub const API_HOST: &str = "api.github.com";
@@ -235,7 +235,7 @@ mod tests {
     use crate::test_support::{FakeTransport, auth_value};
 
     fn token() -> Token {
-        Token::new("ghp_test_token_value_0123456789")
+        Token::parse("ghp_test_token_value_0123456789").expect("token")
     }
 
     /// Every request went to an allowed host, and the token went with

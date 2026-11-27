@@ -111,12 +111,8 @@ impl AvatarResolver {
         &self.status
     }
 
-    /// URLs to try in order. May block on the GitHub API; `now` is Unix seconds.
-    pub fn candidates(&mut self, query: &AvatarQuery<'_>, now: u64) -> Vec<String> {
-        self.resolve(query, now).urls
-    }
-
-    /// [`Self::candidates`], with whether the answer may improve later.
+    /// URLs to try in order, and whether the answer may improve later. May
+    /// block on the GitHub API; `now` is Unix seconds.
     pub fn resolve(&mut self, query: &AvatarQuery<'_>, now: u64) -> Candidates {
         let mut urls = Vec::new();
         let mut push = |url: String| {
@@ -399,7 +395,7 @@ mod tests {
             authored: Some("aaa111"),
         };
         assert_eq!(
-            resolver.candidates(&query, NOW)[0],
+            resolver.resolve(&query, NOW).urls[0],
             "https://avatars.githubusercontent.com/u/194445529?v=4&s=96"
         );
         // GitHub already said this address has no account: no second request.
@@ -609,7 +605,7 @@ mod tests {
             Some(40)
         );
 
-        let fresh = Token::new("ghp_brand_new_token_value_012345");
+        let fresh = Token::parse("ghp_brand_new_token_value_012345").expect("token");
         resolver.set_token(Some(fresh.clone()));
         assert_eq!(resolver.status(), &ApiStatus::default());
         fake.reply(
@@ -644,7 +640,8 @@ mod tests {
         let fake = Arc::new(FakeTransport::default());
         fake.reply(&list_url(100, Some("aaa111")), 401, &[], b"{}");
         let mut resolver = resolver(&fake);
-        resolver.set_token(Some(Token::new("ghp_revoked_token_0000000000")));
+        let revoked = Token::parse("ghp_revoked_token_0000000000").expect("token");
+        resolver.set_token(Some(revoked));
         ask(&mut resolver, "someone@example.com", None, NOW);
         assert!(resolver.status().token_rejected);
         let requests = fake.requests.lock().expect("requests");

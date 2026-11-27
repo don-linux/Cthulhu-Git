@@ -50,7 +50,7 @@ pub fn github_repo(remotes: &[Remote]) -> Option<GitHubRepo> {
 /// `https://github.com/o/r(.git)`, `git@github.com:o/r(.git)` and
 /// `ssh://git@github.com/o/r(.git)`. A user name, the default port, `www.`
 /// and a trailing slash are accepted.
-pub fn parse_github_url(url: &str) -> Option<GitHubRepo> {
+fn parse_github_url(url: &str) -> Option<GitHubRepo> {
     let url = url.trim();
     let path = if let Some(rest) = strip_prefix_ignore_case(url, "https://") {
         let (authority, path) = rest.split_once('/')?;
