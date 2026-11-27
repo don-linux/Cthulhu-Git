@@ -3,7 +3,7 @@
 //! Fixtures shell out to the system git. Author identity is set on those
 //! commands only, so the test process environment stays untouched.
 
-#[path = "common/mod.rs"]
+#[path = "it/support.rs"]
 mod common;
 
 use std::ffi::OsStr;

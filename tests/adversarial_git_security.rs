@@ -9,7 +9,7 @@
 
 #![cfg(unix)]
 
-#[path = "common/mod.rs"]
+#[path = "it/support.rs"]
 mod common;
 
 use std::env;

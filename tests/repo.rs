@@ -1,6 +1,6 @@
 //! `inspect` against real temporary repositories and the system git.
 
-#[path = "common/mod.rs"]
+#[path = "it/support.rs"]
 mod common;
 
 use std::fs;

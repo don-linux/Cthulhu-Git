@@ -7,7 +7,7 @@
 //! relative-override cases re-exec a child when they must `chdir`.
 #![cfg(unix)]
 
-#[path = "common/mod.rs"]
+#[path = "it/support.rs"]
 mod common;
 
 use std::env;

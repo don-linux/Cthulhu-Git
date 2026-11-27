@@ -13,7 +13,7 @@
 //! graph is a second worker and is not part of that wait; a load still in
 //! flight keeps repainting, so the graph cases wait on that separately.
 
-#[path = "../../tests/common/mod.rs"]
+#[path = "../../tests/it/support.rs"]
 mod harness;
 
 use std::cell::RefCell;

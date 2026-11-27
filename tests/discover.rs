@@ -5,6 +5,7 @@
 //! rename, so no process ever runs it while it is open for writing (`ETXTBSY`).
 #![cfg(unix)]
 
+#[path = "it/support.rs"]
 mod common;
 
 use std::env;

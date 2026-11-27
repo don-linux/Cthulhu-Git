@@ -11,6 +11,7 @@
 
 #![cfg(unix)]
 
+#[path = "it/support.rs"]
 mod common;
 
 use std::env;
