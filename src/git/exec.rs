@@ -561,18 +561,18 @@ fn capture(
     let status = loop {
         if past_cap(&slots) {
             // Stop git now instead of waiting for it to write the rest.
-            stop_group(pid, &mut child);
+            stop_running(&mut child);
             return Err(output_limit(command_name));
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() >= timeout => {
-                stop_group(pid, &mut child);
+                stop_running(&mut child);
                 return Err(timed_out(command_name, timeout));
             }
             Ok(None) => {}
             Err(error) => {
-                stop_group(pid, &mut child);
+                stop_running(&mut child);
                 return Err(GitError::Spawn(error));
             }
         }
@@ -583,15 +583,14 @@ fn capture(
         }
     };
 
-    // git has exited, but a grandchild can still hold a pipe. Give the
-    // readers a moment, stop the tree, and give them one more.
+    // git has exited, but a helper left in its group can still hold a pipe.
+    // Give the readers a moment, stop the group, and give them one more.
     let mut stopped = false;
     while slots.iter().any(Option::is_none) {
         match rx.recv_timeout(READER_BUDGET) {
             Ok((slot, drained)) => slots[slot] = Some(drained),
             Err(_) if !stopped => {
-                // `setsid` may have moved that grandchild out of git's group.
-                super::reap::reap_process_tree(pid);
+                stop_leftovers(pid);
                 stopped = true;
             }
             Err(_) => break,
@@ -607,25 +606,25 @@ fn capture(
             status,
         }),
         (Err(error), _) | (_, Err(error)) => {
-            // The child already exited. A grandchild may still hold a pipe.
-            stop_group(pid, &mut child);
+            // A helper left in git's group may still hold a pipe.
+            stop_leftovers(pid);
             Err(GitError::Spawn(error))
         }
         _ => {
-            stop_group(pid, &mut child);
+            stop_leftovers(pid);
             Err(output_limit(command_name))
         }
     }
 }
 
-/// Kill the child's process group, including a `setsid` grandchild, then
-/// briefly `try_wait` the direct child. `wait` is not used: a process stuck
-/// in uninterruptible I/O would pin the caller, which is the stall this
-/// timeout exists to bound.
-fn stop_group(pid: u32, child: &mut Child) {
+/// While git has not been reaped: kill it, its descendants (a `setsid`
+/// grandchild included) and its process group, then briefly `try_wait` the
+/// direct child. `wait` is not used: a process stuck in uninterruptible I/O
+/// would pin the caller, which is the stall this timeout exists to bound.
+fn stop_running(child: &mut Child) {
     #[cfg(unix)]
     {
-        super::reap::reap_process_tree(pid);
+        super::reap::reap_process_tree(child.id());
     }
     #[cfg(not(unix))]
     {
@@ -633,9 +632,23 @@ fn stop_group(pid: u32, child: &mut Child) {
         // child only; grandchildren are not killed. Job Objects would, and
         // they need unsafe, which this crate forbids. This module has no
         // Windows kill helper to shell out to.
-        let _ = (pid, child.kill());
+        let _ = child.kill();
     }
     reap(child, Duration::from_millis(50));
+}
+
+/// After git has exited and been reaped: kill what is left in its process
+/// group. A `setsid` grandchild was reparented when git exited and is out of
+/// reach. Windows has no group to stop.
+fn stop_leftovers(pid: u32) {
+    #[cfg(unix)]
+    {
+        super::reap::kill_group(pid);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
 }
 
 fn reap(child: &mut Child, budget: Duration) {

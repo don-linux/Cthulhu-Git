@@ -11,6 +11,7 @@ mod exec;
 mod glance;
 mod graph;
 mod log;
+#[cfg(unix)]
 mod reap;
 mod remotes;
 mod repo;
@@ -31,6 +32,7 @@ pub use log::{
     CommitDetail, CommitFile, CommitHover, CommitStats, DiffKind, DiffLine, FileDiff, Person,
     SHORT_OID_LEN, commit_hover, email_key, file_diff, latest_commit, parse_co_authors, short_oid,
 };
+#[cfg(unix)]
 pub use reap::reap_process_tree;
 pub use remotes::{Remote, remotes};
 pub use repo::{Head, RepoInfo, inspect};
