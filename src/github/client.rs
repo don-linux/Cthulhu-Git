@@ -180,14 +180,9 @@ pub(crate) fn commit_accounts(
     Ok((accounts, limit))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GitHubUser {
     pub login: String,
-}
-
-#[derive(Deserialize)]
-struct UserBody {
-    login: String,
 }
 
 /// `GET /user`: who the token belongs to, and how much of the limit is left.
@@ -198,8 +193,8 @@ pub fn authenticated_user(
 ) -> Result<(GitHubUser, RateLimit), ApiError> {
     let response = http::get(transport, "https://api.github.com/user", Some(token))?;
     let limit = check(&response, now)?;
-    let body: UserBody = serde_json::from_slice(&response.body).map_err(|_| ApiError::Malformed)?;
-    Ok((GitHubUser { login: body.login }, limit))
+    let user = serde_json::from_slice(&response.body).map_err(|_| ApiError::Malformed)?;
+    Ok((user, limit))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
