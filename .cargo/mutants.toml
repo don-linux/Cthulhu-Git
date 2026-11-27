@@ -4,7 +4,12 @@
 # .config/nextest.toml; this file's own `profile` key is a Cargo build profile.
 test_tool = "nextest"
 additional_cargo_test_args = ["--profile", "mutants"]
+# Never mutate the code that picks which processes to kill. A mutant there can
+# widen the victim set to every process of the user: `is_descendant -> true`
+# made `reap_process_tree` SIGKILL the whole desktop session. Its unit tests
+# still run; only the mutation run skips it.
 exclude_globs = [
+    "src/git/reap.rs",
     "src/main.rs",
     "src/ui/theme/**",
     "src/ui/icons.rs",
@@ -12,4 +17,8 @@ exclude_globs = [
     "src/**/*_tests.rs",
     "src/**/test_support.rs",
 ]
-exclude_re = ["impl (Debug|Display)"]
+exclude_re = [
+    "impl (Debug|Display)",
+    # The terminal's session kill, for the same reason as reap.rs above.
+    "\\b(should_signal|stop_session|signal_pid|pty_pid|session_of|session_of_ps|session_from_stat|processes_in_session|kill_process_tree)\\b",
+]

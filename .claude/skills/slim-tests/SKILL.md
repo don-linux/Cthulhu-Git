@@ -15,11 +15,22 @@ cargo nextest run                       # must be green first
 cargo llvm-cov --html --ignore-filename-regex '(_tests|test_support)\.rs$' \
   --output-dir target/cov-base
 cargo mutants --list -f <file> | wc -l  # size the mutation run
-cargo mutants -f <file> -j2 -o target/mut-base
+cargo mutants -f <file> -o target/mut-base
 ```
 
 `cargo mutants` reports per mutant (caught / missed / timeout), not which test
 killed it, so compare whole runs.
+
+Mutants of process-kill code can signal every process of the user and end
+the desktop session. `.cargo/mutants.toml` excludes `src/git/reap.rs` and the
+terminal's session kill; keep any new kill path out of mutation runs the same
+way. On Linux, also run each test binary in its own PID namespace, so a mutant
+that kills "everything" only reaches its own test:
+
+```bash
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="bwrap --die-with-parent \
+  --unshare-pid --dev-bind / / --proc /proc" cargo mutants -f <file> ...
+```
 
 cargo-mutants copies the tree to `$TMPDIR`. Keep that directory outside any
 git repository (never under `target/`): the fixtures assume no repository
@@ -39,7 +50,7 @@ above their temp dirs, and git would otherwise find this one.
 ```bash
 cargo nextest run
 cargo llvm-cov --html ... --output-dir target/cov-new   # covered prod lines must not drop
-cargo mutants -f <file> -j2 -o target/mut-new
+cargo mutants -f <file> -o target/mut-new
 comm -23 <(sort target/mut-base/mutants.out/caught.txt) \
          <(sort target/mut-new/mutants.out/caught.txt)        # must be empty
 ```
