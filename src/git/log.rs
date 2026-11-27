@@ -612,16 +612,16 @@ pub fn file_diff(git: &Git, root: &Path, oid: &str, path: &str) -> Result<FileDi
 /// Turns one `git show -p` into lines. The `diff --git` preamble is dropped.
 /// A binary file, a submodule, or a mode-only change becomes `notice` and no lines.
 pub(crate) fn parse_file_diff(text: &str) -> FileDiff {
-    if text
-        .lines()
+    // Only the header before the first hunk describes the file. Hunk lines
+    // are file content and can contain anything.
+    let mut header = text.lines().take_while(|line| hunk_starts(line).is_none());
+    if header
+        .clone()
         .any(|line| line.starts_with("Binary files ") || line.starts_with("GIT binary patch"))
     {
         return noticed(NOTICE_BINARY);
     }
-    if text
-        .lines()
-        .any(|line| line.contains("Subproject commit") || line.contains(" 160000"))
-    {
+    if header.any(is_gitlink_header) {
         return noticed(NOTICE_SUBMODULE);
     }
 
@@ -709,6 +709,21 @@ pub(crate) fn parse_file_diff(text: &str) -> FileDiff {
         lines,
         columns,
     }
+}
+
+/// `index a..b 160000`, `new file mode 160000`, and the other mode lines of a
+/// submodule (gitlink) entry.
+fn is_gitlink_header(line: &str) -> bool {
+    [
+        "index ",
+        "new file mode ",
+        "deleted file mode ",
+        "old mode ",
+        "new mode ",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+        && line.ends_with(" 160000")
 }
 
 fn noticed(notice: &str) -> FileDiff {
@@ -1267,6 +1282,20 @@ mod tests {
             parse_file_diff("diff --git a/x b/x\n").notice.as_deref(),
             Some("No line changes.")
         );
+        assert_eq!(
+            parse_file_diff(
+                "new file mode 160000\nindex 0000000..abc\n@@ -0,0 +1 @@\n+Subproject commit abc\n"
+            )
+            .notice
+            .as_deref(),
+            Some("Submodule update.")
+        );
+        // The markers inside a text file's hunks are content, not a header.
+        let text = parse_file_diff(
+            "diff --git a/price.txt b/price.txt\nindex abc..def 100644\n@@ -1,2 +1,2 @@\n-price 150000\n+price 160000\n Subproject commit is just text here\n",
+        );
+        assert_eq!(text.notice, None);
+        assert_eq!(text.lines.len(), 4, "hunk header and three lines: {text:?}");
     }
 
     #[test]
