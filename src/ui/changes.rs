@@ -104,7 +104,7 @@ pub fn show(
                     ui.set_max_size(Vec2::new(width, height));
                     ui.spacing_mut().item_spacing.y = 8.0;
                     let title = format!("Changes · {}", git::short_oid(&changes.oid));
-                    ui.label(RichText::new(title).strong().size(18.0).color(palette.text));
+                    ui.label(RichText::new(title).strong().size(18.0));
                     let body = ui.available_height();
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
@@ -148,7 +148,7 @@ fn file_row(ui: &mut Ui, palette: &Palette, file: &CommitFile, selected: bool) -
                 .scope(|ui| {
                     ui.set_max_width(path_width);
                     ui.add(
-                        Label::new(RichText::new(heading(file)).color(palette.text))
+                        Label::new(RichText::new(heading(file)))
                             .truncate()
                             .selectable(false),
                     )
@@ -174,7 +174,7 @@ fn heading(file: &CommitFile) -> String {
 
 fn file_counts(ui: &mut Ui, file: &CommitFile, palette: &Palette) {
     if file.is_binary() {
-        ui.label(RichText::new("binary").small().color(palette.text_muted));
+        ui.label(RichText::new("binary").small().weak());
         return;
     }
     if let Some(deletions) = file.deletions.filter(|count| *count > 0) {
@@ -198,11 +198,11 @@ fn diff_pane(ui: &mut Ui, changes: &Changes, diffs: &DiffCache, palette: &Palett
         ui.set_height(height);
         ui.set_width(ui.available_width());
         let (Some(file), Some(key)) = (changes.files.get(changes.selected), &changes.key) else {
-            ui.label(RichText::new("No files.").color(palette.text_muted));
+            ui.label(RichText::new("No files.").weak());
             return;
         };
         ui.add(
-            Label::new(RichText::new(heading(file)).strong().color(palette.text))
+            Label::new(RichText::new(heading(file)).strong())
                 .truncate()
                 .selectable(false),
         );
@@ -213,7 +213,7 @@ fn diff_pane(ui: &mut Ui, changes: &Changes, diffs: &DiffCache, palette: &Palett
                 ui.label(RichText::new(message).color(palette.error));
             }
             Some(Cached::Pending) | None => {
-                ui.label(RichText::new("Loading…").color(palette.text_muted));
+                ui.label(RichText::new("Loading…").weak());
             }
         }
     });
@@ -221,11 +221,11 @@ fn diff_pane(ui: &mut Ui, changes: &Changes, diffs: &DiffCache, palette: &Palett
 
 fn paint_diff(ui: &mut Ui, diff: &FileDiff, palette: &Palette) {
     if let Some(notice) = &diff.notice {
-        ui.label(RichText::new(notice).color(palette.text_muted));
+        ui.label(RichText::new(notice).weak());
         return;
     }
     if diff.lines.is_empty() {
-        ui.label(RichText::new("No line changes.").color(palette.text_muted));
+        ui.label(RichText::new("No line changes.").weak());
         return;
     }
     ui.spacing_mut().item_spacing.y = 0.0;

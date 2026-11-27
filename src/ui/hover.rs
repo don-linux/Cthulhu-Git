@@ -109,22 +109,19 @@ fn card(
         ui.vertical(|ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                ui.label(RichText::new(&author.name).strong().color(palette.text));
+                ui.label(RichText::new(&author.name).strong());
                 email_link(ui, &author.email, palette);
             });
             match (detail, failed) {
                 (Some(hover), _) => {
                     let when = relative_time(clock::now_unix(), hover.authored_unix);
-                    ui.label(
-                        RichText::new(format!("{when} · {}", hover.authored_at))
-                            .color(palette.text_muted),
-                    );
+                    ui.label(RichText::new(format!("{when} · {}", hover.authored_at)).weak());
                 }
                 (None, Some(message)) => {
                     ui.label(RichText::new(message).color(palette.error));
                 }
                 _ => {
-                    ui.label(RichText::new("Loading…").color(palette.text_muted));
+                    ui.label(RichText::new("Loading…").weak());
                 }
             }
         });
@@ -134,13 +131,9 @@ fn card(
         ui.horizontal(|ui| {
             ui.add_space((AUTHOR_AVATAR - CO_AUTHOR_AVATAR) / 2.0);
             avatar(ui, avatars, person, CO_AUTHOR_AVATAR, context, None);
-            ui.label(RichText::new(&person.name).strong().color(palette.text));
+            ui.label(RichText::new(&person.name).strong());
             email_link(ui, &person.email, palette);
-            ui.label(
-                RichText::new("Co-author")
-                    .italics()
-                    .color(palette.text_muted),
-            );
+            ui.label(RichText::new("Co-author").italics().weak());
         });
     }
 
@@ -228,7 +221,7 @@ pub(super) fn email_link(ui: &mut Ui, email: &str, palette: &Palette) {
                 url,
             );
         }
-        None => fitting_label(ui, RichText::new(text).color(palette.text_muted)),
+        None => fitting_label(ui, RichText::new(text).weak()),
     }
 }
 
@@ -279,16 +272,16 @@ pub(super) fn commit_stats_line(ui: &mut Ui, stats: CommitStats, palette: &Palet
         } else {
             format!("{} files changed", stats.files)
         };
-        ui.label(RichText::new(files).color(palette.text));
+        ui.label(RichText::new(files));
         if stats.insertions > 0 {
-            ui.label(RichText::new(", ").color(palette.text_muted));
+            ui.label(RichText::new(", ").weak());
             ui.label(
                 RichText::new(plural(stats.insertions, "insertion", "(+)"))
                     .color(palette.diff_added),
             );
         }
         if stats.deletions > 0 {
-            ui.label(RichText::new(", ").color(palette.text_muted));
+            ui.label(RichText::new(", ").weak());
             ui.label(
                 RichText::new(plural(stats.deletions, "deletion", "(-)"))
                     .color(palette.diff_removed),
@@ -430,7 +423,7 @@ fn line_with_links(
     strong: bool,
 ) {
     let text = |content: &str| {
-        let rich = RichText::new(content).color(palette.text);
+        let rich = RichText::new(content);
         if strong { rich.strong() } else { rich }
     };
     let Some(github) = github else {

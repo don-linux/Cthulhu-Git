@@ -265,14 +265,7 @@ pub fn show(
     } else {
         rows.len().to_string()
     };
-    ui.add(
-        Label::new(
-            RichText::new(format!("Commit history ({count})"))
-                .strong()
-                .color(palette.text),
-        )
-        .truncate(),
-    );
+    ui.add(Label::new(RichText::new(format!("Commit history ({count})")).strong()).truncate());
     ui.add_space(6.0);
     // A reload that has not landed yet keeps the commit the user chose.
     retain_selected(ui.ctx(), selected_commit, rows, loading);
@@ -280,20 +273,14 @@ pub fn show(
     if rows.is_empty() {
         // The column between the sidebars can be narrower than these sentences.
         // Wrap inside it; truncating would drop the line the loading state shows.
-        ui.add(Label::new(text::wrapped(
-            ui,
-            RichText::new(empty).color(palette.text_muted),
-        )));
+        ui.add(Label::new(text::wrapped(ui, RichText::new(empty).weak())));
         return HistoryOutput {
             columns: None,
             reveal_detail: false,
         };
     }
     if graph.truncated {
-        ui.label(
-            RichText::new(format!("Showing the latest {} commits.", rows.len()))
-                .color(palette.text_muted),
-        );
+        ui.label(RichText::new(format!("Showing the latest {} commits.", rows.len())).weak());
         ui.add_space(4.0);
     }
 
@@ -510,13 +497,9 @@ fn header(
                 |ui| {
                     ui.set_clip_rect(title.intersect(rect));
                     ui.add(
-                        Label::new(
-                            RichText::new(column.title())
-                                .strong()
-                                .color(palette.text_muted),
-                        )
-                        .selectable(false)
-                        .truncate(),
+                        Label::new(RichText::new(column.title()).weak())
+                            .selectable(false)
+                            .truncate(),
                     );
                 },
             );
