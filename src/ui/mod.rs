@@ -270,15 +270,13 @@ impl CthulhuApp {
             git_probe: None,
         };
         if let Some(path) = first_open {
-            // The window stays hidden until the first frame is painted.
-            // Finishing this open here means that frame is the repository
-            // chrome, or the home screen with the error. The history graph
-            // follows on the worker and is not part of that wait. A later
-            // open stays on a worker thread: the window is visible then,
-            // and blocking it would freeze the UI.
+            // The window stays hidden until its first frame is painted, so
+            // opening here makes that frame the repository or the home
+            // screen with the error, never a home screen that then flips.
             let result = load(&app.find_git, &path).map_err(|error| error.to_string());
             app.finish_open(ctx, path, result);
         }
+        // Home, with no first open or a failed one, scans from the start.
         if let Screen::Home(scan) = &mut app.screen {
             *scan = HomeScan::start(ctx, &app.find_git, app.settings.recent_repositories.clone());
         }
@@ -330,9 +328,7 @@ impl CthulhuApp {
         }
     }
 
-    /// Chrome runs on a worker thread: blocking the UI thread would freeze the
-    /// window. The history graph is a second worker, started once this open
-    /// has installed the repository.
+    /// On a worker: the window is visible now, and waiting would freeze it.
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
         let find_git = Arc::clone(&self.find_git);
         let worker_path = path.clone();
@@ -354,9 +350,6 @@ impl CthulhuApp {
 
     /// Installs the repository and starts reading its history graph, or goes
     /// Home when opening failed.
-    ///
-    /// The history graph is not part of this result. A later log failure stays
-    /// on the repository screen and keeps `last_repository`.
     fn finish_open(
         &mut self,
         ctx: &egui::Context,
@@ -696,8 +689,8 @@ fn scan_glances(
     }
 }
 
-/// Repository chrome. The history graph is not built here, so a log failure
-/// does not reject the open or forget the repository.
+/// Repository chrome. The history graph is read later, so a log failure
+/// stays on the repository screen and keeps `last_repository`.
 fn load(find_git: &FindGit, path: &Path) -> Result<Refreshed, GitError> {
     reload_repo(&find_git()?, path)
 }
