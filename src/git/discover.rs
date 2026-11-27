@@ -290,162 +290,226 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn inputs(path_dirs: &[&Path], fallbacks: Vec<PathBuf>) -> DiscoverInputs {
+    fn inputs(path_var: Option<OsString>, fallbacks: Vec<PathBuf>) -> DiscoverInputs {
         DiscoverInputs {
             override_path: None,
-            path_var: Some(env::join_paths(path_dirs).expect("joinable PATH")),
+            path_var,
             exe_name: "git",
             fallbacks,
             skip_paths: Vec::new(),
         }
     }
 
-    #[test]
-    fn missing_override_is_reported_before_searching() {
-        let mut inputs = inputs(&[], Vec::new());
-        inputs.override_path = Some("/no/such/cthulhu-git".into());
-        let error = discover_with(&inputs).expect_err("missing override");
-        assert!(
-            matches!(error, GitError::BadOverride(path) if path == Path::new("/no/such/cthulhu-git"))
-        );
+    fn joined(dirs: &[PathBuf]) -> Option<OsString> {
+        Some(env::join_paths(dirs).expect("joinable PATH"))
     }
 
-    #[test]
-    fn override_pointing_to_a_directory_is_rejected() {
-        let dir = TempDir::with_prefix("cthulhu-override-").expect("temp dir");
-        let mut inputs = inputs(&[], Vec::new());
-        inputs.override_path = Some(dir.path().into());
-        let error = discover_with(&inputs).expect_err("directory is not git");
-        assert!(matches!(error, GitError::BadOverride(path) if path == dir.path()));
-    }
-
-    #[test]
-    fn relative_and_empty_path_entries_are_not_searched() {
-        // `/usr/bin` is not absolute on Windows, so the one absolute entry has
-        // to be a path this platform actually treats as absolute.
-        let absolute = if cfg!(windows) {
-            PathBuf::from(r"C:\Program Files\Git\cmd")
-        } else {
-            PathBuf::from("/usr/bin")
-        };
-        let inputs = DiscoverInputs {
-            override_path: None,
-            path_var: Some(
-                env::join_paths([
-                    Path::new("."),
-                    Path::new(""),
-                    Path::new("bin"),
-                    absolute.as_path(),
-                ])
-                .expect("PATH"),
-            ),
-            exe_name: "git",
-            fallbacks: Vec::new(),
-            skip_paths: Vec::new(),
-        };
-        let searched = find_git_in(&inputs).searched;
-        assert_eq!(searched, vec![absolute.join("git")]);
-    }
-
-    #[test]
-    fn duplicate_locations_are_searched_once() {
-        let inputs = inputs(
-            &[Path::new("/opt/a"), Path::new("/opt/a")],
-            vec![PathBuf::from("/opt/a/git")],
-        );
-        assert_eq!(
-            find_git_in(&inputs).searched,
-            vec![PathBuf::from("/opt/a/git")]
-        );
-    }
-
-    #[test]
-    fn not_found_lists_every_searched_location() {
-        let empty = TempDir::with_prefix("cthulhu-empty-").expect("temp dir");
-        let fallback = empty.path().join("fallback").join("git");
-        let error = discover_with(&inputs(&[empty.path()], vec![fallback.clone()]))
-            .expect_err("nothing to find");
-        let GitError::NotFound { tried } = error else {
-            panic!("expected NotFound, got {error:?}");
-        };
-        assert_eq!(tried, vec![empty.path().join("git"), fallback]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn file_without_execute_bit_is_not_a_candidate() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = TempDir::with_prefix("cthulhu-exec-bit-").expect("temp dir");
-        let plain = tmp.path().join("plain");
-        let executable = tmp.path().join("executable");
-        for (dir, mode) in [(&plain, 0o644), (&executable, 0o755)] {
-            fs::create_dir(dir).expect("dir");
-            fs::write(dir.join("git"), "").expect("write");
-            fs::set_permissions(dir.join("git"), fs::Permissions::from_mode(mode)).expect("chmod");
+    fn touch_executable(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("dir");
+        let path = dir.join("git");
+        std::fs::write(&path, b"").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
-
-        let found = find_git_in(&inputs(&[&plain, &executable], Vec::new()));
-        assert_eq!(found.existing, vec![executable.join("git")]);
-        assert_eq!(found.searched.len(), 2);
+        path
     }
 
+    /// An override that is missing or not a file is reported before any
+    /// search.
     #[test]
-    fn linux_fallbacks_are_usr_then_usr_local() {
-        assert_eq!(
-            linux_fallback_paths(),
-            vec![
-                PathBuf::from("/usr/bin/git"),
-                PathBuf::from("/usr/local/bin/git")
-            ]
+    fn a_bad_override_is_reported_before_searching() {
+        let dir = TempDir::with_prefix("cthulhu-override-").expect("temp dir");
+        for requested in [Path::new("/no/such/cthulhu-git"), dir.path()] {
+            let mut inputs = inputs(None, Vec::new());
+            inputs.override_path = Some(requested.into());
+            let error = discover_with(&inputs).expect_err("not a git");
+            assert!(
+                matches!(&error, GitError::BadOverride(path) if path == requested),
+                "{requested:?}: {error:?}"
+            );
+        }
+    }
+
+    /// PATH entries and fallbacks, with what is searched and what is found.
+    #[test]
+    fn path_search_table() {
+        let tmp = TempDir::with_prefix("cthulhu-search-").expect("temp dir");
+        let root = tmp.path();
+        let found = touch_executable(&root.join("found"));
+        let spaced = touch_executable(&root.join("Program Files"));
+        let fallback = touch_executable(&root.join("fallback"));
+        let missing = root.join("missing").join("git");
+        let dir = |path: &Path| path.parent().expect("dir").to_path_buf();
+
+        let cases = vec![
+            (
+                "relative and empty entries would resolve in the repository",
+                inputs(
+                    joined(&[".".into(), "".into(), "bin".into(), dir(&missing)]),
+                    Vec::new(),
+                ),
+                vec![missing.clone()],
+                vec![],
+            ),
+            (
+                "a location is searched once",
+                inputs(joined(&[dir(&found), dir(&found)]), vec![found.clone()]),
+                vec![found.clone()],
+                vec![found.clone()],
+            ),
+            (
+                "a quoted absolute entry is unquoted",
+                inputs(
+                    Some(format!("\"{}\"", dir(&spaced).display()).into()),
+                    Vec::new(),
+                ),
+                vec![spaced.clone()],
+                vec![spaced.clone()],
+            ),
+            (
+                "a quoted relative entry is still relative",
+                inputs(Some("\"bin\"".into()), Vec::new()),
+                vec![],
+                vec![],
+            ),
+            (
+                "a skipped PATH entry is not searched, a fallback still is",
+                DiscoverInputs {
+                    skip_paths: vec![found.clone()],
+                    ..inputs(joined(&[dir(&found)]), vec![fallback.clone()])
+                },
+                vec![fallback.clone()],
+                vec![fallback.clone()],
+            ),
+            (
+                "a fallback may name a skipped path",
+                DiscoverInputs {
+                    skip_paths: vec![found.clone()],
+                    ..inputs(None, vec![found.clone()])
+                },
+                vec![found.clone()],
+                vec![found.clone()],
+            ),
+        ];
+        #[cfg(unix)]
+        let cases = {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+
+            let mut cases = cases;
+            let plain = touch_executable(&root.join("plain"));
+            std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+            cases.push((
+                "a file without the execute bit is no candidate",
+                inputs(joined(&[dir(&plain), dir(&found)]), Vec::new()),
+                vec![plain, found.clone()],
+                vec![found.clone()],
+            ));
+            let link = root.join("link");
+            std::fs::create_dir(&link).expect("link dir");
+            symlink(&found, link.join("git")).expect("symlink");
+            cases.push((
+                "a symlink to a skipped git is skipped",
+                DiscoverInputs {
+                    skip_paths: vec![found.clone()],
+                    ..inputs(joined(&[link]), Vec::new())
+                },
+                vec![],
+                vec![],
+            ));
+            cases
+        };
+        for (case, inputs, searched, existing) in cases {
+            let candidates = find_git_in(&inputs);
+            assert_eq!(candidates.searched, searched, "{case}");
+            assert_eq!(candidates.existing, existing, "{case}");
+        }
+        let error = discover_with(&inputs(joined(&[dir(&missing)]), Vec::new()))
+            .expect_err("nothing to find");
+        assert!(
+            matches!(&error, GitError::NotFound { tried } if *tried == [missing.clone()]),
+            "{error:?}"
         );
     }
 
     #[test]
-    fn macos_fallbacks_skip_the_xcode_stub_without_a_developer_git() {
-        let paths = macos_fallback_paths(|_| false);
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from(MACOS_HOMEBREW_GIT),
-                PathBuf::from(MACOS_USR_LOCAL_GIT),
-                PathBuf::from(MACOS_MACPORTS_GIT),
-            ]
-        );
-        assert!(!paths.iter().any(|path| path == Path::new(MACOS_SHIM_GIT)));
-    }
-
-    #[test]
-    fn macos_fallbacks_keep_homebrew_ahead_of_the_stub_when_clt_exists() {
-        let clt = Path::new(MACOS_CLT_GIT);
-        let paths = macos_fallback_paths(|path| path == clt);
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from(MACOS_HOMEBREW_GIT),
-                PathBuf::from(MACOS_USR_LOCAL_GIT),
-                PathBuf::from(MACOS_MACPORTS_GIT),
-                PathBuf::from(MACOS_CLT_GIT),
-                PathBuf::from(MACOS_SHIM_GIT),
-            ]
-        );
-    }
-
-    #[test]
-    fn macos_fallbacks_include_xcode_git_only_when_that_file_exists() {
-        let xcode = Path::new(MACOS_XCODE_GIT);
-        let paths = macos_fallback_paths(|path| path == xcode);
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from(MACOS_HOMEBREW_GIT),
-                PathBuf::from(MACOS_USR_LOCAL_GIT),
-                PathBuf::from(MACOS_MACPORTS_GIT),
-                PathBuf::from(MACOS_XCODE_GIT),
-                PathBuf::from(MACOS_SHIM_GIT),
-            ]
-        );
+    fn fallback_order_per_platform() {
+        let paths = |list: &[&str]| list.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let only = |wanted: &'static str| move |path: &Path| path == Path::new(wanted);
+        let base = |name: &str| {
+            let root = if cfg!(windows) { r"C:\" } else { "/" };
+            PathBuf::from(root).join(name)
+        };
+        let windows = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(key, tail)| base(key).join(tail))
+                .collect::<Vec<_>>()
+        };
+        let cases = [
+            (
+                "linux: /usr/bin first",
+                linux_fallback_paths(),
+                paths(&["/usr/bin/git", "/usr/local/bin/git"]),
+            ),
+            (
+                "macos: no xcode stub without a developer git",
+                macos_fallback_paths(|_| false),
+                paths(&[MACOS_HOMEBREW_GIT, MACOS_USR_LOCAL_GIT, MACOS_MACPORTS_GIT]),
+            ),
+            (
+                "macos: homebrew ahead of the command line tools and the stub",
+                macos_fallback_paths(only(MACOS_CLT_GIT)),
+                paths(&[
+                    MACOS_HOMEBREW_GIT,
+                    MACOS_USR_LOCAL_GIT,
+                    MACOS_MACPORTS_GIT,
+                    MACOS_CLT_GIT,
+                    MACOS_SHIM_GIT,
+                ]),
+            ),
+            (
+                "macos: xcode's git only when that file exists",
+                macos_fallback_paths(only(MACOS_XCODE_GIT)),
+                paths(&[
+                    MACOS_HOMEBREW_GIT,
+                    MACOS_USR_LOCAL_GIT,
+                    MACOS_MACPORTS_GIT,
+                    MACOS_XCODE_GIT,
+                    MACOS_SHIM_GIT,
+                ]),
+            ),
+            (
+                "windows: every install location, in order",
+                windows_fallback_paths(|key| Some(base(key).into_os_string())),
+                windows(&[
+                    ("ProgramFiles", r"Git\cmd\git.exe"),
+                    ("ProgramFiles", r"Git\bin\git.exe"),
+                    ("ProgramFiles(x86)", r"Git\cmd\git.exe"),
+                    ("LOCALAPPDATA", r"Programs\Git\cmd\git.exe"),
+                    ("USERPROFILE", r"scoop\shims\git.exe"),
+                    ("ProgramW6432", r"Git\cmd\git.exe"),
+                    ("ProgramData", r"chocolatey\bin\git.exe"),
+                ]),
+            ),
+            (
+                "windows: unset and relative bases are skipped",
+                windows_fallback_paths(|key| match key {
+                    "ProgramW6432" | "ProgramData" => Some(base(key).into_os_string()),
+                    "ProgramFiles" => Some(OsString::from("not-absolute")),
+                    _ => None,
+                }),
+                windows(&[
+                    ("ProgramW6432", r"Git\cmd\git.exe"),
+                    ("ProgramData", r"chocolatey\bin\git.exe"),
+                ]),
+            ),
+        ];
+        for (case, got, expected) in cases {
+            assert_eq!(got, expected, "{case}");
+        }
     }
 
     #[test]
@@ -456,153 +520,6 @@ mod tests {
         } else {
             assert!(skips.is_empty(), "{skips:?}");
         }
-    }
-
-    fn touch_executable(dir: &Path, name: &str) -> PathBuf {
-        use std::fs;
-        fs::create_dir_all(dir).expect("dir");
-        let path = dir.join(name);
-        fs::write(&path, b"").expect("write");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
-        }
-        path
-    }
-
-    #[test]
-    fn skip_paths_drop_a_path_candidate_and_keep_fallbacks() {
-        let tmp = TempDir::with_prefix("cthulhu-skip-").expect("temp dir");
-        let shim_dir = tmp.path().join("usr").join("bin");
-        let shim = touch_executable(&shim_dir, "git");
-        let fallback_dir = tmp.path().join("opt").join("homebrew").join("bin");
-        let fallback = touch_executable(&fallback_dir, "git");
-
-        let mut skipped = inputs(&[&shim_dir], vec![fallback.clone()]);
-        skipped.skip_paths = vec![shim.clone()];
-        let found = find_git_in(&skipped);
-        assert_eq!(found.existing, vec![fallback.clone()]);
-        assert!(
-            !found.searched.iter().any(|path| path == &shim),
-            "skipped PATH entry was still searched: {:?}",
-            found.searched
-        );
-
-        let kept = DiscoverInputs {
-            override_path: None,
-            path_var: None,
-            exe_name: "git",
-            fallbacks: vec![shim.clone()],
-            skip_paths: vec![shim.clone()],
-        };
-        assert_eq!(
-            find_git_in(&kept).existing,
-            vec![shim],
-            "fallbacks must still be able to name the shim"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn skip_paths_match_a_symlink_to_the_canonical_file() {
-        use std::os::unix::fs::symlink;
-
-        let tmp = TempDir::with_prefix("cthulhu-skip-link-").expect("temp dir");
-        let real_dir = tmp.path().join("real");
-        let real = touch_executable(&real_dir, "git");
-        let link_dir = tmp.path().join("link");
-        std::fs::create_dir(&link_dir).expect("link dir");
-        let link = link_dir.join("git");
-        symlink(&real, &link).expect("symlink");
-
-        let mut inputs = inputs(&[&link_dir], Vec::new());
-        inputs.skip_paths = vec![real];
-        let found = find_git_in(&inputs);
-        assert!(
-            found.existing.is_empty(),
-            "symlink to a skipped git was a candidate: {:?}",
-            found.existing
-        );
-        assert!(found.searched.is_empty(), "{:?}", found.searched);
-    }
-
-    #[test]
-    fn quoted_absolute_path_entry_is_unquoted_and_searched() {
-        let tmp = TempDir::with_prefix("cthulhu-quoted-").expect("temp dir");
-        let dir = tmp.path().join("Program Files");
-        let git = touch_executable(&dir, "git");
-        let quoted = format!("\"{}\"", dir.display());
-        assert!(!Path::new(&quoted).is_absolute());
-
-        let inputs = DiscoverInputs {
-            override_path: None,
-            path_var: Some(OsString::from(quoted)),
-            exe_name: "git",
-            fallbacks: Vec::new(),
-            skip_paths: Vec::new(),
-        };
-        assert_eq!(find_git_in(&inputs).existing, vec![git]);
-    }
-
-    #[test]
-    fn quoted_relative_path_entry_is_not_searched() {
-        let inputs = DiscoverInputs {
-            override_path: None,
-            path_var: Some(OsString::from("\"bin\"")),
-            exe_name: "git",
-            fallbacks: Vec::new(),
-            skip_paths: Vec::new(),
-        };
-        assert!(find_git_in(&inputs).searched.is_empty());
-    }
-
-    #[test]
-    fn windows_fallbacks_add_program_w6432_and_chocolatey_for_absolute_bases() {
-        let base = |name: &str| {
-            if cfg!(windows) {
-                PathBuf::from(r"C:\").join(name)
-            } else {
-                PathBuf::from("/").join(name)
-            }
-        };
-        let program_w6432 = base("ProgramW6432");
-        let program_data = base("ProgramData");
-        let program_files = base("ProgramFiles");
-        let paths = windows_fallback_paths(|key| match key {
-            "ProgramW6432" => Some(program_w6432.clone().into()),
-            "ProgramData" => Some(program_data.clone().into()),
-            "ProgramFiles" => Some(OsString::from("not-absolute")),
-            _ => None,
-        });
-        assert_eq!(
-            paths,
-            vec![
-                program_w6432.join(r"Git\cmd\git.exe"),
-                program_data.join(r"chocolatey\bin\git.exe"),
-            ]
-        );
-
-        let full = windows_fallback_paths(|key| Some(base(key).into_os_string()));
-        assert_eq!(
-            full,
-            [
-                ("ProgramFiles", r"Git\cmd\git.exe"),
-                ("ProgramFiles", r"Git\bin\git.exe"),
-                ("ProgramFiles(x86)", r"Git\cmd\git.exe"),
-                ("LOCALAPPDATA", r"Programs\Git\cmd\git.exe"),
-                ("USERPROFILE", r"scoop\shims\git.exe"),
-                ("ProgramW6432", r"Git\cmd\git.exe"),
-                ("ProgramData", r"chocolatey\bin\git.exe"),
-            ]
-            .into_iter()
-            .map(|(key, tail)| base(key).join(tail))
-            .collect::<Vec<_>>()
-        );
-        assert!(
-            full.iter().any(|path| path.starts_with(&program_files)),
-            "ProgramFiles must stay in the table: {full:?}"
-        );
     }
 
     #[cfg(windows)]
