@@ -7,14 +7,16 @@ Map of the theme logic. Update this file when you change it.
 ```text
 settings.json "theme": "dark"
   -> theme::resolve(id)          unknown or missing id -> DEFAULT_THEME
-  -> theme::apply(ctx, theme)    palette -> egui Visuals; theme stored in the egui context
+  -> theme::apply(ctx, theme)    palette -> egui Visuals, plus the shared spacing and
+                                 corner radii; theme stored in the egui context
   -> views: theme::current(ui.ctx()).palette.<role>
 ```
 
 A theme is only data: a `Palette` of named color roles. `apply` is the only
-code that touches `egui::Visuals`. Views do not pick theme colors with
-`Color32` literals; `Color32::PLACEHOLDER`, `Color32::TRANSPARENT`, the white
-tint of an avatar texture and the terminal's ANSI colors are the exceptions.
+code that touches `egui::Visuals` and egui's spacing. Views do not pick theme
+colors with `Color32` literals; `Color32::PLACEHOLDER`, `Color32::TRANSPARENT`,
+the white tint of an avatar texture and the terminal's ANSI colors are the
+exceptions.
 
 ## Where things are
 
@@ -26,7 +28,8 @@ tint of an avatar texture and the terminal's ANSI colors are the exceptions.
 | `src/ui/theme/mod.rs` | `DEFAULT_THEME` | Used when settings have no theme or an unknown id |
 | `src/ui/theme/mod.rs` | `by_id`, `resolve` | Id lookup, with fallback to the default |
 | `src/ui/theme/mod.rs` | `apply` | Activates a theme; pins egui to the theme's dark/light base (ignores the OS preference) |
-| `src/ui/theme/mod.rs` | `visuals` | The palette-to-egui mapping (widgets, panels, selection, strokes) |
+| `src/ui/theme/mod.rs` | `BUTTON_PADDING`, `INTERACT_SIZE` | Spacing every theme shares, set by `apply`: icon buttons and the bars size themselves from the padding, checkbox and list rows from the interact height |
+| `src/ui/theme/mod.rs` | `visuals` | The palette-to-egui mapping (widgets, panels, selection, strokes), and the small corner radii of egui's own widgets (checkboxes, text fields, hover frames) |
 | `src/ui/theme/mod.rs` | `current` | The active theme, for views |
 | `src/ui/theme/dark.rs` | `THEME` | The dark theme (the only one today) |
 | `src/ui/mod.rs` | `CthulhuApp::new` | Applies the saved theme at startup |

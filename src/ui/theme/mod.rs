@@ -1,10 +1,10 @@
 //! Color themes. A theme is only data (a [`Palette`]); [`apply`] is the one
-//! place that turns it into egui visuals. The map for changing this module
-//! is `docs/THEMES.md`.
+//! place that turns it into egui visuals, and that sets the spacing every
+//! theme shares. The map for changing this module is `docs/THEMES.md`.
 
 mod dark;
 
-use eframe::egui::{self, Color32, Context, Id, Stroke, Visuals};
+use eframe::egui::{self, Color32, Context, CornerRadius, Id, Stroke, Vec2, Visuals, vec2};
 
 /// How many distinct lane colors a theme provides. Extra lanes cycle through them.
 /// This is the git layer's count, so the palette and the assignment cannot diverge.
@@ -82,6 +82,13 @@ fn storage_id() -> Id {
     Id::unique("cthulhu-git-theme")
 }
 
+/// The views are laid out around this padding: icon buttons, the bars that
+/// hold them and Fetch and Pull size themselves from it.
+const BUTTON_PADDING: Vec2 = vec2(4.0, 1.0);
+
+/// Checkbox, branch and settings rows take their height from this.
+const INTERACT_SIZE: Vec2 = vec2(40.0, 18.0);
+
 /// Makes `theme` the active one. The OS light/dark preference is ignored:
 /// the theme decides.
 pub fn apply(ctx: &Context, theme: &'static Theme) {
@@ -92,6 +99,10 @@ pub fn apply(ctx: &Context, theme: &'static Theme) {
     };
     ctx.set_theme(base);
     ctx.set_visuals_of(base, visuals(theme));
+    ctx.all_styles_mut(|style| {
+        style.spacing.button_padding = BUTTON_PADDING;
+        style.spacing.interact_size = INTERACT_SIZE;
+    });
     ctx.data_mut(|data| data.insert_temp(storage_id(), theme));
 }
 
@@ -136,6 +147,14 @@ fn visuals(theme: &Theme) -> Visuals {
     widgets.open.weak_bg_fill = palette.surface_active;
     widgets.open.bg_stroke = Stroke::new(1.0, palette.border);
     widgets.open.fg_stroke = text;
+
+    // Checkboxes, text fields and hover frames keep tight corners. The app's
+    // own cards and buttons round theirs with `widgets::CORNER_RADIUS`.
+    widgets.noninteractive.corner_radius = CornerRadius::same(2);
+    widgets.inactive.corner_radius = CornerRadius::same(2);
+    widgets.hovered.corner_radius = CornerRadius::same(3);
+    widgets.active.corner_radius = CornerRadius::same(2);
+    widgets.open.corner_radius = CornerRadius::same(2);
 
     visuals.selection.bg_fill = palette.selection;
     visuals.selection.stroke = Stroke::new(1.0, palette.accent);
