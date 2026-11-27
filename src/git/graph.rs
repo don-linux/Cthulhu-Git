@@ -999,7 +999,7 @@ mod tests {
         tip
     }
 
-    /// A tip: name, commit, color, checked out. The first one is principal.
+    /// A tip: name, commit, color, checked out. `main` is principal.
     type LaneTip = (&'static str, &'static str, usize, bool);
 
     /// One row: commit, labels as `name:color` (`*` when checked out),
@@ -1225,6 +1225,56 @@ mod tests {
                 ("base", "", 0, 0, "0>.:0 1>.:2"),
             ],
         ),
+        (
+            "without a principal no lane is held open",
+            &[("f", &["base"]), ("t", &["base"]), ("base", &[])],
+            &[("feature", "f", 1, false), ("topic", "t", 2, false)],
+            2,
+            &[
+                ("f", "feature:1", 0, 1, ".>0:1"),
+                ("t", "topic:2", 1, 2, "0>0:1 .>0:2"),
+                ("base", "", 0, 2, "0>.:2"),
+            ],
+        ),
+        (
+            "tips outside the window hold no lane and get no label",
+            &[("a", &["b"]), ("b", &[])],
+            &[
+                ("main", "gone", 0, false),
+                ("feature", "a", 3, false),
+                ("old", "lost", 5, false),
+            ],
+            1,
+            &[("a", "feature:3", 0, 3, ".>0:3"), ("b", "", 0, 3, "0>.:3")],
+        ),
+        (
+            "a second parent continues the lane when the first is outside the window",
+            &[("tip", &["m"]), ("m", &["missing", "b"]), ("b", &[])],
+            &[("main", "tip", 0, false)],
+            1,
+            &[
+                ("tip", "main:0", 0, 0, ".>0:0"),
+                ("m", "", 0, 0, "0>0:0"),
+                ("b", "", 0, 0, "0>.:0"),
+            ],
+        ),
+        (
+            "a repeated parent is drawn once",
+            &[
+                ("m", &["a", "b", "b", "a"]),
+                ("a", &["c"]),
+                ("b", &["c"]),
+                ("c", &[]),
+            ],
+            &[("main", "m", 0, false)],
+            2,
+            &[
+                ("m", "main:0", 0, 0, ".>0:0 .>1:0"),
+                ("a", "", 0, 0, "0>0:0 1>1:0"),
+                ("b", "", 1, 0, "0>0:0 .>0:0 1>.:0"),
+                ("c", "", 0, 0, "0>.:0"),
+            ],
+        ),
     ];
 
     fn traces(spec: &str) -> Vec<GraphTrace> {
@@ -1259,9 +1309,8 @@ mod tests {
                 .collect();
             let tips: Vec<GraphTip> = tips
                 .iter()
-                .enumerate()
-                .map(|(index, &(name, oid, color, current))| GraphTip {
-                    principal: index == 0,
+                .map(|&(name, oid, color, current)| GraphTip {
+                    principal: name == "main",
                     current,
                     ..tip(name, oid, color)
                 })
