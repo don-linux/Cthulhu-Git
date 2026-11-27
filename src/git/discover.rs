@@ -500,14 +500,22 @@ mod tests {
         }
     }
 
+    /// `/usr/bin/git` is skipped only on macOS, and each platform searches
+    /// its own fallback table.
     #[test]
-    fn from_env_skips_usr_bin_git_only_on_macos() {
-        let skips = DiscoverInputs::from_env().skip_paths;
-        if cfg!(target_os = "macos") {
-            assert_eq!(skips, vec![PathBuf::from(MACOS_SHIM_GIT)]);
+    fn from_env_uses_this_platforms_tables() {
+        let inputs = DiscoverInputs::from_env();
+        let expected = if cfg!(target_os = "macos") {
+            (
+                vec![PathBuf::from(MACOS_SHIM_GIT)],
+                macos_fallback_paths(|path| path.is_file()),
+            )
+        } else if cfg!(windows) {
+            (Vec::new(), windows_fallback_paths(|name| env::var_os(name)))
         } else {
-            assert!(skips.is_empty(), "{skips:?}");
-        }
+            (Vec::new(), linux_fallback_paths())
+        };
+        assert_eq!((inputs.skip_paths, inputs.fallbacks), expected);
     }
 
     #[cfg(windows)]

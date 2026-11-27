@@ -156,21 +156,46 @@ fn output_past_the_cap_is_refused() {
     }
 }
 
-/// Git exits while a grandchild still holds its stdout. The call returns
-/// git's result instead of waiting for the grandchild, which is then stopped.
+/// Git exits while a grandchild still holds its stdout. The call does not
+/// wait for the grandchild. Stopping git's group ends a writer in it, and the
+/// call returns git's result. A writer that left the group with `setsid` is
+/// out of reach, and the call fails instead of returning a partial output.
 #[cfg(unix)]
 #[test]
 fn background_writer_does_not_pin_a_finished_git() {
-    let case = "detached writer";
-    let tmp = temp();
-    let fake = fake_git(&tmp.path().join("git"), "2.43.0", "writer");
-    let git = git_at(fake.clone());
-    let cwd = tmp.path().to_path_buf();
-    let result = within(case, Duration::from_secs(8), move || {
-        git.run(&cwd, &["status"]).map(drop)
-    });
-    result.expect("a git that already exited must return");
-    assert_pid_dead(case, &sidecar(&fake, ".pid"));
+    for (case, mode, in_group) in [
+        ("detached writer", "writer", true),
+        ("setsid writer", "setsid-writer", false),
+    ] {
+        let tmp = temp();
+        let fake = fake_git(&tmp.path().join("git"), "2.43.0", mode);
+        let git = git_at(fake.clone());
+        let cwd = tmp.path().to_path_buf();
+        let result = within(case, Duration::from_secs(8), move || {
+            git.run(&cwd, &["status"]).map(drop)
+        });
+        let pid_file = sidecar(&fake, ".pid");
+        if in_group {
+            assert!(result.is_ok(), "{case:?}: {result:?}");
+            assert_pid_dead(case, &pid_file);
+        } else {
+            assert!(
+                matches!(&result, Err(GitError::Spawn(_))),
+                "{case:?}: {result:?}"
+            );
+            // Nothing of git's reaches it, so the test stops it.
+            let pid: i32 = fs::read_to_string(&pid_file)
+                .expect("pid file")
+                .trim()
+                .parse()
+                .expect("pid");
+            let sleeper = rustix::process::Pid::from_raw(pid).filter(|_| pid > 1);
+            let _ = rustix::process::kill_process(
+                sleeper.expect("a child pid"),
+                rustix::process::Signal::KILL,
+            );
+        }
+    }
 }
 
 #[cfg(unix)]

@@ -1178,6 +1178,9 @@ mod tests {
                 },
             ]
         );
+        // A side that starts at 0 is empty, so a stray line there has no number.
+        let stray = parse_file_diff("@@ -0,0 +0,0 @@\n x\n");
+        assert_eq!((stray.lines[1].old, stray.lines[1].new), (None, None));
     }
 
     #[test]
@@ -1256,6 +1259,8 @@ mod tests {
             (b"\n", Some(0)),
             (b"\nno tabs", None),
             (b"\n1\t0\t\0only-old\0", None),
+            // Digits only: `u64::from_str` alone would take the sign.
+            (b"\n+1\t0\ta\0", None),
         ] {
             let parsed = parse_numstat(numstat).map(|files| files.len());
             assert_eq!(parsed, files, "{numstat:?}");
