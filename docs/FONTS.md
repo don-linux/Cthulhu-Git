@@ -67,6 +67,23 @@ the Regular cut of each family is bundled.
 app. Departure Mono is drawn at 11 pt so its pixels sit on the grid. Meslo
 LGS NF is the face that includes prompt icons.
 
+## Faces egui ships
+
+egui's default fonts (crate `epaint_default_fonts`) are compiled in as well.
+Their license texts are copied unchanged into `assets/fonts/egui/`; update
+them when egui is upgraded.
+
+| Face | Used for | License file |
+| ---- | -------- | ------------ |
+| Hack | hashes, diffs, the `builtin` terminal face | `Hack-Regular.txt` (MIT, Bitstream Vera) |
+| Noto Emoji | emoji fallback | `OFL.txt` (SIL OFL 1.1) |
+| emoji-icon-font | symbol fallback | `emoji-icon-font-mit-license.txt` (MIT) |
+| Ubuntu Light | fallback after Hack for symbols such as `√` | `UFL.txt` (Ubuntu Font Licence 1.0) |
+
+The interface icons in `assets/icons/` (Lucide, ISC; some derived from
+Feather, MIT) are compiled in too; `assets/icons/LICENSE` ships beside the
+font notices.
+
 ## Add a face
 
 1. Put the unmodified Regular file and its license text in a new directory

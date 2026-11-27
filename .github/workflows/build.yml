@@ -121,6 +121,8 @@ jobs:
           cp packaging/linux/cthulhu-git.desktop "dist/$name/share/applications/"
           cp -R target/icons/hicolor "dist/$name/share/icons/"
           stage_font_licenses "dist/$name/share/doc/cthulhu-git/fonts"
+          mkdir -p "dist/$name/share/doc/cthulhu-git/icons"
+          cp assets/icons/LICENSE "dist/$name/share/doc/cthulhu-git/icons/"
           tar czf "dist/$name.tar.gz" -C dist "$name"
           rm -rf "dist/$name"
 
@@ -160,6 +162,8 @@ jobs:
           cp packaging/linux/cthulhu-git.desktop "$appdir/usr/share/applications/"
           cp -R target/icons/hicolor "$appdir/usr/share/icons/"
           stage_font_licenses "$appdir/usr/share/doc/cthulhu-git/fonts"
+          mkdir -p "$appdir/usr/share/doc/cthulhu-git/icons"
+          cp assets/icons/LICENSE "$appdir/usr/share/doc/cthulhu-git/icons/"
           cp target/icons/hicolor/256x256/apps/cthulhu-git.png "$appdir/cthulhu-git.png"
           ln -sfn cthulhu-git.png "$appdir/.DirIcon"
           ln -sfn usr/bin/cthulhu-git "$appdir/AppRun"
@@ -184,12 +188,16 @@ jobs:
           dpkg-deb --contents "$deb" | grep -F 'usr/share/doc/cthulhu-git/fonts/ubuntu/LICENCE.txt'
           test -f /usr/share/doc/cthulhu-git/fonts/FONTS.md
           test -f /usr/share/doc/cthulhu-git/fonts/ubuntu/LICENCE.txt
+          test -f /usr/share/doc/cthulhu-git/fonts/egui/UFL.txt
+          test -f /usr/share/doc/cthulhu-git/icons/LICENSE
 
           rpm -qpi "$rpm"
           rpm -qpR "$rpm"
           rpm -qpl "$rpm" | grep -qx /usr/share/applications/cthulhu-git.desktop
           rpm -qpl "$rpm" | grep -qx /usr/share/doc/cthulhu-git/fonts/FONTS.md
           rpm -qpl "$rpm" | grep -qx /usr/share/doc/cthulhu-git/fonts/ubuntu/LICENCE.txt
+          rpm -qpl "$rpm" | grep -qx /usr/share/doc/cthulhu-git/fonts/egui/UFL.txt
+          rpm -qpl "$rpm" | grep -qx /usr/share/doc/cthulhu-git/icons/LICENSE
 
           cd "$RUNNER_TEMP"
           rm -rf -- "$RUNNER_TEMP/squashfs-root"
@@ -199,6 +207,8 @@ jobs:
           test -f squashfs-root/.DirIcon
           test -f squashfs-root/usr/share/doc/cthulhu-git/fonts/FONTS.md
           test -f squashfs-root/usr/share/doc/cthulhu-git/fonts/ubuntu/LICENCE.txt
+          test -f squashfs-root/usr/share/doc/cthulhu-git/fonts/egui/UFL.txt
+          test -f squashfs-root/usr/share/doc/cthulhu-git/icons/LICENSE
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -311,6 +321,8 @@ jobs:
           mkdir -p "dist/$name"
           cp "target/$TARGET/release/cthulhu-git.exe" README.md LICENSE "dist/$name/"
           stage_font_licenses "dist/$name/fonts"
+          mkdir -p "dist/$name/icons"
+          cp assets/icons/LICENSE "dist/$name/icons/"
           cd dist
           7z a "$name.zip" "$name"
 
@@ -459,6 +471,8 @@ jobs:
           ln -sfn /Applications "$staging/Applications"
           cp README.md LICENSE "$staging/"
           stage_font_licenses "$staging/fonts"
+          mkdir -p "$staging/icons"
+          cp assets/icons/LICENSE "$staging/icons/"
           dmg="dist/cthulhu-git-${LABEL}-macos-universal.dmg"
           hdiutil create -volname "Cthulhu Git" -srcfolder "$staging" -ov -format UDZO "$dmg"
           hdiutil verify "$dmg"

@@ -75,7 +75,7 @@ assets = [
     ["target/icons/hicolor/128x128/apps/cthulhu-git.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
     ["target/icons/hicolor/256x256/apps/cthulhu-git.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["target/icons/hicolor/512x512/apps/cthulhu-git.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
-    # The binaries embed the fonts, so the notices have to ship with the package.
+    # The binary embeds the fonts and the icons, so their notices ship with the package.
     ["docs/FONTS.md", "usr/share/doc/cthulhu-git/fonts/", "644"],
     ["assets/fonts/aspekta/OFL.txt", "usr/share/doc/cthulhu-git/fonts/aspekta/", "644"],
     ["assets/fonts/departure-mono/OFL.txt", "usr/share/doc/cthulhu-git/fonts/departure-mono/", "644"],
@@ -87,6 +87,11 @@ assets = [
     ["assets/fonts/ubuntu/LICENCE.txt", "usr/share/doc/cthulhu-git/fonts/ubuntu/", "644"],
     ["assets/fonts/ubuntu-mono/LICENCE.txt", "usr/share/doc/cthulhu-git/fonts/ubuntu-mono/", "644"],
     ["assets/fonts/ubuntu-sans/LICENCE.txt", "usr/share/doc/cthulhu-git/fonts/ubuntu-sans/", "644"],
+    ["assets/fonts/egui/Hack-Regular.txt", "usr/share/doc/cthulhu-git/fonts/egui/", "644"],
+    ["assets/fonts/egui/OFL.txt", "usr/share/doc/cthulhu-git/fonts/egui/", "644"],
+    ["assets/fonts/egui/UFL.txt", "usr/share/doc/cthulhu-git/fonts/egui/", "644"],
+    ["assets/fonts/egui/emoji-icon-font-mit-license.txt", "usr/share/doc/cthulhu-git/fonts/egui/", "644"],
+    ["assets/icons/LICENSE", "usr/share/doc/cthulhu-git/icons/", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -116,6 +121,11 @@ assets = [
     { source = "assets/fonts/ubuntu/LICENCE.txt", dest = "/usr/share/doc/cthulhu-git/fonts/ubuntu/LICENCE.txt", mode = "644", doc = true },
     { source = "assets/fonts/ubuntu-mono/LICENCE.txt", dest = "/usr/share/doc/cthulhu-git/fonts/ubuntu-mono/LICENCE.txt", mode = "644", doc = true },
     { source = "assets/fonts/ubuntu-sans/LICENCE.txt", dest = "/usr/share/doc/cthulhu-git/fonts/ubuntu-sans/LICENCE.txt", mode = "644", doc = true },
+    { source = "assets/fonts/egui/Hack-Regular.txt", dest = "/usr/share/doc/cthulhu-git/fonts/egui/Hack-Regular.txt", mode = "644", doc = true },
+    { source = "assets/fonts/egui/OFL.txt", dest = "/usr/share/doc/cthulhu-git/fonts/egui/OFL.txt", mode = "644", doc = true },
+    { source = "assets/fonts/egui/UFL.txt", dest = "/usr/share/doc/cthulhu-git/fonts/egui/UFL.txt", mode = "644", doc = true },
+    { source = "assets/fonts/egui/emoji-icon-font-mit-license.txt", dest = "/usr/share/doc/cthulhu-git/fonts/egui/emoji-icon-font-mit-license.txt", mode = "644", doc = true },
+    { source = "assets/icons/LICENSE", dest = "/usr/share/doc/cthulhu-git/icons/LICENSE", mode = "644", doc = true },
 ]
 
 [package.metadata.generate-rpm.requires]
