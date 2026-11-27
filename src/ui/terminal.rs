@@ -200,6 +200,13 @@ fn windows_shell_argv(
     Err("Could not find an absolute PowerShell.".to_owned())
 }
 
+/// alacritty builds the ConPTY command line by pasting the program in
+/// unquoted, and `CreateProcessW` then splits `C:\Program Files\...` at the
+/// space and tries `C:\Program.exe` first. Windows paths cannot contain `"`.
+fn conpty_program(path: &str) -> String {
+    format!("\"{path}\"")
+}
+
 fn windows_join(base: &str, child: &str) -> String {
     let base = base.trim_end_matches(['\\', '/']);
     format!("{base}\\{child}")
@@ -544,8 +551,13 @@ impl ShellSession {
             passwd_shell().as_deref(),
             &unset_refs,
         )?;
+        let program = if cfg!(windows) {
+            conpty_program(&argv.program)
+        } else {
+            argv.program
+        };
         let options = tty::Options {
-            shell: Some(tty::Shell::new(argv.program, argv.args)),
+            shell: Some(tty::Shell::new(program, argv.args)),
             working_directory: Some(cwd.to_path_buf()),
             env: shell_env(),
             ..tty::Options::default()
@@ -2453,6 +2465,10 @@ END
         .expect("pwsh");
         assert_eq!(both.program, pwsh);
         assert_eq!(both.args, ["-NoLogo"]);
+        assert_eq!(
+            conpty_program(&both.program),
+            r#""C:\Program Files\PowerShell\7\pwsh.exe""#
+        );
 
         let second = windows_shell_argv(
             Some(r"C:\Program Files"),
