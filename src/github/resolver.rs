@@ -319,8 +319,8 @@ impl AvatarResolver {
 
 #[cfg(test)]
 mod tests {
-    use super::super::http::fake::FakeTransport;
     use super::*;
+    use crate::test_support::FakeTransport;
 
     const NOW: u64 = 1_800_000_000;
     const LIST: &str = "https://api.github.com/repos/don-linux/Cthulhu-Git/commits";

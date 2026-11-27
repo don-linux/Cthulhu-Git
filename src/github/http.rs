@@ -244,74 +244,28 @@ fn resolve_location(host: &str, location: &str) -> Result<String, HttpError> {
 }
 
 #[cfg(test)]
-pub(crate) mod fake {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    use super::*;
-
-    /// A URL and the headers sent with it.
-    pub type Request = (String, Vec<(String, String)>);
-
-    /// Answers from a table and records every request, headers included.
-    #[derive(Default)]
-    pub struct FakeTransport {
-        pub responses: Mutex<HashMap<String, HttpResponse>>,
-        pub requests: Mutex<Vec<Request>>,
-    }
-
-    impl FakeTransport {
-        pub fn reply(&self, url: &str, status: u16, headers: &[(&str, &str)], body: &[u8]) {
-            self.responses.lock().unwrap().insert(
-                url.to_owned(),
-                HttpResponse {
-                    status,
-                    headers: headers
-                        .iter()
-                        .map(|(name, value)| (name.to_ascii_lowercase(), (*value).to_owned()))
-                        .collect(),
-                    body: body.to_vec(),
-                },
-            );
-        }
-
-        pub fn urls(&self) -> Vec<String> {
-            self.requests
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(url, _)| url.clone())
-                .collect()
-        }
-    }
-
-    impl Transport for FakeTransport {
-        fn get_once(
-            &self,
-            url: &str,
-            headers: &[(&str, String)],
-        ) -> Result<HttpResponse, HttpError> {
-            self.requests.lock().unwrap().push((
-                url.to_owned(),
-                headers
-                    .iter()
-                    .map(|(name, value)| ((*name).to_owned(), value.clone()))
-                    .collect(),
-            ));
-            self.responses
-                .lock()
-                .unwrap()
-                .get(url)
-                .cloned()
-                .ok_or_else(|| HttpError::Transport(format!("no fake reply for {url}")))
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::fake::FakeTransport;
     use super::*;
+    use crate::test_support::{FakeTransport, auth_value};
+
+    fn token() -> Token {
+        Token::new("ghp_test_token_value_0123456789")
+    }
+
+    /// Every request went to an allowed host, and the token went with
+    /// each one to the API and with none anywhere else.
+    fn assert_token_only_on_api(fake: &FakeTransport, token: &Token, case: &str) {
+        let expected = format!("Bearer {}", token.expose());
+        for (url, headers) in fake.requests.lock().expect("requests").iter() {
+            let host = allowed_host(url).unwrap_or_else(|error| panic!("{case}: {url}: {error}"));
+            let auth = auth_value(headers);
+            if host == API_HOST {
+                assert_eq!(auth, Some(expected.as_str()), "{case}: {url}");
+            } else {
+                assert_eq!(auth, None, "{case}: {url}");
+            }
+        }
+    }
 
     #[test]
     fn body_read_errors_are_classified_like_request_errors() {
@@ -335,32 +289,6 @@ mod tests {
     }
 
     #[test]
-    fn only_https_on_known_hosts_and_default_port() {
-        assert_eq!(
-            allowed_host("https://api.github.com/repos/a/b").as_deref(),
-            Ok("api.github.com")
-        );
-        assert_eq!(
-            allowed_host("https://Avatars.GitHubUserContent.com/u/1?s=96").as_deref(),
-            Ok("avatars.githubusercontent.com")
-        );
-        for refused in [
-            "http://api.github.com/",
-            "https://evil.example/",
-            "https://api.github.com.evil.example/",
-            "https://user:pass@api.github.com/",
-            "https://api.github.com:8443/",
-            "file:///etc/passwd",
-            "not a url",
-        ] {
-            assert!(
-                matches!(allowed_host(refused), Err(HttpError::NotAllowed)),
-                "{refused}"
-            );
-        }
-    }
-
-    #[test]
     fn bodies_are_capped_after_decompression() {
         let big = vec![0u8; 10_000];
         assert_eq!(
@@ -373,71 +301,343 @@ mod tests {
         ));
     }
 
+    /// A URL and the host it may reach; `None` is refused and never requested.
+    const URLS: &[(&str, Option<&str>)] = &[
+        ("https://github.com/x", Some("github.com")),
+        ("https://GITHUB.COM/x", Some("github.com")),
+        ("https://API.GITHUB.COM/repos/a/b", Some("api.github.com")),
+        (
+            "https://api.github.com#@evil.example",
+            Some("api.github.com"),
+        ),
+        ("https://github.com/foo%2Fbar", Some("github.com")),
+        ("https://github.com/\\@evil.example", Some("github.com")),
+        (
+            "https://Avatars.GitHubUserContent.com/u/1?s=96",
+            Some("avatars.githubusercontent.com"),
+        ),
+        ("https://gravatar.com/avatar/abc", Some("gravatar.com")),
+        (
+            "https://www.gravatar.com/avatar/abc",
+            Some("www.gravatar.com"),
+        ),
+        (
+            "https://secure.gravatar.com/avatar/abc",
+            Some("secure.gravatar.com"),
+        ),
+        ("https://evil.example/", None),
+        ("https://github.com./x", None),
+        ("https://api.github.com.", None),
+        ("https://[::1]/", None),
+        ("https://[::1]:443/", None),
+        ("https://127.0.0.1/", None),
+        ("https://2130706433/", None),
+        ("https://api.github.com@evil.example/", None),
+        ("https://api.github.com%2e%2e@evil.example/", None),
+        ("https://user:pass@api.github.com/", None),
+        ("https://evil.example#@api.github.com", None),
+        ("https://evil.example?x=@api.github.com", None),
+        ("https://xn--gthub-cza.com/x", None),
+        ("https://xn--80ak6aa92e.com/", None),
+        ("https://gïthub.com/x", None),
+        ("https://github%2ecom/", None),
+        ("https://%67ithub.com/", None),
+        ("https://api.github.com%00.evil.example/", None),
+        ("https://api.github.com%2fevil.example/", None),
+        ("https://github.com\\@evil.example/", None),
+        ("https://evil.example\\@api.github.com/", None),
+        ("https://github.com/x y", None),
+        (" https://github.com/x", None),
+        ("https:// github.com/x", None),
+        ("https://api.github.com /x", None),
+        ("https://api.github.com\n.evil.example/", None),
+        ("https://api.github.com\t.evil.example/", None),
+        ("https://api.github.com.evil.example/", None),
+        ("https://www.github.com/", None),
+        ("http://api.github.com/", None),
+        ("http://github.com/x", None),
+        ("https://api.github.com:443/x", None),
+        ("https://api.github.com:8443/", None),
+        ("https:///evil.example/", None),
+        ("file:///etc/passwd", None),
+        ("not a url", None),
+        ("", None),
+    ];
+
     #[test]
-    fn the_token_goes_only_to_the_api_host() {
-        let fake = FakeTransport::default();
-        let api = "https://api.github.com/user";
-        let image = "https://avatars.githubusercontent.com/u/1?s=96";
-        fake.reply(api, 200, &[], b"{}");
-        fake.reply(image, 200, &[], b"png");
-        let token = Token::new("ghp_example_token_value");
-        get(&fake, api, Some(&token)).expect("api");
-        get(&fake, image, Some(&token)).expect("image");
-        let requests = fake.requests.lock().unwrap();
-        let auth = |index: usize| {
-            requests[index]
-                .1
-                .iter()
-                .find(|(name, _)| name == "Authorization")
-                .map(|(_, value)| value.clone())
-        };
-        assert_eq!(auth(0).as_deref(), Some("Bearer ghp_example_token_value"));
-        assert_eq!(auth(1), None);
+    fn only_https_on_the_allowed_hosts_is_requested() {
+        assert_eq!(
+            ALLOWED_HOSTS,
+            [
+                "api.github.com",
+                "avatars.githubusercontent.com",
+                "github.com",
+                "gravatar.com",
+                "www.gravatar.com",
+                "secure.gravatar.com",
+            ]
+        );
+        let huge = format!("https://evil.example/{}", "a".repeat(80_000));
+        let long = format!("https://github.com/{}", "b".repeat(20_000));
+        let urls = URLS
+            .iter()
+            .copied()
+            .chain([(huge.as_str(), None), (long.as_str(), Some("github.com"))]);
+        let secret = token();
+        for (url, host) in urls {
+            match allowed_host(url) {
+                Ok(allowed) => assert_eq!(Some(allowed.as_str()), host, "{url}"),
+                Err(error) => assert_eq!((error, host), (HttpError::NotAllowed, None), "{url}"),
+            }
+            let fake = FakeTransport::default();
+            let _ = get(&fake, url, Some(&secret));
+            let requested: &[&str] = if host.is_some() { &[url] } else { &[] };
+            assert_eq!(fake.urls(), requested, "{url}");
+            assert_token_only_on_api(&fake, &secret, url);
+        }
     }
 
-    #[test]
-    fn redirects_stay_inside_the_allowed_hosts() {
-        let fake = FakeTransport::default();
-        fake.reply(
-            "https://github.com/don-linux.png?size=96",
-            302,
+    /// One canned reply: URL, status, headers.
+    type Reply = (&'static str, u16, &'static [(&'static str, &'static str)]);
+
+    /// The first URL, the replies on the way (the last one answers 200
+    /// with `ok`), what `get` returns, and every URL it requested.
+    type Redirects = (
+        &'static [Reply],
+        Result<(), HttpError>,
+        &'static [&'static str],
+    );
+
+    const REDIRECTS: &[Redirects] = &[
+        // Three hops, across hosts: the token goes to the API hop only.
+        (
+            &[
+                (
+                    "https://github.com/a",
+                    302,
+                    &[("Location", "//api.github.com/b")],
+                ),
+                (
+                    "https://api.github.com/b",
+                    302,
+                    &[("Location", "//avatars.githubusercontent.com/u/9")],
+                ),
+                (
+                    "https://avatars.githubusercontent.com/u/9",
+                    302,
+                    &[("Location", "https://github.com/x.png")],
+                ),
+                ("https://github.com/x.png", 200, &[]),
+            ],
+            Ok(()),
+            &[
+                "https://github.com/a",
+                "https://api.github.com/b",
+                "https://avatars.githubusercontent.com/u/9",
+                "https://github.com/x.png",
+            ],
+        ),
+        // A fourth redirect is one too many.
+        (
+            &[
+                ("https://github.com/r1", 302, &[("Location", "/r2")]),
+                ("https://github.com/r2", 302, &[("Location", "/r3")]),
+                ("https://github.com/r3", 302, &[("Location", "/r4")]),
+                ("https://github.com/r4", 302, &[("Location", "/r5")]),
+                ("https://github.com/r5", 200, &[]),
+            ],
+            Err(HttpError::TooManyRedirects),
+            &[
+                "https://github.com/r1",
+                "https://github.com/r2",
+                "https://github.com/r3",
+                "https://github.com/r4",
+            ],
+        ),
+        (
             &[(
-                "Location",
-                "https://avatars.githubusercontent.com/u/194445529?size=96&v=4",
+                "https://github.com/loop.png",
+                302,
+                &[("Location", "/loop.png")],
             )],
-            b"",
-        );
-        fake.reply(
-            "https://avatars.githubusercontent.com/u/194445529?size=96&v=4",
-            200,
-            &[],
-            b"png",
-        );
-        let response =
-            get(&fake, "https://github.com/don-linux.png?size=96", None).expect("followed");
-        assert_eq!(response.body, b"png");
+            Err(HttpError::TooManyRedirects),
+            &[
+                "https://github.com/loop.png",
+                "https://github.com/loop.png",
+                "https://github.com/loop.png",
+                "https://github.com/loop.png",
+            ],
+        ),
+        // A relative location stays on the host that sent it.
+        (
+            &[
+                (
+                    "https://api.github.com/old",
+                    302,
+                    &[("Location", "/new?x=1")],
+                ),
+                ("https://api.github.com/new?x=1", 200, &[]),
+            ],
+            Ok(()),
+            &[
+                "https://api.github.com/old",
+                "https://api.github.com/new?x=1",
+            ],
+        ),
+        (
+            &[
+                ("https://github.com/old", 302, &[("Location", "/new")]),
+                ("https://github.com/new", 200, &[]),
+            ],
+            Ok(()),
+            &["https://github.com/old", "https://github.com/new"],
+        ),
+        (
+            &[
+                (
+                    "https://api.github.com/start",
+                    302,
+                    &[("Location", "//Avatars.GitHubUserContent.com/u/1")],
+                ),
+                ("https://Avatars.GitHubUserContent.com/u/1", 200, &[]),
+            ],
+            Ok(()),
+            &[
+                "https://api.github.com/start",
+                "https://Avatars.GitHubUserContent.com/u/1",
+            ],
+        ),
+        // A downgrade or a foreign host is refused before it is requested.
+        (
+            &[(
+                "https://api.github.com/start",
+                302,
+                &[("Location", "http://api.github.com/start")],
+            )],
+            Err(HttpError::NotAllowed),
+            &["https://api.github.com/start"],
+        ),
+        (
+            &[(
+                "https://api.github.com/start",
+                302,
+                &[("Location", "http://evil.example/collect")],
+            )],
+            Err(HttpError::NotAllowed),
+            &["https://api.github.com/start"],
+        ),
+        (
+            &[(
+                "https://github.com/start",
+                302,
+                &[("Location", "http://github.com/start")],
+            )],
+            Err(HttpError::NotAllowed),
+            &["https://github.com/start"],
+        ),
+        (
+            &[(
+                "https://github.com/leak.png",
+                302,
+                &[("Location", "https://evil.example/collect")],
+            )],
+            Err(HttpError::NotAllowed),
+            &["https://github.com/leak.png"],
+        ),
+        (
+            &[(
+                "https://api.github.com/start",
+                302,
+                &[("Location", "//evil.example/steal")],
+            )],
+            Err(HttpError::NotAllowed),
+            &["https://api.github.com/start"],
+        ),
+        (
+            &[(
+                "https://api.github.com/start",
+                302,
+                &[("Location", "//user:pass@evil.example/x")],
+            )],
+            Err(HttpError::NotAllowed),
+            &["https://api.github.com/start"],
+        ),
+        (
+            &[(
+                "https://api.github.com/start",
+                302,
+                &[("Location", "///evil.example/x")],
+            )],
+            Err(HttpError::NotAllowed),
+            &["https://api.github.com/start"],
+        ),
+        (
+            &[(
+                "https://api.github.com/start",
+                302,
+                &[("Location", "https://api.github.com.evil.example/x")],
+            )],
+            Err(HttpError::NotAllowed),
+            &["https://api.github.com/start"],
+        ),
+        (
+            &[(
+                "https://github.com/start",
+                302,
+                &[("Location", " https://evil.example/x")],
+            )],
+            Err(HttpError::NotAllowed),
+            &["https://github.com/start"],
+        ),
+        (
+            &[(
+                "https://api.github.com/start",
+                302,
+                &[(
+                    "Location",
+                    "https://user:pass@evil example/?access_token=pass",
+                )],
+            )],
+            Err(HttpError::NotAllowed),
+            &["https://api.github.com/start"],
+        ),
+        // The first of two locations is the one followed.
+        (
+            &[(
+                "https://api.github.com/start",
+                302,
+                &[
+                    ("Location", "https://evil.example/first"),
+                    ("Location", "https://github.com/second"),
+                ],
+            )],
+            Err(HttpError::NotAllowed),
+            &["https://api.github.com/start"],
+        ),
+    ];
 
-        fake.reply(
-            "https://github.com/leak.png",
-            302,
-            &[("Location", "https://evil.example/collect")],
-            b"",
-        );
-        assert!(matches!(
-            get(&fake, "https://github.com/leak.png", None),
-            Err(HttpError::NotAllowed)
-        ));
-        assert!(!fake.urls().iter().any(|url| url.contains("evil")));
+    #[test]
+    fn redirects_stay_on_the_allowed_hosts_and_keep_the_token_on_the_api() {
+        let secret = token();
+        for (replies, result, requested) in REDIRECTS {
+            let start = replies[0].0;
+            let fake = FakeTransport::default();
+            for (url, status, headers) in *replies {
+                fake.reply(url, *status, headers, b"ok");
+            }
+            let got = get(&fake, start, Some(&secret)).map(|response| response.body);
+            assert_eq!(got, result.clone().map(|()| b"ok".to_vec()), "{start}");
+            assert_eq!(fake.urls(), *requested, "{start}");
+            assert_token_only_on_api(&fake, &secret, start);
+        }
 
-        fake.reply(
-            "https://github.com/loop.png",
-            302,
-            &[("Location", "/loop.png")],
-            b"",
-        );
+        let fake = FakeTransport::default();
+        fake.reply("https://github.com/start", 302, &[], b"");
         assert_eq!(
-            get(&fake, "https://github.com/loop.png", None),
-            Err(HttpError::TooManyRedirects)
+            get(&fake, "https://github.com/start", None),
+            Err(HttpError::Transport(
+                "redirect without a location".to_owned()
+            ))
         );
     }
 }

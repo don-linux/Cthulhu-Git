@@ -238,8 +238,8 @@ pub fn fetch_image(transport: &dyn Transport, url: &str) -> Result<Vec<u8>, Fetc
 
 #[cfg(test)]
 mod tests {
-    use super::super::http::fake::FakeTransport;
     use super::*;
+    use crate::test_support::FakeTransport;
 
     const NOW: u64 = 1_800_000_000;
 
