@@ -24,6 +24,16 @@ pub fn absent_git() -> Git {
     }
 }
 
+/// The case count comes from `PROPTEST_CASES`: 64 through
+/// `.cargo/config.toml`. A failing seed is not written into the tree; the
+/// failure becomes a row in a table test.
+pub fn proptest_config() -> proptest::test_runner::Config {
+    proptest::test_runner::Config {
+        failure_persistence: None,
+        ..proptest::test_runner::Config::default()
+    }
+}
+
 /// The commit every fixture branch points at.
 pub const TIP: &str = "0123456789abcdef0123456789abcdef01234567";
 

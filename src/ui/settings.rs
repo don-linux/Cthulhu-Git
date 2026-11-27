@@ -978,24 +978,276 @@ fn card(ui: &mut Ui, palette: &Palette, add: impl FnOnce(&mut Ui)) {
 
 #[cfg(test)]
 mod tests {
-    use super::{fonts, stale_font, stale_terminal};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use eframe::egui::accesskit::Role;
+    use eframe::egui::output::OutputCommand;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::{NodeT, Queryable};
+
+    use super::*;
+    use crate::ui::test_support::tree_text;
+
+    type Shared<T> = Rc<RefCell<T>>;
+
+    /// Settings with `ui_font` and `terminal_font` saved and installed the way
+    /// the app installs them, keeping the last frame's actions.
+    fn settings(
+        ui_font: Option<&'static str>,
+        terminal_font: Option<&'static str>,
+        about: AboutInfo,
+    ) -> (Harness<'static>, Shared<GitHubAuth>, Shared<Vec<Action>>) {
+        let github = Shared::<GitHubAuth>::default();
+        let actions = Shared::<Vec<Action>>::default();
+        let (github_ui, actions_ui) = (Rc::clone(&github), Rc::clone(&actions));
+        let mut faces = fonts::FontService::default();
+        let mut preview = None;
+        let view = SettingsView {
+            author_avatars: true,
+            api_status: ApiStatus::default(),
+            busy: false,
+            about,
+        };
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 1600.0))
+            .with_step_dt(1.0 / 60.0)
+            .build_ui(move |ui| {
+                theme::apply(ui.ctx(), theme::DEFAULT_THEME);
+                faces.sync(ui.ctx(), ui_font, terminal_font);
+                let mut github = github_ui.borrow_mut();
+                let shown = show(
+                    ui,
+                    ui_font,
+                    terminal_font,
+                    &mut preview,
+                    None,
+                    &view,
+                    &mut github,
+                );
+                *actions_ui.borrow_mut() = shown;
+            });
+        // Faces queued on the first pass are installed on the next.
+        harness.step();
+        (harness, github, actions)
+    }
+
+    fn click(harness: &mut Harness<'_>, label: &str) {
+        harness.get_by_label(label).click();
+        harness.step();
+    }
+
+    #[test]
+    fn each_page_lists_its_own_faces_and_asks_only_on_a_click() {
+        const INTERFACE: &[&str] = &[
+            "Ubuntu",
+            "Ubuntu Mono",
+            "Ubuntu Sans",
+            "IBM Plex Sans",
+            "Obel Mono",
+            "Aspekta",
+            "Inter",
+        ];
+        const TERMINAL: &[&str] = &["Built-in", "Obel Mono", "Meslo LGS NF", "Departure Mono"];
+        const NONE: &[&str] = &[];
+        let unknown = (Some("JetBrains Mono"), Some("Fira Code"));
+        let ui_font = |id: &str| Action::SetUiFont(Some(id.to_owned()));
+        let terminal_font = |id: &str| Action::SetTerminalFont(Some(id.to_owned()));
+        // (saved faces, page, faces listed, a face not listed, warning, clicked, asked for)
+        #[rustfmt::skip]
+        let cases = [
+            ((None, None), "Appearance", INTERFACE, "Meslo LGS NF", None, "Inter", ui_font("inter")),
+            ((None, None), "Terminal", TERMINAL, "Ubuntu Sans", None, "Departure Mono", terminal_font("departure-mono")),
+            // Obel Mono is on both pages, and each sets only its own surface.
+            ((Some("ubuntu-sans"), Some("builtin")), "Appearance", INTERFACE, "Meslo LGS NF", None, "Obel Mono", ui_font("obel-mono")),
+            ((Some("obel-mono"), Some("builtin")), "Terminal", TERMINAL, "Ubuntu Sans", None, "Obel Mono", terminal_font("obel-mono")),
+            // A face that is not bundled is reported, not rewritten.
+            (unknown, "Appearance", INTERFACE, "Meslo LGS NF", Some("\"JetBrains Mono\" is not bundled. The interface is using Ubuntu."), "Inter", ui_font("inter")),
+            (unknown, "Terminal", TERMINAL, "Ubuntu Sans", Some("\"Fira Code\" is not bundled. The terminal is using Meslo LGS NF."), "Departure Mono", terminal_font("departure-mono")),
+            ((None, None), "History", NONE, "Inter", None, "Show author avatars", Action::SetAuthorAvatars(false)),
+        ];
+        for ((ui, terminal), page, listed, absent, warning, clicked, asked) in cases {
+            let case = format!("{page} with {ui:?} and {terminal:?}");
+            let (mut harness, _github, actions) =
+                settings(ui, terminal, AboutInfo::current("2.43.0"));
+            if page != "Appearance" {
+                click(&mut harness, page);
+            }
+            assert!(
+                actions.borrow().is_empty(),
+                "{case}: {:?}",
+                actions.borrow()
+            );
+            for face in listed.iter().chain(warning.as_ref()) {
+                harness.get_by_label(face);
+            }
+            assert!(
+                harness.query_by_label(absent).is_none(),
+                "{case}: lists {absent}"
+            );
+            click(&mut harness, clicked);
+            assert_eq!(*actions.borrow(), [asked], "{case}");
+        }
+    }
+
+    /// `ghp_` and 36 characters: the shape of a classic personal access token.
+    const FAKE_TOKEN: &str = "ghp_agentnetworktesttokenvalueXXXXXXXXXX";
+
+    fn assert_no_token_material(text: &str) {
+        for needle in ["?", "@", "ghp_", "github_pat_", FAKE_TOKEN] {
+            assert!(!text.contains(needle), "{text:?} contains {needle}");
+        }
+    }
+
+    /// egui appends output commands across passes. A click's commands are the
+    /// suffix while the earlier ones are still in front.
+    fn commands_since<'a>(
+        previous: &[OutputCommand],
+        harness: &'a Harness<'_>,
+    ) -> &'a [OutputCommand] {
+        let commands = &harness.output().platform_output.commands;
+        commands.strip_prefix(previous).unwrap_or(commands)
+    }
+
+    #[test]
+    fn a_typed_token_stays_masked_and_out_of_links_and_copied_text() {
+        const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+        const DATE: &str = "2026-10-24";
+        let version = env!("CARGO_PKG_VERSION");
+        let license = env!("CARGO_PKG_LICENSE");
+        let repository = env!("CARGO_PKG_REPOSITORY");
+        let releases = format!("{repository}/releases");
+        assert_no_token_material(repository);
+        let about = AboutInfo {
+            version: version.to_owned(),
+            version_date: DATE.to_owned(),
+            commit: COMMIT.to_owned(),
+            license: license.to_owned(),
+            description: env!("CARGO_PKG_DESCRIPTION").to_owned(),
+            repository: repository.to_owned(),
+            git_version: "2.43.0".to_owned(),
+        };
+        let (mut harness, github, _actions) = settings(None, None, about);
+
+        // Save, Verify, Remove, Import and Use GH_TOKEN all leave the process.
+        // This test only types into the masked field.
+        click(&mut harness, "GitHub Auth");
+        // The link's readable name is the requirement; egui exposes it as a label.
+        harness.get_by_label("Open GitHub's token form, already set to read-only");
+        harness.get_by_role(Role::PasswordInput).click();
+        harness.step();
+        harness
+            .get_by_role(Role::PasswordInput)
+            .type_text(FAKE_TOKEN);
+        harness.step();
+        {
+            let auth = github.borrow();
+            assert_eq!(auth.draft, FAKE_TOKEN, "the field did not take the token");
+            assert!(!auth.busy(), "typing started a keychain or network task");
+            assert!(!auth.has_token(), "typing stored a token");
+            assert_eq!(auth.stored(), Stored::None);
+            assert!(auth.notice().is_none(), "typing produced a notice");
+        }
+        let field = harness.get_by_role(Role::PasswordInput);
+        let mut shown = field.value().unwrap_or_default();
+        if shown.is_empty() {
+            shown = field.children().filter_map(|child| child.value()).collect();
+        }
+        assert_eq!(
+            shown,
+            "\u{2022}".repeat(FAKE_TOKEN.len()),
+            "password display"
+        );
+        for page in ["GitHub Auth", "History", "About"] {
+            if page != "GitHub Auth" {
+                click(&mut harness, page);
+            }
+            let tree = tree_text(&harness);
+            assert!(
+                !tree.contains(FAKE_TOKEN),
+                "{page}: token in the accessibility tree"
+            );
+        }
+        assert_eq!(
+            github.borrow().draft,
+            FAKE_TOKEN,
+            "leaving GitHub Auth dropped the typed token"
+        );
+
+        let tops = ["Terminal", "History", "GitHub Auth", "About"]
+            .map(|label| harness.get_by_label(label).rect().top());
+        assert!(
+            tops[..3].iter().all(|top| tops[3] > *top),
+            "About is not last in the navigation: {tops:?}"
+        );
+        let about_labels = [version, DATE, COMMIT, license, "2.43.0", repository];
+        for label in about_labels
+            .into_iter()
+            .chain(["© 2026 Don Linux", "Cthulhu-Git logo"])
+        {
+            harness.get_by_label(label);
+        }
+        for node in harness.root().children_recursive() {
+            if let Some(url) = node.accesskit_node().url() {
+                assert!(url == repository || url == releases, "link to {url:?}");
+            }
+        }
+        for url in [repository, releases.as_str()] {
+            let previous = harness.output().platform_output.commands.clone();
+            click(&mut harness, url);
+            let fresh = commands_since(&previous, &harness);
+            assert!(
+                fresh.iter().any(
+                    |command| matches!(command, OutputCommand::OpenUrl(open) if open.url == url)
+                ),
+                "no OpenUrl for {url}: {fresh:?}"
+            );
+        }
+        let previous = harness.output().platform_output.commands.clone();
+        click(&mut harness, "Copy version info");
+        let copied = commands_since(&previous, &harness)
+            .iter()
+            .find_map(|command| match command {
+                OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .expect("Copy version info copies text");
+        for part in [version, COMMIT, repository] {
+            assert!(copied.contains(part), "{copied:?} lacks {part}");
+        }
+        assert_no_token_material(&copied);
+    }
 
     #[test]
     fn font_warning_does_not_interpolate_unsanitized_text() {
-        let bidi = "\u{202E}JetBrains Mono";
-        let warning = stale_font(Some(bidi), fonts::UI_FACES).expect("warning");
-        assert_eq!(warning, "JetBrains Mono");
-        assert!(!warning.contains('\u{202E}'));
-
         let huge = "x".repeat(100_000);
-        let warning = stale_font(Some(&huge), fonts::UI_FACES).expect("warning");
-        assert_eq!(warning, "x".repeat(128));
-        assert!(!warning.contains(&huge));
-
-        assert!(stale_font(Some("obel\nmono"), fonts::UI_FACES).is_none());
-        assert!(stale_terminal(Some("fira\ncode")).is_none());
-        let terminal = stale_terminal(Some("\u{202E}Fira Code")).expect("warning");
-        assert_eq!(terminal, "Fira Code");
-        assert!(!terminal.contains('\u{202E}'));
+        let name = |text: &str| Some(text.to_owned());
+        // (case, warning, the name it shows)
+        let cases = [
+            (
+                "bidi interface",
+                stale_font(Some("\u{202E}JetBrains Mono"), fonts::UI_FACES),
+                name("JetBrains Mono"),
+            ),
+            (
+                "huge interface",
+                stale_font(Some(&huge), fonts::UI_FACES),
+                Some("x".repeat(128)),
+            ),
+            (
+                "newline interface",
+                stale_font(Some("obel\nmono"), fonts::UI_FACES),
+                None,
+            ),
+            ("newline terminal", stale_terminal(Some("fira\ncode")), None),
+            (
+                "bidi terminal",
+                stale_terminal(Some("\u{202E}Fira Code")),
+                name("Fira Code"),
+            ),
+        ];
+        for (case, warning, shown) in cases {
+            assert_eq!(warning, shown, "{case}");
+        }
     }
 }

@@ -20,8 +20,6 @@ mod history_tests;
 mod home;
 mod hover;
 mod icons;
-#[cfg(test)]
-mod network_tests;
 mod repo_view;
 mod settings;
 mod terminal;

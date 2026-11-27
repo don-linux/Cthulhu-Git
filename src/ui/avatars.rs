@@ -566,53 +566,197 @@ pub fn paint_avatar(
 
 #[cfg(test)]
 mod tests {
-    use cthulhu_git::github::{HttpError, HttpResponse};
+    use cthulhu_git::github::{HttpError, HttpResponse, direct_avatar_url, gravatar_url};
+    use image::ImageFormat;
+    use proptest::prelude::*;
 
     use super::offline::Offline;
     use super::*;
-
-    fn person(name: &str, email: &str) -> Person {
-        Person::new(name, email)
-    }
+    use crate::ui::test_support::proptest_config;
 
     #[test]
-    fn initials_use_the_first_and_last_words() {
-        assert_eq!(initials(&person("Ada Voss", "a@b")), "AV");
-        assert_eq!(initials(&person("Herbert West Jr", "a@b")), "HJ");
-        assert_eq!(initials(&person("cthulhu", "a@b")), "C");
-        assert_eq!(initials(&person("  ", "zed@b")), "Z");
-        assert_eq!(initials(&person("", "")), "?");
-        assert_eq!(initials(&person("ñandú ébano", "a@b")), "ÑÉ");
-        assert_eq!(initials(&person("- Cursor Agent", "a@b")), "CA");
-        assert_eq!(initials(&person("ß ß", "a@b")), "ßß");
-        assert_eq!(initials(&person("ßeta Smith", "a@b")), "ßS");
-        assert_eq!(initials(&person("", "\u{fb03}x@b")), "\u{fb03}");
+    fn initials_are_the_first_and_last_words_or_the_address() {
+        // (name, email, initials). A letter whose uppercase is several (ß is
+        // SS, ﬃ is FFI) stays as written, so initials stay two letters.
+        const CASES: [(&str, &str, &str); 18] = [
+            ("Ada Voss", "a@b", "AV"),
+            ("Herbert West Jr", "a@b", "HJ"),
+            ("cthulhu", "a@b", "C"),
+            ("  ", "zed@b", "Z"),
+            ("", "", "?"),
+            ("ñandú ébano", "a@b", "ÑÉ"),
+            ("- Cursor Agent", "a@b", "CA"),
+            ("ß", "a@b", "ß"),
+            ("ß ß", "a@b", "ßß"),
+            ("ßeta Smith", "a@b", "ßS"),
+            ("ﬁ", "a@b", "ﬁ"),
+            ("ﬀ", "a@b", "ﬀ"),
+            ("ŉ", "", "ŉ"),
+            ("ﬃ", "", "ﬃ"),
+            ("ﬄ", "", "ﬄ"),
+            ("ﬁ ﬂ", "", "ﬁﬂ"),
+            ("", "\u{fb03}x@b", "\u{fb03}"),
+            ("!!!", "ﬃ@example.test", "ﬃ"),
+        ];
+        for (name, email, expected) in CASES {
+            let person = Person::new(name, email);
+            assert_eq!(initials(&person), expected, "{name:?} {email:?}");
+        }
+    }
+
+    proptest! {
+        #![proptest_config(proptest_config())]
+
+        #[test]
+        fn initials_are_one_or_two_letters(
+            name in prop::collection::vec(any::<char>(), 0..=24),
+            email in prop::collection::vec(any::<char>(), 0..=24),
+        ) {
+            let person = Person::new(String::from_iter(name), String::from_iter(email));
+            let text = initials(&person);
+            prop_assert!((1..=2).contains(&text.chars().count()), "{person:?} -> {text:?}");
+        }
     }
 
     #[test]
     fn a_person_keeps_one_color() {
-        let a = person("Ada", "Ada@Miskatonic.test");
-        let b = person("Someone else", " ada@miskatonic.test ");
+        let a = Person::new("Ada", "Ada@Miskatonic.test");
+        let b = Person::new("Someone else", " ada@miskatonic.test ");
         assert_eq!(initials_color(&a), initials_color(&b));
     }
 
-    fn png(width: u32, height: u32) -> Vec<u8> {
+    fn encode(
+        width: u32,
+        height: u32,
+        format: ImageFormat,
+        pixel: impl Fn(u32, u32) -> [u8; 4],
+    ) -> Vec<u8> {
+        let picture = image::RgbaImage::from_fn(width, height, |x, y| image::Rgba(pixel(x, y)));
         let mut bytes = Vec::new();
-        image::RgbaImage::from_pixel(width, height, image::Rgba([10, 20, 30, 255]))
-            .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
-            .expect("encode");
+        image::DynamicImage::ImageRgba8(picture)
+            .write_to(&mut Cursor::new(&mut bytes), format)
+            .unwrap_or_else(|error| panic!("encode {format:?} {width}x{height}: {error}"));
         bytes
     }
 
+    fn solid(width: u32, height: u32, format: ImageFormat) -> Vec<u8> {
+        encode(width, height, format, |_, _| [20, 40, 80, 255])
+    }
+
     #[test]
-    fn decodes_and_squares_pictures_within_the_limits() {
-        let square = decode(&png(48, 48)).expect("small png");
-        assert_eq!(square.size, [48, 48]);
-        let wide = decode(&png(300, 200)).expect("wide png");
-        assert_eq!(wide.size, [96, 96]);
-        assert!(decode(&png(2000, 10)).is_none(), "wider than MAX_SIDE");
-        assert!(decode(b"not an image").is_none());
-        assert!(decode(b"").is_none());
+    fn decode_squares_png_and_jpeg_within_the_limits() {
+        // (width, height, side of the square, or refused). Each size runs both
+        // ways round, as PNG and as JPEG.
+        const SIZES: [(u32, u32, Option<usize>); 6] = [
+            (48, 48, Some(48)),
+            (97, 97, Some(96)),
+            (180, 90, Some(90)),
+            (1024, 16, Some(16)),
+            (300, 200, Some(96)),
+            (1025, 16, None),
+        ];
+        for format in [ImageFormat::Png, ImageFormat::Jpeg] {
+            for (long, short, side) in SIZES {
+                for (width, height) in [(long, short), (short, long)] {
+                    let size = decode(&solid(width, height, format)).map(|image| image.size);
+                    let expected = side.map(|side| [side, side]);
+                    assert_eq!(size, expected, "{format:?} {width}x{height}");
+                }
+            }
+        }
+        // Thirds of red, green and blue. The center crop keeps green only; a
+        // stretch would bring red and blue in at the ends.
+        for vertical in [false, true] {
+            let (width, height) = if vertical { (40, 120) } else { (120, 40) };
+            let bytes = encode(width, height, ImageFormat::Png, |x, y| {
+                let along = if vertical { y } else { x };
+                match along / 40 {
+                    0 => [220, 0, 0, 255],
+                    1 => [0, 200, 0, 255],
+                    _ => [0, 0, 220, 255],
+                }
+            });
+            let picture = decode(&bytes).expect("banded png");
+            assert_eq!(picture.size, [40, 40], "vertical {vertical}");
+            for along in [10, 20, 30] {
+                let (x, y) = if vertical { (20, along) } else { (along, 20) };
+                let [red, green, blue, alpha] = picture.pixels[y * 40 + x].to_array();
+                assert!(
+                    green > 180 && red < 40 && blue < 40 && alpha > 200,
+                    "vertical {vertical}: pixel {x},{y} is {red},{green},{blue},{alpha}"
+                );
+            }
+        }
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mix = if crc & 1 == 1 { 0xEDB8_8320 } else { 0 };
+                crc = (crc >> 1) ^ mix;
+            }
+        }
+        !crc
+    }
+
+    const PNG_SIGNATURE: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10];
+
+    /// The signature and one IHDR chunk: a size and no pixels.
+    fn png_header(width: u32, height: u32) -> Vec<u8> {
+        let mut chunk = b"IHDR".to_vec();
+        chunk.extend(width.to_be_bytes());
+        chunk.extend(height.to_be_bytes());
+        chunk.extend([8, 6, 0, 0, 0]);
+        let mut file = PNG_SIGNATURE.to_vec();
+        file.extend(13u32.to_be_bytes());
+        file.extend(&chunk);
+        file.extend(crc32(&chunk).to_be_bytes());
+        file
+    }
+
+    /// 1×1 white GIF89a: LZW minimum code size 2, then clear, index 0, end.
+    const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00\
+        \x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
+    /// 1×1 white BMP, 24 bits per pixel.
+    const BMP: &[u8] = b"BM\x3a\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00\x28\x00\x00\x00\
+        \x01\x00\x00\x00\x01\x00\x00\x00\x01\x00\x18\x00\x00\x00\x00\x00\x04\x00\x00\x00\
+        \x13\x0b\x00\x00\x13\x0b\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\x00";
+
+    #[test]
+    fn decode_refuses_other_formats_and_broken_pictures() {
+        let png = solid(32, 24, ImageFormat::Png);
+        let jpeg = solid(32, 24, ImageFormat::Jpeg);
+        // The header row must fail on its size, not on a bad checksum.
+        assert_eq!(&png[12..16], b"IHDR");
+        assert_eq!(png[29..33], crc32(&png[12..29]).to_be_bytes(), "IHDR crc");
+        // A one-byte JPEG change can still decode, so all but the magic goes.
+        let wiped = |bytes: &[u8]| {
+            let mut bytes = bytes.to_vec();
+            bytes[4..].fill(0);
+            bytes
+        };
+        let cases = [
+            ("empty", Vec::new()),
+            ("text", b"not an image".to_vec()),
+            ("unknown bytes", vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            ("png signature", PNG_SIGNATURE.to_vec()),
+            ("jpeg header", b"\xff\xd8\xff".to_vec()),
+            ("gif header", b"GIF89a".to_vec()),
+            ("truncated png", png[..png.len() / 3].to_vec()),
+            ("truncated jpeg", jpeg[..jpeg.len() / 3].to_vec()),
+            ("wiped png", wiped(&png)),
+            ("wiped jpeg", wiped(&jpeg)),
+            ("100000x100000 png header", png_header(100_000, 100_000)),
+            // Well formed, but not PNG or JPEG. Through arboard, Windows builds
+            // decode BMP and macOS builds TIFF; no build decodes GIF.
+            ("gif", GIF.to_vec()),
+            ("bmp", BMP.to_vec()),
+        ];
+        for (case, bytes) in cases {
+            assert!(decode(&bytes).is_none(), "{case}");
+        }
     }
 
     #[test]
@@ -621,20 +765,16 @@ mod tests {
         let cache = DiskCache {
             dir: dir.path().join("avatars"),
         };
-        assert!(matches!(
-            cache.lookup("ada@miskatonic.test"),
-            Cached::Unknown
-        ));
-        cache.store_miss("ada@miskatonic.test");
-        assert!(matches!(cache.lookup("ada@miskatonic.test"), Cached::Miss));
-        cache.store_image("ada@miskatonic.test", b"bytes");
-        assert!(
-            matches!(cache.lookup("ada@miskatonic.test"), Cached::Image(bytes) if bytes == b"bytes")
-        );
+        let ada = "ada@miskatonic.test";
+        assert!(matches!(cache.lookup(ada), Cached::Unknown));
+        cache.store_miss(ada);
+        assert!(matches!(cache.lookup(ada), Cached::Miss));
+        cache.store_image(ada, b"bytes");
+        assert!(matches!(cache.lookup(ada), Cached::Image(bytes) if bytes == b"bytes"));
         cache.store_miss("west@arkham.test");
         cache.clear_misses();
         assert!(matches!(cache.lookup("west@arkham.test"), Cached::Unknown));
-        let names: Vec<String> = fs::read_dir(dir.path().join("avatars"))
+        let names: Vec<String> = fs::read_dir(&cache.dir)
             .expect("dir")
             .map(|entry| {
                 entry
@@ -649,20 +789,13 @@ mod tests {
             !names[0].contains("ada"),
             "file names are hashed: {names:?}"
         );
-    }
 
-    #[test]
-    fn a_stale_entry_is_unknown() {
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        let cache = DiskCache {
-            dir: dir.path().to_path_buf(),
-        };
+        // Older than its time to live, an entry is unknown again.
         cache.store_miss("old@example.test");
-        let path = cache.path("old@example.test", "miss");
         let old = SystemTime::now() - MISS_TTL - Duration::from_secs(60);
         fs::File::options()
             .write(true)
-            .open(&path)
+            .open(cache.path("old@example.test", "miss"))
             .and_then(|file| file.set_modified(old))
             .expect("age the file");
         assert!(matches!(cache.lookup("old@example.test"), Cached::Unknown));
@@ -672,38 +805,16 @@ mod tests {
     fn a_disabled_service_never_queues_work() {
         let ctx = Context::default();
         let mut service = AvatarService::disabled();
-        let ada = person("Ada", "ada@miskatonic.test");
+        let ada = Person::new("Ada", "ada@miskatonic.test");
         assert!(service.texture(&ctx, &ada, None, None).is_none());
         assert!(service.jobs.is_none());
         assert!(service.entries.is_empty());
     }
 
-    #[test]
-    fn an_offline_service_ends_with_initials() {
-        let ctx = Context::default();
-        let mut service = AvatarService::with_transport(Arc::new(Offline), None, true);
-        let ada = person("Ada", "ada@miskatonic.test");
-        assert!(service.texture(&ctx, &ada, None, None).is_none());
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while matches!(
-            service.entries.get("ada@miskatonic.test"),
-            Some(Entry::Pending)
-        ) && std::time::Instant::now() < deadline
-        {
-            thread::sleep(Duration::from_millis(10));
-            service.poll(&ctx);
-        }
-        assert!(matches!(
-            service.entries.get("ada@miskatonic.test"),
-            Some(Entry::Missing)
-        ));
-        assert!(service.texture(&ctx, &ada, None, None).is_none());
-    }
-
+    /// Times out on the GitHub avatar and serves a picture from Gravatar.
     struct FirstTimeout {
         direct: String,
         gravatar: String,
-        picture: Vec<u8>,
     }
 
     impl Transport for FirstTimeout {
@@ -715,41 +826,11 @@ mod tests {
                 return Ok(HttpResponse {
                     status: 200,
                     headers: Vec::new(),
-                    body: self.picture.clone(),
+                    body: solid(8, 8, ImageFormat::Png),
                 });
             }
             Err(HttpError::NotAllowed)
         }
-    }
-
-    #[test]
-    fn a_timeout_tries_the_next_avatar_url() {
-        let email = "1+ada@users.noreply.github.com";
-        let direct = cthulhu_git::github::direct_avatar_url(email).expect("direct");
-        let gravatar = cthulhu_git::github::gravatar_url(email);
-        let transport = Arc::new(FirstTimeout {
-            direct,
-            gravatar,
-            picture: png(8, 8),
-        });
-        let ctx = Context::default();
-        let mut service = AvatarService::with_transport(transport, None, true);
-        let ada = person("Ada", email);
-        assert!(service.texture(&ctx, &ada, None, None).is_none());
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !matches!(
-            service.entries.get(email),
-            Some(Entry::Ready(_)) | Some(Entry::Missing) | Some(Entry::Retry(_))
-        ) && std::time::Instant::now() < deadline
-        {
-            thread::sleep(Duration::from_millis(10));
-            service.poll(&ctx);
-        }
-        assert!(
-            matches!(service.entries.get(email), Some(Entry::Ready(_))),
-            "the gravatar should be used after the github avatar times out, got {:?}",
-            service.entries.get(email).map(std::mem::discriminant)
-        );
     }
 
     struct AlwaysTimeout;
@@ -760,40 +841,66 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_timeout_retries_without_a_miss_file() {
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        let ctx = Context::default();
-        let mut service = AvatarService::with_transport(
-            Arc::new(AlwaysTimeout),
-            Some(DiskCache {
-                dir: dir.path().to_path_buf(),
-            }),
-            true,
-        );
-        let email = "1+ada@users.noreply.github.com";
-        let ada = person("Ada", email);
-        assert!(service.texture(&ctx, &ada, None, None).is_none());
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !matches!(service.entries.get(email), Some(Entry::Retry(_)))
-            && std::time::Instant::now() < deadline
-        {
-            thread::sleep(Duration::from_millis(10));
-            service.poll(&ctx);
+    fn state(entry: Option<&Entry>) -> &'static str {
+        match entry {
+            None => "none",
+            Some(Entry::Pending) => "pending",
+            Some(Entry::Ready(_)) => "ready",
+            Some(Entry::Missing) => "missing",
+            Some(Entry::Retry(_)) => "retry",
         }
-        assert!(
-            matches!(service.entries.get(email), Some(Entry::Retry(_))),
-            "got {:?}",
-            service.entries.get(email).map(std::mem::discriminant)
-        );
-        let files: Vec<_> = fs::read_dir(dir.path())
-            .expect("dir")
-            .map(|entry| entry.expect("entry").file_name())
-            .collect();
-        assert!(
-            files.is_empty(),
-            "a timeout must not be stored as a miss: {files:?}"
-        );
+    }
+
+    #[test]
+    fn a_lookup_ends_with_a_picture_a_miss_or_a_retry() {
+        let noreply = "1+ada@users.noreply.github.com";
+        let first_timeout = FirstTimeout {
+            direct: direct_avatar_url(noreply).expect("direct"),
+            gravatar: gravatar_url(noreply),
+        };
+        let offline: Arc<dyn Transport> = Arc::new(Offline);
+        let gravatar: Arc<dyn Transport> = Arc::new(first_timeout);
+        let timeouts: Arc<dyn Transport> = Arc::new(AlwaysTimeout);
+        let plain = "ada@miskatonic.test";
+        // (case, transport, address, disk cache, where the entry settles, the file left)
+        #[rustfmt::skip]
+        let cases = [
+            ("offline", Arc::clone(&offline), plain, true, "missing", Some("miss")),
+            ("offline in memory", offline, plain, false, "missing", None),
+            ("gravatar after a timeout", Arc::clone(&gravatar), noreply, true, "ready", Some("img")),
+            ("gravatar in memory", gravatar, noreply, false, "ready", None),
+            // A timeout is not a miss: a later session asks again.
+            ("every request times out", timeouts, noreply, true, "retry", None),
+        ];
+        let ctx = Context::default();
+        for (case, transport, email, cached, settles, file) in cases {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let cache = cached.then(|| DiskCache {
+                dir: dir.path().to_path_buf(),
+            });
+            let mut service = AvatarService::with_transport(transport, cache, true);
+            let ada = Person::new("Ada", email);
+            assert!(service.texture(&ctx, &ada, None, None).is_none(), "{case}");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while state(service.entries.get(email)) == "pending" && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+                service.poll(&ctx);
+            }
+            assert_eq!(state(service.entries.get(email)), settles, "{case}");
+            // A settled lookup is not queued again.
+            let shown = service.texture(&ctx, &ada, None, None).is_some();
+            assert_eq!(shown, settles == "ready", "{case}");
+            assert_eq!(state(service.entries.get(email)), settles, "{case}");
+            let files: Vec<String> = fs::read_dir(dir.path())
+                .expect("dir")
+                .filter_map(|entry| {
+                    let path = entry.expect("entry").path();
+                    path.extension()
+                        .map(|kind| kind.to_string_lossy().into_owned())
+                })
+                .collect();
+            assert_eq!(files, Vec::from_iter(file.map(str::to_owned)), "{case}");
+        }
     }
 
     /// A symlink planted at the cache path or at a leftover temp name, pointing
@@ -802,8 +909,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn avatar_cache_does_not_write_through_a_planted_symlink() {
-        use std::os::unix::fs::symlink;
-
         let key = "ada@miskatonic.test";
         let image = format!("{}.img", sha256_hex(key));
         for planted in [image.clone(), format!("{image}.{}.tmp", std::process::id())] {
@@ -813,13 +918,12 @@ mod tests {
                 dir: cache_dir.path().to_path_buf(),
             };
             let target = outside.path().join("precious.txt");
-            let original = b"precious-outside-target\n";
-            fs::write(&target, original).expect("target");
-            symlink(&target, cache_dir.path().join(&planted)).expect("symlink");
+            fs::write(&target, b"precious").expect("target");
+            std::os::unix::fs::symlink(&target, cache_dir.path().join(&planted)).expect("symlink");
 
             cache.store_image(key, b"image-bytes");
 
-            assert_eq!(fs::read(&target).expect("target"), original, "{planted}");
+            assert_eq!(fs::read(&target).expect("target"), b"precious", "{planted}");
             // `lookup` reads only a regular file, never a link.
             assert!(
                 matches!(cache.lookup(key), Cached::Image(bytes) if bytes == b"image-bytes"),

@@ -611,77 +611,190 @@ pub(crate) fn relative_time(now: i64, then: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use cthulhu_git::settings::HistoryColumns;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    use proptest::prelude::*;
+
     use super::*;
+    use crate::ui::repo_view::{self, ViewState};
+    use crate::ui::test_support::{
+        absent_git, commit, opened, painted_texts, proptest_config, tree_text,
+    };
+    use crate::ui::theme;
 
     #[test]
     fn relative_times_read_naturally() {
-        let now = 1_800_000_000;
-        assert_eq!(relative_time(now, now), "just now");
-        assert_eq!(relative_time(now, now + 500), "just now");
-        assert_eq!(relative_time(now, now - 59), "just now");
-        assert_eq!(relative_time(now, now - 60), "1 minute ago");
-        assert_eq!(relative_time(now, now - 5 * 60), "5 minutes ago");
-        assert_eq!(relative_time(now, now - 3 * 3600), "3 hours ago");
-        assert_eq!(relative_time(now, now - 86_400), "1 day ago");
-        assert_eq!(relative_time(now, now - 15 * 86_400), "2 weeks ago");
-        assert_eq!(relative_time(now, now - 70 * 86_400), "2 months ago");
-        assert_eq!(relative_time(now, now - 800 * 86_400), "2 years ago");
+        const NOW: i64 = 1_800_000_000;
+        const HOUR: i64 = 60 * 60;
+        const DAY: i64 = 24 * HOUR;
+        // (seconds ago, text). Each unit starts with a second either side.
+        const CASES: [(i64, &str); 22] = [
+            // A time in the future is clock skew.
+            (-500, "just now"),
+            (0, "just now"),
+            (59, "just now"),
+            (60, "1 minute ago"),
+            (5 * 60, "5 minutes ago"),
+            (HOUR - 1, "59 minutes ago"),
+            (HOUR, "1 hour ago"),
+            (HOUR + 1, "1 hour ago"),
+            (3 * HOUR, "3 hours ago"),
+            (DAY, "1 day ago"),
+            (7 * DAY - 1, "6 days ago"),
+            (7 * DAY, "1 week ago"),
+            (7 * DAY + 1, "1 week ago"),
+            (15 * DAY, "2 weeks ago"),
+            (30 * DAY - 1, "4 weeks ago"),
+            (30 * DAY, "1 month ago"),
+            (30 * DAY + 1, "1 month ago"),
+            (70 * DAY, "2 months ago"),
+            (365 * DAY - 1, "12 months ago"),
+            (365 * DAY, "1 year ago"),
+            (365 * DAY + 1, "1 year ago"),
+            (800 * DAY, "2 years ago"),
+        ];
+        for (ago, text) in CASES {
+            assert_eq!(relative_time(NOW, NOW - ago), text, "{ago}s ago");
+        }
+        // The difference saturates instead of overflowing.
+        for (now, then, text) in [
+            (i64::MAX, 0, "292471208677 years ago"),
+            (i64::MAX, i64::MIN, "292471208677 years ago"),
+            (i64::MIN, i64::MAX, "just now"),
+        ] {
+            assert_eq!(relative_time(now, then), text, "{now} after {then}");
+        }
+    }
+
+    /// "just now", then minutes, hours and so on to years; within a unit, the count.
+    fn rank(text: &str) -> (usize, u64) {
+        const UNITS: [&str; 6] = ["minute", "hour", "day", "week", "month", "year"];
+        let Some((count, unit)) = text
+            .strip_suffix(" ago")
+            .and_then(|text| text.split_once(' '))
+        else {
+            assert_eq!(text, "just now");
+            return (0, 0);
+        };
+        let unit = UNITS
+            .iter()
+            .position(|name| unit.trim_end_matches('s') == *name)
+            .expect(text);
+        (unit + 1, count.parse().expect(text))
+    }
+
+    /// An issue reference: its label, number, and owner and repository.
+    type Issue<'a> = (&'a str, u64, Option<(&'a str, &'a str)>);
+
+    /// The issues in `text`, once the segments are checked to rebuild `text`
+    /// and each label to be `owner/repo`, the marker and the number.
+    fn issues(text: &str) -> Vec<Issue<'_>> {
+        let is_name = |name: &str| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+        };
+        let mut rebuilt = String::new();
+        let mut found = Vec::new();
+        for segment in issue_segments(text) {
+            match segment {
+                Segment::Text(part) => rebuilt.push_str(part),
+                Segment::Issue {
+                    label,
+                    owner,
+                    repo,
+                    number,
+                } => {
+                    rebuilt.push_str(label);
+                    assert_eq!(owner.is_some(), repo.is_some(), "{text:?}");
+                    let pair = owner.zip(repo);
+                    let prefix = pair.map_or(String::new(), |(owner, repo)| {
+                        assert!(is_name(owner) && is_name(repo), "{text:?}: {label:?}");
+                        format!("{owner}/{repo}")
+                    });
+                    assert!(
+                        number >= 1
+                            && (label == format!("{prefix}#{number}")
+                                || label == format!("{prefix}GH-{number}")),
+                        "{text:?}: {label:?} is not issue {number}"
+                    );
+                    found.push((label, number, pair));
+                }
+            }
+        }
+        assert_eq!(rebuilt, text);
+        found
+    }
+
+    proptest! {
+        #![proptest_config(proptest_config())]
+
+        #[test]
+        fn a_longer_gap_never_reads_shorter(
+            now in any::<i64>(),
+            left in 0..=i64::MAX,
+            right in 0..=i64::MAX,
+        ) {
+            let (short, long) = (left.min(right), left.max(right));
+            let earlier = relative_time(now, now.saturating_sub(short));
+            let later = relative_time(now, now.saturating_sub(long));
+            prop_assert!(
+                rank(&earlier) <= rank(&later),
+                "now {now}: {short}s is {earlier}, {long}s is {later}"
+            );
+        }
+
+        #[test]
+        fn issue_segments_rebuild_any_text(
+            text in prop_oneof!["\\PC{0,36}", "(GH-|#|[A-Za-z0-9_.]|ünïcode|✓| |/){0,20}"],
+        ) {
+            issues(&text);
+        }
     }
 
     #[test]
     fn issue_references_follow_the_vs_code_rule() {
-        assert_eq!(
-            issue_segments("Fix #12 and GH-7, see octo/repo#3."),
-            [
-                Segment::Text("Fix "),
-                Segment::Issue {
-                    label: "#12",
-                    owner: None,
-                    repo: None,
-                    number: 12,
-                },
-                Segment::Text(" and "),
-                Segment::Issue {
-                    label: "GH-7",
-                    owner: None,
-                    repo: None,
-                    number: 7,
-                },
-                Segment::Text(", see "),
-                Segment::Issue {
-                    label: "octo/repo#3",
-                    owner: Some("octo"),
-                    repo: Some("repo"),
-                    number: 3,
-                },
-                Segment::Text("."),
-            ]
-        );
-        for plain in ["#0", "#012", "#12abc", "issue #", "C#", "##", ""] {
-            assert!(
-                issue_segments(plain)
-                    .iter()
-                    .all(|segment| matches!(segment, Segment::Text(_))),
-                "{plain}"
-            );
+        // (text, each issue: label, number, owner and repo)
+        #[rustfmt::skip]
+        const CASES: &[(&str, &[Issue<'static>])] = &[
+            ("", &[]),
+            ("#", &[]),
+            ("GH-", &[]),
+            ("#0", &[]),
+            ("#012", &[]),
+            ("GH-0", &[]),
+            ("C#", &[]),
+            ("##", &[]),
+            ("issue #", &[]),
+            ("#12abc", &[]),
+            ("foo#12bar", &[]),
+            ("#12_3", &[]),
+            // Too large for the number.
+            ("#99999999999999999999999", &[]),
+            ("#1", &[("#1", 1, None)]),
+            ("GH-2", &[("GH-2", 2, None)]),
+            ("GH-GH-1", &[("GH-1", 1, None)]),
+            ("end #8", &[("#8", 8, None)]),
+            ("/#4", &[("#4", 4, None)]),
+            // An empty owner is no owner.
+            ("/repo#3", &[("#3", 3, None)]),
+            // A multibyte letter right before the marker.
+            ("ü#9", &[("#9", 9, None)]),
+            ("ünïcode #5 ✓", &[("#5", 5, None)]),
+            ("Fix #12 and GH-7, see octo/repo#3.", &[
+                ("#12", 12, None),
+                ("GH-7", 7, None),
+                ("octo/repo#3", 3, Some(("octo", "repo"))),
+            ]),
+            ("a/b/c#1", &[("b/c#1", 1, Some(("b", "c")))]),
+            ("owner_name/repo.name#10", &[("owner_name/repo.name#10", 10, Some(("owner_name", "repo.name")))]),
+            ("octo/repoGH-3", &[("octo/repoGH-3", 3, Some(("octo", "repo")))]),
+        ];
+        for (text, expected) in CASES {
+            assert_eq!(issues(text), *expected, "{text:?}");
         }
-        assert_eq!(
-            issue_segments("#99999999999999999999999"),
-            [Segment::Text("#99999999999999999999999")]
-        );
-        assert_eq!(
-            issue_segments("ünïcode #5 ✓"),
-            [
-                Segment::Text("ünïcode "),
-                Segment::Issue {
-                    label: "#5",
-                    owner: None,
-                    repo: None,
-                    number: 5,
-                },
-                Segment::Text(" ✓"),
-            ]
-        );
     }
 
     #[test]
@@ -733,5 +846,77 @@ mod tests {
         cache.request(&"b".repeat(40));
         cache.request(&"c".repeat(40));
         assert_eq!(cache.wanted, Some("c".repeat(40)));
+        // A poll while the read runs keeps it and starts nothing.
+        cache.poll(&Context::default(), &absent_git(), Path::new("/repos"));
+        let running = cache.inflight.as_ref().map(|(oid, _)| oid.as_str());
+        assert_eq!(running, Some("a".repeat(40).as_str()));
+        assert_eq!(cache.wanted, Some("c".repeat(40)));
+    }
+
+    /// The message cell opens no card. The author cell opens one that names
+    /// the co-author from the row while the details are still loading, or
+    /// failed: the fixture's git is installed nowhere.
+    #[test]
+    fn history_hover_card_names_the_author_and_coauthor() {
+        const SUMMARY: &str = "Lanterns for the night expedition";
+        let hash = "ab".repeat(20);
+        let mut row = commit(SUMMARY);
+        row.oid.clone_from(&hash);
+        row.author = Person::new("Ada Voss", "ada@miskatonic.test");
+        row.co_authors = vec![Person::new("Herbert West", "west@arkham.test")];
+        let mut repo = opened("missing-repo", row);
+        let mut avatars = AvatarService::disabled();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1500.0, 640.0))
+            .with_step_dt(1.0 / 60.0)
+            .build_ui(move |ui| {
+                theme::apply(ui.ctx(), theme::DEFAULT_THEME);
+                let view = ViewState {
+                    error: None,
+                    branches_open: false,
+                    detail_open: false,
+                    terminal_open: false,
+                    syncing: None,
+                    columns: HistoryColumns::default(),
+                    history_loading: false,
+                    busy: false,
+                };
+                let _ = repo_view::show(ui, &mut repo, &view, &mut avatars);
+            });
+
+        for (cell, opens) in [(SUMMARY, false), ("Ada Voss, Herbert West", true)] {
+            harness
+                .query_all_by_label(cell)
+                .min_by(|left, right| left.rect().left().total_cmp(&right.rect().left()))
+                .unwrap_or_else(|| panic!("no {cell:?} cell\n{}", tree_text(&harness)))
+                .hover();
+            harness.run_steps(60);
+            let text = tree_text(&harness);
+            let card = if opens {
+                text.contains("Co-author")
+                    && text.contains("Herbert West")
+                    && (text.contains("Loading…") || text.contains("Could not run git"))
+            } else {
+                text.contains("Co-author") || text.contains("Loading…")
+            };
+            assert_eq!(card, opens, "{cell}\n{text}");
+        }
+        let fonts: Vec<_> = painted_texts(&harness)
+            .into_iter()
+            .filter(|(_, galley)| galley.text() == hash)
+            .flat_map(|(_, galley)| {
+                let sections = galley.job.sections.clone();
+                sections
+                    .into_iter()
+                    .map(|section| section.format.font_id.family)
+            })
+            .collect();
+        assert!(
+            !fonts.is_empty()
+                && fonts
+                    .iter()
+                    .all(|family| *family == egui::FontFamily::Monospace),
+            "the card's hash is not monospace: {fonts:?}"
+        );
     }
 }
