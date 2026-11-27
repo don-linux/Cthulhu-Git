@@ -1310,6 +1310,36 @@ fn history_hover_card_names_the_author_and_coauthor() {
         hover_is_loading_or_error(&text),
         "card showed neither loading nor an error\n{text}"
     );
+    let hash_fonts = painted_fonts(&harness, &"ab".repeat(20));
+    assert!(
+        !hash_fonts.is_empty()
+            && hash_fonts
+                .iter()
+                .all(|font| font.family == egui::FontFamily::Monospace),
+        "the card's hash is not monospace: {hash_fonts:?}"
+    );
+}
+
+/// The fonts of every painted text that reads exactly `exact`.
+fn painted_fonts(harness: &Harness<'_>, exact: &str) -> Vec<egui::FontId> {
+    fn walk(shape: &egui::Shape, exact: &str, found: &mut Vec<egui::FontId>) {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == exact => found.extend(
+                text.galley
+                    .job
+                    .sections
+                    .iter()
+                    .map(|section| section.format.font_id.clone()),
+            ),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, exact, found)),
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    for clipped in &harness.output().shapes {
+        walk(&clipped.shape, exact, &mut found);
+    }
+    found
 }
 
 #[test]

@@ -268,9 +268,11 @@ fn card(
         let hash = ui
             .add(
                 Label::new(
+                    // `small()` replaces the text style, so the family is set
+                    // after it: small size, monospace face.
                     RichText::new(&row.oid)
-                        .monospace()
                         .small()
+                        .family(egui::FontFamily::Monospace)
                         .color(palette.hash),
                 )
                 .sense(Sense::click())
