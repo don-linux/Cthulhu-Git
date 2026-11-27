@@ -282,7 +282,7 @@ re-runs the test binary as a child process with that variable set.
 
 Before a release that moves the Git layer, settings, startup or CI, run an
 adversarial pass. The checklist and the file each pass owns are in
-[docs/ADVERSARIAL-TESTING.md](docs/ADVERSARIAL-TESTING.md). The 0.0.2 pass is
+[docs/TESTING.md](docs/TESTING.md). The 0.0.2 pass is
 written up in
 [docs/adversarial-reports/v0.0.2.md](docs/adversarial-reports/v0.0.2.md).
 

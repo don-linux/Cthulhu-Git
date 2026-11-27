@@ -32,7 +32,7 @@ clippy before a turn ends.
 - Do not add a dependency without asking. Prefer std and what is already locked.
 - Prefer deleting or merging code over adding a layer. No test-only hooks inside
   production code: inject the dependency (settings path, transport, store, git).
-- Security invariants live in `docs/ADVERSARIAL-TESTING.md`: the token only reaches
+- Security invariants live in `docs/TESTING.md`: the token only reaches
   `api.github.com`, inherited `GIT_*` variables are scrubbed, repository config
   never runs code on reads, network input is size-capped. Keep their tests.
 - Comments explain *why*. Do not narrate history or past bugs.

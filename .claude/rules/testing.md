@@ -38,9 +38,9 @@ paths:
 - `unsafe` is forbidden in tests too, so `env::set_var` is unavailable. When a
   case truly needs a hostile inherited environment, re-exec the test binary
   (`--exact` with the full module path, `--include-ignored`).
-- Fake `git` executables: one shared script published with
-  `common::shared_script` (unique temp name, closed, renamed into place), plus
-  a per-case sidecar. Never write a script in place that another process may
+- Fake `git` executables: links to the one script `support::fake_git`
+  publishes (unique temp name, closed, renamed into place), plus per-case
+  sidecars. Never write a script in place that another process may
   be executing (ETXTBSY under nextest).
 - Anything that can hang uses `recv_timeout` and a fake that sleeps briefly.
   Never assert on wall-clock speed.
