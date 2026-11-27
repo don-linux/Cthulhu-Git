@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::{self, JoinHandle};
@@ -332,90 +332,29 @@ fn ensure_cwd(path: &Path) -> Result<(), String> {
 
 /// Environment applied only to the PTY child.
 ///
-/// `clear` and the shell binding for Ctrl+L (`clear-screen`) write the
-/// terminfo `clear` capability. A parent `TERM` of `dumb`, or an empty one,
-/// writes nothing, so the screen stays as it was. Alacritty's `setup_env`
-/// chooses the same name and also sets `COLORTERM`, but it stores both on the
-/// whole process. `tty::Options.env` overrides them for the child only.
-fn shell_env() -> HashMap<String, String> {
-    shell_env_from(
-        alacritty_terminfo_installed(),
-        std::env::var("LANG").ok().as_deref(),
-        std::env::var("LC_ALL").ok().as_deref(),
-        std::env::var("LC_CTYPE").ok().as_deref(),
-    )
-}
-
-/// `TERM` and `COLORTERM` for the PTY child.
+/// `TERM` is `xterm-256color`, whose terminfo every system ships. `clear` and
+/// the shell binding for Ctrl+L (`clear-screen`) write its `clear`
+/// capability; a parent `TERM` of `dumb`, or an empty one, writes nothing.
+/// Alacritty's `setup_env` also sets `TERM` and `COLORTERM`, but on the whole
+/// process; `tty::Options.env` sets them for the child only.
 ///
 /// A Dock launch leaves `LANG`, `LC_ALL`, and `LC_CTYPE` unset, and the shell
 /// then treats the stream as ASCII. An existing locale is left alone so the
 /// child inherits it.
-fn shell_env_from(
-    alacritty_installed: bool,
+fn shell_env(
     lang: Option<&str>,
     lc_all: Option<&str>,
     lc_ctype: Option<&str>,
 ) -> HashMap<String, String> {
-    let mut env = HashMap::new();
-    env.insert("TERM".to_owned(), term_name(alacritty_installed).to_owned());
-    env.insert("COLORTERM".to_owned(), "truecolor".to_owned());
-    if locale_is_unset(lang, lc_all, lc_ctype) {
+    let mut env = HashMap::from([
+        ("TERM".to_owned(), "xterm-256color".to_owned()),
+        ("COLORTERM".to_owned(), "truecolor".to_owned()),
+    ]);
+    let blank = |value: Option<&str>| value.is_none_or(str::is_empty);
+    if blank(lang) && blank(lc_all) && blank(lc_ctype) {
         env.insert("LANG".to_owned(), "en_US.UTF-8".to_owned());
     }
     env
-}
-
-fn locale_is_unset(lang: Option<&str>, lc_all: Option<&str>, lc_ctype: Option<&str>) -> bool {
-    fn blank(value: Option<&str>) -> bool {
-        value.is_none_or(|text| text.is_empty())
-    }
-    blank(lang) && blank(lc_all) && blank(lc_ctype)
-}
-
-/// `alacritty` when that terminfo entry is installed, otherwise `xterm-256color`.
-fn term_name(alacritty_installed: bool) -> &'static str {
-    if alacritty_installed {
-        "alacritty"
-    } else {
-        "xterm-256color"
-    }
-}
-
-fn alacritty_terminfo_installed() -> bool {
-    terminfo_installed("alacritty")
-}
-
-/// Same lookup as `alacritty_terminal::tty::setup_env`: `TERMINFO`, otherwise
-/// `~/.terminfo`, then `TERMINFO_DIRS`, `PREFIX`, and the system databases.
-fn terminfo_installed(name: &str) -> bool {
-    let Some(first) = name.chars().next() else {
-        return false;
-    };
-    let letter = first.to_string();
-    let hex = format!("{:x}", u32::from(first));
-    let mut dirs = Vec::new();
-    if let Some(dir) = std::env::var_os("TERMINFO") {
-        dirs.push(PathBuf::from(dir));
-    } else if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
-    {
-        dirs.push(PathBuf::from(home).join(".terminfo"));
-    }
-    if let Ok(list) = std::env::var("TERMINFO_DIRS") {
-        dirs.extend(list.split(':').map(PathBuf::from));
-    }
-    if let Ok(prefix) = std::env::var("PREFIX") {
-        let prefix = PathBuf::from(prefix);
-        dirs.push(prefix.join("etc/terminfo"));
-        dirs.push(prefix.join("lib/terminfo"));
-        dirs.push(prefix.join("share/terminfo"));
-    }
-    dirs.push(PathBuf::from("/etc/terminfo"));
-    dirs.push(PathBuf::from("/lib/terminfo"));
-    dirs.push(PathBuf::from("/usr/share/terminfo"));
-    dirs.push(PathBuf::from("/boot/system/data/terminfo"));
-    dirs.iter()
-        .any(|dir| dir.join(&letter).join(name).exists() || dir.join(&hex).join(name).exists())
 }
 
 /// One shell for the open repository, or the message left after it exits.
@@ -562,7 +501,11 @@ impl ShellSession {
         let options = tty::Options {
             shell: Some(tty::Shell::new(program, argv.args)),
             working_directory: Some(cwd.to_path_buf()),
-            env: shell_env(),
+            env: shell_env(
+                std::env::var("LANG").ok().as_deref(),
+                std::env::var("LC_ALL").ok().as_deref(),
+                std::env::var("LC_CTYPE").ok().as_deref(),
+            ),
             ..tty::Options::default()
         };
         let size = window_size(metrics, ctx.pixels_per_point());
@@ -2159,7 +2102,7 @@ mod tests {
         let Some(dir) = std::env::var_os("CTHULHU_TERMINAL_RELATIVE_SHELL_DIR") else {
             return;
         };
-        let dir = PathBuf::from(dir);
+        let dir = std::path::PathBuf::from(dir);
         let marker = dir.join("marker");
         let ctx = egui::Context::default();
         let metrics = test_metrics();
@@ -2385,24 +2328,24 @@ END
         assert!(error.contains("Cannot enter"), "{error}");
     }
 
-    /// (alacritty terminfo installed, LANG, LC_ALL, LC_CTYPE, TERM, LANG for
-    /// the shell). A Dock launch has no locale, so the shell gets UTF-8; a
-    /// locale that is set is inherited.
+    /// (LANG, LC_ALL, LC_CTYPE, LANG for the shell). A Dock launch has no
+    /// locale, so the shell gets UTF-8; a locale that is set is inherited.
     #[test]
     fn shell_env_names_the_terminal_and_fills_a_missing_locale() {
         const UTF8: Option<&str> = Some("en_US.UTF-8");
         #[rustfmt::skip]
         let cases = [
-            (true, None, None, None, "alacritty", UTF8),
-            (false, None, None, None, "xterm-256color", UTF8),
-            (false, Some("fr_FR.UTF-8"), None, None, "xterm-256color", None),
-            (false, None, Some("C"), None, "xterm-256color", None),
-            (false, None, None, UTF8, "xterm-256color", None),
+            (None, None, None, UTF8),
+            (Some(""), Some(""), Some(""), UTF8),
+            (Some("fr_FR.UTF-8"), None, None, None),
+            (None, Some("C"), None, None),
+            (None, None, UTF8, None),
         ];
-        for (alacritty, lang, lc_all, lc_ctype, term, given) in cases {
-            let env = shell_env_from(alacritty, lang, lc_all, lc_ctype);
-            let case = format!("{alacritty} {lang:?} {lc_all:?} {lc_ctype:?}");
-            assert_eq!(env.get("TERM").map(String::as_str), Some(term), "{case}");
+        for (lang, lc_all, lc_ctype, given) in cases {
+            let env = shell_env(lang, lc_all, lc_ctype);
+            let case = format!("{lang:?} {lc_all:?} {lc_ctype:?}");
+            assert_eq!(env["TERM"], "xterm-256color", "{case}");
+            assert_eq!(env["COLORTERM"], "truecolor", "{case}");
             assert_eq!(env.get("LANG").map(String::as_str), given, "{case}");
         }
     }
