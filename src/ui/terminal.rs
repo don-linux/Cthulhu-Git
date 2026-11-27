@@ -33,8 +33,8 @@ use alacritty_terminal::term::{
 use alacritty_terminal::tty::{self, Pty};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, Event, FontId, Id, Key, Modifiers, Painter, PointerButton,
-    Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2,
+    self, Align2, Color32, CursorIcon, Event, EventFilter, FontId, Id, Key, Modifiers, Painter,
+    PointerButton, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2,
 };
 
 use super::theme::Palette;
@@ -1135,6 +1135,15 @@ pub fn show(
                 let focused = response.has_focus();
                 handle_pointer(ui, session, &response, visible, &metrics);
                 if focused {
+                    // egui moves focus on Tab and the arrows and drops it on
+                    // Escape. In a terminal those keys belong to the shell.
+                    let shell_keys = EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    };
+                    ui.memory_mut(|memory| memory.set_focus_lock_filter(response.id, shell_keys));
                     handle_keys(ui, session);
                 }
             } else {
@@ -2690,6 +2699,60 @@ END
         session.resize(&bigger, 1.0);
         assert_eq!(std::process::id(), pid);
         drop(session);
+    }
+
+    /// Escape, Tab and the arrows belong to the shell (vim, completion,
+    /// history), so they must not move focus out of the terminal.
+    #[cfg(unix)]
+    #[test]
+    fn focused_terminal_keeps_escape_tab_and_arrows() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let cwd = dir.path().to_owned();
+        let view_id = Id::new("focus test");
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(Vec2::new(640.0, 320.0))
+            .with_step_dt(1.0 / 60.0)
+            .build_ui_state(
+                move |ui, terminal: &mut Option<Terminal>| {
+                    let _ = ui.button("Above");
+                    let palette = super::super::theme::DEFAULT_THEME.palette;
+                    show(ui, terminal, &cwd, view_id, &palette, true);
+                },
+                None,
+            );
+        let started = std::time::Instant::now();
+        while !matches!(harness.state(), Some(Terminal::Live(_))) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "shell did not start"
+            );
+            harness.step();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let inside = Pos2::new(320.0, 200.0);
+        harness.hover_at(inside);
+        for pressed in [true, false] {
+            harness.event(Event::PointerButton {
+                pos: inside,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            });
+            harness.step();
+        }
+        harness.step();
+        let focused = |harness: &egui_kittest::Harness<'_, Option<Terminal>>| {
+            harness
+                .ctx
+                .memory(|memory| memory.has_focus(focus_id(view_id)))
+        };
+        assert!(focused(&harness), "a click focuses the terminal");
+        for key in [Key::Escape, Key::Tab, Key::ArrowUp, Key::ArrowLeft] {
+            harness.key_press(key);
+            harness.step();
+            harness.step();
+            assert!(focused(&harness), "{key:?} moved focus out of the terminal");
+        }
     }
 
     fn prompt_on_screen(columns: usize, screen_lines: usize, bytes: &[u8]) -> Range<usize> {
