@@ -987,7 +987,7 @@ mod tests {
     use egui_kittest::kittest::{NodeT, Queryable};
 
     use super::*;
-    use crate::ui::test_support::tree_text;
+    use crate::ui::test_support::{painted_texts, tree_text};
 
     type Shared<T> = Rc<RefCell<T>>;
 
@@ -1137,6 +1137,8 @@ mod tests {
         harness
             .get_by_role(Role::PasswordInput)
             .type_text(FAKE_TOKEN);
+        // The first keystroke into an empty field is painted a frame later.
+        harness.step();
         harness.step();
         {
             let auth = github.borrow();
@@ -1151,11 +1153,8 @@ mod tests {
         if shown.is_empty() {
             shown = field.children().filter_map(|child| child.value()).collect();
         }
-        assert_eq!(
-            shown,
-            "\u{2022}".repeat(FAKE_TOKEN.len()),
-            "password display"
-        );
+        let masked = "\u{2022}".repeat(FAKE_TOKEN.len());
+        assert_eq!(shown, masked, "password display");
         for page in ["GitHub Auth", "History", "About"] {
             if page != "GitHub Auth" {
                 click(&mut harness, page);
@@ -1164,6 +1163,20 @@ mod tests {
             assert!(
                 !tree.contains(FAKE_TOKEN),
                 "{page}: token in the accessibility tree"
+            );
+            // Painted text that no widget reports never reaches the tree.
+            let painted: Vec<_> = painted_texts(&harness)
+                .iter()
+                .map(|(_, galley)| galley.text().to_owned())
+                .collect();
+            assert!(
+                painted.iter().all(|text| !text.contains(FAKE_TOKEN)),
+                "{page}: token painted"
+            );
+            assert_eq!(
+                painted.contains(&masked),
+                page == "GitHub Auth",
+                "{page}: masked field"
             );
         }
         assert_eq!(
