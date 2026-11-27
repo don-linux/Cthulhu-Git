@@ -41,14 +41,15 @@ of writing through it). On Unix the file is private to the user (mode 0600).
 | `src/settings.rs` | `set_ui_font` | Trims the interface face id; a blank name clears it |
 | `src/settings.rs` | `set_terminal_font` | Trims the terminal face id; a blank name clears it |
 | `src/ui/settings.rs` | `show` | Settings sidebar and the Appearance, Terminal, History and GitHub Auth pages |
-| `src/ui/mod.rs` | `CthulhuApp::font_preview` | A 240-point preview shell on the Terminal page, clipped to one prompt line. Ignores pointer and keyboard. Dropped when settings closes. Not saved |
+| `src/ui/mod.rs` | `SettingsScreen::preview` | A 240-point preview shell on the Terminal page, clipped to one prompt line. Ignores pointer and keyboard. Dropped when settings closes. Not saved |
 | `src/ui/fonts.rs` | `FontService` | Registers the bundled interface and terminal faces |
 | `src/ui/mod.rs` | `Action::SetUiFont` | Stores the interface face id and saves |
 | `src/ui/mod.rs` | `Action::SetTerminalFont` | Stores the terminal face id and saves |
 | `src/settings.rs` | `MAX_RECENT_REPOSITORIES` | Recent list size (10) |
 | `src/settings.rs` | `SettingsError` | Read / parse / write errors shown to the user |
 | `src/ui/mod.rs` | `CthulhuApp::new` | Loads settings, applies the theme, picks the startup screen |
-| `src/ui/mod.rs` | `CthulhuApp::poll_opening` | Remembers a repository on success; forgets `last_repository` when it fails to open |
+| `src/ui/mod.rs` | `load_settings` | The settings and `save_path`: a file that could not be read leaves no save path, so nothing is written over it |
+| `src/ui/mod.rs` | `CthulhuApp::finish_open` | Remembers a repository on success; forgets `last_repository` when it fails to open |
 | `src/ui/mod.rs` | `CthulhuApp::ui`, `Action::ToggleBranchesSidebar`, `Action::ToggleDetailSidebar` | Flips `branches_sidebar_hidden` (saved as `history_sidebar_hidden`) or `detail_sidebar_hidden` when the repository view asks |
 | `src/ui/mod.rs` | `CthulhuApp::ui`, `Action::ToggleTerminal` | Flips `terminal_hidden` when the repository view asks. Showing the terminal also opens the right sidebar |
 | `src/settings.rs` | `HistoryColumns`, `HistoryColumns::normalized` | Width of each history column, validated field by field |
