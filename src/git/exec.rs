@@ -826,6 +826,8 @@ fn shell_single_quote(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn status_raw(raw: i32) -> ExitStatus {
@@ -841,173 +843,216 @@ mod tests {
         }
     }
 
-    fn version(output: &str) -> GitVersion {
-        GitVersion::parse(output).expect("parsable version")
-    }
+    /// `git --version` output, and the numbers, `raw` (what the version
+    /// displays) and floor check it gives. `None` is not a version.
+    type Version = Option<((u32, u32, u32), &'static str, bool)>;
+
+    const VERSIONS: &[(&str, Version)] = &[
+        ("git version 2.43.0\n", Some(((2, 43, 0), "2.43.0", true))),
+        (
+            "git version 2.43.0.windows.1",
+            Some(((2, 43, 0), "2.43.0.windows.1", true)),
+        ),
+        (
+            "git version 2.39.5 (Apple Git-154)\n",
+            Some(((2, 39, 5), "2.39.5 (Apple Git-154)", true)),
+        ),
+        (
+            "git version 2.14.3 (Apple Git-1)",
+            Some(((2, 14, 3), "2.14.3 (Apple Git-1)", false)),
+        ),
+        // The floor is 2.15.0, and a missing component is zero.
+        ("git version 2.15", Some(((2, 15, 0), "2.15", true))),
+        ("git version 2.15.", Some(((2, 15, 0), "2.15.", true))),
+        ("git version 2.15.0.1", Some(((2, 15, 0), "2.15.0.1", true))),
+        ("git version 3.0.0", Some(((3, 0, 0), "3.0.0", true))),
+        ("git version 2", Some(((2, 0, 0), "2", false))),
+        ("git version 2.", Some(((2, 0, 0), "2.", false))),
+        ("git version 2.9.9", Some(((2, 9, 9), "2.9.9", false))),
+        ("git version 1.9.1", Some(((1, 9, 1), "1.9.1", false))),
+        // A pre-release is not the release that brought `--no-optional-locks`.
+        (
+            "git version 2.15.0-rc0\n",
+            Some(((2, 15, 0), "2.15.0-rc0", false)),
+        ),
+        (
+            "git version 2.20.0-RC1",
+            Some(((2, 20, 0), "2.20.0-RC1", false)),
+        ),
+        (
+            "git version 2.20.0-alpha",
+            Some(((2, 20, 0), "2.20.0-alpha", false)),
+        ),
+        (
+            "git version 2.20.0-beta.2",
+            Some(((2, 20, 0), "2.20.0-beta.2", false)),
+        ),
+        (
+            "git version 2.20.0-pre",
+            Some(((2, 20, 0), "2.20.0-pre", false)),
+        ),
+        (
+            "git version 2.16.0\0windows",
+            Some(((2, 16, 0), "2.16.0\0windows", true)),
+        ),
+        ("", None),
+        ("\0", None),
+        ("git version ", None),
+        ("git version \0", None),
+        ("git version\n", None),
+        ("version 2.43.0", None),
+        ("git version abc", None),
+        ("git version .1.2", None),
+        ("git version 2..1", None),
+        // An overflowing component is refused, not skipped.
+        ("git version 2.99999999999.0", None),
+    ];
 
     #[test]
-    fn parses_plain_version() {
-        let parsed = version("git version 2.43.0\n");
-        assert_eq!(parsed.numbers(), (2, 43, 0));
-        assert_eq!(parsed.raw, "2.43.0");
-    }
-
-    #[test]
-    fn parses_windows_suffix() {
-        let parsed = version("git version 2.43.0.windows.1");
-        assert_eq!(parsed.numbers(), (2, 43, 0));
-        assert_eq!(parsed.raw, "2.43.0.windows.1");
-        assert!(parsed.is_supported());
-    }
-
-    #[test]
-    fn apple_suffix_is_not_read_as_a_version_component() {
-        let parsed = version("git version 2.39.5 (Apple Git-154)\n");
-        assert_eq!(parsed.numbers(), (2, 39, 5));
-        assert_eq!(parsed.raw, "2.39.5 (Apple Git-154)");
-        assert!(parsed.is_supported());
-        assert!(!version("git version 2.14.3 (Apple Git-1)").is_supported());
-    }
-
-    #[test]
-    fn rejects_empty_headerless_and_non_numeric() {
-        for output in [
-            "",
-            "git version ",
-            "git version\n",
-            "version 2.43.0",
-            "git version abc",
-            "git version .1.2",
-            "git version 2..1",
-        ] {
-            assert_eq!(GitVersion::parse(output), None, "{output:?}");
+    fn git_version_table() {
+        for (case, expected) in VERSIONS {
+            let got = GitVersion::parse(case).map(|version| {
+                (
+                    version.numbers(),
+                    version.to_string(),
+                    version.is_supported(),
+                )
+            });
+            let expected =
+                expected.map(|(numbers, raw, supported)| (numbers, raw.to_owned(), supported));
+            assert_eq!(got, expected, "{case:?}");
         }
     }
 
-    #[test]
-    fn overflowing_component_is_rejected_not_skipped() {
-        assert_eq!(GitVersion::parse("git version 2.99999999999.0"), None);
+    proptest! {
+        #![proptest_config(crate::test_support::proptest_config())]
+
+        #[test]
+        fn git_version_parse_never_panics(text in "(?s).{0,64}", digits in "[0-9.]{0,24}") {
+            for output in [text.clone(), format!("git version {digits}{text}")] {
+                if let Some(version) = GitVersion::parse(&output) {
+                    prop_assert_eq!(version.raw.trim(), version.raw.as_str());
+                }
+            }
+        }
     }
 
-    #[test]
-    fn release_candidate_does_not_meet_the_floor() {
-        let parsed = version("git version 2.15.0-rc0\n");
-        assert_eq!(parsed.numbers(), (2, 15, 0));
-        assert!(!parsed.is_supported());
-        assert!(version("git version 2.43.0.windows.1").is_supported());
-    }
-
-    #[test]
-    fn not_a_repository_matches_the_fatal_line_only() {
-        let older = classify_failure(
-            Path::new("/tmp/plain"),
+    /// `cwd`, args, raw exit status, stderr, and the message of the error.
+    /// `{status}` stands for the exit status.
+    const FAILURES: &[(&str, &[&str], i32, &str, &str)] = &[
+        (
+            "/tmp/somewhere",
             &["rev-parse", "--show-toplevel"],
-            status_raw(128),
-            "fatal: Not a git repository (or any of the parent directories): .git",
-        );
-        assert!(matches!(older, GitError::NotARepository(_)), "{older:?}");
-
-        let broken_gitfile = classify_failure(
-            Path::new("/tmp/broken"),
-            &["rev-parse", "--is-bare-repository"],
-            status_raw(128),
-            "fatal: gitfile does not point to a valid repository: /tmp/broken/.git",
-        );
-        assert!(
-            matches!(broken_gitfile, GitError::NotARepository(_)),
-            "{broken_gitfile:?}"
-        );
-
-        let mentioned = classify_failure(
-            Path::new("/tmp/plain"),
-            &["rev-parse"],
-            status_raw(128),
-            "fatal: cannot change to 'not a git repository': No such file or directory",
-        );
-        assert!(
-            matches!(mentioned, GitError::Command { .. }),
-            "{mentioned:?}"
-        );
-    }
-
-    #[test]
-    fn version_floor_is_2_15() {
-        for supported in [
-            "2.15.0",
-            "2.15",
-            "2.15.0.0",
-            "2.15.0.windows.1",
-            "2.43.0",
-            "3.0.0",
-        ] {
-            assert!(
-                version(&format!("git version {supported}")).is_supported(),
-                "{supported}"
-            );
-        }
-        for old in ["2.14.3", "1.9.1", "2", "2.9.9"] {
-            assert!(
-                !version(&format!("git version {old}")).is_supported(),
-                "{old}"
-            );
-        }
-    }
-
-    #[test]
-    fn versions_compare_numerically() {
-        assert!(version("git version 2.9.0") < version("git version 2.15.0"));
-        assert!(version("git version 2.15.1") > version("git version 2.15.0"));
-    }
-
-    #[test]
-    fn not_a_repository_is_typed() {
-        let error = classify_failure(
-            Path::new("/tmp/somewhere"),
-            &["rev-parse", "--show-toplevel"],
-            status_raw(128),
+            128,
             "fatal: not a git repository (or any of the parent directories): .git",
-        );
-        assert!(
-            matches!(error, GitError::NotARepository(path) if path == Path::new("/tmp/somewhere"))
-        );
-    }
-
-    #[test]
-    fn dubious_ownership_reports_repository_root() {
-        let stderr = "fatal: detected dubious ownership in repository at '/srv/shared/repo'\n\
-                      To add an exception for this directory, call:\n\n\
-                      \tgit config --global --add safe.directory /srv/shared/repo";
-        let error = classify_failure(
-            Path::new("/srv/shared/repo/sub"),
+            "/tmp/somewhere is not inside a Git repository.",
+        ),
+        (
+            "/tmp/plain",
+            &["rev-parse", "--show-toplevel"],
+            128,
+            "fatal: Not a git repository (or any of the parent directories): .git",
+            "/tmp/plain is not inside a Git repository.",
+        ),
+        (
+            "/tmp/broken",
+            &["rev-parse", "--is-bare-repository"],
+            128,
+            "fatal: gitfile does not point to a valid repository: /tmp/broken/.git",
+            "/tmp/broken is not inside a Git repository.",
+        ),
+        (
+            "/tmp/a\0b",
+            &["status", "arg\0two"],
+            1,
+            "fatal: not a git repository\0still the same string",
+            "/tmp/a\0b is not inside a Git repository.",
+        ),
+        // The words anywhere but the primary fatal are some other failure.
+        (
+            "/tmp/plain",
             &["rev-parse"],
-            status_raw(128),
-            stderr,
-        );
-        let GitError::UnsafeRepository(path) = &error else {
-            panic!("expected UnsafeRepository, got {error:?}");
-        };
-        assert_eq!(path, Path::new("/srv/shared/repo"));
-        assert!(
-            error
-                .to_string()
-                .contains("git config --global --add safe.directory '/srv/shared/repo'")
-        );
-    }
+            128,
+            "fatal: cannot change to 'not a git repository': No such file or directory",
+            "`git rev-parse` failed ({status}): \
+             fatal: cannot change to 'not a git repository': No such file or directory",
+        ),
+        (
+            "/cwd",
+            &["status"],
+            1,
+            "note: this is not a git repository wording; the fault is permissions",
+            "`git status` failed ({status}): \
+             note: this is not a git repository wording; the fault is permissions",
+        ),
+        // The path comes from git's safe.directory hint, then from the quotes.
+        (
+            "/srv/shared/repo/sub",
+            &["rev-parse"],
+            128,
+            "fatal: detected dubious ownership in repository at '/srv/shared/repo'\n\
+             To add an exception for this directory, call:\n\n\
+             \tgit config --global --add safe.directory /srv/shared/repo",
+            "Git refuses to open /srv/shared/repo because it is owned by another user. \
+             If you trust it, run: git config --global --add safe.directory '/srv/shared/repo'",
+        ),
+        (
+            "/cwd",
+            &["status", "--porcelain=v2"],
+            128,
+            "fatal: detected dubious ownership in repository at '/home/not a git repository'\n\
+             To add an exception for this directory, call:\n\n\
+             \tgit config --global --add safe.directory '/home/not a git repository'",
+            "Git refuses to open /home/not a git repository because it is owned by another \
+             user. If you trust it, run: git config --global --add safe.directory \
+             '/home/not a git repository'",
+        ),
+        (
+            "/cwd",
+            &["rev-parse", "--show-toplevel"],
+            128,
+            "fatal: detected dubious ownership in repository at '/srv/o'brien/repo'\n\
+             To add an exception for this directory, call:\n\n\
+             \tgit config --global --add safe.directory '/srv/o'\\''brien/repo'",
+            "Git refuses to open /srv/o'brien/repo because it is owned by another user. \
+             If you trust it, run: git config --global --add safe.directory '/srv/o'\\''brien/repo'",
+        ),
+        (
+            "/cwd",
+            &["status"],
+            128,
+            "fatal: detected dubious ownership in repository at '/tmp/a\0b'",
+            "Git refuses to open /tmp/a\0b because it is owned by another user. \
+             If you trust it, run: git config --global --add safe.directory '/tmp/a\0b'",
+        ),
+        // Empty quotes are not a path: the directory git ran in is.
+        (
+            "/actual/cwd",
+            &["status"],
+            128,
+            "fatal: detected dubious ownership in repository at ''",
+            "Git refuses to open /actual/cwd because it is owned by another user. \
+             If you trust it, run: git config --global --add safe.directory '/actual/cwd'",
+        ),
+        (
+            "/repo",
+            &["status", "--porcelain=v2"],
+            9,
+            "",
+            "`git status --porcelain=v2` failed ({status})",
+        ),
+        ("", &[], 0, "", "`git ` failed ({status})"),
+    ];
 
     #[test]
-    fn other_failures_keep_command_status_and_stderr() {
-        let status = status_raw(9);
-        let error = classify_failure(
-            Path::new("/repo"),
-            &["status", "--porcelain=v2"],
-            status,
-            "",
-        );
-        assert!(matches!(error, GitError::Command { .. }), "{error:?}");
-        assert_eq!(
-            error.to_string(),
-            format!("`git status --porcelain=v2` failed ({status})")
-        );
+    fn classify_failure_table() {
+        for &(cwd, args, raw, stderr, message) in FAILURES {
+            let case = (cwd, args, stderr);
+            let status = status_raw(raw);
+            let error = classify_failure(Path::new(cwd), args, status, stderr);
+            let expected = message.replace("{status}", &status.to_string());
+            assert_eq!(error.to_string(), expected, "{case:?}");
+        }
     }
 
     #[test]

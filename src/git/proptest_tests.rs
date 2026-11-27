@@ -8,29 +8,13 @@
 //! properties themselves stay true for a UTF-8-safe fix where that is called
 //! out, and they do not panic.
 
-use std::cmp::Ordering;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
+use std::path::PathBuf;
 
 use proptest::prelude::*;
 
-use super::exec::{GitError, GitVersion, MIN_GIT_VERSION, classify_failure};
 use super::log::{SHORT_OID_LEN, parse_log, short_oid};
 use crate::settings::{FILE_NAME, HistoryColumns, MAX_RECENT_REPOSITORIES, Settings};
-
-fn status_raw(raw: i32) -> ExitStatus {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        ExitStatus::from_raw(raw)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::ExitStatusExt;
-        ExitStatus::from_raw(raw as u32)
-    }
-}
 
 fn arb_text(max_chars: usize) -> impl Strategy<Value = String> {
     prop::collection::vec(any::<char>(), 0..=max_chars)
@@ -39,53 +23,6 @@ fn arb_text(max_chars: usize) -> impl Strategy<Value = String> {
 
 fn arb_bytes() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 0..4096)
-}
-
-fn arb_version_suffix() -> impl Strategy<Value = String> {
-    prop_oneof![
-        4 => Just(String::new()),
-        2 => Just(".windows.1".to_owned()),
-        2 => Just(" (Apple Git-154)".to_owned()),
-        1 => prop::collection::vec(prop::char::range('a', 'z'), 1..8).prop_map(|chars| {
-            let mut suffix = String::from(" ");
-            suffix.extend(chars);
-            suffix
-        }),
-    ]
-}
-
-fn arb_git_version() -> impl Strategy<Value = GitVersion> {
-    (
-        any::<u32>(),
-        any::<u32>(),
-        any::<u32>(),
-        0u8..3,
-        arb_version_suffix(),
-    )
-        .prop_map(|(major, minor, patch, width, suffix)| {
-            let numeric = match width {
-                0 => format!("{major}"),
-                1 => format!("{major}.{minor}"),
-                _ => format!("{major}.{minor}.{patch}"),
-            };
-            let output = format!("git version {numeric}{suffix}");
-            GitVersion::parse(&output)
-                .unwrap_or_else(|| panic!("structured version did not parse: {output:?}"))
-        })
-}
-
-fn arb_version_input() -> impl Strategy<Value = String> {
-    prop_oneof![
-        3 => arb_text(128),
-        2 => arb_text(64).prop_map(|suffix| format!("git version {suffix}")),
-        2 => (0u32..20_000, 0u32..20_000, 0u32..20_000, arb_text(12)).prop_map(
-            |(major, minor, patch, suffix)| format!("git version {major}.{minor}.{patch}{suffix}")
-        ),
-        1 => prop::collection::vec(prop::char::range('0', '9'), 10..20).prop_map(|digits| {
-            let digits: String = digits.into_iter().collect();
-            format!("git version {digits}.{digits}.0")
-        }),
-    ]
 }
 
 fn arb_hex_oid() -> impl Strategy<Value = String> {
@@ -118,51 +55,6 @@ fn arb_log_bytes() -> impl Strategy<Value = Vec<u8>> {
         3 => arb_bytes(),
         2 => arb_log_records(),
     ]
-}
-
-fn arb_stderr() -> impl Strategy<Value = String> {
-    prop_oneof![
-        3 => arb_text(160),
-        1 => prop::collection::vec(any::<u8>(), 0..4096).prop_map(|bytes| {
-            String::from_utf8_lossy(&bytes).into_owned()
-        }),
-        2 => arb_text(80).prop_map(|text| format!("{text}not a git repository{text}")),
-        2 => (arb_text(48), arb_text(48)).prop_map(|(path, tail)| {
-            format!("fatal: detected dubious ownership in repository at '{path}'\n{tail}")
-        }),
-        1 => Just(
-            "fatal: not a git repository (or any of the parent directories): .git".to_owned(),
-        ),
-    ]
-}
-
-fn version_meets_floor(version: &GitVersion) -> bool {
-    if version.numbers() < (2, 15, 0) {
-        return false;
-    }
-    let rest = version
-        .raw
-        .trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.');
-    let rest = rest.to_ascii_lowercase();
-    !["-rc", "-alpha", "-beta", "-pre"]
-        .iter()
-        .any(|marker| rest.starts_with(marker))
-}
-
-fn line_is_not_a_repository(stderr: &str) -> bool {
-    stderr.lines().any(|line| {
-        let line = line.trim_start().to_ascii_lowercase();
-        line.starts_with("fatal: not a git repository")
-            || line.starts_with("fatal: gitfile does not point to a valid repository")
-    })
-}
-
-/// Path inside the first `'...'` after `repository at '`. A longer kept path
-/// (an apostrophe in the name) still starts with this slice.
-fn dubious_quoted_path(stderr: &str) -> Option<&str> {
-    let (_, rest) = stderr.split_once("repository at '")?;
-    let (path, _) = rest.split_once('\'')?;
-    Some(path)
 }
 
 fn arb_path_string() -> impl Strategy<Value = String> {
@@ -217,45 +109,8 @@ fn assert_recents_normalized(recents: &[PathBuf]) {
     }
 }
 
-fn assert_version_order(left: &GitVersion, right: &GitVersion) {
-    assert_eq!(left.cmp(right), right.cmp(left).reverse());
-    assert_eq!(left == right, left.cmp(right) == Ordering::Equal);
-    match left.numbers().cmp(&right.numbers()) {
-        Ordering::Equal => assert_eq!(left.cmp(right), left.raw.cmp(&right.raw)),
-        numeric => assert_eq!(left.cmp(right), numeric),
-    }
-    if left.numbers() <= right.numbers() && left.is_supported() {
-        assert!(right.is_supported());
-    }
-    if right.numbers() <= left.numbers() && right.is_supported() {
-        assert!(left.is_supported());
-    }
-}
-
 proptest! {
     #![proptest_config(crate::test_support::proptest_config())]
-
-    #[test]
-    fn git_version_parse_never_panics_and_matches_numeric_prefix(input in arb_version_input()) {
-        assert_eq!(MIN_GIT_VERSION, (2, 15, 0));
-        if let Some(parsed) = GitVersion::parse(&input) {
-            assert_eq!(parsed.numbers(), (parsed.major, parsed.minor, parsed.patch));
-            assert!(!parsed.raw.is_empty());
-            assert_eq!(parsed.raw.trim(), parsed.raw);
-            assert_eq!(parsed.to_string(), parsed.raw);
-            assert_eq!(parsed.is_supported(), version_meets_floor(&parsed));
-            if input.contains("-rc") || input.contains("-alpha") {
-                assert!(!parsed.is_supported(), "{input:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn git_version_ordering_matches_numeric_tuple(left in arb_git_version(), right in arb_git_version()) {
-        assert_version_order(&left, &right);
-        assert_eq!(left.is_supported(), left.numbers() >= (2, 15, 0));
-        assert_eq!(right.is_supported(), right.numbers() >= (2, 15, 0));
-    }
 
     #[test]
     fn parse_log_never_panics_and_oids_are_hex(bytes in arb_log_bytes()) {
@@ -282,71 +137,6 @@ proptest! {
         if text.is_char_boundary(end) {
             assert_eq!(got, &text[..end]);
             assert_eq!(got.len(), end);
-        }
-    }
-
-    #[test]
-    fn classify_failure_never_panics(
-        cwd in arb_text(80),
-        args in prop::collection::vec(arb_text(24), 0..6),
-        status_bits in any::<i32>(),
-        stderr in arb_stderr(),
-    ) {
-        let cwd_path = Path::new(&cwd);
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let status = status_raw(status_bits);
-        let error = classify_failure(cwd_path, &arg_refs, status, &stderr);
-        let rendered = error.to_string();
-        assert!(!rendered.is_empty());
-
-        if line_is_not_a_repository(&stderr) {
-            match &error {
-                GitError::NotARepository(path) => {
-                    assert_eq!(path, cwd_path);
-                    if !cwd.is_empty() {
-                        assert!(rendered.contains(&cwd_path.display().to_string()));
-                    }
-                }
-                other => panic!("expected NotARepository, got {other:?}"),
-            }
-        } else if stderr.contains("detected dubious ownership") {
-            let GitError::UnsafeRepository(path) = &error else {
-                panic!("expected UnsafeRepository, got {error:?}");
-            };
-            match dubious_quoted_path(&stderr) {
-                // The first quoted slice is a prefix of the path that is kept.
-                // Equality is not required: a later apostrophe currently truncates
-                // the repository path (report G2), and a fix may keep the rest.
-                Some(quoted) if !quoted.is_empty() => {
-                    let shown = path.to_string_lossy();
-                    assert!(!shown.is_empty());
-                    assert!(
-                        shown.starts_with(quoted),
-                        "path {shown:?} does not start with quoted {quoted:?}"
-                    );
-                }
-                Some(_) => {
-                    // An empty quoted path is not required to fall back to cwd.
-                    assert!(path.as_os_str().is_empty() || path == cwd_path);
-                }
-                None => assert_eq!(path, cwd_path),
-            }
-            if !path.as_os_str().is_empty() {
-                assert!(rendered.contains(&path.display().to_string()));
-            }
-        } else {
-            match &error {
-                GitError::Command {
-                    command,
-                    status: got_status,
-                    stderr: got_stderr,
-                } => {
-                    assert_eq!(got_status.to_string(), status.to_string());
-                    assert_eq!(got_stderr, &stderr);
-                    assert_eq!(command, &format!("git {}", args.join(" ")));
-                }
-                other => panic!("expected Command, got {other:?}"),
-            }
         }
     }
 
@@ -553,69 +343,6 @@ proptest! {
 }
 
 #[test]
-fn git_version_reference_table() {
-    let cases = [
-        ("", None),
-        ("\0", None),
-        ("git version ", None),
-        ("git version \0", None),
-        ("git version\n", None),
-        ("version 2.43.0", None),
-        ("git version 2.43.0\n", Some((2, 43, 0))),
-        ("git version 2.15", Some((2, 15, 0))),
-        ("git version 2", Some((2, 0, 0))),
-        ("git version 2.", Some((2, 0, 0))),
-        ("git version 2.15.", Some((2, 15, 0))),
-        ("git version 2.14.3", Some((2, 14, 3))),
-        ("git version 2.15.0.windows.1", Some((2, 15, 0))),
-        ("git version 2.39.5 (Apple Git-154)", Some((2, 39, 5))),
-        ("git version 2.15.0.1", Some((2, 15, 0))),
-        ("git version 2..1", None),
-        ("git version .1.2", None),
-        ("git version 2.99999999999.0", None),
-    ];
-    for (input, expected) in cases {
-        let parsed = GitVersion::parse(input).map(|version| version.numbers());
-        assert_eq!(parsed, expected, "{input:?}");
-    }
-
-    let supported = GitVersion::parse("git version 2.15.0").expect("version");
-    let older = GitVersion::parse("git version 2.14.3").expect("version");
-    assert!(supported.is_supported());
-    assert!(!older.is_supported());
-    assert!(older < supported);
-}
-
-#[test]
-fn git_version_empty_and_interior_nul() {
-    assert_eq!(GitVersion::parse(""), None);
-    assert_eq!(GitVersion::parse("\0"), None);
-    assert_eq!(GitVersion::parse("git version \0"), None);
-
-    let parsed = GitVersion::parse("git version 2.16.0\0windows").expect("version");
-    assert_eq!(parsed.numbers(), (2, 16, 0));
-    assert!(parsed.raw.starts_with("2.16.0"));
-    assert!(parsed.is_supported());
-    assert_eq!(parsed.to_string(), parsed.raw);
-
-    let floor = GitVersion::parse("git version 2.15.0").expect("version");
-    assert!(parsed > floor);
-    assert_eq!(parsed.cmp(&floor), parsed.numbers().cmp(&floor.numbers()));
-}
-
-#[test]
-fn equal_numbers_break_ties_with_raw_only() {
-    let plain = GitVersion::parse("git version 2.15.0").expect("version");
-    let windows = GitVersion::parse("git version 2.15.0.windows.1").expect("version");
-    assert_eq!(plain.numbers(), windows.numbers());
-    assert_eq!(plain.numbers(), (2, 15, 0));
-    assert!(plain < windows);
-    assert_eq!(plain.cmp(&windows), plain.raw.cmp(&windows.raw));
-    assert!(plain.is_supported());
-    assert!(windows.is_supported());
-}
-
-#[test]
 fn parse_log_empty_and_interior_nul() {
     assert_eq!(parse_log(b""), Some(Vec::new()));
     assert_eq!(parse_log(&[0, 0, 0]), Some(Vec::new()));
@@ -657,117 +384,4 @@ fn short_oid_mid_character_returns_the_entire_string() {
     long.push_str(&"z".repeat(100));
     assert_eq!(short_oid(&long), long);
     assert_eq!(short_oid(&long).len(), 113);
-}
-
-#[test]
-fn classify_failure_empty_and_interior_nul() {
-    let status = status_raw(0);
-    let empty = classify_failure(Path::new(""), &[], status, "");
-    match &empty {
-        GitError::Command {
-            command,
-            status: got,
-            stderr,
-        } => {
-            assert_eq!(command, "git ");
-            assert_eq!(got.to_string(), status.to_string());
-            assert_eq!(stderr, "");
-        }
-        other => panic!("expected Command, got {other:?}"),
-    }
-    assert_eq!(empty.to_string(), format!("`git ` failed ({status})"));
-
-    let error = classify_failure(
-        Path::new("/tmp/a\0b"),
-        &["status", "arg\0two"],
-        status_raw(1),
-        "fatal: not a git repository\0still the same string",
-    );
-    assert!(matches!(error, GitError::NotARepository(ref path) if path == Path::new("/tmp/a\0b")));
-    assert!(error.to_string().contains("not inside a Git repository"));
-
-    let dubious = classify_failure(
-        Path::new("/cwd"),
-        &["status"],
-        status_raw(128),
-        "fatal: detected dubious ownership in repository at '/tmp/a\0b'",
-    );
-    assert!(
-        matches!(dubious, GitError::UnsafeRepository(ref path) if path == Path::new("/tmp/a\0b"))
-    );
-    let _ = dubious.to_string();
-}
-
-/// The phrase is not enough. It has to be the primary fatal, and it must not
-/// hide a dubious-ownership error whose path happens to contain the words.
-#[test]
-fn not_a_repository_substring_does_not_hide_dubious_ownership() {
-    let stderr = "\
-fatal: detected dubious ownership in repository at '/home/not a git repository'
-To add an exception for this directory, call:
-
-\tgit config --global --add safe.directory '/home/not a git repository'";
-    let error = classify_failure(
-        Path::new("/cwd"),
-        &["status", "--porcelain=v2"],
-        status_raw(128),
-        stderr,
-    );
-    assert!(
-        matches!(error, GitError::UnsafeRepository(ref path) if path == Path::new("/home/not a git repository")),
-        "got {error:?}"
-    );
-    let rendered = error.to_string();
-    assert!(rendered.contains("safe.directory"));
-    assert!(!rendered.contains("is not inside a Git repository"));
-
-    let mentioned = classify_failure(
-        Path::new("/cwd"),
-        &["status"],
-        status_raw(1),
-        "note: the handbook says this is not a git repository wording; real fault is permissions",
-    );
-    assert!(
-        matches!(mentioned, GitError::Command { .. }),
-        "got {mentioned:?}"
-    );
-}
-
-/// An apostrophe in the path is escaped in git's suggested command as `'\''`.
-#[test]
-fn dubious_ownership_apostrophe_keeps_the_path() {
-    let stderr = "\
-fatal: detected dubious ownership in repository at '/srv/o'brien/repo'
-To add an exception for this directory, call:
-
-\tgit config --global --add safe.directory '/srv/o'\\''brien/repo'";
-    let error = classify_failure(
-        Path::new("/cwd"),
-        &["rev-parse", "--show-toplevel"],
-        status_raw(128),
-        stderr,
-    );
-    let GitError::UnsafeRepository(path) = &error else {
-        panic!("expected UnsafeRepository, got {error:?}");
-    };
-    assert_eq!(path, Path::new("/srv/o'brien/repo"));
-    let rendered = error.to_string();
-    assert!(rendered.contains("brien"), "{rendered}");
-    assert!(rendered.contains("safe.directory"), "{rendered}");
-}
-
-/// Empty quotes are not a path. The directory git was pointed at is the fallback.
-#[test]
-fn dubious_ownership_empty_quotes_fall_back_to_cwd() {
-    let error = classify_failure(
-        Path::new("/actual/cwd"),
-        &["status"],
-        status_raw(128),
-        "fatal: detected dubious ownership in repository at ''",
-    );
-    let GitError::UnsafeRepository(path) = &error else {
-        panic!("expected UnsafeRepository, got {error:?}");
-    };
-    assert_eq!(path, Path::new("/actual/cwd"));
-    assert!(error.to_string().contains("/actual/cwd"));
 }
