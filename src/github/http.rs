@@ -3,6 +3,7 @@
 //! Redirects are followed here, not by ureq, so every hop is checked against
 //! [`ALLOWED_HOSTS`]. The GitHub token is attached only on `api.github.com`.
 
+use std::io::Read;
 use std::time::Duration;
 
 use ureq::http::Uri;
@@ -153,21 +154,17 @@ impl Transport for UreqTransport {
 }
 
 /// Reads at most `limit` bytes; a longer body is an error, not a truncation.
-fn read_capped(reader: &mut impl std::io::Read, limit: usize) -> Result<Vec<u8>, HttpError> {
+/// One byte past the limit is read to tell the two apart.
+fn read_capped(reader: &mut impl Read, limit: usize) -> Result<Vec<u8>, HttpError> {
     let mut body = Vec::new();
-    let mut buffer = [0u8; 8192];
-    loop {
-        let read = match reader.read(&mut buffer) {
-            Ok(0) => return Ok(body),
-            Ok(read) => read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(classify_io(error)),
-        };
-        if body.len() + read > limit {
-            return Err(HttpError::TooLarge);
-        }
-        body.extend_from_slice(&buffer[..read]);
+    reader
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut body)
+        .map_err(classify_io)?;
+    if body.len() > limit {
+        return Err(HttpError::TooLarge);
     }
+    Ok(body)
 }
 
 /// GETs `url`, following up to three redirects inside [`ALLOWED_HOSTS`].
