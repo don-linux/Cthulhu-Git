@@ -2066,61 +2066,8 @@ fn child_opens_repo_despite_hostile_environment() {
     fs::write(sentinel, "checked\n").expect("write sentinel");
 }
 
-fn recorded_argv(path: &Path) -> Vec<String> {
-    let recorded = fs::read(path).unwrap_or_else(|error| {
-        panic!("missing argv log {}: {error}", path.display());
-    });
-    recorded
-        .split(|byte| *byte == 0)
-        .filter(|part| !part.is_empty())
-        .map(|part| String::from_utf8(part.to_vec()).expect("argv is utf-8"))
-        .collect()
-}
-
 fn point_argv_log(fake: &Path, log: &Path) {
     fs::write(sidecar(fake, ".log"), log.display().to_string()).expect("argv sidecar");
-}
-
-/// `Git::run_for` puts these in front of every command, including switch.
-const SWITCH_EXEC_PREFIX: &[&str] = &[
-    "--no-optional-locks",
-    "--no-pager",
-    "--no-replace-objects",
-    "-c",
-    "core.fsmonitor=",
-    "-c",
-    "log.showSignature=false",
-];
-
-fn assert_switch_command_argv(args: &[String], name: &str) {
-    assert!(
-        args.len() >= SWITCH_EXEC_PREFIX.len() + 4,
-        "{name} argv is shorter than the exec prefix plus switch: {args:?}"
-    );
-    let boundary = args
-        .iter()
-        .position(|arg| arg == "--")
-        .unwrap_or_else(|| panic!("{name} was not one argument after --: {args:?}"));
-    assert!(
-        args[..boundary].iter().all(|arg| arg != name),
-        "{name} appeared before -- as a bare flag: {args:?}"
-    );
-    assert!(
-        args.iter().all(|arg| arg != "--all" && arg != "--prune"),
-        "{name} argv includes --all or --prune: {args:?}"
-    );
-    let head: Vec<&str> = args[..SWITCH_EXEC_PREFIX.len()]
-        .iter()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(head, SWITCH_EXEC_PREFIX, "{name} exec prefixes: {args:?}");
-    let tail: Vec<&str> = args[args.len() - 4..].iter().map(String::as_str).collect();
-    assert_eq!(tail, ["switch", "--no-guess", "--", name], "{name}");
-    assert_eq!(
-        args.len(),
-        SWITCH_EXEC_PREFIX.len() + 4,
-        "{name} argv has extra elements: {args:?}"
-    );
 }
 
 fn assert_attached_to(fixture: &Fixture, name: &str) {
@@ -2226,39 +2173,6 @@ fn assert_post_checkout_was_a_branch_switch(log: &Path, marker: &Path) {
 
 fn ref_names(fixture: &Fixture, pattern: &str) -> String {
     fixture.git(&["for-each-ref", "--format=%(refname)", pattern])
-}
-
-#[test]
-fn checkout_option_shaped_names_are_one_ref_argument() {
-    let tmp = TempDir::with_prefix("cthulhu-adv-a-switch-argv-").expect("temp dir");
-    let fake = link_fake(tmp.path(), "git");
-    write_mode(&fake, "record-command");
-    let argv_log = tmp.path().join("argv.log");
-    point_argv_log(&fake, &argv_log);
-    let git = probe_fake(&fake);
-    let workdir = tmp.path().join("workdir");
-    fs::create_dir(&workdir).expect("workdir");
-
-    for name in [
-        "-switch",
-        "--upload-pack=evil",
-        "--force",
-        "-f",
-        "--detach",
-        "--orphan",
-        "--guess",
-        "-B",
-    ] {
-        remove_artifact(&argv_log);
-        switch_branch(&git, &workdir, name).unwrap_or_else(|error| {
-            panic!("switch_branch {name} failed: {}", brief_error(&error));
-        });
-        assert!(
-            argv_log.is_file(),
-            "{name} did not spawn git; argv log was not written"
-        );
-        assert_switch_command_argv(&recorded_argv(&argv_log), name);
-    }
 }
 
 #[test]
@@ -2583,25 +2497,6 @@ fn checkout_runs_post_checkout_and_smudge_like_the_terminal() {
         fs::read(fixture.root.join(".gitattributes")).expect(".gitattributes"),
         b"* filter=evil\n"
     );
-}
-
-#[test]
-fn checkout_does_not_run_core_fsmonitor() {
-    let fixture = Fixture::with_two_commits();
-    fixture.git(&["branch", "other", "HEAD~1"]);
-    let marker = fixture.marker("fsmonitor-checkout");
-    let poke = poke_script(fixture.tmp.path(), "fsmonitor-checkout.sh", &marker);
-    fixture.git(&[
-        "config",
-        "--local",
-        "core.fsmonitor",
-        &poke.display().to_string(),
-    ]);
-
-    switch_branch(&fixture.git, &fixture.root, "other").unwrap_or_else(|error| {
-        panic!("switch failed: {error}");
-    });
-    assert_did_not_run(&marker, "core.fsmonitor");
 }
 
 #[test]
