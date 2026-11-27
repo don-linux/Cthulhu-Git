@@ -430,20 +430,15 @@ fn command_with_env(
 
     command
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_PAGER", "cat")
         // The "C" locale exists everywhere and keeps the stderr we match on in English.
         .env("LC_ALL", "C")
-        .env("LANGUAGE", "C");
-
-    // The sweep above drops GIT_NO_LAZY_FETCH because it is not in KEPT_GIT_VARS.
-    // Put a user-set value back unchanged. Otherwise disable lazy fetches of
-    // promisor objects. Git 2.15 does not read the name; unknown environment
-    // variables are unused, so the assignment is safe on the version floor.
-    command.env(
-        "GIT_NO_LAZY_FETCH",
-        inherited("GIT_NO_LAZY_FETCH").unwrap_or(OsStr::new("1")),
-    );
+        .env("LANGUAGE", "C")
+        // No lazy fetch of promisor objects, unless the user's own value
+        // (removed by the sweep) says otherwise. Git 2.15 ignores the name.
+        .env(
+            "GIT_NO_LAZY_FETCH",
+            inherited("GIT_NO_LAZY_FETCH").unwrap_or(OsStr::new("1")),
+        );
 
     // Windows spells it `Path`; `inherited` compares names as the platform does.
     apply_child_path(&mut command, inherited("PATH"), path_extras);
@@ -468,7 +463,10 @@ fn command_with_env(
 
 /// Points `command` at `cwd` and puts `args` after the options every
 /// [`Git::run`] gets. Command-line options win over any config file, so a
-/// repository cannot turn these back on.
+/// repository cannot turn these back on. For its own children, git turns
+/// `--no-optional-locks` into `GIT_OPTIONAL_LOCKS=0` and `--no-pager` into
+/// `GIT_PAGER=cat` (`git.c`, since 2.15), and [`command_with_env`] removes
+/// an inherited value of either.
 fn harden<'a>(command: &'a mut Command, cwd: &Path, args: &[&str]) -> &'a mut Command {
     command
         .current_dir(cwd)
@@ -1198,6 +1196,9 @@ mod tests {
             ("GIT_CONFIG_VALUE_0", REMOVED),
             ("GIT_CONFIG_PARAMETERS", REMOVED),
             ("GIT_TRACE", REMOVED),
+            // git sets these for its children from the hardening prefix.
+            ("GIT_OPTIONAL_LOCKS", REMOVED),
+            ("GIT_PAGER", REMOVED),
             // Git for Windows reads these as `GIT_WORK_TREE` and `GIT_INDEX_FILE`.
             ("Git_Work_Tree", other_case.clone()),
             ("git_index_file", other_case),
@@ -1213,8 +1214,6 @@ mod tests {
             ("HOME", INHERITED),
             // Owned names replace the inherited value.
             ("GIT_TERMINAL_PROMPT", set("0")),
-            ("GIT_OPTIONAL_LOCKS", set("0")),
-            ("GIT_PAGER", set("cat")),
             ("LC_ALL", set("C")),
             ("LANGUAGE", set("C")),
         ];

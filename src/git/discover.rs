@@ -52,12 +52,9 @@ impl DiscoverInputs {
 /// `/usr/bin/git` on macOS. Other platforms leave the list empty so a Linux
 /// test can opt in by filling [`DiscoverInputs::skip_paths`] itself.
 fn path_skips_from_env() -> Vec<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
+    if cfg!(target_os = "macos") {
         vec![PathBuf::from(MACOS_SHIM_GIT)]
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
+    } else {
         Vec::new()
     }
 }
@@ -209,7 +206,6 @@ const MACOS_SHIM_GIT: &str = "/usr/bin/git";
 /// never exits, so it is searched only when a real developer git is already
 /// installed. MacPorts lives at `/opt/local/bin/git`, after Homebrew and
 /// `/usr/local`. `exists` is injected so Linux tests can lock the table.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn macos_fallback_paths(exists: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
     let clt = Path::new(MACOS_CLT_GIT);
     let xcode = Path::new(MACOS_XCODE_GIT);
@@ -230,7 +226,6 @@ fn macos_fallback_paths(exists: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
     paths
 }
 
-#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
 fn linux_fallback_paths() -> Vec<PathBuf> {
     ["/usr/bin/git", "/usr/local/bin/git"]
         .into_iter()
@@ -238,29 +233,27 @@ fn linux_fallback_paths() -> Vec<PathBuf> {
         .collect()
 }
 
-#[cfg(target_os = "macos")]
+/// This platform's table. Every table compiles everywhere, so the tests of
+/// one run on all.
 fn platform_fallbacks() -> Vec<PathBuf> {
-    macos_fallback_paths(|path| path.is_file())
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn platform_fallbacks() -> Vec<PathBuf> {
-    linux_fallback_paths()
+    if cfg!(target_os = "macos") {
+        macos_fallback_paths(|path| path.is_file())
+    } else if cfg!(windows) {
+        windows_fallback_paths(|name| env::var_os(name))
+    } else if cfg!(unix) {
+        linux_fallback_paths()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Git for Windows (machine and per-user installs), Scoop, the 64-bit
 /// `ProgramW6432` view, and Chocolatey. GUI apps often start before the
-/// installer has updated `PATH`. A relative base is ignored.
-#[cfg(windows)]
-fn platform_fallbacks() -> Vec<PathBuf> {
-    windows_fallback_paths(|name| env::var_os(name))
-}
-
-/// Joins each `(env var, relative tail)` whose base is absolute.
+/// installer has updated `PATH`. Joins each `(env var, relative tail)` whose
+/// base is absolute; a relative base is ignored.
 ///
 /// `var` is injected so Linux tests can lock the table, including
 /// `ProgramW6432` and Chocolatey, without a Windows `PATH` or a real Git.
-#[cfg(any(windows, test))]
 fn windows_fallback_paths(var: impl Fn(&str) -> Option<OsString>) -> Vec<PathBuf> {
     const TAILS: &[(&str, &str)] = &[
         ("ProgramFiles", r"Git\cmd\git.exe"),
@@ -278,11 +271,6 @@ fn windows_fallback_paths(var: impl Fn(&str) -> Option<OsString>) -> Vec<PathBuf
             base.is_absolute().then(|| base.join(tail))
         })
         .collect()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn platform_fallbacks() -> Vec<PathBuf> {
-    Vec::new()
 }
 
 #[cfg(test)]
