@@ -35,6 +35,8 @@ rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["eframe"] }
+# keyring's own core: its in-memory mock store stands in for the keychain.
+keyring-core = "1.1.0"
 proptest = "1.12.0"
 tempfile = "3.27.0"
 

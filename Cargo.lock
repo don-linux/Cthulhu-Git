@@ -941,6 +941,7 @@ dependencies = [
  "ico",
  "image",
  "keyring",
+ "keyring-core",
  "pollster",
  "proptest",
  "resvg",

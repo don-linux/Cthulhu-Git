@@ -52,7 +52,7 @@ atomic: a temp file next to `settings.json` is renamed over it
 | `src/ui/mod.rs` | `Action::SetAuthorAvatars` | Stores `author_avatars`, switches the avatar service, saves |
 | `src/ui/github_auth.rs` | `GitHubAuth`, `Change::InKeychain` | Reads, saves and removes the GitHub token in the system keychain on a worker thread; reports `InKeychain` so the app stores `github_token_in_keyring`. A failed save leaves the flag alone, so a token saved earlier is still read next launch |
 | `src/ui/mod.rs` | `CthulhuApp::poll_github` | Applies `InKeychain` (saves only when the flag changes) and hands the token to the avatar service |
-| `src/github/token.rs` | `load_token`, `save_token`, `delete_token` | The keychain entry. A stored value that is not a token is an error, not "nothing stored" |
+| `src/github/token.rs` | `Keychain`, `load_token`, `save_token`, `delete_token` | The keychain entry, reached through one worker thread so calls run in order. A stored value that is not a token is an error, not "nothing stored". A save that misses its 5 s deadline is never kept: it is skipped, or undone if it lands late |
 | `src/settings.rs` | `lenient_columns`, `lenient_per_mille` | Per-field validation of `history_columns`; `180.0` reads as 180 |
 | `src/ui/settings.rs` | `history_page`, `github_page` | The History and GitHub Auth pages |
 | `src/ui/mod.rs` | `CthulhuApp::save_settings` | The only caller of `save_to` |
