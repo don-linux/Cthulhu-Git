@@ -612,27 +612,28 @@ pub fn file_diff(git: &Git, root: &Path, oid: &str, path: &str) -> Result<FileDi
 /// Turns one `git show -p` into lines. The `diff --git` preamble is dropped.
 /// A binary file, a submodule, or a mode-only change becomes `notice` and no lines.
 pub(crate) fn parse_file_diff(text: &str) -> FileDiff {
-    // Only the header before the first hunk describes the file. Hunk lines
-    // are file content and can contain anything.
-    let mut header = text.lines().take_while(|line| hunk_starts(line).is_none());
+    let header: Vec<&str> = header_lines(text).collect();
     if header
-        .clone()
+        .iter()
         .any(|line| line.starts_with("Binary files ") || line.starts_with("GIT binary patch"))
     {
         return noticed(NOTICE_BINARY);
     }
-    if header.any(is_gitlink_header) {
+    if header.iter().copied().any(is_gitlink_header) {
         return noticed(NOTICE_SUBMODULE);
     }
+    let saw_mode = header
+        .iter()
+        .any(|line| line.starts_with("old mode ") || line.starts_with("new mode "));
 
-    let mut saw_mode = false;
     let mut lines = Vec::new();
     let mut old_no = 0u32;
     let mut new_no = 0u32;
     let mut in_hunk = false;
     for line in text.lines() {
-        if line.starts_with("old mode ") || line.starts_with("new mode ") {
-            saw_mode = true;
+        if line.starts_with("diff --git ") {
+            in_hunk = false;
+            continue;
         }
         if let Some((old, new)) = hunk_starts(line) {
             in_hunk = true;
@@ -709,6 +710,21 @@ pub(crate) fn parse_file_diff(text: &str) -> FileDiff {
         lines,
         columns,
     }
+}
+
+/// The header of every `diff --git` section: its lines before the first hunk.
+/// `git show` prints a type change as two sections. Hunk lines are file
+/// content and can contain anything, so they are left out.
+fn header_lines(text: &str) -> impl Iterator<Item = &str> {
+    let mut in_hunk = false;
+    text.lines().filter(move |line| {
+        if line.starts_with("diff --git ") {
+            in_hunk = false;
+        } else if hunk_starts(line).is_some() {
+            in_hunk = true;
+        }
+        !in_hunk
+    })
 }
 
 /// `index a..b 160000`, `new file mode 160000`, and the other mode lines of a
@@ -1252,50 +1268,71 @@ mod tests {
 
     #[test]
     fn unified_diff_notices_replace_lines_that_are_not_a_text_hunk() {
-        assert_eq!(
-            parse_file_diff("Binary files a/bin.dat and b/bin.dat differ\n")
-                .notice
-                .as_deref(),
-            Some("Binary file.")
-        );
-        assert_eq!(
-            parse_file_diff("GIT binary patch\ndelta 1\n")
-                .notice
-                .as_deref(),
-            Some("Binary file.")
-        );
-        assert_eq!(
-            parse_file_diff(
-                "index abc..def 160000\n@@ -1 +1 @@\n-Subproject commit abc\n+Subproject commit def\n"
-            )
-            .notice
-            .as_deref(),
-            Some("Submodule update.")
-        );
-        assert_eq!(
-            parse_file_diff("old mode 100644\nnew mode 100755\n")
-                .notice
-                .as_deref(),
-            Some("File mode changed.")
-        );
-        assert_eq!(
-            parse_file_diff("diff --git a/x b/x\n").notice.as_deref(),
-            Some("No line changes.")
-        );
-        assert_eq!(
-            parse_file_diff(
-                "new file mode 160000\nindex 0000000..abc\n@@ -0,0 +1 @@\n+Subproject commit abc\n"
-            )
-            .notice
-            .as_deref(),
-            Some("Submodule update.")
-        );
+        for (diff, notice) in [
+            (
+                "Binary files a/bin.dat and b/bin.dat differ\n",
+                "Binary file.",
+            ),
+            ("GIT binary patch\ndelta 1\n", "Binary file."),
+            (
+                "index abc..def 160000\n@@ -1 +1 @@\n-Subproject commit abc\n+Subproject commit def\n",
+                "Submodule update.",
+            ),
+            ("old mode 100644\nnew mode 100755\n", "File mode changed."),
+            ("diff --git a/x b/x\n", "No line changes."),
+            (
+                "new file mode 160000\nindex 0000000..abc\n@@ -0,0 +1 @@\n+Subproject commit abc\n",
+                "Submodule update.",
+            ),
+            // A type change is two sections, and the second header counts too.
+            (
+                concat!(
+                    "diff --git a/x b/x\ndeleted file mode 120000\nindex 1de5659..0000000\n",
+                    "--- a/x\n+++ /dev/null\n@@ -1 +0,0 @@\n-target\n\\ No newline at end of file\n",
+                    "diff --git a/x b/x\nnew file mode 100644\nindex 0000000..8352675\n",
+                    "Binary files /dev/null and b/x differ\n",
+                ),
+                "Binary file.",
+            ),
+            (
+                concat!(
+                    "diff --git a/x b/x\ndeleted file mode 100644\nindex 1de5659..0000000\n",
+                    "--- a/x\n+++ /dev/null\n@@ -1 +0,0 @@\n-text\n",
+                    "diff --git a/x b/x\nnew file mode 160000\nindex 0000000..abc\n",
+                    "--- /dev/null\n+++ b/x\n@@ -0,0 +1 @@\n+Subproject commit abc\n",
+                ),
+                "Submodule update.",
+            ),
+        ] {
+            assert_eq!(
+                parse_file_diff(diff).notice.as_deref(),
+                Some(notice),
+                "{diff:?}"
+            );
+        }
         // The markers inside a text file's hunks are content, not a header.
         let text = parse_file_diff(
             "diff --git a/price.txt b/price.txt\nindex abc..def 100644\n@@ -1,2 +1,2 @@\n-price 150000\n+price 160000\n Subproject commit is just text here\n",
         );
         assert_eq!(text.notice, None);
         assert_eq!(text.lines.len(), 4, "hunk header and three lines: {text:?}");
+        // The second section's `---`/`+++` header is not a hunk line.
+        let type_change = parse_file_diff(concat!(
+            "diff --git a/x b/x\ndeleted file mode 120000\n--- a/x\n+++ /dev/null\n",
+            "@@ -1 +0,0 @@\n-target\n",
+            "diff --git a/x b/x\nnew file mode 100644\n--- /dev/null\n+++ b/x\n",
+            "@@ -0,0 +1 @@\n+hello\n",
+        ));
+        let texts: Vec<&str> = type_change
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            ["@@ -1 +0,0 @@", "target", "@@ -0,0 +1 @@", "hello"],
+            "{type_change:?}"
+        );
     }
 
     #[test]
