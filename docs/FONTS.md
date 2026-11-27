@@ -17,7 +17,7 @@ settings.json "ui_font": "inter"
 settings.json "terminal_font": null
   -> fonts::resolve_terminal      unknown or missing id -> meslo-lgs-nf
                                   "builtin" -> built-in monospace
-  -> FontService::sync            egui family "terminal", measured one pass later
+  -> FontService::sync            egui family "terminal", measured once egui has it
 ```
 
 Hashes and diffs stay on the built-in monospace. Choosing Obel Mono for the

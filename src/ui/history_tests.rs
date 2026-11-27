@@ -14,9 +14,11 @@ use cthulhu_git::github::GitHubRepo;
 use cthulhu_git::settings::HistoryColumns;
 use eframe::egui::accesskit::Role;
 use eframe::egui::output::OutputCommand;
-use eframe::egui::{self, Modifiers, MouseWheelUnit, PointerButton, Pos2, TouchPhase};
-use egui_kittest::Harness;
+use eframe::egui::{
+    self, Modifiers, MouseWheelSource, MouseWheelUnit, PointerButton, Pos2, TouchPhase,
+};
 use egui_kittest::kittest::Queryable;
+use egui_kittest::{Harness, HarnessBuilder};
 
 use super::avatars::AvatarService;
 use super::hover::HoverCache;
@@ -75,7 +77,15 @@ fn screen(
 }
 
 fn harness(size: egui::Vec2, screen: Screen) -> Harness<'static, Screen> {
-    Harness::builder()
+    harness_from(Harness::builder(), size, screen)
+}
+
+fn harness_from(
+    builder: HarnessBuilder<Screen>,
+    size: egui::Vec2,
+    screen: Screen,
+) -> Harness<'static, Screen> {
+    builder
         .with_size(size)
         .with_pixels_per_point(PIXELS_PER_POINT)
         .with_step_dt(1.0 / 60.0)
@@ -182,7 +192,7 @@ fn opened(name: &str, commits: &[(String, String)], truncated: bool) -> OpenedRe
             authored_at: "2026-01-01 00:00".to_owned(),
             message: summary.clone(),
         }),
-        view_id: egui::Id::new(("agent-history", name)),
+        view_id: egui::Id::unique(("agent-history", name)),
         terminal: None,
         github: None,
         hover: HoverCache::default(),
@@ -498,12 +508,14 @@ fn wheel_x(harness: &mut Harness<'_, Screen>, at: Pos2, delta_x: f32) {
         unit: MouseWheelUnit::Point,
         delta: egui::Vec2::ZERO,
         phase: TouchPhase::Start,
+        source: MouseWheelSource::Unknown,
         modifiers: Modifiers::default(),
     });
     harness.input_mut().events.push(egui::Event::MouseWheel {
         unit: MouseWheelUnit::Point,
         delta: egui::vec2(delta_x, 0.0),
         phase: TouchPhase::Move,
+        source: MouseWheelSource::Unknown,
         modifiers: Modifiers::default(),
     });
     harness.step();
@@ -934,7 +946,10 @@ fn long_cells_stay_inside_their_columns() {
         message: 20,
         author: 20,
     };
-    let harness = harness(
+    // No bundled face has 字; the app draws it from the system fonts, which
+    // the harness does not load. Its tofu is as wide as a glyph to elide.
+    let harness = harness_from(
+        Harness::builder().allow_missing_glyphs(),
         egui::vec2(1600.0, HEIGHT),
         screen(repo, columns, false, false),
     );

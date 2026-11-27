@@ -811,7 +811,7 @@ fn preview_hit_id() -> Id {
 }
 
 fn preview_view_id() -> Id {
-    Id::new("settings-font-preview")
+    Id::unique("settings-font-preview")
 }
 
 fn nav_button(ui: &mut Ui, label: &str, icon: Icon, selected: bool) -> egui::Response {
@@ -863,7 +863,7 @@ fn note(ui: &mut Ui, text: &str, color: Color32) {
 }
 
 fn page_id() -> Id {
-    Id::new("settings-page")
+    Id::unique("settings-page")
 }
 
 /// Same chrome as the repository bars.
@@ -1009,7 +1009,7 @@ mod tests {
             busy: false,
             about,
         };
-        let mut harness = Harness::builder()
+        let harness = Harness::builder()
             .with_size(egui::vec2(1100.0, 1600.0))
             .with_step_dt(1.0 / 60.0)
             .build_ui(move |ui| {
@@ -1027,8 +1027,6 @@ mod tests {
                 );
                 *actions_ui.borrow_mut() = shown;
             });
-        // Faces queued on the first pass are installed on the next.
-        harness.step();
         (harness, github, actions)
     }
 

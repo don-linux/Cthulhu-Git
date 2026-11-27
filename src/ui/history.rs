@@ -16,7 +16,7 @@ use cthulhu_git::settings::HistoryColumns;
 use eframe::egui::text::{LayoutJob, TextFormat, TextWrapping};
 use eframe::egui::{
     self, Align, Color32, CursorIcon, FontId, Galley, Id, Label, Layout, Mesh, Pos2, Rect,
-    RichText, ScrollArea, Sense, Stroke, TextStyle, Ui, UiBuilder, Vec2, WidgetInfo, WidgetType,
+    RichText, Role, ScrollArea, Sense, Stroke, TextStyle, Ui, UiBuilder, Vec2, WidgetInfo,
 };
 
 use super::avatars::{self, AvatarService};
@@ -549,11 +549,7 @@ fn header(
             .interact(grab, divider_id(view_id, index), Sense::click_and_drag())
             .on_hover_cursor(CursorIcon::ResizeColumn);
         response.widget_info(|| {
-            WidgetInfo::labeled(
-                WidgetType::Other,
-                true,
-                format!("Resize {}", column.title()),
-            )
+            WidgetInfo::labeled(Role::Unknown, true, format!("Resize {}", column.title()))
         });
         let active = response.hovered() || response.dragged();
         painter.vline(
@@ -618,7 +614,7 @@ fn history_row(
     if !ui.is_rect_visible(rect) {
         return;
     }
-    let row_id = ui.id().with(("history-row", row.oid.as_str()));
+    let row_id = ui.scope_id().with(("history-row", row.oid.as_str()));
     let palette = cx.palette;
     // The pointer, not a hover widget: the hash and message click sensors sit
     // on top of the row and must not take this highlight away.
@@ -783,7 +779,7 @@ fn text_cell(ui: &mut Ui, rect: Rect, text: &str, font: FontId, color: Color32, 
         .with_clip_rect(rect.intersect(ui.clip_rect()))
         .galley(pos, galley, color);
     ui.interact(text_rect, id, Sense::hover())
-        .widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text));
+        .widget_info(|| WidgetInfo::labeled(Role::Label, true, text));
 }
 
 fn display_name(person: &Person) -> &str {
@@ -873,7 +869,7 @@ fn author_cell(
         );
     }
     ui.interact(rect, id, Sense::hover())
-        .widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, names.as_str()));
+        .widget_info(|| WidgetInfo::labeled(Role::Label, true, names.as_str()));
 }
 
 fn lane_center(graph: Rect, lane: usize, lane_width: f32) -> f32 {
@@ -1456,7 +1452,7 @@ fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette, lit: boo
     let response = ui
         .interact(
             chip.rect,
-            ui.id().with(("branch-label", chip.oid.as_str())),
+            ui.scope_id().with(("branch-label", chip.oid.as_str())),
             Sense::click(),
         )
         .on_hover_cursor(CursorIcon::PointingHand);
@@ -1464,7 +1460,7 @@ fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette, lit: boo
         toggle_lit_branch(ui, view_id, &chip.name);
         clear_selected_commit(ui, view_id);
     }
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, chip.names.as_str()));
+    response.widget_info(|| WidgetInfo::labeled(Role::Label, true, chip.names.as_str()));
 }
 
 fn chip_fill(palette: &Palette, color: usize, current: bool, lit: bool) -> Color32 {

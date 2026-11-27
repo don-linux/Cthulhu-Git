@@ -2744,7 +2744,7 @@ END
     fn focused_terminal_keeps_escape_tab_and_arrows_until_ctrl_tab() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let cwd = dir.path().to_owned();
-        let view_id = Id::new("focus test");
+        let view_id = Id::unique("focus test");
         let mut harness = egui_kittest::Harness::builder()
             .with_size(Vec2::new(640.0, 320.0))
             .with_step_dt(1.0 / 60.0)

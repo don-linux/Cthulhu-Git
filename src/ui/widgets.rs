@@ -97,7 +97,7 @@ struct ClipboardToast {
 }
 
 fn clipboard_toast_id() -> Id {
-    Id::new("cthulhu-clipboard-toast")
+    Id::unique("cthulhu-clipboard-toast")
 }
 
 /// Puts the full hash on the clipboard and posts a short notice for

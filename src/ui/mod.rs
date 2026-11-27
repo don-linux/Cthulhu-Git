@@ -449,7 +449,7 @@ impl CthulhuApp {
                         })
                         .collect(),
                     latest: refreshed.latest,
-                    view_id: egui::Id::new(("repo-view", self.opened_count)),
+                    view_id: egui::Id::unique(("repo-view", self.opened_count)),
                     terminal: None,
                     github: refreshed.github,
                     hover: hover::HoverCache::default(),
@@ -1348,7 +1348,7 @@ mod tests {
                 receiver,
             });
             match meanwhile {
-                Meanwhile::AnotherView => repo.view_id = egui::Id::new("another view"),
+                Meanwhile::AnotherView => repo.view_id = egui::Id::unique("another view"),
                 Meanwhile::UncheckFeature => repo.branches[1].checked = false,
                 Meanwhile::UncheckAll => {
                     for branch in &mut repo.branches {

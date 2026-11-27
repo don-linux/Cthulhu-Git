@@ -79,7 +79,7 @@ pub fn resolve(id: Option<&str>) -> &'static Theme {
 }
 
 fn storage_id() -> Id {
-    Id::new("cthulhu-git-theme")
+    Id::unique("cthulhu-git-theme")
 }
 
 /// Makes `theme` the active one. The OS light/dark preference is ignored:

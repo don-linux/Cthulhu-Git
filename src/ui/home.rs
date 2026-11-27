@@ -114,7 +114,7 @@ fn show_narrow(ui: &mut Ui, state: &HomeState<'_>) -> Option<Action> {
 /// Vertically centers the mark. The block's height is remembered from the
 /// previous frame; the first frame sits high and asks for another paint.
 fn show_brand(ui: &mut Ui, state: &HomeState<'_>) -> Option<Action> {
-    let height_id = egui::Id::new("home-brand-height");
+    let height_id = egui::Id::unique("home-brand-height");
     let known = ui
         .ctx()
         .data(|data| data.get_temp::<f32>(height_id))
@@ -249,14 +249,13 @@ fn recent_card(ui: &mut Ui, path: &Path, facts: Facts<'_>, enabled: bool) -> egu
     } else {
         Sense::hover()
     };
-    let mut response = ui.interact(rect, ui.id().with(&path_text), sense);
+    let mut response = ui.interact(rect, ui.scope_id().with(&path_text), sense);
     response = response.on_hover_text(&path_text);
     if enabled && ui.rect_contains_pointer(rect) {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, path_text.clone())
-    });
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, path_text.clone()));
     let hovered = enabled && ui.rect_contains_pointer(rect);
     paint_card(ui, rect, hovered, enabled, &palette);
     let inner = card_inner(rect);

@@ -14,7 +14,7 @@ use eframe::egui::{Context, Id, TextEdit};
 
 /// The token field, so its undo history can be cleared.
 pub fn token_field_id() -> Id {
-    Id::new("settings-github-token")
+    Id::unique("settings-github-token")
 }
 
 /// Where the token in use lives.

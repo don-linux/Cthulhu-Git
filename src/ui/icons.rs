@@ -89,7 +89,7 @@ impl Icon {
 
     /// Uploaded to the GPU on first use and kept for the life of the context.
     fn texture(self, ctx: &Context) -> TextureHandle {
-        let id = Id::new(("cthulhu-git-icon", self.name()));
+        let id = Id::unique(("cthulhu-git-icon", self.name()));
         if let Some(texture) = ctx.data(|data| data.get_temp::<TextureHandle>(id)) {
             return texture;
         }
@@ -256,7 +256,7 @@ pub fn app_logo(ui: &mut Ui, size: f32) -> Response {
 
 /// Uploaded once and kept for the life of the context, same as the interface icons.
 fn logo_texture(ctx: &Context) -> TextureHandle {
-    let id = Id::new(LOGO_TEXTURE_ID);
+    let id = Id::unique(LOGO_TEXTURE_ID);
     if let Some(texture) = ctx.data(|data| data.get_temp(id)) {
         return texture;
     }

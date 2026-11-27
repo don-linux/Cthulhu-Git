@@ -12,9 +12,9 @@ publish = false
 alacritty_terminal = "0.26.0"
 directories = "6.0.0"
 dunce = "1.0.5"
-# persistence is not a default feature in eframe 0.36. It remembers the
+# persistence is not a default feature in eframe 0.37. It remembers the
 # window position, restored size, and whether it was maximized.
-eframe = { version = "0.36.2", features = ["persistence"] }
+eframe = { version = "0.37.0", features = ["persistence"] }
 # Author avatars. Already in the tree through eframe; only these decoders.
 # No GIF: its decoder allocates up to 50 MB before image's limits apply.
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
@@ -36,7 +36,7 @@ zeroize = "1"
 rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
-egui_kittest = { version = "0.36", features = ["eframe"] }
+egui_kittest = { version = "0.37.0", features = ["eframe"] }
 # keyring's own core: its in-memory mock store stands in for the keychain.
 keyring-core = "1.1.0"
 proptest = "1.12.0"

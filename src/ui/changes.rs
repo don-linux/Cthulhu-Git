@@ -192,7 +192,7 @@ pub fn show(
     let available = ctx.content_rect();
     let width = (available.width() - 80.0).clamp(560.0, 1200.0);
     let height = (available.height() - 80.0).clamp(320.0, 800.0);
-    let response = egui::Modal::new(egui::Id::new(("commit-changes", changes.oid.as_str())))
+    let response = egui::Modal::new(egui::Id::unique(("commit-changes", changes.oid.as_str())))
         .frame(Frame::NONE)
         .backdrop_color(Color32::from_black_alpha(MODAL_BACKDROP_ALPHA))
         .show(ctx, |ui| {
