@@ -932,6 +932,7 @@ dependencies = [
  "directories",
  "dunce",
  "eframe",
+ "egui",
  "egui_kittest",
  "embed-resource",
  "ico",

@@ -1,9 +1,13 @@
 //! Bundled faces for the interface and the terminal.
 //!
-//! Nothing is read from the operating system. Each face is compiled into the
-//! binary. egui loads `set_fonts` at once when no text has been laid out yet
-//! in the pass, otherwise on the next pass. A named family egui has not loaded
-//! draws boxes, so the specimens and the terminal grid read the fonts egui has
+//! Each face is compiled into the binary. Behind it in every chain come
+//! egui's bundled icon and monochrome emoji fonts, so emoji look the same on
+//! every system. Only a character none of them has, such as CJK, comes from
+//! the system fonts eframe looks up (its `system_fonts` feature).
+//!
+//! egui loads `set_fonts` at once when no text has been laid out yet in the
+//! pass, otherwise on the next pass. A named family egui has not loaded draws
+//! boxes, so the specimens and the terminal grid read the fonts egui has
 //! loaded, never the ones last asked for. The terminal point size belongs to
 //! the face loaded in the same font map.
 //!
@@ -220,7 +224,7 @@ pub fn terminal_font_id(ui: &egui::Ui) -> FontId {
 
 /// Proportional becomes `ui_id`. Every bundled face is also registered under
 /// its own name so a row can draw a specimen before it is the one in use.
-/// Emoji fallbacks stay at the end of each chain.
+/// egui's icon and emoji fallbacks stay at the end of each chain.
 fn definitions(ui_id: &str, terminal_id: Option<&str>) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let fallbacks = proportional_fallbacks(&fonts);
@@ -262,7 +266,8 @@ fn definitions(ui_id: &str, terminal_id: Option<&str>) -> FontDefinitions {
     fonts
 }
 
-/// egui's proportional list starts with Ubuntu Light. The rest are emoji.
+/// egui's proportional list starts with Ubuntu Light. The rest are its icon
+/// and monochrome emoji fonts.
 fn proportional_fallbacks(fonts: &FontDefinitions) -> Vec<String> {
     fonts
         .families
@@ -463,7 +468,7 @@ mod tests {
         }
 
         // One real load. A missing glyph measures zero wide, so Meslo's prompt
-        // icon is its own glyph, not a fallback's.
+        // icon is its own glyph, not a fallback's, and the emoji is egui's.
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput::default());
         FontService::default().sync(&ctx, None, Some(DEFAULT_TERMINAL_ID));
@@ -473,6 +478,7 @@ mod tests {
             assert!(fonts.glyph_width(&obel, 'M') > 0.0);
             assert!(fonts.glyph_width(&meslo, PROMPT_ICON) > 0.0);
             assert_eq!(fonts.glyph_width(&obel, PROMPT_ICON), 0.0);
+            assert!(fonts.glyph_width(&FontId::proportional(14.0), '\u{1f419}') > 0.0);
         });
         finish_pass(&ctx);
     }

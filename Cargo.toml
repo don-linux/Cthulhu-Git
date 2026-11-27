@@ -15,6 +15,10 @@ dunce = "1.0.5"
 # persistence is not a default feature in eframe 0.37. It remembers the
 # window position, restored size, and whether it was maximized.
 eframe = { version = "0.37.0", features = ["persistence"] }
+# Only for this feature, which eframe does not forward: egui bundles its
+# monochrome emoji fonts again, so emoji look the same on every system
+# instead of coming from the system's color emoji font.
+egui = { version = "0.37.0", default-features = false, features = ["monochrome_emoji_fonts"] }
 # Author avatars. Already in the tree through eframe; only these decoders.
 # No GIF: its decoder allocates up to 50 MB before image's limits apply.
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }

@@ -2,10 +2,16 @@
 
 Map of the bundled faces. Update this file when you change them.
 
-The app does not read fonts from the operating system. Each face below is
-compiled into the binary from `assets/fonts/`. A license file sits next to
-every face and has to stay there: the licenses require the notice to travel
-with the font.
+Each face below is compiled into the binary from `assets/fonts/`, and so are
+egui's own fonts (see the last table). A license file sits next to every face
+and has to stay there: the licenses require the notice to travel with the
+font.
+
+The operating system's fonts are used only for a character no bundled face
+has, such as Chinese, Japanese or Korean text. eframe looks them up through
+its default `system_fonts` feature. Emoji never get that far: egui's
+monochrome emoji fonts sit at the end of every chain, so they look the same
+on every system.
 
 ## How it works
 
@@ -70,14 +76,18 @@ LGS NF is the face that includes prompt icons.
 ## Faces egui ships
 
 egui's default fonts (crate `epaint_default_fonts`) are compiled in as well.
-Their license texts are copied unchanged into `assets/fonts/egui/`; update
-them when egui is upgraded.
+eframe enables `default_fonts`; the emoji fonts need egui's
+`monochrome_emoji_fonts` feature, which eframe does not forward, so
+`Cargo.toml` turns it on with a direct `egui` dependency. Their license texts
+are copied unchanged into `assets/fonts/egui/`; update them when egui is
+upgraded.
 
 | Face | Used for | License file |
 | ---- | -------- | ------------ |
 | Hack | hashes, diffs, the `builtin` terminal face | `Hack-Regular.txt` (MIT, Bitstream Vera) |
 | Noto Emoji | emoji fallback | `OFL.txt` (SIL OFL 1.1) |
 | emoji-icon-font | symbol fallback | `emoji-icon-font-mit-license.txt` (MIT) |
+| egui-icons | the logos in `egui::special_emojis`, a subset of emoji-icon-font | `emoji-icon-font-mit-license.txt` (MIT) |
 | Ubuntu Light | fallback after Hack for symbols such as `√` | `UFL.txt` (Ubuntu Font Licence 1.0) |
 
 The interface icons in `assets/icons/` (Lucide, ISC; some derived from
