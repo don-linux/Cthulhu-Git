@@ -10,11 +10,11 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
 
 use cthulhu_git::git::{Git, GitError};
 use eframe::egui::Context;
+
+use super::task::{Stopped, Task};
 
 /// Keys kept. Every frame asks again for what it shows, so what is on screen
 /// stays recent and the keys nobody asked for in the longest time leave.
@@ -45,7 +45,7 @@ pub struct AsyncCache<K, V> {
     entries: HashMap<K, State<V>>,
     /// Least recently asked for first.
     order: VecDeque<K>,
-    inflight: Option<(K, Receiver<Result<V, String>>)>,
+    inflight: Option<(K, Task<Result<V, GitError>>)>,
     /// Asked for while another read was running. Only the newest is kept.
     wanted: Option<K>,
 }
@@ -64,15 +64,15 @@ impl<K, V> Default for AsyncCache<K, V> {
 impl<K: GitRead<V>, V: Send + 'static> AsyncCache<K, V> {
     /// Collects a finished read and starts the one waiting.
     pub fn poll(&mut self, ctx: &Context, git: &Git, root: &Path) {
-        if let Some((key, receiver)) = self.inflight.take() {
-            let state = match receiver.try_recv() {
-                Ok(Ok(value)) => State::Ready(value),
-                Ok(Err(message)) => State::Failed(message),
-                Err(TryRecvError::Empty) => {
-                    self.inflight = Some((key, receiver));
+        if let Some((key, task)) = self.inflight.take() {
+            let state = match task.poll() {
+                Some(Ok(Ok(value))) => State::Ready(value),
+                Some(Ok(Err(error))) => State::Failed(error.to_string()),
+                Some(Err(Stopped)) => State::Failed(K::LOST.to_owned()),
+                None => {
+                    self.inflight = Some((key, task));
                     return;
                 }
-                Err(TryRecvError::Disconnected) => State::Failed(K::LOST.to_owned()),
             };
             self.insert(key, state);
         }
@@ -100,21 +100,10 @@ impl<K: GitRead<V>, V: Send + 'static> AsyncCache<K, V> {
     }
 
     fn start(&mut self, ctx: &Context, git: &Git, root: &Path, key: K) {
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
-        let git = git.clone();
-        let root = root.to_path_buf();
-        let worker_key = key.clone();
-        thread::spawn(move || {
-            let _ = sender.send(
-                worker_key
-                    .read(&git, &root)
-                    .map_err(|error| error.to_string()),
-            );
-            ctx.request_repaint();
-        });
+        let (git, root, worker_key) = (git.clone(), root.to_path_buf(), key.clone());
+        let task = Task::spawn(ctx, move || worker_key.read(&git, &root));
         self.insert(key.clone(), State::Loading);
-        self.inflight = Some((key, receiver));
+        self.inflight = Some((key, task));
     }
 }
 
@@ -180,9 +169,9 @@ mod tests {
     #[test]
     fn only_the_newest_request_waits_while_one_is_running() {
         let mut cache = AsyncCache::<String, CommitHover>::default();
-        let (_sender, receiver) = mpsc::channel();
+        let (task, _sender) = Task::pending();
         cache.insert("a".to_owned(), State::Loading);
-        cache.inflight = Some(("a".to_owned(), receiver));
+        cache.inflight = Some(("a".to_owned(), task));
         cache.request("a");
         assert_eq!(cache.wanted, None);
         cache.request("b");
