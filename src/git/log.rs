@@ -25,13 +25,6 @@ pub(crate) fn split_fields(record: &[u8], count: usize) -> Option<Vec<&[u8]>> {
     Some(fields)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Commit {
-    pub oid: String,
-    /// First line of the commit message.
-    pub summary: String,
-}
-
 /// Someone named on a commit: its author, or a `Co-authored-by` trailer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Person {

@@ -28,9 +28,8 @@ pub use graph::{
     LANE_COLORS, branch_graph, graph_tips, head_commit_oid, layout_graph,
 };
 pub use log::{
-    Commit, CommitDetail, CommitFile, CommitHover, CommitStats, DiffKind, DiffLine, FileDiff,
-    Person, SHORT_OID_LEN, commit_hover, email_key, file_diff, latest_commit, parse_co_authors,
-    short_oid,
+    CommitDetail, CommitFile, CommitHover, CommitStats, DiffKind, DiffLine, FileDiff, Person,
+    SHORT_OID_LEN, commit_hover, email_key, file_diff, latest_commit, parse_co_authors, short_oid,
 };
 pub use reap::reap_process_tree;
 pub use remotes::{Remote, remotes};
