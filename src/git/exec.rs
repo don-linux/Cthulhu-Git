@@ -1057,21 +1057,26 @@ mod tests {
 
     #[test]
     fn a_read_error_is_not_an_empty_success() {
+        /// One byte, one error, then EOF: a reader that retried the error
+        /// would end cleanly instead of hanging.
         struct ThenBoom {
-            sent: bool,
+            reads: usize,
         }
         impl Read for ThenBoom {
             fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-                if !self.sent {
-                    self.sent = true;
-                    buf[0] = b'x';
-                    return Ok(1);
+                self.reads += 1;
+                match self.reads {
+                    1 => {
+                        buf[0] = b'x';
+                        Ok(1)
+                    }
+                    2 => Err(io::Error::other("mid-read")),
+                    _ => Ok(0),
                 }
-                Err(io::Error::other("mid-read"))
             }
         }
         let flag = AtomicBool::new(false);
-        let read = read_capped(ThenBoom { sent: false }, 64, &flag);
+        let read = read_capped(ThenBoom { reads: 0 }, 64, &flag);
         assert!(
             read.error.is_some(),
             "a mid-read error must not look like EOF"

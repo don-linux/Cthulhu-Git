@@ -525,9 +525,15 @@ mod tests {
             ),
             // Older files: sidebars show, the terminal stays hidden, fonts,
             // columns and avatars keep their defaults, no keychain lookup.
+            // The two `true` fields are spelled out: `Settings::default()`
+            // reads the same functions serde does.
             (
                 r#"{ "recent_repositories": [] }"#,
-                Some(Settings::default()),
+                Some(Settings {
+                    terminal_hidden: true,
+                    author_avatars: true,
+                    ..Settings::default()
+                }),
             ),
             (r#"{ "theme": "abyss" }"#, Some(abyss())),
             (
