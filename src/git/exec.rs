@@ -291,11 +291,17 @@ impl fmt::Display for GitVersion {
 /// Entries already on `path` stay where they are, so a directory the user
 /// put first still wins. Directories are appended in the order given.
 /// Existence is the caller's decision: this does not touch the filesystem.
+///
+/// Empty and relative entries are dropped. Git runs with the repository as
+/// its working directory, so they would resolve inside the repository, and an
+/// empty `path` would otherwise produce a leading empty entry.
 pub fn extend_path_for_gui(path: &OsStr, extra_dirs_that_exist: &[PathBuf]) -> OsString {
     if extra_dirs_that_exist.is_empty() {
         return path.to_os_string();
     }
-    let mut dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .collect();
     for extra in extra_dirs_that_exist {
         if !dirs.iter().any(|dir| dir == extra) {
             dirs.push(extra.clone());
@@ -1058,6 +1064,26 @@ mod tests {
                 PathBuf::from(MACOS_USR_LOCAL_BIN),
             ]
         );
+    }
+
+    #[test]
+    fn extend_path_for_gui_never_adds_an_entry_that_resolves_in_the_repository() {
+        let extras = vec![PathBuf::from(MACOS_HOMEBREW_BIN)];
+        for (parent, expected) in [
+            // No PATH at all: the child must not start with an empty entry (the cwd).
+            ("", vec![MACOS_HOMEBREW_BIN]),
+            (
+                "/usr/bin::./bin:bin:/bin",
+                vec!["/usr/bin", "/bin", MACOS_HOMEBREW_BIN],
+            ),
+        ] {
+            let extended = extend_path_for_gui(OsStr::new(parent), &extras);
+            assert_eq!(
+                std::env::split_paths(&extended).collect::<Vec<_>>(),
+                expected.iter().map(PathBuf::from).collect::<Vec<_>>(),
+                "{parent:?} -> {extended:?}"
+            );
+        }
     }
 
     #[test]
