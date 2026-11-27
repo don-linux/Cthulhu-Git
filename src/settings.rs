@@ -1,7 +1,6 @@
 //! User settings, stored as one JSON file in the per-user config folder of
 //! each OS. The map for changing this module is `docs/SETTINGS.md`.
 
-use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -189,11 +188,16 @@ impl Default for Settings {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
-    Read(PathBuf, io::Error),
-    Parse(PathBuf, serde_json::Error),
-    Write(PathBuf, io::Error),
+    #[error("Could not read settings from {0}: {1}")]
+    Read(PathBuf, #[source] io::Error),
+    #[error(
+        "Settings file {0} is invalid ({1}); using the defaults and leaving the file as it is."
+    )]
+    Parse(PathBuf, #[source] serde_json::Error),
+    #[error("Could not save settings to {0}: {1}")]
+    Write(PathBuf, #[source] io::Error),
 }
 
 impl Settings {
@@ -383,37 +387,6 @@ where
     T: Deserialize<'de> + Default,
 {
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
-}
-
-impl fmt::Display for SettingsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Read(path, error) => {
-                write!(
-                    f,
-                    "Could not read settings from {}: {error}",
-                    path.display()
-                )
-            }
-            Self::Parse(path, error) => write!(
-                f,
-                "Settings file {} is invalid ({error}); using the defaults and leaving the file as it is.",
-                path.display()
-            ),
-            Self::Write(path, error) => {
-                write!(f, "Could not save settings to {}: {error}", path.display())
-            }
-        }
-    }
-}
-
-impl std::error::Error for SettingsError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Read(_, error) | Self::Write(_, error) => Some(error),
-            Self::Parse(_, error) => Some(error),
-        }
-    }
 }
 
 #[cfg(test)]

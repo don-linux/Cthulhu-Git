@@ -58,27 +58,18 @@ impl Drop for Token {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TokenStoreError {
     /// No keychain or Secret Service to talk to. The token can still be used
     /// for this session.
+    #[error("No system keychain is available ({0}).")]
     Unavailable(String),
     /// The keychain exists but did not answer: it is locked, or the call
     /// passed the deadline. A token already stored is left in place.
+    #[error("The system keychain did not answer ({0}).")]
     Locked(String),
+    #[error("The system keychain refused the request ({0}).")]
     Failed(String),
-}
-
-impl fmt::Display for TokenStoreError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unavailable(detail) => write!(f, "No system keychain is available ({detail})."),
-            Self::Locked(detail) => write!(f, "The system keychain did not answer ({detail})."),
-            Self::Failed(detail) => {
-                write!(f, "The system keychain refused the request ({detail}).")
-            }
-        }
-    }
 }
 
 fn store_error(error: &keyring::Error) -> TokenStoreError {

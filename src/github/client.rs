@@ -27,37 +27,28 @@ impl RateLimit {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ApiError {
     /// 401: the token is wrong, expired or revoked.
+    #[error("GitHub rejected the token")]
     Unauthorized,
     /// 404 or 409: private without a token, gone, or empty.
+    #[error("GitHub did not find the repository")]
     NotFound,
     /// 422: GitHub does not have this commit, for example one never pushed.
+    #[error("GitHub does not have that commit")]
     UnknownCommit,
     /// The primary or secondary rate limit. `until` is Unix seconds.
-    RateLimited {
-        until: Option<u64>,
-    },
+    #[error("GitHub's rate limit was reached")]
+    RateLimited { until: Option<u64> },
+    #[error("GitHub refused the request")]
     Forbidden,
+    #[error("GitHub answered {0}")]
     Status(u16),
+    #[error("GitHub sent an unexpected answer")]
     Malformed,
-    Http(HttpError),
-}
-
-impl std::fmt::Display for ApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unauthorized => f.write_str("GitHub rejected the token"),
-            Self::NotFound => f.write_str("GitHub did not find the repository"),
-            Self::UnknownCommit => f.write_str("GitHub does not have that commit"),
-            Self::RateLimited { .. } => f.write_str("GitHub's rate limit was reached"),
-            Self::Forbidden => f.write_str("GitHub refused the request"),
-            Self::Status(status) => write!(f, "GitHub answered {status}"),
-            Self::Malformed => f.write_str("GitHub sent an unexpected answer"),
-            Self::Http(error) => write!(f, "{error}"),
-        }
-    }
+    #[error(transparent)]
+    Http(#[from] HttpError),
 }
 
 /// Maps a status to an error, reading the rate-limit headers GitHub documents
@@ -183,7 +174,7 @@ pub fn commit_accounts(
         url.push_str("&sha=");
         url.push_str(sha);
     }
-    let response = http::get(transport, &url, token).map_err(ApiError::Http)?;
+    let response = http::get(transport, &url, token)?;
     let limit = check(&response, now)?;
     let accounts = parse_commit_accounts(&response.body).ok_or(ApiError::Malformed)?;
     Ok((accounts, limit))
@@ -205,20 +196,22 @@ pub fn authenticated_user(
     token: &Token,
     now: u64,
 ) -> Result<(GitHubUser, RateLimit), ApiError> {
-    let response =
-        http::get(transport, "https://api.github.com/user", Some(token)).map_err(ApiError::Http)?;
+    let response = http::get(transport, "https://api.github.com/user", Some(token))?;
     let limit = check(&response, now)?;
     let body: UserBody = serde_json::from_slice(&response.body).map_err(|_| ApiError::Malformed)?;
     Ok((GitHubUser { login: body.login }, limit))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FetchError {
     /// 404, 410, a refused URL, or a body over the cap. Try the next URL.
+    #[error("no picture at that URL")]
     Missing,
     /// Timeout, connect, or TLS. Try the next URL, and do not remember a miss
     /// when every URL failed this way.
+    #[error("could not reach the picture's host")]
     Unavailable,
+    #[error("the picture could not be downloaded: {0}")]
     Failed(String),
 }
 

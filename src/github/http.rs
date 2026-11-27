@@ -43,38 +43,27 @@ impl HttpResponse {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HttpError {
     /// Not HTTPS, a host outside [`ALLOWED_HOSTS`], or a URL with credentials or a
     /// port. It does not carry the URL: the message reaches the UI, and a refused
     /// URL may hold credentials or a token in its query.
+    #[error("refused to request a URL that is not plain HTTPS on a GitHub host")]
     NotAllowed,
+    #[error("too many redirects")]
     TooManyRedirects,
+    #[error("the request timed out")]
     TimedOut,
+    #[error("could not connect")]
     Connect,
+    #[error("the TLS handshake failed: {0}")]
     Tls(String),
+    #[error("the response is larger than the limit")]
     TooLarge,
     /// Anything else the transport reported. The message is not matched on.
+    #[error("{0}")]
     Transport(String),
 }
-
-impl std::fmt::Display for HttpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotAllowed => {
-                f.write_str("refused to request a URL that is not plain HTTPS on a GitHub host")
-            }
-            Self::TooManyRedirects => f.write_str("too many redirects"),
-            Self::TimedOut => f.write_str("the request timed out"),
-            Self::Connect => f.write_str("could not connect"),
-            Self::Tls(message) => write!(f, "the TLS handshake failed: {message}"),
-            Self::TooLarge => f.write_str("the response is larger than the limit"),
-            Self::Transport(message) => f.write_str(message),
-        }
-    }
-}
-
-impl std::error::Error for HttpError {}
 
 fn classify_ureq(error: ureq::Error) -> HttpError {
     match error {
