@@ -165,92 +165,9 @@ fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Reads `# branch.oid` / `# branch.head` from `git status --porcelain=v2 --branch -z`.
-///
-/// Production code reads HEAD with `symbolic-ref` instead, so this parser is
-/// exercised by the unit and property tests only.
-#[cfg(test)]
-pub(crate) fn parse_head(stdout: &[u8]) -> Option<Head> {
-    let mut oid = None;
-    let mut head = None;
-
-    for record in stdout.split(|byte| *byte == 0) {
-        let Some(header) = record.strip_prefix(b"# ") else {
-            continue;
-        };
-        let header = String::from_utf8_lossy(header);
-        if let Some(value) = header.strip_prefix("branch.oid ") {
-            oid = Some(value.to_owned());
-        } else if let Some(value) = header.strip_prefix("branch.head ") {
-            head = Some(value.to_owned());
-        }
-    }
-
-    let head = head?;
-    let oid = oid?;
-    Some(match (head.as_str(), oid.as_str()) {
-        ("(detached)", "(initial)") => return None,
-        ("(detached)", oid) => Head::Detached {
-            short_oid: short_oid(oid).to_owned(),
-        },
-        (_, "(initial)") => Head::Unborn(head),
-        _ => Head::Branch(head),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-
-    fn status(records: &[&str]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for record in records {
-            out.extend_from_slice(record.as_bytes());
-            out.push(0);
-        }
-        out
-    }
-
-    #[test]
-    fn branch_header() {
-        let stdout = status(&[
-            &format!("# branch.oid {OID}"),
-            "# branch.head feature/necronomicon",
-            "# branch.upstream origin/feature/necronomicon",
-            "# branch.ab +1 -2",
-            "1 .M N... 100644 100644 100644 aaaa bbbb README.md",
-        ]);
-        assert_eq!(
-            parse_head(&stdout),
-            Some(Head::Branch("feature/necronomicon".to_owned()))
-        );
-    }
-
-    #[test]
-    fn detached_header_uses_short_oid() {
-        let stdout = status(&[&format!("# branch.oid {OID}"), "# branch.head (detached)"]);
-        assert_eq!(
-            parse_head(&stdout),
-            Some(Head::Detached {
-                short_oid: "4b825dc642cb".to_owned()
-            })
-        );
-    }
-
-    #[test]
-    fn unborn_header() {
-        let stdout = status(&["# branch.oid (initial)", "# branch.head main"]);
-        assert_eq!(parse_head(&stdout), Some(Head::Unborn("main".to_owned())));
-    }
-
-    #[test]
-    fn missing_headers_are_rejected() {
-        assert_eq!(parse_head(b""), None);
-        assert_eq!(parse_head(&status(&["# branch.head main"])), None);
-        assert_eq!(parse_head(&status(&[&format!("# branch.oid {OID}")])), None);
-    }
 
     #[test]
     fn head_display_matches_ui_wording() {

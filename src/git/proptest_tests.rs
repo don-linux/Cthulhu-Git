@@ -18,7 +18,6 @@ use proptest::test_runner::FileFailurePersistence;
 
 use super::exec::{GitError, GitVersion, MIN_GIT_VERSION, classify_failure};
 use super::log::{SHORT_OID_LEN, parse_log, short_oid};
-use super::repo::{Head, parse_head};
 use crate::settings::{FILE_NAME, HistoryColumns, MAX_RECENT_REPOSITORIES, Settings};
 
 fn status_raw(raw: i32) -> ExitStatus {
@@ -49,10 +48,6 @@ fn arb_text(max_chars: usize) -> impl Strategy<Value = String> {
 
 fn arb_bytes() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 0..4096)
-}
-
-fn arb_record_bytes(max_len: usize) -> impl Strategy<Value = Vec<u8>> {
-    prop::collection::vec(1u8..=255, 0..max_len)
 }
 
 fn arb_version_suffix() -> impl Strategy<Value = String> {
@@ -100,69 +95,6 @@ fn arb_version_input() -> impl Strategy<Value = String> {
             format!("git version {digits}.{digits}.0")
         }),
     ]
-}
-
-fn arb_status_bytes() -> impl Strategy<Value = Vec<u8>> {
-    (
-        arb_record_bytes(64),
-        arb_record_bytes(48),
-        0u8..6,
-        any::<bool>(),
-        prop::collection::vec(any::<u8>(), 0..32),
-    )
-        .prop_map(|(oid, name, kind, noise, extra)| {
-            // 0 branch, 1 detached, 2 unborn, 3 detached+initial, 4 missing oid, 5 missing head.
-            let oid_val = if kind == 2 || kind == 3 {
-                b"(initial)".to_vec()
-            } else {
-                oid
-            };
-            let head_val = if kind == 1 || kind == 3 {
-                b"(detached)".to_vec()
-            } else {
-                name
-            };
-            let mut out = Vec::new();
-            if kind != 4 {
-                out.extend(b"# branch.oid ");
-                out.extend(oid_val);
-                out.push(0);
-            }
-            if kind != 5 {
-                out.extend(b"# branch.head ");
-                out.extend(head_val);
-                out.push(0);
-            }
-            if noise {
-                out.extend(extra);
-                out.push(0);
-            }
-            out
-        })
-}
-
-fn arb_head_bytes() -> impl Strategy<Value = Vec<u8>> {
-    prop_oneof![
-        3 => arb_bytes(),
-        2 => arb_status_bytes(),
-    ]
-}
-
-fn last_porcelain_headers(stdout: &[u8]) -> (Option<String>, Option<String>) {
-    let mut oid = None;
-    let mut head = None;
-    for record in stdout.split(|byte| *byte == 0) {
-        let Some(header) = record.strip_prefix(b"# ") else {
-            continue;
-        };
-        let header = String::from_utf8_lossy(header);
-        if let Some(value) = header.strip_prefix("branch.oid ") {
-            oid = Some(value.to_owned());
-        } else if let Some(value) = header.strip_prefix("branch.head ") {
-            head = Some(value.to_owned());
-        }
-    }
-    (oid, head)
 }
 
 fn arb_hex_oid() -> impl Strategy<Value = String> {
@@ -332,35 +264,6 @@ proptest! {
         assert_version_order(&left, &right);
         assert_eq!(left.is_supported(), left.numbers() >= (2, 15, 0));
         assert_eq!(right.is_supported(), right.numbers() >= (2, 15, 0));
-    }
-
-    #[test]
-    fn parse_head_never_panics(bytes in arb_head_bytes()) {
-        let parsed = parse_head(&bytes);
-        if let Some(head) = parsed {
-            let rendered = head.to_string();
-            match &head {
-                Head::Detached { short_oid } => {
-                    let (oid, _) = last_porcelain_headers(&bytes);
-                    let oid = oid.expect("detached head has an oid");
-                    assert!(oid.starts_with(short_oid));
-                    // ASCII hex always cuts cleanly. A non-boundary cut currently
-                    // keeps the whole oid; see `parse_head_detached_short_oid_is_not_capped_at_twelve`.
-                    let end = SHORT_OID_LEN.min(oid.len());
-                    if oid.is_char_boundary(end) {
-                        assert_eq!(short_oid.len(), end);
-                    }
-                    if short_oid.is_ascii() {
-                        assert!(short_oid.len() <= SHORT_OID_LEN);
-                    }
-                    assert!(rendered.contains(short_oid));
-                }
-                Head::Branch(name) | Head::Unborn(name) => {
-                    // Empty names are accepted by the parser.
-                    assert!(rendered.starts_with(name));
-                }
-            }
-        }
     }
 
     #[test]
@@ -722,31 +625,6 @@ fn equal_numbers_break_ties_with_raw_only() {
 }
 
 #[test]
-fn parse_head_empty_and_interior_nul() {
-    assert_eq!(parse_head(b""), None);
-    assert_eq!(parse_head(&[0, 0, 0]), None);
-
-    let mut bytes = b"# branch.oid ".to_vec();
-    bytes.extend(b"abc\0def");
-    bytes.push(0);
-    bytes.extend(b"# branch.head ma\0in\0");
-    let head = parse_head(&bytes).expect("head");
-    assert_eq!(head, Head::Branch("ma".to_owned()));
-    assert_eq!(head.to_string(), "ma");
-
-    let unborn = b"# branch.oid (initial)\0# branch.head \0";
-    assert_eq!(
-        parse_head(unborn),
-        Some(Head::Unborn(String::new())),
-        "empty branch names are accepted"
-    );
-    assert_eq!(
-        parse_head(unborn).expect("unborn").to_string(),
-        " (no commits yet)"
-    );
-}
-
-#[test]
 fn parse_log_empty_and_interior_nul() {
     assert_eq!(parse_log(b""), Some(Vec::new()));
     assert_eq!(parse_log(&[0, 0, 0]), Some(Vec::new()));
@@ -788,27 +666,6 @@ fn short_oid_mid_character_returns_the_entire_string() {
     long.push_str(&"z".repeat(100));
     assert_eq!(short_oid(&long), long);
     assert_eq!(short_oid(&long).len(), 113);
-}
-
-/// Same failure as G1, reached through detached `branch.oid` bytes.
-#[test]
-fn parse_head_detached_short_oid_is_not_capped_at_twelve() {
-    let mut stdout = Vec::new();
-    stdout.extend(b"# branch.oid ");
-    stdout.extend("a".repeat(11).as_bytes());
-    stdout.extend([0xc3, 0xa9]);
-    stdout.extend(b"zzzz");
-    stdout.push(0);
-    stdout.extend(b"# branch.head (detached)");
-    stdout.push(0);
-
-    let head = parse_head(&stdout).expect("head");
-    let Head::Detached { short_oid } = &head else {
-        panic!("expected detached, got {head:?}");
-    };
-    assert!(short_oid.len() > SHORT_OID_LEN, "{short_oid:?}");
-    assert!(short_oid.ends_with("zzzz"), "{short_oid:?}");
-    assert!(head.to_string().contains(short_oid));
 }
 
 #[test]
