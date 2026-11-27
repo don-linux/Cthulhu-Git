@@ -25,16 +25,20 @@ mod network_tests;
 mod repo_view;
 mod settings;
 mod terminal;
+#[cfg(test)]
+mod test_support;
 pub mod theme;
 mod widgets;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
 use cthulhu_git::git::{
-    self, Branch, CommitDetail, Git, GraphCandidate, GraphTip, Head, HistoryGraph, RepoInfo,
+    self, Branch, CommitDetail, Git, GitError, GraphCandidate, GraphTip, Head, HistoryGraph,
+    RepoInfo,
 };
 use cthulhu_git::github::{self as gh, GitHubRepo};
 use cthulhu_git::settings::{HistoryColumns, Settings, SettingsError};
@@ -48,6 +52,8 @@ use github_auth::GitHubAuth;
 const HISTORY_LIMIT: usize = 1000;
 
 pub struct OpenedRepo {
+    /// The git that opened the repository. Every later read and write uses it.
+    pub git: Git,
     pub info: RepoInfo,
     pub graph: HistoryGraph,
     /// Tips the displayed graph was built from.
@@ -158,6 +164,7 @@ pub struct CthulhuApp {
     sync_job: Option<SyncJob>,
     avatars: AvatarService,
     github: GitHubAuth,
+    find_git: FindGit,
     /// `git --version` for the About page. `None` until Settings has asked.
     git_version: Option<String>,
     git_probe: Option<Receiver<String>>,
@@ -186,7 +193,12 @@ pub struct Startup {
     pub settings_path: Option<PathBuf>,
     /// Builds the avatar service once the settings say whether avatars are on.
     pub avatars: fn(enabled: bool) -> AvatarService,
+    /// Finds git for each open, the recent list and the About page.
+    pub find_git: FindGit,
 }
+
+/// How the app finds git. [`Git::discover`] reads `CTHULHU_GIT` and `PATH`.
+pub type FindGit = Arc<dyn Fn() -> Result<Git, GitError> + Send + Sync>;
 
 impl Startup {
     /// The user's settings file and avatars from the network.
@@ -195,6 +207,7 @@ impl Startup {
             command_line,
             settings_path: Settings::default_path(),
             avatars: |enabled| AvatarService::new(avatar_cache_dir(), enabled),
+            find_git: Arc::new(Git::discover),
         }
     }
 }
@@ -205,6 +218,7 @@ impl CthulhuApp {
             command_line,
             settings_path,
             avatars,
+            find_git,
         } = startup;
         let (settings, loaded_ok, error) =
             loaded_settings(settings_path.as_deref().map(Settings::load_from));
@@ -240,6 +254,7 @@ impl CthulhuApp {
             sync_job: None,
             avatars,
             github,
+            find_git,
             git_version: None,
             git_probe: None,
             glances: HashMap::new(),
@@ -254,7 +269,7 @@ impl CthulhuApp {
             // follows on the worker and is not part of that wait. A later
             // open stays on a worker thread: the window is visible then,
             // and blocking it would freeze the UI.
-            let result = load(&path);
+            let result = load(&app.find_git, &path);
             if app.finish_open(path, result) {
                 app.start_open_graph(ctx);
             }
@@ -269,8 +284,9 @@ impl CthulhuApp {
         }
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
+        let find_git = Arc::clone(&self.find_git);
         thread::spawn(move || {
-            let text = match Git::discover() {
+            let text = match find_git() {
                 Ok(git) => git.version.to_string(),
                 Err(_) => "Not found".to_owned(),
             };
@@ -321,7 +337,8 @@ impl CthulhuApp {
         }
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
-        thread::spawn(move || scan_glances(paths, sender, ctx));
+        let find_git = Arc::clone(&self.find_git);
+        thread::spawn(move || scan_glances(&find_git, paths, sender, ctx));
         self.glance_scan = Some(GlanceScan { receiver });
     }
 
@@ -374,8 +391,9 @@ impl CthulhuApp {
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
         let worker_path = path.clone();
+        let find_git = Arc::clone(&self.find_git);
         thread::spawn(move || {
-            let _ = sender.send(load(&worker_path));
+            let _ = sender.send(load(&find_git, &worker_path));
             ctx.request_repaint();
         });
         self.opening = Some(Opening { path, receiver });
@@ -412,6 +430,7 @@ impl CthulhuApp {
                 self.save_settings();
                 self.opened_count += 1;
                 self.screen = Screen::Repo(Box::new(OpenedRepo {
+                    git: refreshed.git,
                     info: refreshed.info,
                     // Empty until the history worker reports. Filling
                     // `graph_selection` would make `sync_graph` treat this
@@ -693,6 +712,7 @@ impl eframe::App for CthulhuApp {
 }
 
 struct Refreshed {
+    git: Git,
     info: RepoInfo,
     branches: Vec<Branch>,
     latest: Option<CommitDetail>,
@@ -702,8 +722,13 @@ struct Refreshed {
 
 /// One repository at a time. A dropped receiver stops the loop; the git
 /// command already running is left to finish under its own time limit.
-fn scan_glances(paths: Vec<PathBuf>, sender: Sender<GlanceMsg>, ctx: egui::Context) {
-    let git = Git::discover().ok();
+fn scan_glances(
+    find_git: &FindGit,
+    paths: Vec<PathBuf>,
+    sender: Sender<GlanceMsg>,
+    ctx: egui::Context,
+) {
+    let git = find_git().ok();
     for path in paths {
         let glance = match &git {
             Some(git) => match git::glance(git, &path) {
@@ -721,8 +746,8 @@ fn scan_glances(paths: Vec<PathBuf>, sender: Sender<GlanceMsg>, ctx: egui::Conte
 
 /// Repository chrome. The history graph is not built here, so a log failure
 /// does not reject the open or forget the repository.
-fn load(path: &Path) -> OpenResult {
-    let git = Git::discover().map_err(|error| error.to_string())?;
+fn load(find_git: &FindGit, path: &Path) -> OpenResult {
+    let git = find_git().map_err(|error| error.to_string())?;
     reload_repo(&git, path)
 }
 
@@ -743,6 +768,7 @@ fn reload_repo(git: &Git, path: &Path) -> Result<Refreshed, String> {
         .ok()
         .and_then(|remotes| gh::github_repo(&remotes));
     Ok(Refreshed {
+        git: git.clone(),
         info,
         branches,
         latest,
@@ -763,20 +789,19 @@ struct SyncJob {
     receiver: Receiver<Result<Refreshed, String>>,
 }
 
-fn run_sync(root: &Path, command: SyncCommand) -> Result<Refreshed, String> {
-    let git = Git::discover().map_err(|error| error.to_string())?;
+fn run_sync(git: &Git, root: &Path, command: SyncCommand) -> Result<Refreshed, String> {
     match &command {
         SyncCommand::Fetch(branch) => {
-            git::fetch(&git, root, branch).map_err(|error| error.to_string())?;
+            git::fetch(git, root, branch).map_err(|error| error.to_string())?;
         }
         SyncCommand::Pull => {
-            git::pull_ff_only(&git, root).map_err(|error| error.to_string())?;
+            git::pull_ff_only(git, root).map_err(|error| error.to_string())?;
         }
         SyncCommand::Checkout(name) => {
-            git::switch_branch(&git, root, name).map_err(|error| error.to_string())?;
+            git::switch_branch(git, root, name).map_err(|error| error.to_string())?;
         }
     }
-    reload_repo(&git, root)
+    reload_repo(git, root)
 }
 
 /// Keeps the sidebar checkboxes. A branch that was not in the list yet stays
@@ -860,6 +885,7 @@ impl CthulhuApp {
         }
         let view_id = repo.view_id;
         let root = repo.info.root.clone();
+        let git = repo.git.clone();
         let kind = match &command {
             SyncCommand::Fetch(_) => SyncKind::Fetch,
             SyncCommand::Pull => SyncKind::Pull,
@@ -868,7 +894,7 @@ impl CthulhuApp {
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let result = run_sync(&root, command);
+            let result = run_sync(&git, &root, command);
             let _ = sender.send(result);
             ctx.request_repaint();
         });
@@ -1029,11 +1055,11 @@ impl CthulhuApp {
     }
 
     fn start_graph_load(&mut self, ctx: &egui::Context, tips: Vec<GraphTip>) {
-        let (root, view_id) = {
+        let (git, root, view_id) = {
             let Screen::Repo(repo) = &self.screen else {
                 return;
             };
-            (repo.info.root.clone(), repo.view_id)
+            (repo.git.clone(), repo.info.root.clone(), repo.view_id)
         };
         self.graph_generation = self.graph_generation.wrapping_add(1);
         let generation = self.graph_generation;
@@ -1041,7 +1067,7 @@ impl CthulhuApp {
         let ctx = ctx.clone();
         let requested = tips.clone();
         thread::spawn(move || {
-            let result = reload_graph(&root, &requested);
+            let result = reload_graph(&git, &root, &requested);
             let _ = sender.send(result);
             ctx.request_repaint();
         });
@@ -1054,9 +1080,8 @@ impl CthulhuApp {
     }
 }
 
-fn reload_graph(root: &Path, tips: &[GraphTip]) -> Result<HistoryGraph, String> {
-    let git = Git::discover().map_err(|error| error.to_string())?;
-    git::branch_graph(&git, root, tips, HISTORY_LIMIT).map_err(|error| error.to_string())
+fn reload_graph(git: &Git, root: &Path, tips: &[GraphTip]) -> Result<HistoryGraph, String> {
+    git::branch_graph(git, root, tips, HISTORY_LIMIT).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -1140,6 +1165,7 @@ mod settings_load_tests {
             sync_job: None,
             avatars: AvatarService::disabled(),
             github: GitHubAuth::default(),
+            find_git: std::sync::Arc::new(|| Ok(super::test_support::absent_git())),
             git_version: None,
             git_probe: None,
             glances: std::collections::HashMap::new(),

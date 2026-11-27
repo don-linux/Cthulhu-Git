@@ -53,7 +53,7 @@ pub struct DiffCache {
 }
 
 impl DiffCache {
-    pub fn poll(&mut self, ctx: &egui::Context, root: &Path) {
+    pub fn poll(&mut self, ctx: &egui::Context, git: &Git, root: &Path) {
         if let Some(inflight) = &self.inflight {
             let result = match inflight.receiver.try_recv() {
                 Ok(result) => Some(result),
@@ -75,7 +75,7 @@ impl DiffCache {
         if self.inflight.is_none()
             && let Some((oid, path)) = self.wanted.take()
         {
-            self.start(ctx, root, oid, path);
+            self.start(ctx, git, root, oid, path);
         }
     }
 
@@ -103,15 +103,15 @@ impl DiffCache {
         self.wanted = Some(key);
     }
 
-    fn start(&mut self, ctx: &egui::Context, root: &Path, oid: String, path: String) {
+    fn start(&mut self, ctx: &egui::Context, git: &Git, root: &Path, oid: String, path: String) {
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
         let root: PathBuf = root.to_path_buf();
         let worker_oid = oid.clone();
         let worker_path = path.clone();
+        let git = git.clone();
         thread::spawn(move || {
-            let result = Git::discover()
-                .and_then(|git| git::file_diff(&git, &root, &worker_oid, &worker_path))
+            let result = git::file_diff(&git, &root, &worker_oid, &worker_path)
                 .map_err(|error| error.to_string());
             let _ = sender.send(result);
             ctx.request_repaint();
@@ -177,6 +177,7 @@ pub fn show(
     ctx: &egui::Context,
     changes: &mut Changes,
     diffs: &mut DiffCache,
+    git: &Git,
     root: &Path,
     palette: &Palette,
 ) -> bool {
@@ -186,7 +187,7 @@ pub fn show(
     {
         diffs.request(&changes.oid, &path);
     }
-    diffs.poll(ctx, root);
+    diffs.poll(ctx, git, root);
 
     let available = ctx.content_rect();
     let width = (available.width() - 80.0).clamp(560.0, 1200.0);

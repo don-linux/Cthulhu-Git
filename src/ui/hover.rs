@@ -52,7 +52,7 @@ pub struct HoverCache {
 
 impl HoverCache {
     /// Collects a finished read and starts the next one.
-    pub fn poll(&mut self, ctx: &Context, root: &Path) {
+    pub fn poll(&mut self, ctx: &Context, git: &Git, root: &Path) {
         if let Some((oid, receiver)) = &self.inflight {
             let result = match receiver.try_recv() {
                 Ok(result) => Some(result),
@@ -74,7 +74,7 @@ impl HoverCache {
         if self.inflight.is_none()
             && let Some(oid) = self.wanted.take()
         {
-            self.start(ctx, root, oid);
+            self.start(ctx, git, root, oid);
         }
     }
 
@@ -101,15 +101,15 @@ impl HoverCache {
         self.wanted = Some(oid.to_owned());
     }
 
-    fn start(&mut self, ctx: &Context, root: &Path, oid: String) {
+    fn start(&mut self, ctx: &Context, git: &Git, root: &Path, oid: String) {
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
         let root: PathBuf = root.to_path_buf();
         let worker_oid = oid.clone();
+        let git = git.clone();
         thread::spawn(move || {
-            let result = Git::discover()
-                .and_then(|git| git::commit_hover(&git, &root, &worker_oid))
-                .map_err(|error| error.to_string());
+            let result =
+                git::commit_hover(&git, &root, &worker_oid).map_err(|error| error.to_string());
             let _ = sender.send(result);
             ctx.request_repaint();
         });

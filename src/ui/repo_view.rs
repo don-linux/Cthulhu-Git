@@ -54,7 +54,7 @@ pub fn show(
 ) -> Vec<Action> {
     let palette = theme::current(ui.ctx()).palette;
     let mut actions = Vec::new();
-    repo.diffs.poll(ui.ctx(), &repo.info.root);
+    repo.diffs.poll(ui.ctx(), &repo.git, &repo.info.root);
     // The toggle buttons and dragging a sidebar edge past its minimum width
     // both flip these; the app saves the change.
     let branches_were_open = state.branches_open;
@@ -255,6 +255,7 @@ pub fn show(
             ui.ctx(),
             &mut changes,
             &mut repo.diffs,
+            &repo.git,
             &repo.info.root,
             &palette,
         );

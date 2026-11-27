@@ -253,7 +253,7 @@ pub fn show(
     } else {
         empty_history(&repo.branches, repo.detached_oid.is_some())
     };
-    repo.hover.poll(ui.ctx(), &repo.info.root);
+    repo.hover.poll(ui.ctx(), &repo.git, &repo.info.root);
     let OpenedRepo {
         graph,
         hover,

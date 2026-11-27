@@ -135,6 +135,7 @@ fn opened(name: &str, commits: &[Commit], truncated: bool) -> OpenedRepo {
     let oid = commits.first().map(|commit| commit.oid.clone());
     let tips = oid.iter().map(|oid| tip(oid)).collect::<Vec<_>>();
     OpenedRepo {
+        git: super::test_support::absent_git(),
         info: RepoInfo {
             root: std::path::PathBuf::from("/repos").join(name),
             name: name.to_owned(),

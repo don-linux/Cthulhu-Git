@@ -1151,6 +1151,7 @@ fn hover_repo() -> OpenedRepo {
     }];
     let graph = layout_graph(&commits, &tips);
     OpenedRepo {
+        git: super::test_support::absent_git(),
         info: RepoInfo {
             root: PathBuf::from("/cthulhu-agent-network-missing/repo"),
             name: "missing-repo".to_owned(),

@@ -1,10 +1,9 @@
 //! Adversarial UI cases.
 //!
 //! Anything that constructs [`CthulhuApp`] does it through a [`Sandbox`]: its
-//! own settings file and avatars that never reach the network, so no test
-//! reads or writes the real settings. A child process remains only where git
-//! itself is replaced by a fake on `PATH`. Pure widgets are driven in-process
-//! with [`Harness::new_ui`](egui_kittest::Harness::new_ui).
+//! own settings file, avatars that never reach the network, and the system git
+//! or a fake one, so no test reads or writes the real settings. Pure widgets
+//! are driven in-process with [`Harness::new_ui`](egui_kittest::Harness::new_ui).
 //!
 //! Opening a repository shows a spinner, which repaints forever.
 //! [`Harness::run`](egui_kittest::Harness::run) is not used; settle with
@@ -21,7 +20,6 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 #[cfg(unix)]
-use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
 #[cfg(unix)]
@@ -29,9 +27,8 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(unix)]
-use std::process::Output;
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -56,15 +53,10 @@ use super::terminal::Terminal;
 use super::theme;
 use super::{Action, CthulhuApp, ListedBranch, OpenedRepo, Screen, Startup, SyncKind};
 
-const CHILD_ENV: &str = "CTHULHU_ADVERSARIAL_UI_CHILD";
 const WINDOW_SIZE: egui::Vec2 = egui::Vec2::new(520.0, 400.0);
 const PIXELS_PER_POINT: f32 = 2.0;
 /// 200 × 100ms. Opening a repository on a slow runner can take longer than 8s.
 const OPEN_ATTEMPTS: usize = 200;
-
-fn spawned() -> bool {
-    std::env::var_os(CHILD_ENV).is_some()
-}
 
 /// `true` when creating a temp directory failed because the quota is exhausted.
 fn is_quota(error: &std::io::Error) -> bool {
@@ -104,63 +96,6 @@ fn temp_dir(prefix: &str) -> TempDir {
         }
         Err(error) => panic!("temp dir: {error}"),
     }
-}
-
-/// `clear_git_override` drops `CTHULHU_GIT` so a fake on `PATH` is the one
-/// that gets probed. Existing cases leave the override alone.
-#[cfg(unix)]
-fn reexec_env(test_name: &str, extra: &[(&str, &OsStr)], clear_git_override: bool) -> Output {
-    let config = temp_dir("cthulhu-adv-ui-config-");
-    let home = temp_dir("cthulhu-adv-ui-home-");
-    let mut command = Command::new(std::env::current_exe().expect("test executable"));
-    command
-        .args([
-            "--exact",
-            test_name,
-            "--include-ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(CHILD_ENV, "1")
-        .env("XDG_CONFIG_HOME", config.path())
-        .env("HOME", home.path())
-        .env("XDG_DATA_HOME", home.path().join("data"))
-        .env("XDG_CACHE_HOME", home.path().join("cache"))
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE");
-    if clear_git_override {
-        command.env_remove("CTHULHU_GIT");
-    }
-    for (key, value) in extra {
-        command.env(key, value);
-    }
-    command.output().expect("spawn child test")
-}
-
-#[cfg(unix)]
-fn assert_child_ok(output: &Output, marker: &str) {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    for line in stdout.lines().filter(|line| line.starts_with("FINDING ")) {
-        println!("{line}");
-    }
-    assert!(
-        output.status.success(),
-        "{marker} child failed:\n{stdout}\n{stderr}"
-    );
-    assert!(
-        stdout.contains("1 passed"),
-        "{marker} child did not run:\n{stdout}\n{stderr}"
-    );
-    assert!(
-        stdout.contains(marker),
-        "{marker} missing from child stdout:\n{stdout}\n{stderr}"
-    );
-}
-
-#[cfg(unix)]
-fn child_name(name: &str) -> String {
-    format!("ui::adversarial_tests::{name}")
 }
 
 fn git_program() -> PathBuf {
@@ -230,10 +165,19 @@ impl Sandbox {
 
     /// The app as it starts, on this settings file and without the network.
     fn app(&self, command_line: Option<PathBuf>) -> Harness<'static, CthulhuApp> {
+        self.app_with_git(command_line, Arc::new(cthulhu_git::git::Git::discover))
+    }
+
+    fn app_with_git(
+        &self,
+        command_line: Option<PathBuf>,
+        find_git: super::FindGit,
+    ) -> Harness<'static, CthulhuApp> {
         let startup = Startup {
             command_line,
             settings_path: Some(self.settings.clone()),
             avatars: |_| AvatarService::disabled(),
+            find_git,
         };
         Harness::builder()
             .with_size(WINDOW_SIZE)
@@ -436,6 +380,7 @@ fn opened(name: &str, commits: Vec<Commit>, truncated: bool) -> OpenedRepo {
     graph.truncated = truncated;
     let tips = graph_tips(&commits);
     OpenedRepo {
+        git: super::test_support::absent_git(),
         info: RepoInfo {
             root: PathBuf::from("/repos").join(name),
             name: name.to_owned(),
@@ -2294,30 +2239,19 @@ impl FakeGit {
         Self { _dir: dir, link }
     }
 
-    fn dir(&self) -> &Path {
-        self.link.parent().expect("fake git directory")
+    /// Finds this fake and nothing else.
+    fn finder(&self) -> super::FindGit {
+        let link = self.link.clone();
+        Arc::new(move || {
+            cthulhu_git::git::discover_with(&cthulhu_git::git::DiscoverInputs {
+                override_path: Some(link.clone().into()),
+                path_var: None,
+                exe_name: "git",
+                fallbacks: Vec::new(),
+                skip_paths: Vec::new(),
+            })
+        })
     }
-}
-
-#[cfg(unix)]
-fn reexec_with_fake(test_name: &str, fake: &FakeGit) -> Output {
-    let path = std::env::join_paths(std::iter::once(fake.dir().to_path_buf()).chain(
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
-    ))
-    .expect("join PATH");
-    reexec_env(
-        test_name,
-        &[
-            ("PATH", path.as_os_str()),
-            ("CTHULHU_ADV_UI_GIT", fake.link.as_os_str()),
-        ],
-        true,
-    )
-}
-
-#[cfg(unix)]
-fn fake_from_env() -> PathBuf {
-    PathBuf::from(std::env::var_os("CTHULHU_ADV_UI_GIT").expect("CTHULHU_ADV_UI_GIT"))
 }
 
 #[cfg(unix)]
@@ -2617,32 +2551,13 @@ fn assert_history_contains(link: &Path, root: &Path) {
 #[cfg(unix)]
 #[test]
 fn adversarial_inflight_graph_shows_opening_history() {
-    let fake = FakeGit::install();
-    let output = reexec_with_fake(
-        &child_name("child_inflight_graph_shows_opening_history"),
-        &fake,
-    );
-    assert_child_ok(&output, "CHILD_OK inflight_graph");
-}
-
-#[cfg(unix)]
-#[test]
-#[ignore = "child of adversarial_inflight_graph_shows_opening_history; isolated config"]
-fn child_inflight_graph_shows_opening_history() {
-    if !spawned() {
-        return;
-    }
-    inflight_graph_shows_opening_history();
-}
-
-#[cfg(unix)]
-fn inflight_graph_shows_opening_history() {
     let sandbox = Sandbox::new();
-    let link = fake_from_env();
+    let fake = FakeGit::install();
+    let link = fake.link.clone();
     let (_tmp, root) = repo_dir("lantern-repo");
     write_single_case(&link, "slow", "row-lantern", "detail-lantern");
 
-    let mut harness = sandbox.app(Some(root.clone()));
+    let mut harness = sandbox.app_with_git(Some(root.clone()), fake.finder());
     settle_open(&mut harness);
     assert_opening_history(&harness, "lantern-repo", "row-lantern");
 
@@ -2665,35 +2580,18 @@ fn inflight_graph_shows_opening_history() {
         harness.step();
     }
     assert_one_history_log(&link, &root);
-    println!("CHILD_OK inflight_graph");
 }
 
 #[cfg(unix)]
 #[test]
 fn adversarial_graph_failure_keeps_repository() {
-    let fake = FakeGit::install();
-    let output = reexec_with_fake(&child_name("child_graph_failure_keeps_repository"), &fake);
-    assert_child_ok(&output, "CHILD_OK graph_failure");
-}
-
-#[cfg(unix)]
-#[test]
-#[ignore = "child of adversarial_graph_failure_keeps_repository; isolated config"]
-fn child_graph_failure_keeps_repository() {
-    if !spawned() {
-        return;
-    }
-    graph_failure_keeps_repository();
-}
-
-#[cfg(unix)]
-fn graph_failure_keeps_repository() {
     let sandbox = Sandbox::new();
-    let link = fake_from_env();
+    let fake = FakeGit::install();
+    let link = fake.link.clone();
     let (_tmp, root) = repo_dir("failure-repo");
     write_single_case(&link, "fail", "row-failure", "detail-failure");
 
-    let mut harness = sandbox.app(Some(root.clone()));
+    let mut harness = sandbox.app_with_git(Some(root.clone()), fake.finder());
     settle_graph_failure(&mut harness, GRAPH_FAIL_TEXT);
 
     assert!(
@@ -2717,38 +2615,18 @@ fn graph_failure_keeps_repository() {
     );
     assert_last_repository(&sandbox, &root);
     assert_one_history_log(&link, &root);
-    println!("CHILD_OK graph_failure");
 }
 
 #[cfg(unix)]
 #[test]
 fn adversarial_home_during_graph_load_keeps_settings() {
-    let fake = FakeGit::install();
-    let output = reexec_with_fake(
-        &child_name("child_home_during_graph_load_keeps_settings"),
-        &fake,
-    );
-    assert_child_ok(&output, "CHILD_OK home_during_graph_load");
-}
-
-#[cfg(unix)]
-#[test]
-#[ignore = "child of adversarial_home_during_graph_load_keeps_settings; isolated config"]
-fn child_home_during_graph_load_keeps_settings() {
-    if !spawned() {
-        return;
-    }
-    home_during_graph_load_keeps_settings();
-}
-
-#[cfg(unix)]
-fn home_during_graph_load_keeps_settings() {
     let sandbox = Sandbox::new();
-    let link = fake_from_env();
+    let fake = FakeGit::install();
+    let link = fake.link.clone();
     let (_tmp, root) = repo_dir("rlyeh-slow");
     write_single_case(&link, "slow", "row-rlyeh", "detail-rlyeh");
 
-    let mut harness = sandbox.app(Some(root.clone()));
+    let mut harness = sandbox.app_with_git(Some(root.clone()), fake.finder());
     settle_open(&mut harness);
     assert_opening_history(&harness, "rlyeh-slow", "row-rlyeh");
     let before_home = sandbox.bytes();
@@ -2781,34 +2659,14 @@ fn home_during_graph_load_keeps_settings() {
         );
     }
     assert_one_history_log(&link, &root);
-    println!("CHILD_OK home_during_graph_load");
 }
 
 #[cfg(unix)]
 #[test]
 fn adversarial_second_open_supersedes_inflight_graph() {
-    let fake = FakeGit::install();
-    let output = reexec_with_fake(
-        &child_name("child_second_open_supersedes_inflight_graph"),
-        &fake,
-    );
-    assert_child_ok(&output, "CHILD_OK second_open_supersedes");
-}
-
-#[cfg(unix)]
-#[test]
-#[ignore = "child of adversarial_second_open_supersedes_inflight_graph; isolated config"]
-fn child_second_open_supersedes_inflight_graph() {
-    if !spawned() {
-        return;
-    }
-    second_open_supersedes_inflight_graph();
-}
-
-#[cfg(unix)]
-fn second_open_supersedes_inflight_graph() {
     let sandbox = Sandbox::new();
-    let link = fake_from_env();
+    let fake = FakeGit::install();
+    let link = fake.link.clone();
     let (_first_tmp, first) = repo_dir("alpha-repo");
     let (_second_tmp, second) = repo_dir("beta-repo");
     // The same tip hash on both repositories, so a late graph is not discarded
@@ -2831,7 +2689,7 @@ fn second_open_supersedes_inflight_graph() {
         ],
     );
 
-    let mut harness = sandbox.app(Some(first.clone()));
+    let mut harness = sandbox.app_with_git(Some(first.clone()), fake.finder());
     settle_open(&mut harness);
     assert_opening_history(&harness, "alpha-repo", "row-alpha");
 
@@ -2847,7 +2705,6 @@ fn second_open_supersedes_inflight_graph() {
     }
     assert_history_contains(&link, &first);
     assert_history_contains(&link, &second);
-    println!("CHILD_OK second_open_supersedes");
 }
 
 #[cfg(unix)]
