@@ -592,7 +592,8 @@ impl ShellSession {
                     exited = true;
                 }
                 Ok(Notice::Color(index, format)) => {
-                    let rgb = self.color_rgb(index);
+                    let palette = super::theme::current(ctx).palette;
+                    let rgb = reported_color(self.term.lock().colors(), index, &palette);
                     self.write(format(rgb).as_bytes());
                 }
                 Ok(Notice::Size(format)) => self.write(format(self.size).as_bytes()),
@@ -605,17 +606,6 @@ impl ShellSession {
             }
         }
         exited
-    }
-
-    fn color_rgb(&self, index: usize) -> Rgb {
-        let term = self.term.lock();
-        let colors = term.renderable_content().colors;
-        if index < color::COUNT
-            && let Some(rgb) = colors[index]
-        {
-            return rgb;
-        }
-        Rgb { r: 0, g: 0, b: 0 }
     }
 
     fn write(&self, bytes: &[u8]) {
@@ -1335,6 +1325,23 @@ fn resolve_color(color: Color, colors: &color::Colors, palette: &Palette) -> Col
             }
             named_color(named, palette)
         }
+    }
+}
+
+/// The answer to a color query (OSC 4, 10, 11, 12): the color the program set,
+/// or else the one this widget paints.
+fn reported_color(colors: &color::Colors, index: usize, palette: &Palette) -> Rgb {
+    let color = match u8::try_from(index) {
+        Ok(ansi) => Color::Indexed(ansi),
+        Err(_) if index == NamedColor::Background as usize => Color::Named(NamedColor::Background),
+        Err(_) if index == NamedColor::Cursor as usize => Color::Named(NamedColor::Cursor),
+        Err(_) => Color::Named(NamedColor::Foreground),
+    };
+    let painted = resolve_color(color, colors, palette);
+    Rgb {
+        r: painted.r(),
+        g: painted.g(),
+        b: painted.b(),
     }
 }
 
@@ -2752,6 +2759,35 @@ END
             harness.step();
             harness.step();
             assert!(focused(&harness), "{key:?} moved focus out of the terminal");
+        }
+    }
+
+    /// Programs such as vim ask for the background (OSC 11) to pick light or
+    /// dark colors, so an unset color must be answered with what is painted.
+    #[test]
+    fn color_queries_report_the_painted_colors() {
+        let palette = super::super::theme::DEFAULT_THEME.palette;
+        let rgb = |color: Color32| Rgb {
+            r: color.r(),
+            g: color.g(),
+            b: color.b(),
+        };
+        let set = Rgb { r: 1, g: 2, b: 3 };
+        let mut colors = color::Colors::default();
+        colors[NamedColor::Cursor] = Some(set);
+        colors[5] = Some(set);
+        for (index, expected) in [
+            (NamedColor::Foreground as usize, rgb(palette.text)),
+            (NamedColor::Background as usize, rgb(palette.background)),
+            (NamedColor::Cursor as usize, set),
+            (1, rgb(stored_fallback(1))),
+            (5, set),
+        ] {
+            assert_eq!(
+                reported_color(&colors, index, &palette),
+                expected,
+                "{index}"
+            );
         }
     }
 
