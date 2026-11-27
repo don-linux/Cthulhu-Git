@@ -818,8 +818,6 @@ fn commit_colors(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use proptest::prelude::*;
 
     use super::super::log::FIELD_SEPARATOR;
@@ -1001,406 +999,291 @@ mod tests {
         tip
     }
 
-    fn connected(rows: &[GraphRow]) -> bool {
-        rows.windows(2).all(|pair| {
-            let bottom: BTreeSet<_> = pair[0]
-                .traces
-                .iter()
-                .filter_map(|trace| trace.to_lane)
-                .collect();
-            let top: BTreeSet<_> = pair[1]
-                .traces
-                .iter()
-                .filter_map(|trace| trace.from_lane)
-                .collect();
-            bottom == top
-        })
-    }
+    /// A tip: name, commit, color, checked out. The first one is principal.
+    type LaneTip = (&'static str, &'static str, usize, bool);
 
-    #[test]
-    fn linear_history_is_one_lane() {
-        let commits = vec![
-            commit("a", "third", &["b"]),
-            commit("b", "second", &["c"]),
-            commit("c", "first", &[]),
-        ];
-        let graph = layout_graph(&commits, &[spine("main", "a", 0)]);
-        assert!(connected(&graph.rows));
-        assert_eq!(graph.columns, 1);
-        assert!(graph.rows.iter().all(|row| row.commit_lane == 0));
-        assert_eq!(graph.rows[0].branches[0].name, "main");
-        assert_eq!(graph.rows[0].commit_color, 0);
-        assert!(graph.rows[1].branches.is_empty());
-        assert_eq!(
-            graph.rows[0].traces,
-            vec![GraphTrace {
-                from_lane: None,
-                to_lane: Some(0),
-                color: 0,
-            }]
-        );
-        assert_eq!(
-            graph.rows[1].traces,
-            vec![GraphTrace {
-                from_lane: Some(0),
-                to_lane: Some(0),
-                color: 0,
-            }]
-        );
-        assert_eq!(
-            graph.rows[2].traces,
-            vec![GraphTrace {
-                from_lane: Some(0),
-                to_lane: None,
-                color: 0,
-            }]
-        );
-    }
+    /// One row: commit, labels as `name:color` (`*` when checked out),
+    /// lane, color, and traces as `from>to:color`, where `.` is the dot.
+    type Row = (&'static str, &'static str, usize, usize, &'static str);
 
-    #[test]
-    fn diverging_branches_meet_at_their_parent() {
-        // main is newer, so it is drawn first and keeps the left lane.
-        let commits = vec![
-            commit("main", "on main", &["base"]),
-            commit("feature", "on feature", &["base"]),
-            commit("base", "base", &[]),
-        ];
-        let graph = layout_graph(
-            &commits,
-            &[spine("main", "main", 0), tip("feature", "feature", 3)],
-        );
-        assert!(connected(&graph.rows));
-        assert_eq!(graph.columns, 2);
+    /// What the case shows, commits newest first as `(oid, parents)` (the
+    /// oid doubles as the summary), the tips, the column count, and the rows.
+    type Layout = (
+        &'static str,
+        &'static [(&'static str, &'static [&'static str])],
+        &'static [LaneTip],
+        usize,
+        &'static [Row],
+    );
 
-        let main = &graph.rows[0];
-        assert_eq!(main.commit_lane, 0);
-        assert_eq!(main.commit_color, 0);
-        assert_eq!(main.branches[0].name, "main");
-
-        let feature = &graph.rows[1];
-        assert_eq!(feature.commit_lane, 1);
-        assert_eq!(feature.commit_color, 3);
-        assert!(feature.traces.iter().any(|trace| {
-            trace.from_lane.is_none() && trace.to_lane == Some(0) && trace.color == 3
-        }));
-
-        let base = &graph.rows[2];
-        assert_eq!(base.summary, "base");
-        assert_eq!(base.commit_lane, 0);
-        assert!(base.branches.is_empty());
-    }
-
-    #[test]
-    fn a_merge_opens_a_lane_and_shifts_the_ones_to_its_right() {
-        let commits = vec![
-            commit("m", "merge", &["a", "b"]),
-            commit("a", "left", &["c", "d"]),
-            commit("b", "right", &["c"]),
-            commit("d", "side", &["c"]),
-            commit("c", "base", &[]),
-        ];
-        let graph = layout_graph(&commits, &[spine("main", "m", 0)]);
-        assert!(connected(&graph.rows));
-        assert!(graph.columns >= 3);
-
-        let merge = &graph.rows[0];
-        assert_eq!(merge.commit_lane, 0);
-        assert!(merge.traces.iter().any(|trace| trace.to_lane == Some(0)));
-        assert!(merge.traces.iter().any(|trace| trace.to_lane == Some(1)));
-
-        let left = &graph.rows[1];
-        assert!(
-            left.traces
-                .iter()
-                .any(|trace| { trace.from_lane == Some(1) && trace.to_lane == Some(2) })
-        );
-
-        let right = &graph.rows[2];
-        assert_eq!(right.summary, "right");
-        assert_eq!(right.commit_lane, 2);
-        assert!(
-            right
-                .traces
-                .iter()
-                .any(|trace| { trace.from_lane.is_none() && trace.to_lane == Some(0) })
-        );
-    }
-
-    #[test]
-    fn two_branches_on_one_commit_share_the_dot() {
-        let mut feature = tip("feature", "a", 4);
-        feature.current = true;
-        let graph = layout_graph(
-            &[commit("a", "shared", &[])],
-            &[spine("main", "a", 0), feature],
-        );
-        assert_eq!(graph.columns, 1);
-        assert_eq!(graph.rows[0].commit_color, 0);
-        let label = |name: &str, color, current| GraphBranch {
-            name: name.to_owned(),
-            color,
-            current,
-        };
-        assert_eq!(
-            graph.rows[0].branches,
-            [label("main", 0, false), label("feature", 4, true)]
-        );
-    }
-
-    #[test]
-    fn a_parent_outside_the_list_does_not_leave_a_dangling_lane() {
-        let graph = layout_graph(
-            &[commit("a", "tip", &["missing"])],
-            &[spine("main", "a", 0)],
-        );
-        assert_eq!(graph.columns, 1);
-        assert!(graph.rows[0].traces.is_empty());
-    }
-
-    #[test]
-    fn a_newer_branch_stays_beside_the_principal_spine() {
-        // feature is newer, so it is listed first. main still owns lane 0.
-        let commits = vec![
-            commit("feature", "on feature", &["base"]),
-            commit("main", "on main", &["base"]),
-            commit("base", "base", &[]),
-        ];
-        let graph = layout_graph(
-            &commits,
-            &[spine("main", "main", 0), tip("feature", "feature", 1)],
-        );
-        assert!(connected(&graph.rows));
-        assert_eq!(graph.columns, 2);
-        assert_eq!(graph.rows[0].commit_lane, 1);
-        assert_eq!(graph.rows[0].commit_color, 1);
-        assert_eq!(graph.rows[1].commit_lane, 0);
-        assert_eq!(graph.rows[1].commit_color, 0);
-
-        let base = &graph.rows[2];
-        assert_eq!(base.commit_lane, 0);
-        assert_eq!(base.commit_color, 0);
-        assert!(base.traces.iter().any(|trace| {
-            trace.from_lane == Some(1) && trace.to_lane.is_none() && trace.color == 1
-        }));
-    }
-
-    #[test]
-    fn a_merged_branch_returns_to_the_principal_lane() {
-        let commits = vec![
-            commit("merge", "merge", &["mainline", "feature"]),
-            commit("mainline", "on main", &["base"]),
-            commit("feature", "on feature", &["base"]),
-            commit("base", "base", &[]),
-        ];
-        let graph = layout_graph(
-            &commits,
-            &[spine("main", "merge", 0), tip("feature", "feature", 1)],
-        );
-        assert!(connected(&graph.rows));
-        assert_eq!(graph.rows[0].commit_lane, 0);
-        assert_eq!(graph.rows[0].commit_color, 0);
-
-        let feature = graph
-            .rows
-            .iter()
-            .find(|row| row.summary == "on feature")
-            .expect("feature");
-        assert_eq!(feature.commit_lane, 1);
-        assert_eq!(feature.commit_color, 1);
-        assert!(feature.traces.iter().any(|trace| {
-            trace.from_lane.is_none() && trace.to_lane == Some(0) && trace.color == 1
-        }));
-
-        let base = graph
-            .rows
-            .iter()
-            .find(|row| row.summary == "base")
-            .expect("base");
-        assert_eq!(base.commit_lane, 0);
-        assert_eq!(base.commit_color, 0);
-    }
-
-    #[test]
-    fn two_side_branches_join_the_same_principal_commit() {
-        let commits = vec![
-            commit("feature", "feature", &["base"]),
-            commit("topic", "topic", &["base"]),
-            commit("main", "main", &["base"]),
-            commit("base", "base", &[]),
-        ];
-        let graph = layout_graph(
-            &commits,
+    const LAYOUTS: &[Layout] = &[
+        (
+            "a linear history is one lane",
+            &[("c3", &["c2"]), ("c2", &["c1"]), ("c1", &[])],
+            &[("main", "c3", 0, false)],
+            1,
             &[
-                spine("main", "main", 0),
-                tip("feature", "feature", 1),
-                tip("topic", "topic", 2),
+                ("c3", "main:0", 0, 0, ".>0:0"),
+                ("c2", "", 0, 0, "0>0:0"),
+                ("c1", "", 0, 0, "0>.:0"),
             ],
-        );
-        assert!(connected(&graph.rows));
-        assert_eq!(row_named(&graph, "main").commit_lane, 0);
-        assert_eq!(row_named(&graph, "feature").commit_lane, 1);
-        assert_eq!(row_named(&graph, "topic").commit_lane, 2);
-        let base = row_named(&graph, "base");
-        assert_eq!(base.commit_color, 0);
-        assert!(
-            base.traces
-                .iter()
-                .any(|trace| trace.from_lane == Some(1) && trace.to_lane.is_none())
-        );
-        assert!(
-            base.traces
-                .iter()
-                .any(|trace| trace.from_lane == Some(2) && trace.to_lane.is_none())
-        );
+        ),
+        (
+            "a parent outside the list leaves no dangling lane",
+            &[("a", &["missing"])],
+            &[("main", "a", 0, false)],
+            1,
+            &[("a", "main:0", 0, 0, "")],
+        ),
+        (
+            "two branches on one commit share the dot, the checked-out one marked",
+            &[("a", &[])],
+            &[("main", "a", 0, false), ("feature", "a", 4, true)],
+            1,
+            &[("a", "main:0 feature:4*", 0, 0, "")],
+        ),
+        (
+            "a branch already on the spine only adds its label",
+            &[("main", &["old"]), ("old", &["base"]), ("base", &[])],
+            &[("main", "main", 0, false), ("old", "old", 2, false)],
+            1,
+            &[
+                ("main", "main:0", 0, 0, ".>0:0"),
+                ("old", "old:2", 0, 0, "0>0:0"),
+                ("base", "", 0, 0, "0>.:0"),
+            ],
+        ),
+        (
+            "diverging branches meet at their parent",
+            &[("main", &["base"]), ("feature", &["base"]), ("base", &[])],
+            &[("main", "main", 0, false), ("feature", "feature", 3, false)],
+            2,
+            &[
+                ("main", "main:0", 0, 0, ".>0:0"),
+                ("feature", "feature:3", 1, 3, "0>0:0 .>0:3"),
+                ("base", "", 0, 0, "0>.:0"),
+            ],
+        ),
+        (
+            "a newer branch stays beside the principal spine",
+            &[("feature", &["base"]), ("main", &["base"]), ("base", &[])],
+            &[("main", "main", 0, false), ("feature", "feature", 1, false)],
+            2,
+            &[
+                ("feature", "feature:1", 1, 1, ".>1:1"),
+                ("main", "main:0", 0, 0, ".>0:0 1>1:1"),
+                ("base", "", 0, 0, "0>.:0 1>.:1"),
+            ],
+        ),
+        (
+            "a merge opens a lane and shifts the ones to its right",
+            &[
+                ("m", &["a", "b"]),
+                ("a", &["c", "d"]),
+                ("b", &["c"]),
+                ("d", &["c"]),
+                ("c", &[]),
+            ],
+            &[("main", "m", 0, false)],
+            3,
+            &[
+                ("m", "main:0", 0, 0, ".>0:0 .>1:0"),
+                ("a", "", 0, 0, "0>0:0 .>1:0 1>2:0"),
+                ("b", "", 2, 0, "0>0:0 1>1:0 .>0:0 2>.:0"),
+                ("d", "", 1, 0, "0>0:0 .>0:0 1>.:0"),
+                ("c", "", 0, 0, "0>.:0"),
+            ],
+        ),
+        (
+            "a merged branch returns to the principal lane",
+            &[
+                ("merge", &["mainline", "feature"]),
+                ("mainline", &["base"]),
+                ("feature", &["base"]),
+                ("base", &[]),
+            ],
+            &[
+                ("main", "merge", 0, false),
+                ("feature", "feature", 1, false),
+            ],
+            2,
+            &[
+                ("merge", "main:0", 0, 0, ".>0:0 .>1:1"),
+                ("mainline", "", 0, 0, "0>0:0 1>1:1"),
+                ("feature", "feature:1", 1, 1, "0>0:0 .>0:1 1>.:1"),
+                ("base", "", 0, 0, "0>.:0"),
+            ],
+        ),
+        (
+            "two side branches join the same principal commit",
+            &[
+                ("feature", &["base"]),
+                ("topic", &["base"]),
+                ("main", &["base"]),
+                ("base", &[]),
+            ],
+            &[
+                ("main", "main", 0, false),
+                ("feature", "feature", 1, false),
+                ("topic", "topic", 2, false),
+            ],
+            3,
+            &[
+                ("feature", "feature:1", 1, 1, ".>1:1"),
+                ("topic", "topic:2", 2, 2, "1>1:1 .>2:2"),
+                ("main", "main:0", 0, 0, ".>0:0 1>1:1 2>2:2"),
+                ("base", "", 0, 0, "0>.:0 1>.:1 2>.:2"),
+            ],
+        ),
+        (
+            "unrelated histories do not meet",
+            &[
+                ("other", &["other-base"]),
+                ("main", &["main-base"]),
+                ("other-base", &[]),
+                ("main-base", &[]),
+            ],
+            &[("main", "main", 0, false), ("other", "other", 1, false)],
+            2,
+            &[
+                ("other", "other:1", 1, 1, ".>1:1"),
+                ("main", "main:0", 0, 0, ".>0:0 1>1:1"),
+                ("other-base", "", 1, 1, "0>0:0 1>.:1"),
+                ("main-base", "", 0, 0, "0>.:0"),
+            ],
+        ),
+        (
+            "merged history is one color when only the principal is selected",
+            &[("m", &["a", "b"]), ("a", &["c"]), ("b", &["c"]), ("c", &[])],
+            &[("main", "m", 0, false)],
+            2,
+            &[
+                ("m", "main:0", 0, 0, ".>0:0 .>1:0"),
+                ("a", "", 0, 0, "0>0:0 1>1:0"),
+                ("b", "", 1, 0, "0>0:0 .>0:0 1>.:0"),
+                ("c", "", 0, 0, "0>.:0"),
+            ],
+        ),
+        (
+            "a selected branch keeps its color through two merges",
+            &[
+                ("m2", &["m1", "f2"]),
+                ("f2", &["f1"]),
+                ("m1", &["base", "f1"]),
+                ("f1", &["base"]),
+                ("base", &[]),
+            ],
+            &[("main", "m2", 0, false), ("feature", "f2", 1, false)],
+            2,
+            &[
+                ("m2", "main:0", 0, 0, ".>0:0 .>1:1"),
+                ("f2", "feature:1", 1, 1, "0>0:0 1>1:1"),
+                ("m1", "", 0, 0, "0>0:0 1>1:1 .>1:1"),
+                ("f1", "", 1, 1, "0>0:0 .>0:1 1>.:1"),
+                ("base", "", 0, 0, "0>.:0"),
+            ],
+        ),
+        (
+            "an unselected branch merged into a selected one takes its color",
+            &[
+                ("feature", &["merge"]),
+                ("main", &["base"]),
+                ("merge", &["fline", "side"]),
+                ("side", &["base"]),
+                ("fline", &["base"]),
+                ("base", &[]),
+            ],
+            &[("main", "main", 0, false), ("feature", "feature", 1, false)],
+            3,
+            &[
+                ("feature", "feature:1", 1, 1, ".>1:1"),
+                ("main", "main:0", 0, 0, ".>0:0 1>1:1"),
+                ("merge", "", 1, 1, "0>0:0 1>1:1 .>2:1"),
+                ("side", "", 2, 1, "0>0:0 1>1:1 .>0:1 2>.:1"),
+                ("fline", "", 1, 1, "0>0:0 .>0:1 1>.:1"),
+                ("base", "", 0, 0, "0>.:0"),
+            ],
+        ),
+        (
+            "a branch based on another selected one colors only its own commits",
+            &[
+                ("feature", &["topic"]),
+                ("topic", &["base"]),
+                ("main", &["base"]),
+                ("base", &[]),
+            ],
+            &[
+                ("main", "main", 0, false),
+                ("feature", "feature", 1, false),
+                ("topic", "topic", 2, false),
+            ],
+            2,
+            &[
+                ("feature", "feature:1", 1, 1, ".>1:1"),
+                ("topic", "topic:2", 1, 2, "1>1:2"),
+                ("main", "main:0", 0, 0, ".>0:0 1>1:2"),
+                ("base", "", 0, 0, "0>.:0 1>.:2"),
+            ],
+        ),
+    ];
+
+    fn traces(spec: &str) -> Vec<GraphTrace> {
+        let lane = |text: &str| (text != ".").then(|| text.parse().expect("lane"));
+        spec.split_whitespace()
+            .map(|trace| {
+                let (lanes, color) = trace.split_once(':').expect("color");
+                let (from, to) = lanes.split_once('>').expect("lanes");
+                GraphTrace {
+                    from_lane: lane(from),
+                    to_lane: lane(to),
+                    color: color.parse().expect("color"),
+                }
+            })
+            .collect()
+    }
+
+    fn labels(row: &GraphRow) -> String {
+        let label = |branch: &GraphBranch| {
+            let current = if branch.current { "*" } else { "" };
+            format!("{}:{}{current}", branch.name, branch.color)
+        };
+        row.branches.iter().map(label).collect::<Vec<_>>().join(" ")
     }
 
     #[test]
-    fn a_branch_already_on_the_spine_only_adds_its_label() {
-        let commits = vec![
-            commit("main", "tip", &["old"]),
-            commit("old", "old", &["base"]),
-            commit("base", "base", &[]),
-        ];
-        let graph = layout_graph(&commits, &[spine("main", "main", 0), tip("old", "old", 2)]);
-        assert!(connected(&graph.rows));
-        assert_eq!(graph.columns, 1);
-        let old = row_named(&graph, "old");
-        assert_eq!(old.commit_lane, 0);
-        assert_eq!(old.commit_color, 0);
-        assert_eq!(old.branches[0].name, "old");
-        assert_eq!(old.branches[0].color, 2);
-    }
-
-    #[test]
-    fn unrelated_histories_do_not_meet() {
-        let commits = vec![
-            commit("other", "other tip", &["other-base"]),
-            commit("main", "main tip", &["main-base"]),
-            commit("other-base", "other base", &[]),
-            commit("main-base", "main base", &[]),
-        ];
-        let graph = layout_graph(
-            &commits,
-            &[spine("main", "main", 0), tip("other", "other", 1)],
-        );
-        assert!(connected(&graph.rows));
-        assert_eq!(row_named(&graph, "main tip").commit_lane, 0);
-        assert_eq!(row_named(&graph, "other tip").commit_lane, 1);
-        assert!(graph.rows.iter().all(|row| {
-            row.traces
+    fn layout_table() {
+        for &(case, commits, tips, columns, rows) in LAYOUTS {
+            let commits: Vec<GraphCommit> = commits
                 .iter()
-                .all(|trace| match (trace.from_lane, trace.to_lane) {
-                    (Some(from), Some(to)) => from == to,
-                    (Some(from), None) => from == row.commit_lane,
-                    _ => true,
+                .map(|(oid, parents)| commit(oid, oid, parents))
+                .collect();
+            let tips: Vec<GraphTip> = tips
+                .iter()
+                .enumerate()
+                .map(|(index, &(name, oid, color, current))| GraphTip {
+                    principal: index == 0,
+                    current,
+                    ..tip(name, oid, color)
                 })
-        }));
-    }
-
-    #[test]
-    fn merged_history_is_one_color_when_only_the_principal_is_selected() {
-        let commits = vec![
-            commit("m", "merge", &["a", "b"]),
-            commit("a", "left", &["c"]),
-            commit("b", "right", &["c"]),
-            commit("c", "base", &[]),
-        ];
-        let graph = layout_graph(&commits, &[spine("main", "m", 0)]);
-        assert!(connected(&graph.rows));
-        assert!(graph.rows.iter().all(|row| row.commit_color == 0));
-        assert!(
-            graph
+                .collect();
+            let graph = layout_graph(&commits, &tips);
+            assert_eq!(graph.columns, columns, "{case}");
+            let got: Vec<_> = graph
                 .rows
                 .iter()
-                .all(|row| row.traces.iter().all(|trace| trace.color == 0))
-        );
-    }
-
-    #[test]
-    fn a_selected_branch_keeps_its_color_through_two_merges() {
-        let commits = vec![
-            commit("m2", "merge again", &["m1", "f2"]),
-            commit("f2", "feature again", &["f1"]),
-            commit("m1", "merge", &["base", "f1"]),
-            commit("f1", "feature", &["base"]),
-            commit("base", "base", &[]),
-        ];
-        let graph = layout_graph(&commits, &[spine("main", "m2", 0), tip("feature", "f2", 1)]);
-        assert!(connected(&graph.rows));
-        assert_eq!(row_named(&graph, "merge again").commit_color, 0);
-        assert_eq!(row_named(&graph, "merge").commit_color, 0);
-        assert_eq!(row_named(&graph, "base").commit_color, 0);
-        assert_eq!(row_named(&graph, "feature again").commit_color, 1);
-        assert_eq!(row_named(&graph, "feature").commit_color, 1);
-        for summary in ["merge again", "merge"] {
-            let row = row_named(&graph, summary);
-            assert!(
-                row.traces.iter().any(|trace| trace.color == 1),
-                "{summary} lost the feature color: {:?}",
-                row.traces
-            );
+                .map(|row| {
+                    let shape = (row.commit_lane, row.commit_color, row.traces.clone());
+                    (row.summary.as_str(), labels(row), shape)
+                })
+                .collect();
+            let expected: Vec<_> = rows
+                .iter()
+                .map(|&(summary, labels, lane, color, spec)| {
+                    (summary, labels.to_owned(), (lane, color, traces(spec)))
+                })
+                .collect();
+            assert_eq!(got, expected, "{case}");
         }
-    }
-
-    #[test]
-    fn an_unselected_branch_merged_into_a_selected_one_inherits_its_color() {
-        let commits = vec![
-            commit("feature", "feature", &["merge"]),
-            commit("main", "main", &["base"]),
-            commit("merge", "merge side", &["fline", "side"]),
-            commit("side", "side", &["base"]),
-            commit("fline", "feature line", &["base"]),
-            commit("base", "base", &[]),
-        ];
-        let graph = layout_graph(
-            &commits,
-            &[spine("main", "main", 0), tip("feature", "feature", 1)],
-        );
-        assert!(connected(&graph.rows));
-        assert_eq!(row_named(&graph, "feature").commit_color, 1);
-        assert_eq!(row_named(&graph, "merge side").commit_color, 1);
-        assert_eq!(row_named(&graph, "side").commit_color, 1);
-        assert_eq!(row_named(&graph, "main").commit_color, 0);
-        assert_eq!(row_named(&graph, "base").commit_color, 0);
-        let side = row_named(&graph, "side");
-        assert!(
-            side.traces.iter().any(|trace| trace.color == 1),
-            "side branch lost the feature color: {:?}",
-            side.traces
-        );
-        // main's lane still crosses this row, in the principal color.
-        assert!(side.traces.iter().any(|trace| trace.color == 0));
-    }
-
-    #[test]
-    fn a_branch_based_on_another_selected_branch_only_colors_its_own_commits() {
-        let commits = vec![
-            commit("feature", "feature", &["topic"]),
-            commit("topic", "topic", &["base"]),
-            commit("main", "main", &["base"]),
-            commit("base", "base", &[]),
-        ];
-        let graph = layout_graph(
-            &commits,
-            &[
-                spine("main", "main", 0),
-                tip("feature", "feature", 1),
-                tip("topic", "topic", 2),
-            ],
-        );
-        assert!(connected(&graph.rows));
-        assert_eq!(row_named(&graph, "feature").commit_color, 1);
-        assert_eq!(row_named(&graph, "topic").commit_color, 2);
-        assert_eq!(row_named(&graph, "main").commit_color, 0);
-        assert_eq!(row_named(&graph, "base").commit_color, 0);
-    }
-
-    fn row_named<'a>(graph: &'a HistoryGraph, summary: &str) -> &'a GraphRow {
-        graph
-            .rows
-            .iter()
-            .find(|row| row.summary == summary)
-            .unwrap_or_else(|| panic!("missing {summary}"))
     }
 
     /// A sidebar row: name, tip, checked out, committer time, checked.
