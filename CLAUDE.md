@@ -12,11 +12,11 @@ system `git` (no libgit2). Two crates in one package:
 ```bash
 cargo fmt --all
 cargo clippy --locked --all-targets -- -D warnings   # CI gate on every OS
-cargo test --locked                                  # what CI runs
+cargo nextest run                                    # CI on Linux; one process per test
+cargo test --locked                                  # CI on Windows and macOS
 cargo llvm-cov --html                                # coverage report
-cargo nextest run                                    # same tests, one process each
-cargo deny check licenses bans sources
-cargo shear                                          # unused dependencies
+cargo deny check licenses bans sources               # CI; advisories run weekly
+cargo shear                                          # unused dependencies, CI
 ```
 
 Hooks in `.claude/settings.json` run `cargo fmt` after every Rust edit and

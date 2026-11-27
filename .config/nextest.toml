@@ -10,8 +10,8 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 fail-fast = false
 failure-output = "immediate-final"
 
-# Used by cargo-mutants (NEXTEST_PROFILE=mutants): stop at the first failure,
-# that already proves the mutant is caught.
+# Used by cargo-mutants (`.cargo/mutants.toml` passes `--profile mutants`):
+# stop at the first failure, that already proves the mutant is caught.
 [profile.mutants]
 fail-fast = true
 slow-timeout = { period = "30s", terminate-after = 2 }
