@@ -61,8 +61,10 @@ struct ParsedRef {
 /// thread. Opening a repository already runs git off the UI thread.
 pub fn branches(git: &Git, root: &Path, head: &Head) -> Result<Vec<Branch>, GitError> {
     let separator = FIELD_SEPARATOR as char;
+    // `lstrip=2`, not `short`: `short` prints `heads/v1` for a branch that
+    // shares its name with a tag, which is not a branch name.
     let format = format!(
-        "--format=%(refname:short){separator}%(objectname){separator}%(upstream:short){separator}%(upstream){separator}%(upstream:track){separator}%(committerdate:unix)"
+        "--format=%(refname:lstrip=2){separator}%(objectname){separator}%(upstream:short){separator}%(upstream){separator}%(upstream:track){separator}%(committerdate:unix)"
     );
     let args = ["for-each-ref", format.as_str(), "refs/heads"];
     let output = git.require_ok(root, &args)?;

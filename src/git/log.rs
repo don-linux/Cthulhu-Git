@@ -403,7 +403,8 @@ fn commit_tags(git: &Git, root: &Path, oid: &str) -> Vec<String> {
     let args = [
         "for-each-ref",
         points_at.as_str(),
-        "--format=%(refname:short)",
+        // Not `short`, which prints `tags/v1` when a branch is also named v1.
+        "--format=%(refname:lstrip=2)",
         "refs/tags",
     ];
     match git.require_ok(root, &args) {

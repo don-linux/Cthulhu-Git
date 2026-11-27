@@ -926,6 +926,35 @@ fn adversarial_file_cli_path_shows_directory_error() {
 }
 
 #[test]
+fn branch_names_git_shortens_ambiguously_still_open() {
+    // `%(refname:short)` prints `heads/v1` for a branch that shares its name
+    // with a tag, and `heads/HEAD` for a branch called HEAD.
+    for (name, setup) in [
+        (
+            "tag-named",
+            &[&["branch", "v1"][..], &["tag", "v1"][..]][..],
+        ),
+        (
+            "head-named",
+            &[
+                &["update-ref", "refs/heads/HEAD", "HEAD"][..],
+                &["symbolic-ref", "HEAD", "refs/heads/HEAD"][..],
+            ][..],
+        ),
+    ] {
+        let sandbox = Sandbox::new();
+        let repo = GitRepo::init(name);
+        repo.empty_commit("Awaken");
+        for args in setup {
+            run_git(&repo.root, args);
+        }
+        let mut harness = sandbox.app(Some(repo.root.clone()));
+        settle_open(&mut harness);
+        assert_repo(&harness, name);
+    }
+}
+
+#[test]
 fn adversarial_home_keeps_last_repository() {
     let sandbox = Sandbox::new();
     let repo = GitRepo::init("rlyeh-valid");
