@@ -34,8 +34,8 @@ pub(super) const CELL_PAD: f32 = 8.0;
 const HEADER_HEIGHT: f32 = 30.0;
 const ROW_PAD: f32 = 18.0;
 const ROW_MIN: f32 = 40.0;
-pub(super) const LANE_MIN: f32 = 14.0;
-pub(super) const LANE_MAX: f32 = 28.0;
+const LANE_MIN: f32 = 14.0;
+const LANE_MAX: f32 = 28.0;
 const LANE_STROKE: f32 = 3.0;
 const DOT_OUTER: f32 = 8.0;
 const DOT_INNER: f32 = 6.0;
@@ -105,7 +105,7 @@ pub(super) enum Column {
 }
 
 impl Column {
-    pub(super) const ALL: [Self; 5] = [
+    const ALL: [Self; 5] = [
         Self::Branch,
         Self::Graph,
         Self::Hash,
@@ -113,7 +113,7 @@ impl Column {
         Self::Author,
     ];
 
-    pub(super) fn title(self) -> &'static str {
+    fn title(self) -> &'static str {
         match self {
             Self::Branch => "Branch",
             Self::Graph => "Graph",
@@ -151,13 +151,13 @@ impl Column {
 
 /// Where each column sits, from the left edge of the table's content.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct ColumnLayout {
-    pub left: [f32; 5],
-    pub width: [f32; 5],
+struct ColumnLayout {
+    left: [f32; 5],
+    width: [f32; 5],
     /// The columns' sum, or the panel when that is wider, so a row's
     /// highlight still reaches the right edge.
-    pub content_width: f32,
-    pub lane_width: f32,
+    content_width: f32,
+    lane_width: f32,
 }
 
 impl ColumnLayout {
@@ -183,7 +183,7 @@ pub(super) fn column_mins(hash_text_width: f32, lanes: usize) -> [f32; 5] {
 
 /// A column is its share of `panel`, or its minimum when that is larger.
 /// Nothing is moved between columns.
-pub(super) fn layout_columns(
+fn layout_columns(
     panel: f32,
     columns: &HistoryColumns,
     mins: [f32; 5],
@@ -219,10 +219,6 @@ pub(super) fn per_mille_for(width: f32, panel: f32) -> u16 {
     (width / panel * 1000.0)
         .round()
         .clamp(f32::from(*range.start()), f32::from(*range.end())) as u16
-}
-
-fn default_per_mille(column: Column) -> u16 {
-    column.per_mille(&HistoryColumns::default())
 }
 
 /// What [`show`] asks the repository screen to keep after this frame.
@@ -331,13 +327,13 @@ pub fn show(
                 continue;
             };
             if response.double_clicked() {
-                column.set(&mut live, default_per_mille(column));
+                live = reset_column(live, column);
                 done = Some(live);
             } else if (response.dragged() || response.drag_stopped())
                 && let Some(pointer) = response.interact_pointer_pos()
             {
-                let wanted = (pointer.x - (origin + layout.left[index])).max(mins[index]);
-                column.set(&mut live, share_for(wanted, mins[index], panel));
+                let width = pointer.x - (origin + layout.left[index]);
+                live = drag_column(live, column, width, mins[index], panel);
                 if response.drag_stopped() {
                     done = Some(live);
                 } else {
@@ -424,17 +420,33 @@ fn divider_id(view_id: Id, index: usize) -> Id {
     view_id.with(("history-divider", index))
 }
 
-/// The share to store for a column dragged to `wanted` points. A column
-/// pushed against its minimum stores that minimum's share, so the saved
-/// width matches the one on screen. When the panel is narrower than the
-/// minimum, that share would be the whole panel or more; the smallest share
-/// is stored instead, so a wider window later does not hand the column most
-/// of the panel. The minimum holds it either way.
-fn share_for(wanted: f32, min: f32, panel: f32) -> u16 {
-    if wanted <= min + 0.5 && panel > 0.0 && min / panel * 1000.0 > 1000.0 {
-        return *HistoryColumns::RANGE.start();
-    }
-    per_mille_for(wanted, panel)
+/// `columns` with `column` dragged to `width` points. A column pushed
+/// against its minimum stores that minimum's share, so the saved width
+/// matches the one on screen. When the panel is narrower than the minimum,
+/// that share would be the whole panel or more; the smallest share is stored
+/// instead, so a wider window later does not hand the column most of the
+/// panel. The minimum holds it either way.
+fn drag_column(
+    mut columns: HistoryColumns,
+    column: Column,
+    width: f32,
+    min: f32,
+    panel: f32,
+) -> HistoryColumns {
+    let wanted = width.max(min);
+    let share = if wanted <= min + 0.5 && panel > 0.0 && min / panel * 1000.0 > 1000.0 {
+        *HistoryColumns::RANGE.start()
+    } else {
+        per_mille_for(wanted, panel)
+    };
+    column.set(&mut columns, share);
+    columns
+}
+
+/// `columns` with `column` back at its default share.
+fn reset_column(mut columns: HistoryColumns, column: Column) -> HistoryColumns {
+    column.set(&mut columns, column.per_mille(&HistoryColumns::default()));
+    columns
 }
 
 fn scaled(ui: &Ui, style: TextStyle) -> FontId {
@@ -1312,15 +1324,24 @@ fn click_commit(
     response.clicked() && select_commit(ui, view_id, oid)
 }
 
+/// Lights `name`, or puts it out when it is the lit branch.
+fn toggle_lit(lit: &mut Option<String>, name: &str) {
+    *lit = if lit.as_deref() == Some(name) {
+        None
+    } else {
+        Some(name.to_owned())
+    };
+}
+
 fn toggle_lit_branch(ui: &Ui, view_id: Id, name: &str) {
     let id = lit_branch_id(view_id);
-    let current: Option<String> = ui.ctx().data(|data| data.get_temp(id));
-    if current.as_deref() == Some(name) {
-        ui.ctx().data_mut(|data| data.remove::<String>(id));
-    } else {
-        ui.ctx()
-            .data_mut(|data| data.insert_temp(id, name.to_owned()));
-    }
+    ui.ctx().data_mut(|data| {
+        let mut lit = data.remove_temp::<String>(id);
+        toggle_lit(&mut lit, name);
+        if let Some(lit) = lit {
+            data.insert_temp(id, lit);
+        }
+    });
     // The lanes for this frame are already drawn. One more frame shows the change.
     ui.ctx().request_repaint();
 }
@@ -1343,7 +1364,7 @@ fn lit_branch(ui: &Ui, view_id: Id, rows: &[GraphRow]) -> Option<LitBranch> {
 }
 
 /// Checked-out branch first, then the sidebar order the row already has.
-pub(super) fn ordered_branches(branches: &[GraphBranch]) -> Vec<&GraphBranch> {
+fn ordered_branches(branches: &[GraphBranch]) -> Vec<&GraphBranch> {
     let mut order: Vec<_> = branches.iter().enumerate().collect();
     order.sort_by_key(|(index, branch)| (!branch.current, *index));
     order.into_iter().map(|(_, branch)| branch).collect()
@@ -1573,9 +1594,11 @@ mod tests {
         }
     }
 
-    /// (dragged width, minimum, panel, stored share).
+    /// (dragged width, minimum, panel, stored share). Only the dragged
+    /// column's share changes.
     #[test]
     fn a_dragged_width_is_stored_as_a_share_of_the_panel() {
+        let start = columns([100, 200, 300, 400, 500]);
         for (width, min, panel, stored) in [
             (500.0, 0.0, 1000.0, 500),
             (1.0, 0.0, 1000.0, 20),
@@ -1583,17 +1606,52 @@ mod tests {
             (500.0, 0.0, 0.0, 20),
             (f32::NAN, 0.0, 1000.0, 20),
             (600.0, MESSAGE_MIN, 1000.0, 600),
-            // On a panel that fits the minimum, the saved share is the one on screen.
+            // On a panel that fits the minimum, the saved share is the one on
+            // screen, also when the pointer went past the minimum.
             (MESSAGE_MIN, MESSAGE_MIN, 1660.0, 169),
+            (100.0, MESSAGE_MIN, 1660.0, 169),
             // A 260-point panel cannot hold the 280-point message minimum.
             // Saving 280/260 as 1000 would make the column fill a wider
             // window later.
             (MESSAGE_MIN, MESSAGE_MIN, 260.0, 20),
         ] {
             assert_eq!(
-                share_for(width, min, panel),
-                stored,
+                drag_column(start, Column::Message, width, min, panel),
+                HistoryColumns {
+                    message: stored,
+                    ..start
+                },
                 "{width} of a {panel} panel, minimum {min}"
+            );
+        }
+    }
+
+    /// (branches: has a commit and is checked, detached HEAD, sentence).
+    #[test]
+    fn an_empty_history_says_why() {
+        for (branches, detached, sentence) in [
+            (&[][..], false, "No commits yet."),
+            (&[(false, false)], false, "No commits yet."),
+            (
+                &[(true, false), (false, true)],
+                false,
+                "No branches selected.",
+            ),
+            (&[(true, false)], true, "No commits yet."),
+            (&[(true, true)], false, "No commits yet."),
+        ] {
+            let listed: Vec<ListedBranch> = branches
+                .iter()
+                .map(|&(born, checked)| {
+                    let mut listed = crate::ui::test_support::listed("b", checked);
+                    listed.branch.oid = born.then(|| "a".repeat(40));
+                    listed
+                })
+                .collect();
+            assert_eq!(
+                empty_history(&listed, detached),
+                sentence,
+                "{branches:?}, detached {detached}"
             );
         }
     }
