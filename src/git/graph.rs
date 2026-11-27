@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use super::exec::{Git, GitError};
-use super::log::{Person, author_and_co_authors};
+use super::log::{Person, author_and_co_authors, is_oid, split_fields};
 
 /// Between the subject and the trailer block: a different byte from the
 /// field separator, so a unit separator in either one stays put.
@@ -158,10 +158,7 @@ fn parse_oid(stdout: &[u8]) -> Option<String> {
     if bytes.last() == Some(&b'\r') {
         bytes.pop();
     }
-    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_hexdigit) {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    is_oid(&bytes).then(|| String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Checked branches, in sidebar order, plus detached `HEAD`.
@@ -278,7 +275,8 @@ pub fn branch_graph(
         }
     }
 
-    // Git 2.55 parses --max-count as a 32-bit signed integer.
+    // git keeps --max-count in a C `int`, and 2.15 reads it with `atoi`, so
+    // a larger value would wrap.
     let max_count = format!(
         "--max-count={}",
         limit.saturating_add(1).min(i32::MAX as usize)
@@ -315,10 +313,6 @@ pub fn branch_graph(
     Ok(graph)
 }
 
-fn is_oid(oid: &str) -> bool {
-    !oid.is_empty() && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
 /// Parses `git log -z` records written with [`GRAPH_FORMAT`].
 ///
 /// Parents are space-separated. The first six unit separators split the
@@ -333,17 +327,16 @@ pub(crate) fn parse_graph_log(stdout: &[u8]) -> Option<Vec<GraphCommit>> {
 }
 
 fn parse_graph_record(record: &[u8]) -> Option<GraphCommit> {
-    let parts = super::log::split_fields(record, 7)?;
-    let oid = parts[0];
-    let parents = parts[1];
-    let identity = [parts[2], parts[3], parts[4], parts[5]];
-    let rest = parts[6];
+    let [oid, parents, mapped_name, mapped_email, name, email, rest] = split_fields(record)?;
     let split = rest.iter().rposition(|byte| *byte == TRAILERS_START)?;
     let (summary, trailers) = (&rest[..split], &rest[split + 1..]);
-    if !is_oid(&String::from_utf8_lossy(oid)) {
+    if !is_oid(oid) {
         return None;
     }
-    let (author, co_authors) = author_and_co_authors(identity, &String::from_utf8_lossy(trailers));
+    let (author, co_authors) = author_and_co_authors(
+        [mapped_name, mapped_email, name, email],
+        &String::from_utf8_lossy(trailers),
+    );
     Some(GraphCommit {
         oid: String::from_utf8_lossy(oid).into_owned(),
         summary: String::from_utf8_lossy(summary).into_owned(),
@@ -357,14 +350,10 @@ fn parse_parents(bytes: &[u8]) -> Option<Vec<String>> {
     if bytes.is_empty() {
         return Some(Vec::new());
     }
-    let mut parents = Vec::new();
-    for parent in bytes.split(|byte| *byte == b' ') {
-        if !is_oid(&String::from_utf8_lossy(parent)) {
-            return None;
-        }
-        parents.push(String::from_utf8_lossy(parent).into_owned());
-    }
-    Some(parents)
+    bytes
+        .split(|byte| *byte == b' ')
+        .map(|parent| is_oid(parent).then(|| String::from_utf8_lossy(parent).into_owned()))
+        .collect()
 }
 
 /// Assigns a lane to every commit. `commits` must already be newest first,

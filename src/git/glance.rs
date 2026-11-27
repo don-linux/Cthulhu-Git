@@ -105,9 +105,7 @@ fn parse_commit_glance(stdout: &[u8]) -> Option<CommitGlance> {
             record.pop();
         }
     }
-    let parts = log::split_fields(&record, 2)?;
-    let when = parts[0];
-    let subject = parts[1];
+    let [when, subject] = log::split_fields(&record)?;
     if !is_local_stamp(when) {
         return None;
     }

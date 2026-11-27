@@ -149,7 +149,7 @@ fn parse_ref_line(line: &[u8]) -> Option<ParsedRef> {
     }
     let oid = if oid.is_empty() {
         None
-    } else if oid.iter().all(u8::is_ascii_hexdigit) {
+    } else if super::log::is_oid(oid) {
         Some(String::from_utf8_lossy(oid).into_owned())
     } else {
         return None;
