@@ -40,7 +40,7 @@ use cthulhu_git::git::{
     RepoInfo,
 };
 use cthulhu_git::github::{self as gh, GitHubRepo};
-use cthulhu_git::settings::{HistoryColumns, Settings, SettingsError};
+use cthulhu_git::settings::{HistoryColumns, Settings};
 use eframe::egui;
 
 use avatars::AvatarService;
@@ -165,25 +165,20 @@ impl HomeScan {
 
 pub struct CthulhuApp {
     settings: Settings,
-    /// `None` when the OS reports no home folder; settings are then not saved.
-    settings_path: Option<PathBuf>,
-    /// `save_settings` writes the file only when this is true. A missing file
-    /// still counts as loaded. A read or parse error does not, so the next
-    /// action cannot replace the user's file with defaults.
-    loaded_ok: bool,
+    /// Where `save_settings` writes. `None` without a home folder, or when the
+    /// file could not be read: writing then would replace the user's file
+    /// with defaults.
+    save_path: Option<PathBuf>,
     screen: Screen,
     opening: Option<Opening>,
     /// The folder dialog: the chosen folder, or `None` when it was cancelled.
     picker: Option<Task<Option<PathBuf>>>,
     error: Option<String>,
     opened_count: u64,
-    /// Covers the current screen. A repository underneath stays open.
-    settings_open: bool,
+    /// Open settings cover the current screen; a repository underneath stays
+    /// open. The chosen page is kept for the session in egui's memory.
+    settings_screen: Option<SettingsScreen>,
     fonts: fonts::FontService,
-    /// Shell drawn on the Terminal settings page. Separate from the repository
-    /// terminal so the preview size does not resize that session. Dropped when
-    /// settings closes; not saved.
-    font_preview: Option<terminal::Terminal>,
     avatars: AvatarService,
     github: GitHubAuth,
     find_git: FindGit,
@@ -191,6 +186,13 @@ pub struct CthulhuApp {
     /// first visit to Settings has answered.
     git_version: Option<String>,
     git_probe: Option<Task<Result<String, GitError>>>,
+}
+
+#[derive(Default)]
+struct SettingsScreen {
+    /// Shell drawn on the Terminal page. Separate from the repository
+    /// terminal so the preview size does not resize that session. Not saved.
+    preview: Option<terminal::Terminal>,
 }
 
 /// Downloaded avatars, beside the settings in the per-user cache folder.
@@ -235,8 +237,7 @@ impl CthulhuApp {
             avatars,
             find_git,
         } = startup;
-        let (settings, loaded_ok, error) =
-            loaded_settings(settings_path.as_deref().map(Settings::load_from));
+        let (settings, save_path, error) = load_settings(settings_path);
         theme::apply(ctx, theme::resolve(settings.theme.as_deref()));
         let mut fonts = fonts::FontService::default();
         fonts.sync(
@@ -254,16 +255,14 @@ impl CthulhuApp {
         }
         let mut app = Self {
             settings,
-            settings_path,
-            loaded_ok,
+            save_path,
             screen: Screen::Home(HomeScan::default()),
             opening: None,
             picker: None,
             error,
             opened_count: 0,
-            settings_open: false,
+            settings_screen: None,
             fonts,
-            font_preview: None,
             avatars,
             github,
             find_git,
@@ -432,15 +431,8 @@ impl CthulhuApp {
     }
 
     /// A failed save keeps the app running; the message joins any current error.
-    ///
-    /// A failed load leaves `loaded_ok` false. Writing then would replace the
-    /// file the user still has, including recents, the theme, and
-    /// `github_token_in_keyring`.
     fn save_settings(&mut self) {
-        if !self.loaded_ok {
-            return;
-        }
-        let Some(path) = &self.settings_path else {
+        let Some(path) = &self.save_path else {
             return;
         };
         if let Err(save_error) = self.settings.save_to(path) {
@@ -466,22 +458,21 @@ impl CthulhuApp {
     }
 }
 
-/// Settings kept after startup, and whether a later save may write them.
+/// The settings at `path` (`None`: no home folder), where later saves may
+/// write them, and the error to show.
 ///
-/// `None` is "no home folder". `Err` is a file that could not be read or
-/// parsed: the window shows the error and keeps the defaults in memory, and
-/// `loaded_ok` stays false so the file is left as it is.
-fn loaded_settings(
-    loaded: Option<Result<Settings, SettingsError>>,
-) -> (Settings, bool, Option<String>) {
-    match loaded {
-        Some(Ok(settings)) => (settings, true, None),
-        Some(Err(error)) => (Settings::default(), false, Some(error.to_string())),
-        None => (
-            Settings::default(),
-            false,
-            Some("No home folder was found, so settings will not be saved.".to_owned()),
-        ),
+/// A missing file is the defaults and is written on the first change. A file
+/// that could not be read or parsed is the user's: the window shows the
+/// error and keeps the defaults in memory, and nothing is ever written over
+/// it, including recents, the theme, and `github_token_in_keyring`.
+fn load_settings(path: Option<PathBuf>) -> (Settings, Option<PathBuf>, Option<String>) {
+    let Some(path) = path else {
+        let error = "No home folder was found, so settings will not be saved.";
+        return (Settings::default(), None, Some(error.to_owned()));
+    };
+    match Settings::load_from(&path) {
+        Ok(settings) => (settings, Some(path), None),
+        Err(error) => (Settings::default(), None, Some(error.to_string())),
     }
 }
 
@@ -498,7 +489,7 @@ impl eframe::App for CthulhuApp {
             self.settings.ui_font.as_deref(),
             self.settings.terminal_font.as_deref(),
         );
-        if self.settings_open {
+        if self.settings_screen.is_some() {
             self.ensure_git_version(ui.ctx());
         }
         self.poll_git_version();
@@ -509,7 +500,7 @@ impl eframe::App for CthulhuApp {
         let syncing = self.sync_for_open_repo();
         let history_loading = self.history_loading();
         let busy = self.busy();
-        let actions = if self.settings_open {
+        let actions = if let Some(settings_screen) = &mut self.settings_screen {
             // The repository stays underneath. Keep the shell alive and take
             // keystrokes away from the hidden terminal.
             if let Screen::Repo { repo, .. } = &mut self.screen {
@@ -520,7 +511,7 @@ impl eframe::App for CthulhuApp {
                 Screen::Repo { repo, .. } => Some(repo.info.root.clone()),
                 Screen::Home(_) => None,
             };
-            terminal::service(ui.ctx(), &mut self.font_preview);
+            terminal::service(ui.ctx(), &mut settings_screen.preview);
             let git_label = self
                 .git_version
                 .as_deref()
@@ -539,7 +530,7 @@ impl eframe::App for CthulhuApp {
                 ui,
                 self.settings.ui_font.as_deref(),
                 self.settings.terminal_font.as_deref(),
-                &mut self.font_preview,
+                &mut settings_screen.preview,
                 cwd.as_deref(),
                 &view,
                 &mut self.github,
@@ -605,16 +596,14 @@ impl CthulhuApp {
             }
             Action::Home => {
                 self.error = None;
-                self.settings_open = false;
-                self.font_preview = None;
+                self.settings_screen = None;
                 self.go_home(ctx);
             }
             Action::OpenSettings => {
-                self.settings_open = true;
+                self.settings_screen.get_or_insert_default();
             }
             Action::CloseSettings => {
-                self.settings_open = false;
-                self.font_preview = None;
+                self.settings_screen = None;
             }
             Action::ToggleBranchesSidebar => {
                 self.settings.branches_sidebar_hidden = !self.settings.branches_sidebar_hidden;
@@ -1068,7 +1057,7 @@ mod tests {
             }
             let home = !matches!(start, Start::NoHomeFolder);
             let mut app = app(&ctx, home.then(|| path.clone()));
-            assert_eq!(app.loaded_ok, loaded, "{start:?}");
+            assert_eq!(app.save_path.is_some(), loaded, "{start:?}");
             assert_eq!(app.error.is_none(), loaded, "{start:?}: {:?}", app.error);
             let error = app.error.clone();
             for (action, fields) in persisting_actions() {
