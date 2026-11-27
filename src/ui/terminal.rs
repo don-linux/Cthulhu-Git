@@ -10,7 +10,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -271,18 +271,21 @@ fn this_host() -> HostOs {
     }
 }
 
-fn vars_to_unset() -> Vec<String> {
-    let mut names: Vec<String> = std::env::vars()
-        .map(|(name, _)| name)
-        .filter(|name| cthulhu_git::git::inherited_git_var_is_cleared(name))
+/// Inherited names the shell must not see: what git commands scrub, plus the
+/// GitHub token variables. A name that is not Unicode is skipped, as the git
+/// scrub does; a value that is not Unicode does not matter.
+fn vars_to_unset(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<String> {
+    let mut names: Vec<String> = vars
+        .into_iter()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| {
+            cthulhu_git::git::inherited_git_var_is_cleared(name)
+                || ["GH_TOKEN", "GITHUB_TOKEN"]
+                    .iter()
+                    .any(|token| token.eq_ignore_ascii_case(name))
+        })
         .collect();
-    for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
-        if std::env::var_os(name).is_some() {
-            names.push(name.to_owned());
-        }
-    }
     names.sort();
-    names.dedup();
     names
 }
 
@@ -543,7 +546,7 @@ impl ShellSession {
             &grid,
             bridge.clone(),
         )));
-        let unset = vars_to_unset();
+        let unset = vars_to_unset(std::env::vars_os());
         let unset_refs: Vec<&str> = unset.iter().map(String::as_str).collect();
         let argv = shell_argv(
             this_host(),
@@ -2779,6 +2782,22 @@ END
                 "{expected:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unset_names_ignore_values_and_names_that_are_not_unicode() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = |bytes: &[u8]| OsString::from_vec(bytes.to_vec());
+        let vars = [
+            (raw(b"GIT_DIR"), raw(b"\xff")),
+            (raw(b"LANG"), raw(b"\xff")),
+            (raw(b"GIT_\xff"), raw(b"x")),
+            (raw(b"GITHUB_TOKEN"), raw(b"\xff")),
+            (raw(b"GIT_SSH_COMMAND"), raw(b"ssh")),
+        ];
+        assert_eq!(vars_to_unset(vars), ["GITHUB_TOKEN", "GIT_DIR"]);
     }
 
     /// Programs such as vim ask for the background (OSC 11) to pick light or
