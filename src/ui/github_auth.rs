@@ -291,80 +291,73 @@ mod tests {
     use super::*;
     use eframe::egui::Context;
 
+    /// A keychain write that failed leaves `github_token_in_keyring` alone: a
+    /// token may still be there for the next launch. A save that timed out is
+    /// not kept either: the keychain worker puts the previous value back if
+    /// the write lands late.
     #[test]
-    fn a_failed_delete_does_not_clear_the_keychain_flag() {
+    fn a_failed_keychain_write_keeps_the_flag() {
+        let token = || Token::new("ghp_abcdefghijklmnopqrstuvwxyz");
+        let saved = |error| Outcome::Saved(token(), Err(error));
+        // (case, outcome, where the token lives after, token handed on, notice)
+        let cases = [
+            (
+                "delete refused",
+                Outcome::Removed(Err(TokenStoreError::Locked("locked".to_owned()))),
+                Stored::Keychain,
+                None,
+                "could not delete",
+            ),
+            (
+                "save timed out",
+                saved(TokenStoreError::Locked(
+                    "the keychain did not answer in time".to_owned(),
+                )),
+                Stored::Session,
+                Some(token()),
+                "not saved",
+            ),
+            (
+                "save locked",
+                saved(TokenStoreError::Locked(
+                    "the collection is locked".to_owned(),
+                )),
+                Stored::Session,
+                Some(token()),
+                "not saved",
+            ),
+            (
+                "save refused",
+                saved(TokenStoreError::Failed("refused".to_owned())),
+                Stored::Session,
+                Some(token()),
+                "not saved",
+            ),
+            (
+                "no keychain",
+                saved(TokenStoreError::Unavailable("no keychain".to_owned())),
+                Stored::Session,
+                Some(token()),
+                "not saved",
+            ),
+        ];
         let ctx = Context::default();
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(Outcome::Removed(Err(TokenStoreError::Locked(
-                "locked".to_owned(),
-            ))))
-            .expect("send");
-        let mut auth = GitHubAuth {
-            token: Some(Token::new("ghp_abcdefghijklmnopqrstuvwxyz")),
-            stored: Stored::Keychain,
-            task: Some(receiver),
-            ..GitHubAuth::default()
-        };
-        let changes = auth.poll(&ctx);
-        assert!(
-            changes
-                .iter()
-                .any(|change| matches!(change, Change::Token(None)))
-        );
-        assert!(
-            !changes
-                .iter()
-                .any(|change| matches!(change, Change::InKeychain(false))),
-            "a failed delete must leave github_token_in_keyring set, got {changes:?}"
-        );
-        assert!(matches!(auth.notice, Some(Notice::Error(_))));
-    }
-
-    /// A save that timed out is not kept either: the keychain worker puts the
-    /// previous value back if the write lands late.
-    #[test]
-    fn a_failed_save_says_the_token_is_not_saved_and_keeps_the_flag() {
-        let ctx = Context::default();
-        for error in [
-            TokenStoreError::Locked("the keychain did not answer in time".to_owned()),
-            TokenStoreError::Locked("the collection is locked".to_owned()),
-            TokenStoreError::Failed("refused".to_owned()),
-            TokenStoreError::Unavailable("no keychain".to_owned()),
-        ] {
+        for (case, outcome, stored, handed_on, notice) in cases {
             let (sender, receiver) = mpsc::channel();
-            sender
-                .send(Outcome::Saved(
-                    Token::new("ghp_abcdefghijklmnopqrstuvwxyz"),
-                    Err(error.clone()),
-                ))
-                .expect("send");
+            sender.send(outcome).expect("send");
             let mut auth = GitHubAuth {
-                task: Some(receiver),
+                token: Some(token()),
                 stored: Stored::Keychain,
+                task: Some(receiver),
                 ..GitHubAuth::default()
             };
             let changes = auth.poll(&ctx);
-            let Some(Notice::Error(notice)) = auth.notice() else {
-                panic!(
-                    "{error:?}: expected an error notice, got {:?}",
-                    auth.notice()
-                );
+            assert_eq!(changes, [Change::Token(handed_on)], "{case}");
+            assert_eq!(auth.stored(), stored, "{case}");
+            let Some(Notice::Error(text)) = auth.notice() else {
+                panic!("{case}: expected an error, got {:?}", auth.notice());
             };
-            assert!(notice.contains("not saved"), "{error:?}: {notice}");
-            assert!(matches!(auth.stored(), Stored::Session), "{error:?}");
-            assert!(
-                changes
-                    .iter()
-                    .any(|change| matches!(change, Change::Token(Some(_)))),
-                "{error:?}: {changes:?}"
-            );
-            assert!(
-                !changes
-                    .iter()
-                    .any(|change| matches!(change, Change::InKeychain(false))),
-                "{error:?}: a failed save must not clear github_token_in_keyring, got {changes:?}"
-            );
+            assert!(text.contains(notice), "{case}: {text}");
         }
     }
 }
