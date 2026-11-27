@@ -1,16 +1,18 @@
 # Cthulhu Git
 
-A small desktop Git client written in Rust with [egui/eframe](https://github.com/emilk/egui).
+A small desktop Git client written in Rust with [egui/eframe](https://github.com/emilk/egui) 0.37.
 It uses the Git installed on the machine. Open a repository with the system
 folder dialog or from the recent list to see its current branch, latest
 commit and commit history.
 
-Fetch and fast-forward pull are available. There is no commit, push, stage or diff yet.
+Fetch, fast-forward pull and switching the local branch are available, and
+a commit's changes open as a diff. There is no commit, push or stage yet.
 
 ## Requirements
 
 - [rustup](https://rustup.rs). The toolchain is pinned to Rust **1.100.0** in
   `rust-toolchain.toml`, so the first `cargo` command installs it automatically.
+  `rust-version` in `Cargo.toml` is 1.100 too.
 - Git **2.15 or newer** on the machine (the app never bundles Git).
 - Linux only: the usual libraries for an OpenGL window on X11 or Wayland.
   On Debian/Ubuntu:
@@ -54,17 +56,18 @@ works; its root is what gets remembered.
 | ----- | ---- | ------- |
 | Top bar, left | Panel button that hides or shows the branches sidebar; the choice is remembered | |
 | Top bar, centered | Repository name (name of the root folder; hover for the full path) | `cthulhu-demo` |
-| Top bar, right | Panel button that hides or shows the latest-commit sidebar; the choice is remembered | |
+| Top bar, right | Panel button that hides or shows the commit sidebar; the choice is remembered | |
 | Left sidebar | Local branches with a checkbox each; checked branches are drawn in the graph | `main · 12 commits · origin/main · in sync` |
 | Middle | Commit history as a table: **Branch**, **Graph**, **Commit Hash**, **Commit Message**, **Author** | `main │ ● │ 21de8d4a3b7c │ Rise from the sea │ (AV) Ada Voss` |
-| Right sidebar | Latest commit: hash, author and co-authors with their avatars, date, message; the terminal beneath it | |
-| Bottom bar, left | House and Settings buttons | |
+| Right sidebar | The commit chosen in the history, else the latest one: hash, author and co-authors with their avatars, date, message, branches, tags and file stats. **View changes** lists its files and shows each one's diff. The terminal sits beneath it | |
+| Bottom bar, left | House, folder (the system folder dialog) and Settings buttons | |
 | Bottom bar | Current branch, next to a branch icon, with Fetch and Pull | `main`, `main (no commits yet)` or `Detached HEAD at 21de8d4a3b7c` |
 | Bottom bar, right | Terminal button. Showing the terminal also opens the right sidebar | |
 
 **The terminal.** Clicking it gives it the keyboard. Tab, the arrows and
 Escape then go to the shell, so completion, history and vim work; Ctrl+Tab
-and Ctrl+Shift+Tab move focus back to the rest of the window.
+and Ctrl+Shift+Tab move focus back to the rest of the window. The shell gets
+`TERM=xterm-256color` and `COLORTERM=truecolor`.
 
 **The history table.** Every column title starts exactly where that column's
 content starts. Each column has its own width, saved as a share of the
@@ -73,14 +76,15 @@ to resize only that column, and double-click it to restore that column. When
 the columns are wider than the panel, the table scrolls sideways. The Author
 column shows the author's avatar, then up to two co-authors from
 `Co-authored-by:` trailers stacked beside it (`+N` for more), then the names.
-Resting the pointer on a commit opens a card like VS Code's Source Control
-Graph hover, hung from the column under the pointer (it stays there while the
-pointer moves into the card): avatar, author with a mail link when the address
-is a plain `local@domain`, relative and exact date, co-authors, the full
-message (`#123`, `GH-123` and `owner/repo#123` linked when the repository is
-on GitHub), the branches on that commit, files changed with insertions and
-deletions when git prints a short stat, the full hash with a Copy button, and
-Open on GitHub when a GitHub remote was found.
+Resting the pointer on a commit's Author cell opens a card like VS Code's
+Source Control Graph hover (it stays open while the pointer moves into the
+card): avatar, author with a mail link when the address is a plain
+`local@domain`, relative and exact date, co-authors, the full message
+(`#123`, `GH-123` and `owner/repo#123` linked when the repository is on
+GitHub), the branches and tags on that commit, the files changed with
+insertions and deletions, the full hash (a click copies it), and Open on
+GitHub when a GitHub remote was found. Clicking a commit's hash or message
+shows that commit in the right sidebar; double-clicking the hash copies it.
 
 Hashes show 12 hex digits, the Linux kernel convention: short, yet unique
 in practice even in very large histories. The history lists the latest 1000
@@ -113,7 +117,9 @@ It holds the theme, the last repository, the recent repositories, which
 sidebars are hidden, the interface font, the terminal font, the history
 column widths, whether
 author avatars are downloaded, and whether a GitHub token sits in the system
-keychain (never the token itself). It is rewritten atomically on every change.
+keychain (never the token itself). It is rewritten atomically on every change,
+readable only by you on Linux and macOS. A file that could not be read at
+startup is left as it is for the rest of the session.
 How to add a setting: [docs/SETTINGS.md](docs/SETTINGS.md).
 
 ## Network and privacy
@@ -155,6 +161,15 @@ Colors come from a theme: a palette of named roles (`text`, `text_muted`,
 never use literal colors. One dark theme ships; there is no theme picker yet.
 How to add a theme: [docs/THEMES.md](docs/THEMES.md).
 
+## Fonts
+
+The interface and terminal faces are compiled into the app and chosen in
+Settings → Appearance and Settings → Terminal. egui's monochrome emoji fonts
+are bundled too, so emoji look the same on every system. A character no
+bundled face has, such as Chinese, Japanese or Korean text, is drawn with the
+system's fonts. The catalog and the licenses are in
+[docs/FONTS.md](docs/FONTS.md).
+
 ## How the Git layer works
 
 The code lives in `src/git/` and has no GUI dependency, so it is tested
@@ -174,16 +189,23 @@ does not stop the search.
    Windows; `git.cmd`/`git.bat` are never used because they need a shell).
    Relative and empty `PATH` entries are skipped so a repository cannot plant
    its own `git.exe` in the current directory. One pair of surrounding quotes
-   is removed first, so a quoted absolute directory is still searched.
+   is removed first, so a quoted absolute directory is still searched. On
+   macOS, `/usr/bin/git` on `PATH` is skipped here (see the next step).
 3. Known install locations, for GUI apps that start with a minimal `PATH`:
    - Linux: `/usr/bin/git`, `/usr/local/bin/git`
-   - macOS: `/opt/homebrew/bin/git`, `/usr/local/bin/git`, then the Command
-     Line Tools or Xcode `git` when that file exists. `/usr/bin/git` is the
-     Xcode stub that opens the installer, so it is tried only after one of
-     those developer copies is present.
+   - macOS: `/opt/homebrew/bin/git`, `/usr/local/bin/git`,
+     `/opt/local/bin/git` (MacPorts), then the Command Line Tools or Xcode
+     `git` when that file exists. `/usr/bin/git` is the Xcode stub that opens
+     the installer, so it is tried only after one of those developer copies
+     is present.
    - Windows: `%ProgramFiles%\Git\cmd\git.exe`, `%ProgramFiles%\Git\bin\git.exe`,
      `%ProgramFiles(x86)%\Git\cmd\git.exe`,
-     `%LOCALAPPDATA%\Programs\Git\cmd\git.exe`, `%USERPROFILE%\scoop\shims\git.exe`
+     `%LOCALAPPDATA%\Programs\Git\cmd\git.exe`, `%USERPROFILE%\scoop\shims\git.exe`,
+     `%ProgramW6432%\Git\cmd\git.exe`, `%ProgramData%\chocolatey\bin\git.exe`
+
+The window keeps the Git it found for every later open, the recent cards and
+About. It searches again only when that Git can no longer start, for example
+after it was moved or uninstalled.
 
 **Running Git** (`exec.rs`). Every invocation goes through one helper:
 
@@ -195,9 +217,13 @@ does not stop the search.
 - `LC_ALL=C` so the messages the app matches on stay in English;
 - every inherited `GIT_*` variable is removed, except `GIT_SSH`,
   `GIT_SSH_COMMAND`, `GIT_SSH_VARIANT`, and `GIT_ASKPASS`. A fixed list cannot
-  cover `GIT_EXEC_PATH` or `GIT_CONFIG_KEY_<n>`. `SSH_AUTH_SOCK`, `HOME`, and
-  `PATH` stay. Launching the app from a hook cannot redirect it to another
+  cover `GIT_EXEC_PATH` or `GIT_CONFIG_KEY_<n>`. On Windows the names match
+  whatever their case, as Git for Windows reads them. `SSH_AUTH_SOCK` and
+  `HOME` stay. Launching the app from a hook cannot redirect it to another
   repository, choose `core.sshCommand`, or run a planted `git-remote-*`;
+- `PATH` stays without its empty and relative entries, so `ssh`, a credential
+  helper or `gpg` is never looked up in the repository. On macOS, Homebrew's
+  `/opt/homebrew/bin` and `/usr/local/bin` are appended when they exist;
 - stdout and stderr are capped at 8 MiB. `git --version` is killed after
   250 ms, reads after 60 s, and fetch or pull after 3 minutes. On Linux and
   macOS the limit signals the whole process group, so a helper git spawned
@@ -228,19 +254,27 @@ recorded (`%an`, `%ae`), summary and trailer block of the latest commits of
 the checked branches; asking for one more than the limit tells whether there
 are more. Co-authors are the `Co-authored-by:` lines of the trailer block,
 matched like VS Code does; one that names the author again (under either
-identity) only adds an address to the author. The hover asks
-`git show --no-color --shortstat --date=format-local:%Y-%m-%d %H:%M --format=%H%x1f%aN%x1f%aE%x1f%an%x1f%ae%x1f%at%x1f%ad%x1f%(trailers:only,unfold)%x1e%B%x1d <oid> --`
-the first time a commit's card opens. An unborn branch skips the calls.
+identity) only adds an address to the author. The hover card and the right
+sidebar ask
+`git show --no-color --no-textconv --no-ext-diff -m --first-parent --numstat -z --date=format-local:%Y-%m-%d %H:%M --format=%H%x1f%aN%x1f%aE%x1f%an%x1f%ae%x1f%at%x1f%ad%x1f%(trailers:only,unfold)%x1e%B%x1d <oid> --`
+the first time they show a commit, plus one `git for-each-ref --points-at`
+for its tags. **View changes** runs `git show -p` for the one file chosen,
+also with `--no-textconv` and `--no-ext-diff`, so a repository's diff
+drivers never run. The window keeps at most 256 commits and 256 diffs it
+read, and drops the one asked for longest ago. An unborn branch skips the
+calls.
 
 **GitHub and avatars** (`src/github/`). No GUI code: every request goes through
-a `Transport`. Tests pass a fake one, and under `cfg!(test)` the window uses
-`AvatarService::disabled()`, so `cargo test` does not touch the network. The
+a `Transport`. Tests pass a fake one, and the window under test is handed
+`AvatarService::disabled()` through `Startup`, so tests do not touch the network. The
 ignored `live_github` test does, and only with `CTHULHU_LIVE_GITHUB=1`. `remote.rs` picks the GitHub remote, `avatar_url.rs` derives URLs
 that need no API call, `client.rs` reads the REST API, `resolver.rs` decides
 which URLs to try for a person, and `token.rs` keeps the optional token.
 
 In the UI, opening a repository and the folder dialog both run on worker
-threads and report back over a channel, so the window never freezes.
+threads and report back over a channel, so the window never freezes. The
+repository opened at launch is the exception: it is read before the window
+first appears, so the first frame already shows it.
 
 ## Platform support
 
@@ -261,12 +295,22 @@ covered by a simulated test that runs on Linux.
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --locked --all-targets -- -D warnings
+cargo nextest run                     # every test in its own process
+cargo test --locked                   # the same suite, plus doctests
+cargo deny check licenses bans sources
+cargo shear                           # unused dependencies
+cargo llvm-cov --html                 # coverage report
 rustup target add x86_64-pc-windows-gnu x86_64-apple-darwin
 cargo check --target x86_64-pc-windows-gnu --all-targets
 cargo check --target x86_64-apple-darwin --all-targets
 ```
+
+`cargo-nextest`, `cargo-deny`, `cargo-shear` and `cargo-llvm-cov` are
+separate installs. CI runs fmt, deny, shear, clippy and nextest (with
+`cargo test --doc`) on Linux, and clippy and `cargo test` on Windows and
+macOS; a weekly workflow checks RustSec advisories. How the tests are laid
+out is in [docs/TESTING.md](docs/TESTING.md).
 
 The two cross checks need a C compiler for the target: `ring` (TLS for the
 avatar requests, through `ureq` and `rustls`) builds C code in its build
@@ -276,15 +320,15 @@ Without them, the Windows and macOS CI jobs, which build natively, are the
 check for those targets.
 
 The crate forbids `unsafe` code. Tests never modify the process environment
-(discovery takes its inputs as a `DiscoverInputs` value), so they run in
-parallel without locks. The test that proves an inherited `GIT_DIR` is ignored
-re-runs the test binary as a child process with that variable set.
+(discovery takes its inputs as a `DiscoverInputs` value, git commands an
+injected environment), so they run in parallel without locks. The test that
+proves an inherited `GIT_DIR` and its kin are ignored re-runs the test binary
+as a child process with those variables set.
 
 Before a release that moves the Git layer, settings, startup or CI, run an
 adversarial pass. The checklist and the file each pass owns are in
-[docs/TESTING.md](docs/TESTING.md). The 0.0.2 pass is
-written up in
-[docs/adversarial-reports/v0.0.2.md](docs/adversarial-reports/v0.0.2.md).
+[docs/TESTING.md](docs/TESTING.md). The passes are written up in
+[docs/adversarial-reports/](docs/adversarial-reports/).
 
 ## Icon
 
@@ -312,13 +356,17 @@ asks for, so nothing is scaled from a bitmap:
 
 To change the icon, edit `assets/icon.svg` and rebuild.
 
+Besides those two icons, `build.rs` only records the commit and its date for
+Settings → About, with one `git log`. Outside a Git checkout both read
+`unknown`.
+
 The interface icons (`panel-left`, `house`, `folder`, `git-branch`, `github`, `info`, `key-round`, …) are
 [Lucide](https://lucide.dev) SVGs in [`assets/icons/`](assets/icons), under
 the license in [`assets/icons/LICENSE`](assets/icons/LICENSE), with
 `currentColor` replaced by white. The app draws them the same way as the logo
 and tints them with the theme's colors. To add one, put the SVG there with
-every `currentColor` set to `#ffffff`, then add it to `Icon` in
-`src/ui/icons.rs`.
+every `currentColor` set to `#ffffff` (a test fails on any that is left),
+then add it to `Icon` in `src/ui/icons.rs`.
 
 ## Releases
 
@@ -335,22 +383,23 @@ to write those notes and cut a release is in
 
 ## Limits of this version
 
-- No commit, push, stage, diff or file list. Fetch, fast-forward pull, and switching the current local branch are the writes. Switching uses `git switch --no-guess` on Git 2.23 and newer, so HEAD stays attached to that branch and a remote of the same name is not turned into a new local branch. Git 2.15 through 2.22 use `git checkout` after the local ref is confirmed, and a branch name that starts with `-` is refused. There is no `--force`: a dirty file that would be overwritten, or a branch checked out in another worktree, leaves the repository unchanged. The switch updates the work tree, so smudge filters and the `post-checkout` hook run, as they do in a terminal.
+- No commit, push or stage. Fetch, fast-forward pull, and switching the current local branch are the writes. Switching uses `git switch --no-guess` on Git 2.23 and newer, so HEAD stays attached to that branch and a remote of the same name is not turned into a new local branch. Git 2.15 through 2.22 use `git checkout` after the local ref is confirmed, and a branch name that starts with `-` is refused. There is no `--force`: a dirty file that would be overwritten, or a branch checked out in another worktree, leaves the repository unchanged. The switch updates the work tree, so smudge filters and the `post-checkout` hook run, as they do in a terminal.
 - The history stops at the latest 1000 commits. Dates and file stats are in
-  the hover card, not in a column.
+  the hover card and the right sidebar, not in a column.
 - A co-author is not looked up on the GitHub API by a commit of their own
   (the API names commit authors only). They still get a picture from a
   no-reply address, the Cursor Agent account, Gravatar, or an address the
   100-commit listing already mapped (authors and committers).
 - GIF avatars are not decoded (only PNG and JPEG). They show initials, and
   that is remembered for a day.
-- A merge commit's hover has no file stats (as in VS Code).
+- A merge commit's files, stats and diffs are its changes against its first
+  parent, not a combined diff.
 - One theme and no theme picker yet.
 - A Git read that does not exit is killed after 60 seconds (`git --version`
   after 250 ms). Fetch and pull are killed after 3 minutes. The window stays
   responsive, but that command still fails.
-- A deleted repository stays in the recent list until it is opened. The open
-  then fails and the entry is not removed.
+- A deleted repository stays in the recent list. Its card says "Can't read
+  this repository", and opening it fails without removing the entry.
 - Shortening a string at 12 bytes keeps the whole string when that cut would
   split a character. Git object ids are ASCII hex, so real commits are not
   affected.
