@@ -195,10 +195,10 @@ struct SettingsScreen {
     preview: Option<terminal::Terminal>,
 }
 
-/// Downloaded avatars, beside the settings in the per-user cache folder.
+/// Downloaded avatars, in the per-user cache folder (the settings are in the
+/// config folder).
 fn avatar_cache_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("io.github", "don-linux", "cthulhu-git")
-        .map(|dirs| dirs.cache_dir().join("avatars"))
+    cthulhu_git::settings::project_dirs().map(|dirs| dirs.cache_dir().join("avatars"))
 }
 
 /// What the app takes from the machine when it starts. [`Startup::system`] is

@@ -27,10 +27,6 @@ pub const TOKEN_TEMPLATE_URL: &str = "https://github.com/settings/personal-acces
 pub struct Token(Zeroizing<String>);
 
 impl Token {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(Zeroizing::new(value.into()))
-    }
-
     /// Trims pasted text. Refuses anything that cannot be a token: too short
     /// or long, or with spaces, control or non-ASCII characters inside.
     pub fn parse(input: &str) -> Option<Self> {

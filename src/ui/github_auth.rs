@@ -274,7 +274,7 @@ mod tests {
     /// the write lands late.
     #[test]
     fn a_failed_keychain_write_keeps_the_flag() {
-        let token = || Token::new("ghp_abcdefghijklmnopqrstuvwxyz");
+        let token = || Token::parse("ghp_abcdefghijklmnopqrstuvwxyz").expect("token");
         let saved = |error| Outcome::Saved(token(), Err(error));
         // (case, outcome, where the token lives after, token handed on, notice)
         let cases = [
