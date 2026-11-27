@@ -21,8 +21,10 @@ font      ui_font and terminal_font are ids of faces compiled into the app
 ```
 
 Saved right away on every change (no timer, no save-on-exit). The write is
-atomic: a temp file next to `settings.json` is renamed over it
-(`std::fs::rename` replaces the file on Linux, macOS and Windows).
+atomic (`write_atomic`): a temp file with a fresh random name is created next
+to `settings.json`, synced to disk, and renamed over it (`std::fs::rename`
+replaces the file on Linux, macOS and Windows, and replaces a symlink instead
+of writing through it). On Unix the file is private to the user (mode 0600).
 
 ## Where things are
 
@@ -32,6 +34,7 @@ atomic: a temp file next to `settings.json` is renamed over it
 | `src/settings.rs` | `Settings::default_path` | Per-OS location (via `directories::ProjectDirs`) |
 | `src/settings.rs` | `Settings::load_from` | Read + parse; dedupes and caps recents |
 | `src/settings.rs` | `Settings::save_to` | Atomic write |
+| `src/settings.rs` | `write_atomic` | Temp file + sync + rename; the avatar cache uses it too |
 | `src/settings.rs` | `remember_repository`, `forget_last_repository` | Last and recent repositories |
 | `src/settings.rs` | `set_ui_font` | Trims the interface face id; a blank name clears it |
 | `src/settings.rs` | `set_terminal_font` | Trims the terminal face id; a blank name clears it |

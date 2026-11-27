@@ -2,10 +2,9 @@
 //! each OS. The map for changing this module is `docs/SETTINGS.md`.
 
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -229,20 +228,9 @@ impl Settings {
         Ok(settings)
     }
 
-    /// Writes a temporary file next to `path` and renames it over `path`, so
-    /// a crash never leaves a half-written file. `std::fs::rename` replaces
-    /// the destination on Linux, macOS and Windows alike.
+    /// Writes the settings with [`write_atomic`].
     pub fn save_to(&self, path: &Path) -> Result<(), SettingsError> {
-        // One temp name per process. Serializing saves keeps two threads from
-        // truncating that same file and publishing a mix of both documents.
-        let _guard = save_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let fail = |error: io::Error| SettingsError::Write(path.to_path_buf(), error);
-
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(fail)?;
-        }
         // A blank id is not a font. Writing the normalized copy keeps a
         // direct field assignment consistent with `load_from`.
         let mut stored = self.clone();
@@ -250,27 +238,7 @@ impl Settings {
         stored.history_columns = stored.history_columns.normalized();
         let mut json = serde_json::to_vec_pretty(&stored).map_err(|error| fail(error.into()))?;
         json.push(b'\n');
-
-        // The process id keeps two running instances from sharing a temp file.
-        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        // `create_new` fails on a symlink instead of following it. Unlink first
-        // so a planted temp symlink cannot truncate a file outside this directory.
-        if fs::symlink_metadata(&tmp).is_ok() {
-            fs::remove_file(&tmp).map_err(fail)?;
-        }
-        let written = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .and_then(|mut file| {
-                file.write_all(&json)?;
-                file.sync_all()
-            });
-        if let Err(error) = written.and_then(|()| fs::rename(&tmp, path)) {
-            let _ = fs::remove_file(&tmp);
-            return Err(fail(error));
-        }
-        Ok(())
+        write_atomic(path, &json).map_err(fail)
     }
 
     /// Makes `root` the repository reopened on launch and the first recent one.
@@ -374,9 +342,28 @@ fn truncate_to_bytes(text: &str, max: usize) -> String {
     text[..end].to_owned()
 }
 
-fn save_lock() -> &'static Mutex<()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    &LOCK
+/// Replaces `path` with `bytes`, creating its folder. The bytes go to a temp
+/// file next to `path`, reach the disk, and the temp file is renamed over
+/// `path`, so a crash never leaves a half-written file. Also used by the
+/// avatar cache.
+///
+/// The temp file has a fresh random name and is created exclusively, so a
+/// link planted next to `path` is never opened; rename(2) replaces a symlink
+/// at `path` instead of writing through it. On Unix the file is 0600.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir)?;
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    file.write_all(bytes)?;
+    file.as_file().sync_all()?;
+    // `keep` clears the temporary attribute Windows gives the file, which
+    // would otherwise follow it to `path`. std's rename, unlike tempfile's
+    // `persist`, retries with POSIX semantics when Windows refuses to replace
+    // the target.
+    let temp = file.into_temp_path().keep()?;
+    fs::rename(&temp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp);
+    })
 }
 
 fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>

@@ -52,10 +52,6 @@ fn entry_names(dir: &Path) -> Vec<String> {
     names
 }
 
-fn pid_temp_path(path: &Path) -> PathBuf {
-    path.with_extension(format!("json.{}.tmp", std::process::id()))
-}
-
 /// Quote `text` as a JSON string. Windows temp paths contain backslashes.
 fn json_string(text: &str) -> String {
     serde_json::to_string(text).expect("json string")
@@ -270,84 +266,49 @@ fn five_mib_json_string_is_an_error() {
     assert_eq!(fs::read(&path).expect("read back"), bytes);
 }
 
-/// Contract for a `settings.json` that is a symlink:
-/// `save_to` may replace the symlink (rename does not follow links) but must
-/// not write through it. A target outside the config directory keeps its
-/// original bytes, the save succeeds, and `load_from` on the settings path
-/// returns the settings that were just saved.
-#[cfg(unix)]
+/// A save meets an entry planted next to `settings.json`: a symlink at the
+/// settings path or at a leftover temp name, pointing outside the config
+/// directory, or a leftover temp file. The save succeeds, never writes through
+/// a link (rename(2) replaces it; the temp file gets a fresh name and is
+/// created exclusively), adds nothing but `settings.json`, and loads back.
 #[test]
-fn save_replaces_settings_symlink_without_changing_outside_target() {
-    let config = temp_dir();
-    let outside = temp_dir();
-    let path = config.path().join(FILE_NAME);
-    let target = outside.path().join("precious.txt");
-    let original = b"precious-outside-target\n";
-    assert!(target.is_absolute());
-    assert!(!target.starts_with(config.path()));
-    fs::write(&target, original).expect("target");
-    symlink(&target, &path).expect("symlink");
-    assert_eq!(fs::read_link(&path).expect("readlink"), target);
+fn save_never_writes_through_a_planted_entry() {
+    let leftover = format!("{FILE_NAME}.{}.tmp", std::process::id());
+    // (planted name, whether it is a symlink to the outside file)
+    #[cfg(unix)]
+    let cases = [(FILE_NAME, true), (&*leftover, true), (&*leftover, false)];
+    #[cfg(not(unix))]
+    let cases = [(&*leftover, false)];
+    for (name, link) in cases {
+        let config = temp_dir();
+        let outside = temp_dir();
+        let path = config.path().join(FILE_NAME);
+        let target = outside.path().join("precious.txt");
+        let original = b"precious-outside-target\n";
+        fs::write(&target, original).expect("target");
+        let planted = config.path().join(name);
+        if link {
+            #[cfg(unix)]
+            symlink(&target, &planted).expect("symlink");
+        } else {
+            fs::write(&planted, b"STALE-TEMP-NOT-JSON").expect("leftover temp");
+        }
 
-    let mut settings = Settings {
-        theme: Some("abyss".to_owned()),
-        ..Settings::default()
-    };
-    settings.remember_repository(Path::new("/src/rlyeh"));
+        let mut settings = Settings {
+            theme: Some("abyss".to_owned()),
+            ..Settings::default()
+        };
+        settings.remember_repository(Path::new("/src/rlyeh"));
+        let result = settings.save_to(&path);
 
-    let result = settings.save_to(&path);
-    assert_eq!(
-        fs::read(&target).expect("target after save"),
-        original,
-        "save_to must not modify a symlink target outside the config directory"
-    );
-    result.expect("save replaces the settings symlink");
-    assert_eq!(Settings::load_from(&path).expect("load"), settings);
-}
-
-/// A stale `settings.json.<pid>.tmp` that points outside the config directory
-/// must not be opened with follow-and-truncate. Save still replaces that
-/// temp entry, leaves no temp file, and the settings path loads the new value.
-#[cfg(unix)]
-#[test]
-fn save_does_not_follow_temp_symlink_onto_outside_target() {
-    let config = temp_dir();
-    let outside = temp_dir();
-    let path = config.path().join(FILE_NAME);
-    let target = outside.path().join("precious.txt");
-    let original = b"precious-outside-target\n";
-    assert!(target.is_absolute());
-    assert!(!target.starts_with(config.path()));
-    fs::write(&target, original).expect("target");
-
-    let tmp = pid_temp_path(&path);
-    assert_eq!(
-        tmp.file_name().and_then(|name| name.to_str()),
-        Some(format!("settings.json.{}.tmp", std::process::id())).as_deref()
-    );
-    symlink(&target, &tmp).expect("temp symlink");
-    assert!(
-        fs::symlink_metadata(&tmp)
-            .expect("temp meta")
-            .file_type()
-            .is_symlink()
-    );
-
-    let mut settings = Settings {
-        theme: Some("abyss".to_owned()),
-        ..Settings::default()
-    };
-    settings.remember_repository(Path::new("/src/rlyeh"));
-
-    let result = settings.save_to(&path);
-    assert_eq!(
-        fs::read(&target).expect("target after save"),
-        original,
-        "save_to followed the temp symlink and modified a file outside the config directory"
-    );
-    result.expect("stale temp symlink is replaced and save succeeds");
-    assert!(!tmp.exists(), "temp path must not remain");
-    assert_eq!(Settings::load_from(&path).expect("load"), settings);
+        let case = format!("{name} link={link}");
+        assert_eq!(fs::read(&target).expect("target"), original, "{case}");
+        result.expect(&case);
+        let mut expected = vec![FILE_NAME.to_owned(), name.to_owned()];
+        expected.dedup();
+        assert_eq!(entry_names(config.path()), expected, "{case}");
+        assert_eq!(Settings::load_from(&path).expect(&case), settings, "{case}");
+    }
 }
 
 #[test]
@@ -371,6 +332,11 @@ fn directory_settings_path_is_read_or_write_error() {
     assert!(
         path.is_dir(),
         "failed save must leave the directory in place"
+    );
+    assert_eq!(
+        entry_names(path.parent().expect("parent")),
+        [FILE_NAME],
+        "failed save must not leave a temp file"
     );
 }
 
@@ -408,31 +374,10 @@ fn unwritable_parent_directory_is_a_write_error() {
         .save_to(&path)
         .expect_err("save into a read-only parent");
     assert!(matches!(error, SettingsError::Write(..)), "{error:?}");
-    assert!(!path.exists(), "failed save must not create settings.json");
     assert!(
-        !pid_temp_path(&path).exists(),
-        "failed save must not leave a temp file"
+        entry_names(&parent).is_empty(),
+        "failed save must leave neither settings.json nor a temp file"
     );
-}
-
-#[test]
-fn stale_temp_file_is_overwritten_and_removed() {
-    let dir = temp_dir();
-    let path = settings_path(&dir);
-    let parent = path.parent().expect("parent");
-    fs::create_dir_all(parent).expect("parent");
-    let tmp = pid_temp_path(&path);
-    fs::write(&tmp, b"STALE-TEMP-NOT-JSON").expect("stale temp");
-
-    let mut settings = Settings::default();
-    settings.remember_repository(Path::new("/src/rlyeh"));
-    settings
-        .save_to(&path)
-        .expect("save over a stale temp file");
-
-    assert!(!tmp.exists(), "temp file must not remain");
-    assert_eq!(entry_names(parent), vec![FILE_NAME.to_owned()]);
-    assert_eq!(Settings::load_from(&path).expect("load"), settings);
 }
 
 #[test]

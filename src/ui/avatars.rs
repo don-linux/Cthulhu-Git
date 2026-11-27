@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -19,6 +19,7 @@ use cthulhu_git::github::{
     ApiStatus, AvatarQuery, AvatarResolver, FetchError, MAX_BODY, RepoContext, Token, Transport,
     UreqTransport, fetch_image, sha256_hex,
 };
+use cthulhu_git::settings::write_atomic;
 use eframe::egui::epaint::RectShape;
 use eframe::egui::{
     Align2, Color32, ColorImage, Context, CornerRadius, FontId, Painter, Pos2, Rect, TextureHandle,
@@ -411,36 +412,12 @@ impl DiskCache {
     }
 
     fn store_image(&self, key: &str, bytes: &[u8]) {
-        let _ = self.write(&self.path(key, "img"), bytes);
+        let _ = write_atomic(&self.path(key, "img"), bytes);
         let _ = fs::remove_file(self.path(key, "miss"));
     }
 
     fn store_miss(&self, key: &str) {
-        let _ = self.write(&self.path(key, "miss"), b"");
-    }
-
-    fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-        fs::create_dir_all(&self.dir)?;
-        // Same sequence as `Settings::save_to`: a temp name that keeps the
-        // real extension, unlink a planted symlink, then `create_new` so a
-        // symlink recreated in the gap fails instead of truncating its target.
-        let tmp = temporary_cache_path(path);
-        if fs::symlink_metadata(&tmp).is_ok() {
-            fs::remove_file(&tmp)?;
-        }
-        let written = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .and_then(|mut file| {
-                file.write_all(bytes)?;
-                file.sync_all()
-            });
-        if let Err(error) = written.and_then(|()| fs::rename(&tmp, path)) {
-            let _ = fs::remove_file(&tmp);
-            return Err(error);
-        }
-        Ok(())
+        let _ = write_atomic(&self.path(key, "miss"), b"");
     }
 
     fn clear_misses(&self) {
@@ -459,18 +436,7 @@ impl DiskCache {
     }
 }
 
-/// `{name}.img.{pid}.tmp` next to `{name}.img`, and the same for `.miss`.
-/// Including the real extension keeps a picture write from sharing a temp
-/// file with a miss write in the same process.
-fn temporary_cache_path(path: &Path) -> PathBuf {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("part");
-    path.with_extension(format!("{extension}.{}.tmp", std::process::id()))
-}
-
-fn fresh(path: &std::path::Path, ttl: Duration) -> bool {
+fn fresh(path: &Path, ttl: Duration) -> bool {
     fs::symlink_metadata(path)
         .ok()
         .filter(|meta| meta.file_type().is_file())
@@ -830,57 +796,49 @@ mod tests {
         );
     }
 
-    /// A planted `{hash}.img.{pid}.tmp` symlink must not be followed. The
-    /// outside file keeps its bytes and the cache path receives the image.
+    /// A symlink planted at the cache path or at a leftover temp name, pointing
+    /// outside the cache, is never written through: the outside file keeps its
+    /// bytes, the cache path holds the image, and no temp file remains.
     #[cfg(unix)]
     #[test]
-    fn avatar_cache_does_not_follow_temp_symlink() {
+    fn avatar_cache_does_not_write_through_a_planted_symlink() {
         use std::os::unix::fs::symlink;
 
-        let cache_dir = tempfile::TempDir::new().expect("cache dir");
-        let outside = tempfile::TempDir::new().expect("outside dir");
-        let cache = DiskCache {
-            dir: cache_dir.path().to_path_buf(),
-        };
         let key = "ada@miskatonic.test";
-        let image = cache.path(key, "img");
-        let tmp = temporary_cache_path(&image);
-        let target = outside.path().join("precious.txt");
-        let original = b"precious-outside-target\n";
-        assert!(target.is_absolute());
-        assert!(!target.starts_with(cache_dir.path()));
-        fs::create_dir_all(cache_dir.path()).expect("cache dir exists");
-        fs::write(&target, original).expect("target");
-        symlink(&target, &tmp).expect("temp symlink");
-        assert!(
-            fs::symlink_metadata(&tmp)
-                .expect("temp meta")
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(
-            tmp.file_name().and_then(|name| name.to_str()),
-            Some(format!("{}.img.{}.tmp", sha256_hex(key), std::process::id()).as_str())
-        );
+        let image = format!("{}.img", sha256_hex(key));
+        for planted in [image.clone(), format!("{image}.{}.tmp", std::process::id())] {
+            let cache_dir = tempfile::TempDir::new().expect("cache dir");
+            let outside = tempfile::TempDir::new().expect("outside dir");
+            let cache = DiskCache {
+                dir: cache_dir.path().to_path_buf(),
+            };
+            let target = outside.path().join("precious.txt");
+            let original = b"precious-outside-target\n";
+            fs::write(&target, original).expect("target");
+            symlink(&target, cache_dir.path().join(&planted)).expect("symlink");
 
-        cache.store_image(key, b"image-bytes");
+            cache.store_image(key, b"image-bytes");
 
-        assert_eq!(
-            fs::read(&target).expect("target after store"),
-            original,
-            "store_image followed the temp symlink and modified a file outside the cache"
-        );
-        assert_eq!(
-            fs::read(&image).expect("cached image"),
-            b"image-bytes",
-            "the cache path should hold the image after the planted symlink is replaced"
-        );
-        assert!(
-            fs::symlink_metadata(&image)
-                .expect("image meta")
-                .file_type()
-                .is_file()
-        );
-        assert!(!tmp.exists(), "temp path must not remain");
+            assert_eq!(fs::read(&target).expect("target"), original, "{planted}");
+            // `lookup` reads only a regular file, never a link.
+            assert!(
+                matches!(cache.lookup(key), Cached::Image(bytes) if bytes == b"image-bytes"),
+                "{planted}"
+            );
+            let mut names: Vec<String> = fs::read_dir(cache_dir.path())
+                .expect("dir")
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+            let mut expected = vec![image.clone(), planted.clone()];
+            expected.dedup();
+            assert_eq!(names, expected, "{planted}: no temp file remains");
+        }
     }
 }
