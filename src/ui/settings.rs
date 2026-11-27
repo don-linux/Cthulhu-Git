@@ -664,7 +664,7 @@ fn shell_preview(ui: &mut Ui, palette: &Palette, preview: &mut Option<Terminal>,
             ui.shrink_clip_rect(content);
             // The page's larger text is not the terminal's.
             ui.style_mut().text_styles = ui.ctx().global_style().text_styles.clone();
-            terminal::show(ui, preview, cwd, preview_view_id(), palette, false);
+            terminal::show_preview(ui, preview, cwd, palette);
         });
         // Clicks land here, including the padding, and do nothing.
         let _ = ui.interact(outer, preview_hit_id(), Sense::CLICK | Sense::DRAG);

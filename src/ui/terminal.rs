@@ -927,12 +927,9 @@ fn prompt_rows(filled: &[bool], cursor_row: usize, max_lines: usize) -> Range<us
     start..cursor + 1
 }
 
-/// Paint the strip and, the first time, start the shell.
-///
-/// When `interactive` is false the shell still runs, so the prompt uses the
-/// current face, but pointer and keyboard are ignored. The widget shows the
-/// prompt block. The PTY stays [`PREVIEW_SCREEN_ROWS`] tall so that block is
-/// not scrolled away.
+/// Paints the strip and, the first time, starts the shell. The strip takes
+/// the pointer and, once clicked, the keyboard. `interactive` false draws
+/// [`show_preview`] instead, for callers that still pass the flag.
 pub fn show(
     ui: &mut Ui,
     terminal: &mut Option<Terminal>,
@@ -941,17 +938,117 @@ pub fn show(
     palette: &Palette,
     interactive: bool,
 ) {
-    let visible = ui.available_rect_before_wrap();
-    let mut metrics = metrics(ui, visible);
     if !interactive {
-        metrics.rows = PREVIEW_SCREEN_ROWS;
+        show_preview(ui, terminal, cwd, palette);
+        return;
     }
+    let visible = ui.available_rect_before_wrap();
+    let metrics = metrics(ui, visible);
+    let painter = start(ui, terminal, cwd, visible, &metrics, palette);
+    match terminal {
+        Some(Terminal::Exited { message }) => {
+            if exited_prompt(ui, visible, message, palette) {
+                *terminal = Some(begin_shell(ui.ctx(), cwd, &metrics));
+            }
+        }
+        Some(Terminal::Live(session)) => {
+            // Before `interact`: egui moves focus when the focused widget
+            // registers, and Tab itself belongs to the shell.
+            if ui.memory(|memory| memory.has_focus(focus_id(view_id)))
+                && let Some(direction) = leave_direction(ui)
+            {
+                ui.memory_mut(|memory| memory.move_focus(direction));
+            }
+            let response = ui.interact(visible, focus_id(view_id), Sense::click_and_drag());
+            let response = response.on_hover_cursor(CursorIcon::Text);
+            if response.hovered() && ui.input(|input| input.pointer.primary_pressed()) {
+                response.request_focus();
+            }
+            session.resize(&metrics, ui.pixels_per_point());
+            let focused = response.has_focus();
+            handle_pointer(ui, session, &response, visible, &metrics);
+            if focused {
+                // egui moves focus on Tab and the arrows and drops it on
+                // Escape. In a terminal those keys belong to the shell.
+                let shell_keys = EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: true,
+                };
+                ui.memory_mut(|memory| memory.set_focus_lock_filter(response.id, shell_keys));
+                handle_keys(ui, session);
+            }
+            paint(&painter, session, visible, &metrics, palette);
+        }
+        Some(Terminal::Starting(_)) | None => {}
+    }
+}
+
+/// The settings preview: the same shell in the current face, drawn as the
+/// prompt block that ends at the cursor. Pointer and keyboard are ignored.
+/// The PTY stays [`PREVIEW_SCREEN_ROWS`] tall so that block is not scrolled
+/// away.
+pub fn show_preview(ui: &mut Ui, terminal: &mut Option<Terminal>, cwd: &Path, palette: &Palette) {
+    let visible = ui.available_rect_before_wrap();
+    let metrics = Metrics {
+        rows: PREVIEW_SCREEN_ROWS,
+        ..metrics(ui, visible)
+    };
+    let painter = start(ui, terminal, cwd, visible, &metrics, palette);
+    match terminal {
+        Some(Terminal::Exited { message }) => {
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            ui.painter().text(
+                visible.left_top(),
+                Align2::LEFT_TOP,
+                message,
+                font,
+                palette.text_muted,
+            );
+        }
+        Some(Terminal::Live(session)) => {
+            session.resize(&metrics, ui.pixels_per_point());
+            let span = {
+                let term = session.term.lock();
+                prompt_span(&term)
+            };
+            let origin = Rect::from_min_size(
+                Pos2::new(
+                    visible.min.x,
+                    visible.min.y - span.start as f32 * metrics.cell_h,
+                ),
+                Vec2::new(
+                    visible.width().max(1.0),
+                    metrics.rows as f32 * metrics.cell_h,
+                ),
+            );
+            // A column change reflows the prompt after the box was sized.
+            let reserved = visible.height() / metrics.cell_h;
+            if (reserved - span.len() as f32).abs() > 0.5 {
+                ui.ctx().request_repaint();
+            }
+            paint(&painter, session, origin, &metrics, palette);
+        }
+        Some(Terminal::Starting(_)) | None => {}
+    }
+}
+
+/// Fills the strip, starts the shell the first time, and says so until it
+/// runs.
+fn start(
+    ui: &Ui,
+    terminal: &mut Option<Terminal>,
+    cwd: &Path,
+    visible: Rect,
+    metrics: &Metrics,
+    palette: &Palette,
+) -> Painter {
     let painter = ui.painter().with_clip_rect(visible);
     painter.rect_filled(visible, 0.0, palette.background);
-
     adopt_starting(terminal);
     if terminal.is_none() {
-        *terminal = Some(begin_shell(ui.ctx(), cwd, &metrics));
+        *terminal = Some(begin_shell(ui.ctx(), cwd, metrics));
         adopt_starting(terminal);
     }
     if matches!(terminal, Some(Terminal::Starting(_))) {
@@ -964,75 +1061,7 @@ pub fn show(
             palette.text_muted,
         );
     }
-
-    if !interactive {
-        surrender_focus(ui.ctx(), view_id);
-    }
-
-    let mut restart = false;
-    match terminal {
-        Some(Terminal::Exited { message }) => {
-            restart = exited_prompt(ui, visible, message, palette, interactive);
-        }
-        Some(Terminal::Live(session)) => {
-            let mut origin = visible;
-            if interactive {
-                // Before `interact`: egui moves focus when the focused widget
-                // registers, and Tab itself belongs to the shell.
-                if ui.memory(|memory| memory.has_focus(focus_id(view_id)))
-                    && let Some(direction) = leave_direction(ui)
-                {
-                    ui.memory_mut(|memory| memory.move_focus(direction));
-                }
-                let response = ui.interact(visible, focus_id(view_id), Sense::click_and_drag());
-                let response = response.on_hover_cursor(CursorIcon::Text);
-                if response.hovered() && ui.input(|input| input.pointer.primary_pressed()) {
-                    response.request_focus();
-                }
-                session.resize(&metrics, ui.pixels_per_point());
-                let focused = response.has_focus();
-                handle_pointer(ui, session, &response, visible, &metrics);
-                if focused {
-                    // egui moves focus on Tab and the arrows and drops it on
-                    // Escape. In a terminal those keys belong to the shell.
-                    let shell_keys = EventFilter {
-                        tab: true,
-                        horizontal_arrows: true,
-                        vertical_arrows: true,
-                        escape: true,
-                    };
-                    ui.memory_mut(|memory| memory.set_focus_lock_filter(response.id, shell_keys));
-                    handle_keys(ui, session);
-                }
-            } else {
-                session.resize(&metrics, ui.pixels_per_point());
-                let span = {
-                    let term = session.term.lock();
-                    prompt_span(&term)
-                };
-                origin = Rect::from_min_size(
-                    Pos2::new(
-                        visible.min.x,
-                        visible.min.y - span.start as f32 * metrics.cell_h,
-                    ),
-                    Vec2::new(
-                        visible.width().max(1.0),
-                        metrics.rows as f32 * metrics.cell_h,
-                    ),
-                );
-                // A column change reflows the prompt after the box was sized.
-                let reserved = visible.height() / metrics.cell_h;
-                if (reserved - span.len() as f32).abs() > 0.5 {
-                    ui.ctx().request_repaint();
-                }
-            }
-            paint(&painter, session, origin, &metrics, palette);
-        }
-        Some(Terminal::Starting(_)) | None => {}
-    }
-    if restart {
-        *terminal = Some(begin_shell(ui.ctx(), cwd, &metrics));
-    }
+    painter
 }
 
 /// Ctrl+Tab and Ctrl+Shift+Tab move focus out of the terminal, as they do
@@ -1066,24 +1095,8 @@ fn begin_shell(ctx: &egui::Context, cwd: &Path, metrics: &Metrics) -> Terminal {
     Terminal::Starting(StartingShell { rx })
 }
 
-fn exited_prompt(
-    ui: &mut Ui,
-    rect: Rect,
-    message: &str,
-    palette: &Palette,
-    interactive: bool,
-) -> bool {
-    if !interactive {
-        let font = egui::TextStyle::Body.resolve(ui.style());
-        ui.painter().text(
-            rect.left_top(),
-            Align2::LEFT_TOP,
-            message,
-            font,
-            palette.text_muted,
-        );
-        return false;
-    }
+/// The exit message and a button to start again. `true` on a click.
+fn exited_prompt(ui: &mut Ui, rect: Rect, message: &str, palette: &Palette) -> bool {
     let mut restart = false;
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
         ui.vertical_centered(|ui| {
