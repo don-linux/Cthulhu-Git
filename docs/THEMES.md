@@ -34,7 +34,8 @@ exceptions.
 | `src/ui/theme/dark.rs` | `THEME` | The dark theme (the only one today) |
 | `src/ui/mod.rs` | `CthulhuApp::new` | Applies the saved theme at startup |
 | `src/ui/widgets.rs`, `home.rs`, `repo_view.rs`, `settings.rs` | `theme::current(..).palette` | Where views read colors |
-| `src/ui/history.rs`, `hover.rs`, `avatars.rs`, `terminal.rs` | `&Palette` | Read the palette their callers pass |
+| `src/ui/terminal.rs` | `theme::current(..).palette` | Answers the shell's color queries with the colors it paints |
+| `src/ui/history.rs`, `hover.rs`, `changes.rs`, `avatars.rs`, `terminal.rs` | `&Palette` | Read the palette their callers pass |
 
 ## Palette roles
 
@@ -50,11 +51,11 @@ exceptions.
 | `text_muted` | Field labels, paths, hints, history column titles |
 | `accent` | Primary button, hover and focus outlines, links |
 | `on_accent` | Text on `accent` |
-| `selection` | Selected text background |
+| `selection` | Selected text background, the chosen history row, and the terminal's selection |
 | `hash` | Commit hashes |
 | `graph` | Commit-graph lanes. Index 0 is the principal branch (`#3794FF` in the dark theme); the rest cycle when there are more lanes than colors. The same hues, faded, fill the branch-name labels, and a translucent stroke of the same hue joins a label to its commit. Author initials (when there is no avatar) use one of these hues, chosen from the address |
 | `warning` | Detached HEAD, a rejected GitHub token, the rate-limit pause on GitHub Auth, and tag chips on a commit |
-| `error` | Error banner |
+| `error` | Error banner, an unreadable recent card, a commit read that failed, a GitHub Auth error |
 | `diff_added` | Insertions in the commit hover's short stat, the `+` on an added diff line, and the "Connected as …" line on GitHub Auth |
 | `diff_removed` | Deletions in the commit hover's short stat, and the `-` on a removed diff line |
 | `diff_added_fill` | Background of an added line in the commit diff |
