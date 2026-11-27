@@ -414,10 +414,11 @@ fn divider_id(view_id: Id, index: usize) -> Id {
 
 /// `columns` with `column` dragged to `width` points. A column pushed
 /// against its minimum stores that minimum's share, so the saved width
-/// matches the one on screen. When the panel is narrower than the minimum,
-/// that share would be the whole panel or more; the smallest share is stored
-/// instead, so a wider window later does not hand the column most of the
-/// panel. The minimum holds it either way.
+/// matches the one on screen; a minimum exactly as wide as the panel stores
+/// the whole panel. When the panel is narrower than the minimum, that share
+/// would be more than the whole panel; the smallest share is stored instead,
+/// so a wider window later does not hand the column most of the panel. The
+/// minimum holds it either way.
 fn drag_column(
     mut columns: HistoryColumns,
     column: Column,
