@@ -24,12 +24,13 @@ use std::time::Duration;
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::index::{Column, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{
-    Config as TermConfig, Osc52, RenderableCursor, Term, TermMode, color,
+    Config as TermConfig, Osc52, RenderableCursor, Term, TermMode, color, point_to_viewport,
+    viewport_to_point,
 };
 use alacritty_terminal::tty::{self, Pty};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
@@ -488,15 +489,10 @@ impl ShellSession {
     }
 
     fn resize(&mut self, metrics: &Metrics, pixels_per_point: f32) {
-        // `Msg::Resize` runs `TIOCSWINSZ` on the event-loop thread. alacritty
-        // exits the process when that ioctl fails: EINVAL for a 0-size, EIO
-        // after the slave hangs up. Compare cell pixels too, so a move
-        // between 1x and 2x still updates `ws_xpixel`.
-        if self.child_exited || !child_can_be_resized(self.pid) {
-            return;
-        }
         let size = window_size(metrics, pixels_per_point);
-        if !pty_size_is_safe(size) || same_window_size(self.size, size) {
+        if !should_resize(self.size, size, self.child_exited, || {
+            child_can_be_resized(self.pid)
+        }) {
             return;
         }
         self.size = size;
@@ -531,19 +527,13 @@ fn window_size(metrics: &Metrics, pixels_per_point: f32) -> WindowSize {
     }
 }
 
+/// Rounded pixels, at least one. `as u16` would turn NaN into 0, and a zero
+/// cell size makes `TIOCSWINSZ` fail and alacritty exit the process.
 fn px(points: f32) -> u16 {
-    // `as u16` turns NaN and infinities into 0. A zero cell size makes
-    // `TIOCSWINSZ` fail and alacritty exit the process.
-    if !points.is_finite() {
-        return 1;
-    }
-    let pixels = points.round();
-    if !pixels.is_finite() || pixels <= 1.0 {
-        1
-    } else if pixels >= f32::from(u16::MAX) {
-        u16::MAX
+    if points.is_finite() {
+        points.round().clamp(1.0, f32::from(u16::MAX)) as u16
     } else {
-        pixels as u16
+        1
     }
 }
 
@@ -555,24 +545,24 @@ fn clamp_cell_px(cells: u16, cell_px: u16) -> u16 {
     cell_px.min(max_cell.max(1)).max(1)
 }
 
-fn same_window_size(left: WindowSize, right: WindowSize) -> bool {
-    left.num_cols == right.num_cols
-        && left.num_lines == right.num_lines
-        && left.cell_width == right.cell_width
-        && left.cell_height == right.cell_height
-}
-
-fn pty_size_is_safe(size: WindowSize) -> bool {
-    let cols = u32::from(size.num_cols);
-    let rows = u32::from(size.num_lines);
-    let width = u32::from(size.cell_width);
-    let height = u32::from(size.cell_height);
-    cols >= 1
-        && rows >= 1
-        && width >= 1
-        && height >= 1
-        && cols * width <= u32::from(u16::MAX)
-        && rows * height <= u32::from(u16::MAX)
+/// Whether the PTY should take `size`. `Msg::Resize` runs `TIOCSWINSZ` on
+/// the event-loop thread, and alacritty exits the process when that ioctl
+/// fails: EINVAL for a 0-size, which [`window_size`] never reports, and EIO
+/// after the slave hangs up, so an exited or dead child is left alone. Cell
+/// pixels count, so a move between 1x and 2x still updates `ws_xpixel`. The
+/// size is compared first: it is the same on almost every frame, and `alive`
+/// reads `/proc`.
+fn should_resize(
+    current: WindowSize,
+    size: WindowSize,
+    child_exited: bool,
+    alive: impl FnOnce() -> bool,
+) -> bool {
+    let same = current.num_cols == size.num_cols
+        && current.num_lines == size.num_lines
+        && current.cell_width == size.cell_width
+        && current.cell_height == size.cell_height;
+    !same && !child_exited && alive()
 }
 
 fn child_can_be_resized(pid: u32) -> bool {
@@ -879,8 +869,9 @@ fn prompt_span<T: EventListener>(term: &Term<T>) -> Range<usize> {
         return 0..1;
     }
     let content = term.renderable_content();
-    let offset = content.display_offset as i32;
-    let cursor_line = content.cursor.point.line.0;
+    let offset = content.display_offset;
+    let cursor_row =
+        point_to_viewport(offset, content.cursor.point).map_or(0, |point| point.line.min(rows - 1));
     let mut filled = vec![false; rows];
     for indexed in content.display_iter {
         if indexed
@@ -889,15 +880,13 @@ fn prompt_span<T: EventListener>(term: &Term<T>) -> Range<usize> {
         {
             continue;
         }
-        let row = indexed.point.line.0 + offset;
-        if row < 0 || row >= rows as i32 {
-            continue;
-        }
-        if cell_holds_prompt(indexed.cell) {
-            filled[row as usize] = true;
+        if let Some(point) = point_to_viewport(offset, indexed.point)
+            && point.line < rows
+            && cell_holds_prompt(indexed.cell)
+        {
+            filled[point.line] = true;
         }
     }
-    let cursor_row = (cursor_line + offset).clamp(0, rows as i32 - 1) as usize;
     prompt_rows(&filled, cursor_row, PREVIEW_MAX_LINES)
 }
 
@@ -1146,9 +1135,14 @@ fn paint(
         {
             continue;
         }
-        let row = indexed.point.line.0 + offset as i32;
-        let col = indexed.point.column.0;
-        if row < 0 || row >= metrics.rows as i32 || col >= metrics.cols {
+        let Some(Point {
+            line: row,
+            column: Column(col),
+        }) = point_to_viewport(offset, indexed.point)
+        else {
+            continue;
+        };
+        if row >= metrics.rows || col >= metrics.cols {
             continue;
         }
         let selected = selection
@@ -1166,7 +1160,7 @@ fn paint(
             std::mem::swap(&mut fg, &mut bg);
         }
         let wide = indexed.flags.contains(Flags::WIDE_CHAR);
-        let cell = cell_rect(rect, metrics, col, row as usize, wide);
+        let cell = cell_rect(rect, metrics, col, row, wide);
         if bg != palette.background || selected || on_cursor {
             painter.rect_filled(cell, 0.0, bg);
         }
@@ -1208,16 +1202,30 @@ fn cell_rect(origin: Rect, metrics: &Metrics, col: usize, row: usize, wide: bool
     Rect::from_min_size(min, Vec2::new(metrics.cell_w * span, metrics.cell_h))
 }
 
+/// What `color` paints with: the color the program set, else this widget's.
+/// Text, bright text and the cursor are the palette's text; the ANSI colors
+/// and the 256-color cube are [`ansi_color`], the dim ones at normal strength.
 fn resolve_color(color: Color, colors: &color::Colors, palette: &Palette) -> Color32 {
+    let index = match color {
+        Color::Spec(rgb) => return Color32::from_rgb(rgb.r, rgb.g, rgb.b),
+        Color::Indexed(index) => usize::from(index),
+        Color::Named(named) => named as usize,
+    };
+    if let Some(rgb) = colors[index] {
+        return Color32::from_rgb(rgb.r, rgb.g, rgb.b);
+    }
+    let dim = NamedColor::DimBlack as usize;
     match color {
-        Color::Spec(rgb) => Color32::from_rgb(rgb.r, rgb.g, rgb.b),
-        Color::Indexed(index) => stored_or_ansi(colors, usize::from(index), index),
-        Color::Named(named) => {
-            if let Some(rgb) = colors[named] {
-                return Color32::from_rgb(rgb.r, rgb.g, rgb.b);
-            }
-            named_color(named, palette)
-        }
+        Color::Named(NamedColor::Background) => palette.background,
+        Color::Named(NamedColor::DimForeground) => palette.text_muted,
+        // Past the 256 colors: read as a color number, the cursor would be
+        // green and the bright text yellow.
+        Color::Named(
+            NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::Cursor,
+        ) => palette.text,
+        Color::Named(_) if index >= dim => ansi_color((index - dim) as u8),
+        // A color number: below 256.
+        _ => ansi_color(index as u8),
     }
 }
 
@@ -1238,55 +1246,9 @@ fn reported_color(colors: &color::Colors, index: usize, palette: &Palette) -> Rg
     }
 }
 
-fn stored_or_ansi(colors: &color::Colors, index: usize, ansi_index: u8) -> Color32 {
-    if index < color::COUNT
-        && let Some(rgb) = colors[index]
-    {
-        return Color32::from_rgb(rgb.r, rgb.g, rgb.b);
-    }
-    let (r, g, b) = ansi_rgb(ansi_index);
-    Color32::from_rgb(r, g, b)
-}
-
-fn named_color(named: NamedColor, palette: &Palette) -> Color32 {
-    match named {
-        NamedColor::Foreground | NamedColor::BrightForeground => palette.text,
-        NamedColor::Background => palette.background,
-        NamedColor::DimForeground => palette.text_muted,
-        NamedColor::Cursor => palette.text,
-        NamedColor::Black => stored_fallback(0),
-        NamedColor::Red => stored_fallback(1),
-        NamedColor::Green => stored_fallback(2),
-        NamedColor::Yellow => stored_fallback(3),
-        NamedColor::Blue => stored_fallback(4),
-        NamedColor::Magenta => stored_fallback(5),
-        NamedColor::Cyan => stored_fallback(6),
-        NamedColor::White => stored_fallback(7),
-        NamedColor::BrightBlack => stored_fallback(8),
-        NamedColor::BrightRed => stored_fallback(9),
-        NamedColor::BrightGreen => stored_fallback(10),
-        NamedColor::BrightYellow => stored_fallback(11),
-        NamedColor::BrightBlue => stored_fallback(12),
-        NamedColor::BrightMagenta => stored_fallback(13),
-        NamedColor::BrightCyan => stored_fallback(14),
-        NamedColor::BrightWhite => stored_fallback(15),
-        NamedColor::DimBlack => stored_fallback(0),
-        NamedColor::DimRed => stored_fallback(1),
-        NamedColor::DimGreen => stored_fallback(2),
-        NamedColor::DimYellow => stored_fallback(3),
-        NamedColor::DimBlue => stored_fallback(4),
-        NamedColor::DimMagenta => stored_fallback(5),
-        NamedColor::DimCyan => stored_fallback(6),
-        NamedColor::DimWhite => stored_fallback(7),
-    }
-}
-
-fn stored_fallback(index: u8) -> Color32 {
-    let (r, g, b) = ansi_rgb(index);
-    Color32::from_rgb(r, g, b)
-}
-
-fn ansi_rgb(index: u8) -> (u8, u8, u8) {
+/// The sixteen ANSI colors, the 6×6×6 cube and the gray ramp, as xterm
+/// numbers them.
+fn ansi_color(index: u8) -> Color32 {
     const ANSI: [[u8; 3]; 16] = [
         [0x1a, 0x1b, 0x26],
         [0xf7, 0x76, 0x8e],
@@ -1306,18 +1268,18 @@ fn ansi_rgb(index: u8) -> (u8, u8, u8) {
         [0xd5, 0xdb, 0xe6],
     ];
     if index < 16 {
-        let rgb = ANSI[usize::from(index)];
-        return (rgb[0], rgb[1], rgb[2]);
+        let [r, g, b] = ANSI[usize::from(index)];
+        return Color32::from_rgb(r, g, b);
     }
     if index < 232 {
         let cube = index - 16;
         let level = |step: u8| {
             if step == 0 { 0 } else { 55 + step * 40 }
         };
-        return (level(cube / 36), level((cube / 6) % 6), level(cube % 6));
+        return Color32::from_rgb(level(cube / 36), level((cube / 6) % 6), level(cube % 6));
     }
     let gray = 8 + 10 * (index - 232);
-    (gray, gray, gray)
+    Color32::from_gray(gray)
 }
 
 fn handle_pointer(
@@ -1462,9 +1424,9 @@ fn hit_at(rect: Rect, pos: Pos2, metrics: &Metrics, session: &ShellSession) -> C
     let row = ((pos.y - rect.min.y) / metrics.cell_h).floor();
     let col = col.clamp(0.0, (metrics.cols - 1) as f32) as usize;
     let row = row.clamp(0.0, (metrics.rows - 1) as f32) as usize;
-    let offset = session.term.lock().renderable_content().display_offset as i32;
+    let offset = session.term.lock().grid().display_offset();
     CellHit {
-        point: Point::new(Line(row as i32 - offset), Column(col)),
+        point: viewport_to_point(offset, Point::new(row, Column(col))),
         col,
         row,
     }
@@ -1535,15 +1497,15 @@ fn apply_key(ctx: &egui::Context, session: &mut ShellSession, event: Event, modi
         }
         Event::Key {
             key,
-            pressed,
+            pressed: true,
             modifiers,
             ..
-        } if pressed => {
-            if let Some(bytes) = encode_key(session, key, modifiers) {
+        } => {
+            let app_cursor = session.term.lock().mode().contains(TermMode::APP_CURSOR);
+            if let Some(bytes) = encode_key(key, modifiers, app_cursor) {
                 session.write(&bytes);
             }
         }
-        Event::Key { .. } => {}
         _ => {}
     }
 }
@@ -1623,27 +1585,10 @@ fn paste_char_is_allowed(ch: char) -> bool {
     }
 }
 
-fn encode_key(session: &ShellSession, key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
-    if key == Key::C && modifiers.ctrl && !modifiers.shift && !modifiers.alt && !modifiers.mac_cmd {
-        let selected = session
-            .term
-            .lock()
-            .selection_to_string()
-            .is_some_and(|text| !text.is_empty());
-        if cfg!(target_os = "macos") || !selected {
-            return Some(vec![0x03]);
-        }
-        return None;
-    }
-    let app_cursor = session.term.lock().mode().contains(TermMode::APP_CURSOR);
-    if let Some(bytes) = special_key(key, modifiers, app_cursor) {
-        return Some(bytes);
-    }
-    letter_key(key, modifiers)
-}
-
-/// `app_cursor` is the terminal's application cursor mode (DECCKM).
-fn special_key(key: Key, modifiers: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
+/// The bytes xterm sends for `key`. `app_cursor` is the terminal's
+/// application cursor mode (DECCKM). A plain letter is text, not a key, so it
+/// sends nothing here.
+fn encode_key(key: Key, modifiers: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
     let modified = xterm_mod(modifiers);
     let bytes = match key {
         Key::Enter => enter_bytes(modified),
@@ -1660,10 +1605,12 @@ fn special_key(key: Key, modifiers: Modifiers, app_cursor: bool) -> Option<Vec<u
         Key::PageDown => csi_tilde(6, modified),
         Key::Delete => csi_tilde(3, modified),
         Key::Insert => csi_tilde(2, modified),
-        Key::F1 => function_key(b'P', modified),
-        Key::F2 => function_key(b'Q', modified),
-        Key::F3 => function_key(b'R', modified),
-        Key::F4 => function_key(b'S', modified),
+        // F1–F4 are SS3 alone (`kf1`) and `CSI 1;<mod>` with modifiers
+        // (`kf13`, `kf25`, …), as xterm's terminfo describes them.
+        Key::F1 => cursor_key(b'P', modified, true),
+        Key::F2 => cursor_key(b'Q', modified, true),
+        Key::F3 => cursor_key(b'R', modified, true),
+        Key::F4 => cursor_key(b'S', modified, true),
         Key::F5 => csi_tilde(15, modified),
         Key::F6 => csi_tilde(17, modified),
         Key::F7 => csi_tilde(18, modified),
@@ -1672,7 +1619,7 @@ fn special_key(key: Key, modifiers: Modifiers, app_cursor: bool) -> Option<Vec<u
         Key::F10 => csi_tilde(21, modified),
         Key::F11 => csi_tilde(23, modified),
         Key::F12 => csi_tilde(24, modified),
-        _ => return None,
+        _ => return letter_key(key, modifiers),
     };
     Some(bytes)
 }
@@ -1726,16 +1673,6 @@ fn csi_tilde(number: u8, modified: u8) -> Vec<u8> {
     }
 }
 
-/// F1–F4 as xterm sends them and terminfo describes them: SS3 alone
-/// (`kf1`), `CSI 1;<mod>` with modifiers (`kf13`, `kf25`, …).
-fn function_key(ss3: u8, modified: u8) -> Vec<u8> {
-    if modified == 1 {
-        vec![0x1b, b'O', ss3]
-    } else {
-        format!("\x1b[1;{modified}{}", ss3 as char).into_bytes()
-    }
-}
-
 fn xterm_mod(modifiers: Modifiers) -> u8 {
     let mut value = 1;
     if modifiers.shift {
@@ -1750,60 +1687,27 @@ fn xterm_mod(modifiers: Modifiers) -> u8 {
     value
 }
 
+/// Ctrl and a letter is that letter's control code, A as 1 through Z as 26;
+/// Alt puts ESC before it, or before the letter itself.
 fn letter_key(key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
     let letter = letter(key)?;
+    let escape = modifiers.alt.then_some(0x1b);
     if modifiers.ctrl {
-        let mut bytes = Vec::new();
-        if modifiers.alt {
-            bytes.push(0x1b);
-        }
-        bytes.push(letter as u8 - b'a' + 1);
-        return Some(bytes);
+        return Some(escape.into_iter().chain([letter - b'a' + 1]).collect());
     }
-    if modifiers.alt {
-        let ch = if modifiers.shift {
-            letter.to_ascii_uppercase()
-        } else {
-            letter
-        };
-        let mut bytes = vec![0x1b];
-        let mut buf = [0; 4];
-        bytes.extend(ch.encode_utf8(&mut buf).as_bytes());
-        return Some(bytes);
-    }
-    None
+    let letter = if modifiers.shift {
+        letter.to_ascii_uppercase()
+    } else {
+        letter
+    };
+    escape.map(|escape| vec![escape, letter])
 }
 
-fn letter(key: Key) -> Option<char> {
-    Some(match key {
-        Key::A => 'a',
-        Key::B => 'b',
-        Key::C => 'c',
-        Key::D => 'd',
-        Key::E => 'e',
-        Key::F => 'f',
-        Key::G => 'g',
-        Key::H => 'h',
-        Key::I => 'i',
-        Key::J => 'j',
-        Key::K => 'k',
-        Key::L => 'l',
-        Key::M => 'm',
-        Key::N => 'n',
-        Key::O => 'o',
-        Key::P => 'p',
-        Key::Q => 'q',
-        Key::R => 'r',
-        Key::S => 's',
-        Key::T => 't',
-        Key::U => 'u',
-        Key::V => 'v',
-        Key::W => 'w',
-        Key::X => 'x',
-        Key::Y => 'y',
-        Key::Z => 'z',
-        _ => return None,
-    })
+/// The lowercase letter of `A` to `Z`, which egui declares in order.
+fn letter(key: Key) -> Option<u8> {
+    (Key::A..=Key::Z)
+        .contains(&key)
+        .then(|| b'a' + (key as u8 - Key::A as u8))
 }
 
 /// Height of the terminal strip. Dragging the value never hides it.
@@ -2122,6 +2026,7 @@ END
 
     #[cfg(target_os = "linux")]
     fn screen_text(session: &ShellSession) -> String {
+        use alacritty_terminal::index::Line;
         let term = session.term.lock();
         let mut text = String::new();
         for index in 0..24i32 {
@@ -2281,10 +2186,14 @@ END
             (Key::PageDown, ALT, false, b"\x1b[6;3~"),
             (Key::Delete, NONE, false, b"\x1b[3~"),
             (Key::Insert, NONE, false, b"\x1b[2~"),
-            (Key::F1, NONE, false, b"\x1bOP"),
+            (Key::F1, NONE, true, b"\x1bOP"),
+            (Key::F1, SHIFT, false, b"\x1b[1;2P"),
+            (Key::F1, CTRL, false, b"\x1b[1;5P"),
             (Key::F2, NONE, false, b"\x1bOQ"),
+            (Key::F2, SHIFT, false, b"\x1b[1;2Q"),
             (Key::F3, NONE, false, b"\x1bOR"),
             (Key::F4, NONE, false, b"\x1bOS"),
+            (Key::F4, SHIFT, false, b"\x1b[1;2S"),
             (Key::F5, NONE, false, b"\x1b[15~"),
             (Key::F6, NONE, false, b"\x1b[17~"),
             (Key::F7, NONE, false, b"\x1b[18~"),
@@ -2300,8 +2209,7 @@ END
             (Key::Space, NONE, false, b""),
         ];
         for &(key, modifiers, app_cursor, expected) in KEYS {
-            let bytes =
-                special_key(key, modifiers, app_cursor).or_else(|| letter_key(key, modifiers));
+            let bytes = encode_key(key, modifiers, app_cursor);
             assert_eq!(
                 bytes.unwrap_or_default(),
                 expected,
@@ -2332,20 +2240,33 @@ END
         }
     }
 
+    /// At every scale each side is at least one cell of at least one pixel,
+    /// and its pixel product fits the `u16` alacritty stores it in.
     #[test]
     fn window_size_never_reports_a_zero_grid() {
-        let metrics = grid_metrics(80, 24, 8.0, 16.0);
-        for scale in [0.0_f32, -1.0, 2.0, f32::NAN, f32::INFINITY] {
-            let size = window_size(&metrics, scale);
-            assert!((1..=u16::MAX).contains(&size.num_cols), "cols at {scale}");
-            assert!((1..=u16::MAX).contains(&size.num_lines), "rows at {scale}");
-            assert!(pty_size_is_safe(size), "unsafe size at {scale}: {size:?}");
-        }
-
+        let fits = |cells: u16, px: u16| {
+            cells >= 1 && px >= 1 && u32::from(cells) * u32::from(px) <= u32::from(u16::MAX)
+        };
+        let small = grid_metrics(80, 24, 8.0, 16.0);
         let huge = grid_metrics(1_000, 400, 1_000.0, 1_000.0);
-        let size = window_size(&huge, 10.0);
-        assert!(pty_size_is_safe(size), "{size:?}");
-        assert!(size.cell_width < 1_000, "cell width was not clamped");
+        for (metrics, scale) in [
+            (&small, 0.0_f32),
+            (&small, -1.0),
+            (&small, 2.0),
+            (&small, f32::NAN),
+            (&small, f32::INFINITY),
+            (&huge, 10.0),
+        ] {
+            let size = window_size(metrics, scale);
+            assert!(
+                fits(size.num_cols, size.cell_width) && fits(size.num_lines, size.cell_height),
+                "{scale}: {size:?}"
+            );
+        }
+        assert!(
+            window_size(&huge, 10.0).cell_width < 1_000,
+            "cell width was not clamped"
+        );
     }
 
     #[test]
@@ -2501,46 +2422,29 @@ END
         assert_eq!(accepted.lock().expect("clipboard").as_slice(), ["hi"]);
     }
 
+    /// (case, new size, child exited, child alive, resize). Cell pixels are
+    /// rounded per scale, so a move from 1x to 2x is a new size. An unchanged
+    /// size never asks whether the child is alive: that reads `/proc`.
     #[test]
-    fn retina_cell_pixels_are_rounded_points() {
+    fn the_pty_takes_only_a_new_size_and_only_while_the_child_lives() {
         let metrics = grid_metrics(80, 24, 8.4, 16.0);
         let one = window_size(&metrics, 1.0);
         let two = window_size(&metrics, 2.0);
-        assert_eq!(two.cell_width, 17);
-        assert_eq!(two.num_cols, one.num_cols);
-        assert_ne!(two.cell_width, one.cell_width);
-        assert!(!same_window_size(one, two));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn resize_after_shell_exit_does_not_kill_the_app() {
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        let ctx = egui::Context::default();
-        let metrics = test_metrics();
-        let mut session = match ShellSession::spawn(dir.path(), &ctx, &metrics) {
-            Ok(session) => session,
-            Err(error) => panic!("{error}"),
-        };
-        session.write(b"exit\n");
-        let started = std::time::Instant::now();
-        let mut saw_exit = false;
-        while started.elapsed() < Duration::from_secs(3) {
-            if session.poll(&ctx) || session.child_exited || !unix_child_is_alive(session.pid) {
-                saw_exit = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
+        assert_eq!((two.num_cols, two.cell_width), (one.num_cols, 17));
+        for (case, size, exited, alive, resize) in [
+            ("same size", one, false, true, false),
+            ("2x", two, false, true, true),
+            ("exited", two, true, true, false),
+            ("hung up", two, false, false, false),
+        ] {
+            let asked = std::cell::Cell::new(false);
+            let decided = should_resize(one, size, exited, || {
+                asked.set(true);
+                alive
+            });
+            assert_eq!(decided, resize, "{case}");
+            assert!(!(asked.get() && case == "same size"), "{case}");
         }
-        assert!(saw_exit, "shell did not exit");
-        let pid = std::process::id();
-        let mut bigger = metrics.clone();
-        bigger.cols = 100;
-        bigger.rows = 40;
-        session.resize(&bigger, 2.0);
-        session.resize(&bigger, 1.0);
-        assert_eq!(std::process::id(), pid);
-        drop(session);
     }
 
     /// Escape, Tab and the arrows belong to the shell (vim, completion,
@@ -2622,23 +2526,6 @@ END
         }
     }
 
-    #[test]
-    fn function_keys_one_to_four_match_xterm_terminfo() {
-        for (ss3, modified, expected) in [
-            (b'P', 1, "\x1bOP"),
-            (b'P', 2, "\x1b[1;2P"),
-            (b'Q', 2, "\x1b[1;2Q"),
-            (b'S', 2, "\x1b[1;2S"),
-            (b'P', 5, "\x1b[1;5P"),
-        ] {
-            assert_eq!(
-                function_key(ss3, modified),
-                expected.as_bytes(),
-                "{expected:?}"
-            );
-        }
-    }
-
     #[cfg(unix)]
     #[test]
     fn unset_names_ignore_values_and_names_that_are_not_unicode() {
@@ -2658,11 +2545,35 @@ END
         assert_eq!(vars_to_unset(vars), ["GITHUB_TOKEN", "GIT_DIR"]);
     }
 
-    /// Programs such as vim ask for the background (OSC 11) to pick light or
-    /// dark colors, so an unset color must be answered with what is painted.
+    /// Colors the program did not set are this widget's. Programs such as vim
+    /// ask for the background (OSC 11) to pick light or dark colors, so an
+    /// unset color is answered with what is painted.
     #[test]
-    fn color_queries_report_the_painted_colors() {
+    fn unset_colors_paint_and_report_the_widgets_own() {
         let palette = super::super::theme::DEFAULT_THEME.palette;
+        let unset = color::Colors::default();
+        for (color, expected) in [
+            (Color::Named(NamedColor::Foreground), palette.text),
+            (Color::Named(NamedColor::BrightForeground), palette.text),
+            (Color::Named(NamedColor::Cursor), palette.text),
+            (Color::Named(NamedColor::DimForeground), palette.text_muted),
+            (Color::Named(NamedColor::Background), palette.background),
+            (Color::Named(NamedColor::BrightWhite), ansi_color(15)),
+            (Color::Named(NamedColor::DimRed), ansi_color(1)),
+            (Color::Indexed(200), ansi_color(200)),
+            (Color::Indexed(255), Color32::from_gray(238)),
+            (
+                Color::Spec(Rgb { r: 1, g: 2, b: 3 }),
+                Color32::from_rgb(1, 2, 3),
+            ),
+        ] {
+            assert_eq!(
+                resolve_color(color, &unset, &palette),
+                expected,
+                "{color:?}"
+            );
+        }
+
         let rgb = |color: Color32| Rgb {
             r: color.r(),
             g: color.g(),
@@ -2676,7 +2587,7 @@ END
             (NamedColor::Foreground as usize, rgb(palette.text)),
             (NamedColor::Background as usize, rgb(palette.background)),
             (NamedColor::Cursor as usize, set),
-            (1, rgb(stored_fallback(1))),
+            (1, rgb(ansi_color(1))),
             (5, set),
         ] {
             assert_eq!(
