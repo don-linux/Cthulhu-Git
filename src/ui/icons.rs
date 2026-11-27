@@ -132,6 +132,9 @@ pub fn icon_button_enabled(
             .frame_when_inactive(false)
             .min_size(icon_button_min_size(ui)),
     );
+    // Nothing visible names an icon-only button, so the hover text does.
+    ui.ctx()
+        .accesskit_node_builder(response.id, |node| node.set_label(hover_text));
     show_hover_tip(ui, &response, hover_text);
     if enabled {
         response = response.on_hover_cursor(CursorIcon::PointingHand);

@@ -1447,7 +1447,7 @@ fn hovering_a_panel_toggle_does_not_grow_the_top_bar() {
             after.height()
         );
         assert!(
-            harness.query_by_label(tip).is_some(),
+            harness.query_by_role_and_label(Role::Label, tip).is_some(),
             "missing hover label {tip:?}\n{}",
             labels(&harness)
         );

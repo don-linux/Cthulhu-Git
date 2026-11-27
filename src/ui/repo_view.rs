@@ -425,7 +425,7 @@ fn branch_row(ui: &mut Ui, listed: &mut ListedBranch, lane: Option<usize>, palet
     ui.push_id(&listed.branch.name, |ui| {
         ui.set_max_width(width);
         ui.horizontal(|ui| {
-            ui.add(egui::Checkbox::without_text(&mut listed.checked));
+            let checkbox = ui.add(egui::Checkbox::without_text(&mut listed.checked));
             let (dot, _) = ui.allocate_exact_size(Vec2::splat(LANE_DOT), Sense::hover());
             if let Some(color) = lane {
                 ui.painter().circle_filled(
@@ -446,6 +446,12 @@ fn branch_row(ui: &mut Ui, listed: &mut ListedBranch, lane: Option<usize>, palet
                         .sense(Sense::click()),
                 )
                 .on_hover_cursor(CursorIcon::PointingHand);
+            // The branch name beside the checkbox is its accessible name. The
+            // empty label `without_text` sets would be read instead, so clear it.
+            ui.ctx().accesskit_node_builder(checkbox.id, |node| {
+                node.clear_label();
+                node.push_labelled_by(response.id.accesskit_id());
+            });
             if response.clicked() {
                 listed.checked = !listed.checked;
             }

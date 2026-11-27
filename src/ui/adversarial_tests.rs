@@ -1651,6 +1651,38 @@ fn seed_latest_hover(repo: &mut OpenedRepo) {
     });
 }
 
+/// Screen readers and kittest's accessibility check need a name on every
+/// control, including the icon-only buttons and the branch checkboxes.
+#[test]
+fn every_button_and_checkbox_has_an_accessible_name() {
+    let mut repo = repo_at(
+        "names",
+        Head::Branch("main".to_owned()),
+        vec![listed_branch("main", true), listed_branch("feature", false)],
+    );
+    let harness = ui_harness(|ui| {
+        let _ = show_repo(ui, &mut repo, true, true, false);
+    });
+    let mut named = Vec::new();
+    for role in [Role::Button, Role::CheckBox] {
+        for node in harness.query_all_by_role(role) {
+            let name = node.accesskit_node().label().unwrap_or_default();
+            assert!(
+                !name.is_empty(),
+                "{role:?} at {:?} has no name",
+                node.rect()
+            );
+            named.push(name);
+        }
+    }
+    for expected in ["Settings", "Open another repository", "main", "feature"] {
+        assert!(
+            named.iter().any(|name| name == expected),
+            "{expected:?} in {named:?}"
+        );
+    }
+}
+
 #[test]
 fn fetch_and_pull_sit_beside_the_branch_name() {
     let scratch = temp_dir("cthulhu-adv-ui-beside-");
