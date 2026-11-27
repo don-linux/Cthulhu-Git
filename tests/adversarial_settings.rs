@@ -52,11 +52,6 @@ fn entry_names(dir: &Path) -> Vec<String> {
     names
 }
 
-/// Quote `text` as a JSON string. Windows temp paths contain backslashes.
-fn json_string(text: &str) -> String {
-    serde_json::to_string(text).expect("json string")
-}
-
 #[track_caller]
 fn assert_parse(error: &SettingsError) {
     assert!(matches!(error, SettingsError::Parse(..)), "{error:?}");
@@ -129,72 +124,6 @@ impl Drop for RestoreMode<'_> {
     fn drop(&mut self) {
         let _ = fs::set_permissions(self.path, fs::Permissions::from_mode(self.mode));
     }
-}
-
-#[test]
-fn utf8_bom_prefixed_object_loads() {
-    let dir = temp_dir();
-    let path = settings_path(&dir);
-    let mut bytes = b"\xEF\xBB\xBF".to_vec();
-    bytes.extend_from_slice(
-        br#"{
-  "theme": "abyss",
-  "last_repository": "/src/rlyeh",
-  "recent_repositories": ["/src/rlyeh", "/src/innsmouth"],
-  "history_sidebar_hidden": true
-}"#,
-    );
-    write_bytes(&path, &bytes);
-
-    // A failed parse must still leave the user-edited file alone.
-    let loaded = Settings::load_from(&path);
-    assert_eq!(fs::read(&path).expect("read back"), bytes);
-    let loaded = loaded.expect("a UTF-8 BOM before a valid settings object must load");
-    assert_eq!(loaded.theme.as_deref(), Some("abyss"));
-    assert_eq!(
-        loaded.last_repository.as_deref(),
-        Some(Path::new("/src/rlyeh"))
-    );
-    assert_eq!(
-        loaded.recent_repositories,
-        [PathBuf::from("/src/rlyeh"), PathBuf::from("/src/innsmouth")]
-    );
-    assert!(loaded.history_sidebar_hidden);
-}
-
-#[test]
-fn null_option_fields_load_as_none() {
-    let dir = temp_dir();
-    let path = settings_path(&dir);
-    write_bytes(&path, br#"{ "theme": null, "last_repository": null }"#);
-
-    let loaded = Settings::load_from(&path).expect("null option fields");
-    assert_eq!(loaded.theme, None);
-    assert_eq!(loaded.last_repository, None);
-    assert!(loaded.recent_repositories.is_empty());
-    assert!(!loaded.history_sidebar_hidden);
-    assert!(!loaded.detail_sidebar_hidden);
-    assert!(loaded.terminal_hidden);
-}
-
-#[test]
-fn null_recent_repositories_load_as_defaults() {
-    let dir = temp_dir();
-    let path = settings_path(&dir);
-    // `null` on an option is "no value". `null` on the recent list is the same
-    // idea as omitting it: an empty list, not a corrupt file.
-    let original = br#"{
-  "theme": null,
-  "last_repository": null,
-  "recent_repositories": null
-}"#;
-    write_bytes(&path, original);
-
-    let loaded = Settings::load_from(&path);
-    assert_eq!(fs::read(&path).expect("read back"), original);
-    let loaded = loaded.expect("null fields should load as defaults");
-    assert_eq!(loaded, Settings::default());
-    assert!(!loaded.history_sidebar_hidden);
 }
 
 #[test]
@@ -446,32 +375,6 @@ fn concurrent_saves_leave_valid_json() {
 }
 
 #[test]
-fn hand_written_odd_paths_are_kept() {
-    let dir = temp_dir();
-    let path = settings_path(&dir);
-    let notes = dir.path().join("readme.txt");
-    fs::write(&notes, b"not a repository").expect("file");
-    assert!(notes.is_file());
-    let notes_json = json_string(notes.to_str().expect("utf-8 temp path"));
-    let body = format!(
-        r#"{{"theme":null,"last_repository":{notes_json},"recent_repositories":["rel/repo","rel/repo","C:\\repo","C:\\repo"],"history_sidebar_hidden":true}}"#
-    );
-    write_bytes(&path, body.as_bytes());
-
-    let loaded = Settings::load_from(&path).expect("odd paths should load");
-    assert_eq!(loaded.last_repository.as_deref(), Some(notes.as_path()));
-    assert!(loaded.last_repository.as_ref().expect("last").is_file());
-    assert_eq!(
-        loaded.recent_repositories,
-        [PathBuf::from("rel/repo"), PathBuf::from(r"C:\repo")]
-    );
-    assert!(loaded.history_sidebar_hidden);
-
-    loaded.save_to(&path).expect("round trip");
-    assert_eq!(Settings::load_from(&path).expect("reload"), loaded);
-}
-
-#[test]
 fn remembering_one_path_twice_keeps_a_single_recent() {
     let mut settings = Settings::default();
     let windows = Path::new(r"C:\repo");
@@ -494,56 +397,4 @@ fn remembering_one_path_twice_keeps_a_single_recent() {
         1
     );
     assert_eq!(settings.recent_repositories.len(), 2);
-}
-
-#[test]
-fn history_sidebar_hidden_round_trips() {
-    let dir = temp_dir();
-    let path = settings_path(&dir);
-    for hidden in [false, true, false] {
-        let settings = Settings {
-            theme: Some("abyss".to_owned()),
-            history_sidebar_hidden: hidden,
-            ..Settings::default()
-        };
-        settings.save_to(&path).expect("save");
-        assert_eq!(Settings::load_from(&path).expect("load"), settings);
-    }
-}
-
-#[test]
-fn detail_sidebar_hidden_round_trips() {
-    let dir = temp_dir();
-    let path = settings_path(&dir);
-    for hidden in [false, true, false] {
-        let settings = Settings {
-            theme: Some("abyss".to_owned()),
-            detail_sidebar_hidden: hidden,
-            ..Settings::default()
-        };
-        settings.save_to(&path).expect("save");
-        assert_eq!(Settings::load_from(&path).expect("load"), settings);
-    }
-}
-
-#[test]
-fn terminal_hidden_round_trips_and_old_files_stay_hidden() {
-    let dir = temp_dir();
-    let path = settings_path(&dir);
-    write_bytes(&path, br#"{ "theme": "abyss" }"#);
-    assert!(
-        Settings::load_from(&path)
-            .expect("old file")
-            .terminal_hidden
-    );
-
-    for hidden in [false, true, false] {
-        let settings = Settings {
-            theme: Some("abyss".to_owned()),
-            terminal_hidden: hidden,
-            ..Settings::default()
-        };
-        settings.save_to(&path).expect("save");
-        assert_eq!(Settings::load_from(&path).expect("load"), settings);
-    }
 }

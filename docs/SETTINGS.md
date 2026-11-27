@@ -32,8 +32,10 @@ of writing through it). On Unix the file is private to the user (mode 0600).
 | ---- | ------ | ---------------- |
 | `src/settings.rs` | `Settings` | The saved fields (serde, `#[serde(default)]`) |
 | `src/settings.rs` | `Settings::default_path` | Per-OS location (via `directories::ProjectDirs`) |
-| `src/settings.rs` | `Settings::load_from` | Read + parse; dedupes and caps recents |
-| `src/settings.rs` | `Settings::save_to` | Atomic write |
+| `src/settings.rs` | `Settings::load_from` | Reads the file; a missing one gives the defaults |
+| `src/settings.rs` | `Settings::from_json` | Parses the bytes: skips a UTF-8 BOM, dedupes and caps recents, sanitizes font ids |
+| `src/settings.rs` | `Settings::save_to` | Writes `to_json` with `write_atomic` |
+| `src/settings.rs` | `Settings::to_json` | The saved bytes: font ids and column widths stored as `from_json` reads them |
 | `src/settings.rs` | `write_atomic` | Temp file + sync + rename; the avatar cache uses it too |
 | `src/settings.rs` | `remember_repository`, `forget_last_repository` | Last and recent repositories |
 | `src/settings.rs` | `set_ui_font` | Trims the interface face id; a blank name clears it |

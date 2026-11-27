@@ -208,37 +208,48 @@ impl Settings {
             .map(|dirs| dirs.config_dir().join(FILE_NAME))
     }
 
-    /// A missing file gives the defaults; an unreadable or invalid one is an error.
+    /// A missing file gives the defaults; an unreadable or invalid one is an
+    /// error. The bytes are read by [`Self::from_json`].
     pub fn load_from(path: &Path) -> Result<Self, SettingsError> {
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => return Err(SettingsError::Read(path.to_path_buf(), error)),
-        };
+        match fs::read(path) {
+            Ok(bytes) => Self::from_json(&bytes)
+                .map_err(|error| SettingsError::Parse(path.to_path_buf(), error)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(SettingsError::Read(path.to_path_buf(), error)),
+        }
+    }
+
+    /// Writes [`Self::to_json`] with [`write_atomic`].
+    pub fn save_to(&self, path: &Path) -> Result<(), SettingsError> {
+        let fail = |error: io::Error| SettingsError::Write(path.to_path_buf(), error);
+        let json = self.to_json().map_err(|error| fail(error.into()))?;
+        write_atomic(path, &json).map_err(fail)
+    }
+
+    /// Settings from the bytes of a settings file. Recents are deduped and
+    /// capped, and font ids sanitized, because the file may be hand-edited.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         // Notepad on Windows writes a UTF-8 BOM in front of otherwise valid JSON.
-        let json = if bytes.starts_with(b"\xEF\xBB\xBF") {
-            &bytes[3..]
-        } else {
-            bytes.as_slice()
-        };
-        let mut settings: Self = serde_json::from_slice(json)
-            .map_err(|error| SettingsError::Parse(path.to_path_buf(), error))?;
+        let json = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+        let mut settings: Self = serde_json::from_slice(json)?;
         settings.normalize_recent();
         settings.normalize_fonts();
         Ok(settings)
     }
 
-    /// Writes the settings with [`write_atomic`].
-    pub fn save_to(&self, path: &Path) -> Result<(), SettingsError> {
-        let fail = |error: io::Error| SettingsError::Write(path.to_path_buf(), error);
-        // A blank id is not a font. Writing the normalized copy keeps a
-        // direct field assignment consistent with `load_from`.
+    /// The bytes of a settings file: pretty JSON and a final newline.
+    ///
+    /// A blank font id and an out-of-range column width are stored the way
+    /// [`Self::from_json`] would read them, so a direct field assignment
+    /// writes the same file as the setters. Fails only on a path that is not
+    /// valid Unicode, which a JSON string cannot hold.
+    pub fn to_json(&self) -> Result<Vec<u8>, serde_json::Error> {
         let mut stored = self.clone();
         stored.normalize_fonts();
         stored.history_columns = stored.history_columns.normalized();
-        let mut json = serde_json::to_vec_pretty(&stored).map_err(|error| fail(error.into()))?;
+        let mut json = serde_json::to_vec_pretty(&stored)?;
         json.push(b'\n');
-        write_atomic(path, &json).map_err(fail)
+        Ok(json)
     }
 
     /// Makes `root` the repository reopened on launch and the first recent one.
@@ -414,6 +425,31 @@ mod tests {
         dir.path().join("nested").join(FILE_NAME)
     }
 
+    fn abyss() -> Settings {
+        Settings {
+            theme: Some("abyss".to_owned()),
+            ..Settings::default()
+        }
+    }
+
+    fn fonts(ui: Option<&str>, terminal: Option<&str>) -> Settings {
+        Settings {
+            ui_font: ui.map(str::to_owned),
+            terminal_font: terminal.map(str::to_owned),
+            ..Settings::default()
+        }
+    }
+
+    /// A last repository that is not one, and recents a user typed by hand.
+    fn odd_paths() -> Settings {
+        Settings {
+            last_repository: Some("/src/readme.txt".into()),
+            recent_repositories: vec!["rel/repo".into(), r"C:\repo".into()],
+            history_sidebar_hidden: true,
+            ..Settings::default()
+        }
+    }
+
     #[test]
     fn missing_file_gives_defaults() {
         let dir = TempDir::new().expect("temp dir");
@@ -444,302 +480,282 @@ mod tests {
         assert_eq!(files, [FILE_NAME]);
     }
 
+    /// Every way a file is read. `None` is a parse error.
     #[test]
-    fn corrupt_file_is_an_error() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = settings_path(&dir);
-        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-        fs::write(&path, "{ not json").expect("write");
-        let error = Settings::load_from(&path).expect_err("corrupt");
-        assert!(matches!(error, SettingsError::Parse(..)), "{error:?}");
-    }
-
-    #[test]
-    fn missing_and_unknown_fields_are_tolerated() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = settings_path(&dir);
-        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-        fs::write(&path, r#"{ "theme": "abyss", "from_the_future": 1 }"#).expect("write");
-        assert_eq!(
-            Settings::load_from(&path).expect("load"),
-            Settings {
-                theme: Some("abyss".to_owned()),
-                ..Settings::default()
-            }
-        );
-    }
-
-    #[test]
-    fn history_sidebar_shows_unless_saved_hidden() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = settings_path(&dir);
-        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-        fs::write(&path, r#"{ "recent_repositories": [] }"#).expect("write");
-        assert!(
-            !Settings::load_from(&path)
-                .expect("load")
-                .history_sidebar_hidden
-        );
-
-        let settings = Settings {
-            history_sidebar_hidden: true,
+    fn from_json_fills_defaults_and_normalizes() {
+        let defaults = HistoryColumns::default();
+        let mut recents: Vec<String> = (0..20).map(|index| format!("/repo-{index}")).collect();
+        recents.insert(1, "/repo-0".to_owned());
+        let recents = serde_json::json!({ "recent_repositories": recents }).to_string();
+        let columns = |history_columns| Settings {
+            history_columns,
             ..Settings::default()
         };
-        settings.save_to(&path).expect("save");
-        assert!(
-            Settings::load_from(&path)
-                .expect("load")
-                .history_sidebar_hidden
-        );
-    }
-
-    #[test]
-    fn detail_sidebar_shows_unless_saved_hidden() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = settings_path(&dir);
-        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-        fs::write(&path, r#"{ "recent_repositories": [] }"#).expect("write");
-        assert!(
-            !Settings::load_from(&path)
-                .expect("load")
-                .detail_sidebar_hidden
-        );
-
-        let settings = Settings {
-            detail_sidebar_hidden: true,
-            ..Settings::default()
-        };
-        settings.save_to(&path).expect("save");
-        assert!(
-            Settings::load_from(&path)
-                .expect("load")
-                .detail_sidebar_hidden
-        );
-    }
-
-    #[test]
-    fn terminal_font_trims_and_old_files_keep_the_default() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = settings_path(&dir);
-        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-        fs::write(&path, r#"{ "theme": "abyss" }"#).expect("write");
-        assert_eq!(
-            Settings::load_from(&path).expect("old file").terminal_font,
-            None
-        );
-
-        let settings = Settings {
-            terminal_font: Some("JetBrains Mono".to_owned()),
-            ..Settings::default()
-        };
-        settings.save_to(&path).expect("save");
-        assert_eq!(Settings::load_from(&path).expect("load"), settings);
-
-        for (json, expected) in [
-            (r#"{ "terminal_font": "  Fira Code  " }"#, Some("Fira Code")),
-            (r#"{ "terminal_font": "   " }"#, None),
-            (r#"{ "terminal_font": "" }"#, None),
-            (r#"{ "terminal_font": null }"#, None),
-        ] {
-            fs::write(&path, json).expect("write");
+        let cases = [
+            ("{ not json", None),
+            (
+                r#"{ "theme": "abyss", "from_the_future": 1 }"#,
+                Some(abyss()),
+            ),
+            // Older files: sidebars show, the terminal stays hidden, fonts,
+            // columns and avatars keep their defaults, no keychain lookup.
+            (
+                r#"{ "recent_repositories": [] }"#,
+                Some(Settings::default()),
+            ),
+            (r#"{ "theme": "abyss" }"#, Some(abyss())),
+            (
+                r#"{ "theme": "abyss", "terminal_hidden": false }"#,
+                Some(Settings {
+                    terminal_hidden: false,
+                    ..abyss()
+                }),
+            ),
+            // `null` is no value, and on the recent list an empty list.
+            (
+                r#"{ "theme": null, "last_repository": null }"#,
+                Some(Settings::default()),
+            ),
+            (
+                r#"{ "theme": null, "last_repository": null, "recent_repositories": null }"#,
+                Some(Settings::default()),
+            ),
+            (
+                "\u{FEFF}{ \"theme\": \"abyss\", \"last_repository\": \"/src/rlyeh\",
+                  \"recent_repositories\": [\"/src/rlyeh\", \"/src/innsmouth\"],
+                  \"history_sidebar_hidden\": true }",
+                Some(Settings {
+                    last_repository: Some("/src/rlyeh".into()),
+                    recent_repositories: vec!["/src/rlyeh".into(), "/src/innsmouth".into()],
+                    history_sidebar_hidden: true,
+                    ..abyss()
+                }),
+            ),
+            (
+                recents.as_str(),
+                Some(Settings {
+                    recent_repositories: (0..MAX_RECENT_REPOSITORIES)
+                        .map(|index| format!("/repo-{index}").into())
+                        .collect(),
+                    ..Settings::default()
+                }),
+            ),
+            (
+                r#"{"theme":null,"last_repository":"/src/readme.txt","recent_repositories":
+                    ["rel/repo","rel/repo","C:\\repo","C:\\repo"],"history_sidebar_hidden":true}"#,
+                Some(odd_paths()),
+            ),
+            // A font id is trimmed; anything else is no font, and the rest loads.
+            (
+                r#"{ "terminal_font": "  Fira Code  " }"#,
+                Some(fonts(None, Some("Fira Code"))),
+            ),
+            (r#"{ "terminal_font": "   " }"#, Some(Settings::default())),
+            (r#"{ "terminal_font": "" }"#, Some(Settings::default())),
+            (r#"{ "terminal_font": null }"#, Some(Settings::default())),
+            (r#"{"ui_font": 1, "theme": "abyss"}"#, Some(abyss())),
+            (
+                r#"{"terminal_font": [], "theme": "abyss", "recent_repositories": ["/src/rlyeh"]}"#,
+                Some(Settings {
+                    recent_repositories: vec!["/src/rlyeh".into()],
+                    ..abyss()
+                }),
+            ),
+            (
+                r#"{"ui_font": "Comic Sans", "theme": "abyss"}"#,
+                Some(Settings {
+                    ui_font: Some("Comic Sans".to_owned()),
+                    ..abyss()
+                }),
+            ),
+            (
+                r#"{"ui_font":"obel\nmono","terminal_font":"\u202EFira","theme":"abyss"}"#,
+                Some(Settings {
+                    terminal_font: Some("Fira".to_owned()),
+                    ..abyss()
+                }),
+            ),
+            // A bad column keeps only its own default.
+            (
+                r#"{ "history_columns": { "branch": 0, "graph": 5000, "hash": "wide",
+                     "message": -3, "author": 250, "future_column": 7 } }"#,
+                Some(columns(HistoryColumns {
+                    author: 250,
+                    ..defaults
+                })),
+            ),
+            (
+                r#"{ "history_columns": { "graph": 333 } }"#,
+                Some(columns(HistoryColumns {
+                    graph: 333,
+                    ..defaults
+                })),
+            ),
+            // A whole float is that width; a fraction is no width at all.
+            (
+                r#"{ "history_columns": { "graph": 180.0, "message": 500.5 } }"#,
+                Some(columns(HistoryColumns {
+                    graph: 180,
+                    ..defaults
+                })),
+            ),
+            (r#"{ "history_columns": null }"#, Some(Settings::default())),
+            (r#"{ "history_columns": 12 }"#, Some(Settings::default())),
+            (
+                r#"{ "history_columns": [1, 2, 3] }"#,
+                Some(Settings::default()),
+            ),
+        ];
+        for (json, expected) in cases {
             assert_eq!(
-                Settings::load_from(&path)
-                    .expect("load")
-                    .terminal_font
-                    .as_deref(),
+                Settings::from_json(json.as_bytes()).ok(),
                 expected,
-                "{json}"
+                "{json:?}"
             );
         }
-
-        let padded = Settings {
-            terminal_font: Some("  Fira Code  ".to_owned()),
-            ..Settings::default()
-        };
-        padded.save_to(&path).expect("save");
-        let value: serde_json::Value =
-            serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
-        assert_eq!(value["terminal_font"], "Fira Code");
-
-        let blank = Settings {
-            terminal_font: Some("   ".to_owned()),
-            ..Settings::default()
-        };
-        blank.save_to(&path).expect("save blank");
-        let value: serde_json::Value =
-            serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
-        assert!(value["terminal_font"].is_null());
-        assert_eq!(
-            Settings::load_from(&path).expect("load").terminal_font,
-            None
-        );
-
-        let mut settings = Settings::default();
-        settings.set_terminal_font(Some("  ".to_owned()));
-        assert_eq!(settings.terminal_font, None);
-        settings.set_terminal_font(Some("  IBM Plex Mono  ".to_owned()));
-        assert_eq!(settings.terminal_font.as_deref(), Some("IBM Plex Mono"));
     }
 
+    /// What `save_to` writes reads back as `expected` (`None`: as saved),
+    /// holds exactly the known keys, and so never a token.
     #[test]
-    fn ui_font_trims_and_old_files_keep_the_default() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = settings_path(&dir);
-        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-        fs::write(&path, r#"{ "theme": "abyss" }"#).expect("write");
-        assert_eq!(Settings::load_from(&path).expect("old file").ui_font, None);
-
-        let settings = Settings {
-            ui_font: Some("inter".to_owned()),
-            ..Settings::default()
-        };
-        settings.save_to(&path).expect("save");
-        assert_eq!(Settings::load_from(&path).expect("load"), settings);
-
-        let padded = Settings {
-            ui_font: Some("  aspekta  ".to_owned()),
-            ..Settings::default()
-        };
-        padded.save_to(&path).expect("save");
-        let value: serde_json::Value =
-            serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
-        assert_eq!(value["ui_font"], "aspekta");
-
-        let mut settings = Settings::default();
-        settings.set_ui_font(Some("   ".to_owned()));
-        assert_eq!(settings.ui_font, None);
-        settings.set_ui_font(Some("  obel-mono  ".to_owned()));
-        assert_eq!(settings.ui_font.as_deref(), Some("obel-mono"));
-    }
-
-    #[test]
-    fn bad_font_field_keeps_the_theme() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = settings_path(&dir);
-        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-
-        fs::write(&path, r#"{"ui_font": 1, "theme": "abyss"}"#).expect("write");
-        let loaded = Settings::load_from(&path).expect("load");
-        assert_eq!(loaded.theme.as_deref(), Some("abyss"));
-        assert_eq!(loaded.ui_font, None);
-
-        fs::write(
-            &path,
-            r#"{"terminal_font": [], "theme": "abyss", "recent_repositories": ["/src/rlyeh"]}"#,
-        )
-        .expect("write");
-        let loaded = Settings::load_from(&path).expect("load");
-        assert_eq!(loaded.theme.as_deref(), Some("abyss"));
-        assert_eq!(loaded.terminal_font, None);
-        assert_eq!(
-            loaded.recent_repositories,
-            vec![PathBuf::from("/src/rlyeh")]
-        );
-
-        fs::write(&path, r#"{"ui_font": "Comic Sans", "theme": "abyss"}"#).expect("write");
-        let loaded = Settings::load_from(&path).expect("load");
-        assert_eq!(loaded.ui_font.as_deref(), Some("Comic Sans"));
-        assert_eq!(loaded.theme.as_deref(), Some("abyss"));
-    }
-
-    #[test]
-    fn hostile_font_ids_round_trip_and_unknown_names_stay_stored() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = settings_path(&dir);
-        let mut settings = Settings::default();
-        settings.set_ui_font(Some("  obel-mono \n".to_owned()));
-        settings.set_terminal_font(Some("  Fira Code \n".to_owned()));
-        settings.save_to(&path).expect("save");
-
-        let loaded = Settings::load_from(&path).expect("load");
-        assert_eq!(loaded.ui_font.as_deref(), Some("obel-mono"));
-        assert_eq!(loaded.terminal_font.as_deref(), Some("Fira Code"));
-        let value: serde_json::Value =
-            serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
-        assert_eq!(value["ui_font"], "obel-mono");
-        assert_eq!(value["terminal_font"], "Fira Code");
-    }
-
-    #[test]
-    fn hostile_font_names_are_stored_sanitized() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = settings_path(&dir);
+    fn to_json_normalizes_and_round_trips() {
+        const KEYS: [&str; 11] = [
+            "author_avatars",
+            "detail_sidebar_hidden",
+            "github_token_in_keyring",
+            "history_columns",
+            "history_sidebar_hidden",
+            "last_repository",
+            "recent_repositories",
+            "terminal_font",
+            "terminal_hidden",
+            "theme",
+            "ui_font",
+        ];
+        const COLUMNS: [&str; 5] = ["author", "branch", "graph", "hash", "message"];
         let huge = "a".repeat(100_000);
-        let mut settings = Settings::default();
-        settings.set_ui_font(Some(huge.clone()));
-        assert_eq!(settings.ui_font.as_deref(), Some("a".repeat(128).as_str()));
-        assert_ne!(settings.ui_font.as_deref(), Some(huge.as_str()));
-
-        settings.set_terminal_font(Some("\u{202E}obel-mono".to_owned()));
-        let stored = settings.terminal_font.clone().expect("sanitized");
-        assert_eq!(stored, "obel-mono");
-        assert!(!stored.contains('\u{202E}'));
-
-        settings.set_ui_font(Some("obel\nmono".to_owned()));
-        assert_eq!(settings.ui_font, None);
-        settings.set_terminal_font(Some("fira\rmono".to_owned()));
-        assert_eq!(settings.terminal_font, None);
-        settings.set_terminal_font(Some("\u{202E}".to_owned()));
-        assert_eq!(settings.terminal_font, None);
-
-        let accented = "é".repeat(100);
-        settings.set_ui_font(Some(accented));
-        let stored = settings.ui_font.clone().expect("truncated");
-        assert_eq!(stored.len(), 128);
-        assert_eq!(stored, "é".repeat(64));
-
-        settings.set_ui_font(Some(huge));
-        settings.set_terminal_font(Some("meslo\u{202E}".to_owned()));
-        settings.save_to(&path).expect("save");
-        let text = fs::read_to_string(&path).expect("read");
-        assert!(!text.contains(&"a".repeat(200)));
-        assert!(!text.contains('\u{202E}'));
-        let loaded = Settings::load_from(&path).expect("load");
-        assert_eq!(loaded.ui_font.as_deref(), Some("a".repeat(128).as_str()));
-        assert_eq!(loaded.terminal_font.as_deref(), Some("meslo"));
-
-        fs::write(
-            &path,
-            "{\"ui_font\":\"obel\\nmono\",\"terminal_font\":\"\\u202EFira\",\"theme\":\"abyss\"}\n",
-        )
-        .expect("write");
-        let loaded = Settings::load_from(&path).expect("load");
-        assert_eq!(loaded.theme.as_deref(), Some("abyss"));
-        assert_eq!(loaded.ui_font, None);
-        assert_eq!(loaded.terminal_font.as_deref(), Some("Fira"));
-    }
-
-    #[test]
-    fn terminal_stays_hidden_unless_saved_open() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = settings_path(&dir);
-        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-        fs::write(&path, r#"{ "recent_repositories": [] }"#).expect("write");
-        assert!(Settings::load_from(&path).expect("load").terminal_hidden);
-
-        for hidden in [false, true, false] {
-            let settings = Settings {
-                terminal_hidden: hidden,
-                ..Settings::default()
-            };
-            settings.save_to(&path).expect("save");
+        let cases = [
+            (
+                Settings {
+                    history_sidebar_hidden: true,
+                    ..abyss()
+                },
+                None,
+            ),
+            (
+                Settings {
+                    detail_sidebar_hidden: true,
+                    ..abyss()
+                },
+                None,
+            ),
+            (
+                Settings {
+                    terminal_hidden: false,
+                    ..abyss()
+                },
+                None,
+            ),
+            (abyss(), None),
+            (odd_paths(), None),
+            (fonts(Some("inter"), Some("JetBrains Mono")), None),
+            (
+                Settings {
+                    history_columns: HistoryColumns {
+                        branch: 300,
+                        graph: 20,
+                        hash: 1000,
+                        message: 999,
+                        author: 21,
+                    },
+                    author_avatars: false,
+                    github_token_in_keyring: true,
+                    ..Settings::default()
+                },
+                None,
+            ),
+            // A direct field assignment is stored the way the setters store it.
+            (
+                fonts(Some("  aspekta  "), Some("  Fira Code  ")),
+                Some(fonts(Some("aspekta"), Some("Fira Code"))),
+            ),
+            (fonts(None, Some("   ")), Some(Settings::default())),
+            (
+                fonts(Some("  obel-mono \n"), Some("  Fira Code \n")),
+                Some(fonts(Some("obel-mono"), Some("Fira Code"))),
+            ),
+            (
+                fonts(Some(huge.as_str()), Some("meslo\u{202E}")),
+                Some(fonts(Some(&huge[..128]), Some("meslo"))),
+            ),
+            (
+                Settings {
+                    history_columns: HistoryColumns {
+                        message: 0,
+                        ..HistoryColumns::default()
+                    },
+                    ..Settings::default()
+                },
+                Some(Settings::default()),
+            ),
+        ];
+        for (saved, expected) in cases {
+            let expected = expected.unwrap_or_else(|| saved.clone());
+            let json = saved.to_json().expect("serializable");
+            let value: serde_json::Value = serde_json::from_slice(&json).expect("json");
             assert_eq!(
-                Settings::load_from(&path).expect("load").terminal_hidden,
-                hidden
+                value,
+                serde_json::to_value(&expected).expect("value"),
+                "{saved:?}"
+            );
+            for (object, known) in [
+                (&value, &KEYS[..]),
+                (&value["history_columns"], &COLUMNS[..]),
+            ] {
+                let mut keys: Vec<&str> = object
+                    .as_object()
+                    .expect("object")
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                keys.sort_unstable();
+                assert_eq!(keys, known, "{saved:?}");
+            }
+            assert_eq!(
+                Settings::from_json(&json).expect("load"),
+                expected,
+                "{saved:?}"
             );
         }
     }
 
     #[test]
-    fn older_files_get_the_history_and_avatar_defaults() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = settings_path(&dir);
-        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-        fs::write(&path, r#"{ "theme": "abyss", "terminal_hidden": false }"#).expect("write");
-        let loaded = Settings::load_from(&path).expect("load");
-        assert_eq!(loaded.history_columns, HistoryColumns::default());
-        assert!(loaded.author_avatars);
-        assert!(!loaded.github_token_in_keyring);
+    fn font_setters_store_the_sanitized_id() {
+        let huge = "a".repeat(100_000);
+        let accented = "é".repeat(100);
+        let cases = [
+            ("  ", None),
+            ("   ", None),
+            ("  IBM Plex Mono  ", Some("IBM Plex Mono")),
+            ("  obel-mono  ", Some("obel-mono")),
+            ("  obel-mono \n", Some("obel-mono")),
+            ("  Fira Code \n", Some("Fira Code")),
+            ("\u{202E}obel-mono", Some("obel-mono")),
+            ("meslo\u{202E}", Some("meslo")),
+            ("obel\nmono", None),
+            ("fira\rmono", None),
+            ("\u{202E}", None),
+            (huge.as_str(), Some(&huge[..128])),
+            // 128 bytes is 64 two-byte chars.
+            (accented.as_str(), Some(&accented[..128])),
+        ];
+        for (name, expected) in cases {
+            let mut settings = Settings::default();
+            settings.set_ui_font(Some(name.to_owned()));
+            settings.set_terminal_font(Some(name.to_owned()));
+            assert_eq!(settings.ui_font.as_deref(), expected, "{name:?}");
+            assert_eq!(settings.terminal_font.as_deref(), expected, "{name:?}");
+        }
     }
 
     #[test]
@@ -747,86 +763,6 @@ mod tests {
         let columns = HistoryColumns::default();
         let sum = columns.branch + columns.graph + columns.hash + columns.message + columns.author;
         assert_eq!(sum, 1000);
-    }
-
-    #[test]
-    fn history_columns_round_trip_and_stay_independent() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = settings_path(&dir);
-        let settings = Settings {
-            history_columns: HistoryColumns {
-                branch: 300,
-                graph: 20,
-                hash: 1000,
-                message: 999,
-                author: 21,
-            },
-            author_avatars: false,
-            github_token_in_keyring: true,
-            ..Settings::default()
-        };
-        settings.save_to(&path).expect("save");
-        assert_eq!(Settings::load_from(&path).expect("load"), settings);
-        let text = fs::read_to_string(&path).expect("read");
-        assert!(
-            !text.contains("token\":"),
-            "no token value is stored: {text}"
-        );
-    }
-
-    #[test]
-    fn a_bad_column_keeps_only_its_own_default() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = settings_path(&dir);
-        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-        let defaults = HistoryColumns::default();
-        fs::write(
-            &path,
-            r#"{ "history_columns": { "branch": 0, "graph": 5000, "hash": "wide",
-                 "message": -3, "author": 250, "future_column": 7 } }"#,
-        )
-        .expect("write");
-        assert_eq!(
-            Settings::load_from(&path).expect("load").history_columns,
-            HistoryColumns {
-                author: 250,
-                ..defaults
-            }
-        );
-
-        fs::write(&path, r#"{ "history_columns": { "graph": 333 } }"#).expect("write");
-        assert_eq!(
-            Settings::load_from(&path).expect("load").history_columns,
-            HistoryColumns {
-                graph: 333,
-                ..defaults
-            }
-        );
-
-        for json in [
-            r#"{ "history_columns": null }"#,
-            r#"{ "history_columns": 12 }"#,
-            r#"{ "history_columns": [1, 2, 3] }"#,
-        ] {
-            fs::write(&path, json).expect("write");
-            assert_eq!(
-                Settings::load_from(&path).expect(json).history_columns,
-                defaults,
-                "{json}"
-            );
-        }
-
-        let out_of_range = Settings {
-            history_columns: HistoryColumns {
-                message: 0,
-                ..defaults
-            },
-            ..Settings::default()
-        };
-        out_of_range.save_to(&path).expect("save");
-        let value: serde_json::Value =
-            serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
-        assert_eq!(value["history_columns"]["message"], defaults.message);
     }
 
     #[test]
@@ -853,24 +789,6 @@ mod tests {
             settings.recent_repositories[0],
             PathBuf::from(format!("/repo-{}", MAX_RECENT_REPOSITORIES + 4))
         );
-    }
-
-    #[test]
-    fn loading_dedupes_and_caps_hand_edited_recents() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = settings_path(&dir);
-        let mut recents: Vec<String> = (0..20).map(|index| format!("/repo-{index}")).collect();
-        recents.insert(1, "/repo-0".to_owned());
-        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-        fs::write(
-            &path,
-            serde_json::json!({ "recent_repositories": recents }).to_string(),
-        )
-        .expect("write");
-
-        let loaded = Settings::load_from(&path).expect("load");
-        assert_eq!(loaded.recent_repositories.len(), MAX_RECENT_REPOSITORIES);
-        assert_eq!(loaded.recent_repositories[1], PathBuf::from("/repo-1"));
     }
 
     #[test]
