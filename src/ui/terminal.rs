@@ -1766,10 +1766,10 @@ fn special_key(session: &ShellSession, key: Key, modifiers: Modifiers) -> Option
         Key::PageDown => csi_tilde(6, modified),
         Key::Delete => csi_tilde(3, modified),
         Key::Insert => csi_tilde(2, modified),
-        Key::F1 => function_key(11, b'P', modified),
-        Key::F2 => function_key(12, b'Q', modified),
-        Key::F3 => function_key(13, b'R', modified),
-        Key::F4 => function_key(14, b'S', modified),
+        Key::F1 => function_key(b'P', modified),
+        Key::F2 => function_key(b'Q', modified),
+        Key::F3 => function_key(b'R', modified),
+        Key::F4 => function_key(b'S', modified),
         Key::F5 => csi_tilde(15, modified),
         Key::F6 => csi_tilde(17, modified),
         Key::F7 => csi_tilde(18, modified),
@@ -1837,11 +1837,13 @@ fn csi_tilde(number: u8, modified: u8) -> Vec<u8> {
     }
 }
 
-fn function_key(number: u8, ss3: u8, modified: u8) -> Vec<u8> {
+/// F1–F4 as xterm sends them and terminfo describes them: SS3 alone
+/// (`kf1`), `CSI 1;<mod>` with modifiers (`kf13`, `kf25`, …).
+fn function_key(ss3: u8, modified: u8) -> Vec<u8> {
     if modified == 1 {
         vec![0x1b, b'O', ss3]
     } else {
-        format!("\x1b[{number};{modified}~").into_bytes()
+        format!("\x1b[1;{modified}{}", ss3 as char).into_bytes()
     }
 }
 
@@ -2759,6 +2761,23 @@ END
             harness.step();
             harness.step();
             assert!(focused(&harness), "{key:?} moved focus out of the terminal");
+        }
+    }
+
+    #[test]
+    fn function_keys_one_to_four_match_xterm_terminfo() {
+        for (ss3, modified, expected) in [
+            (b'P', 1, "\x1bOP"),
+            (b'P', 2, "\x1b[1;2P"),
+            (b'Q', 2, "\x1b[1;2Q"),
+            (b'S', 2, "\x1b[1;2S"),
+            (b'P', 5, "\x1b[1;5P"),
+        ] {
+            assert_eq!(
+                function_key(ss3, modified),
+                expected.as_bytes(),
+                "{expected:?}"
+            );
         }
     }
 
