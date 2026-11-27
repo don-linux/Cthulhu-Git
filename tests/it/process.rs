@@ -6,20 +6,22 @@
 
 use std::fs;
 use std::io::ErrorKind;
-use std::path::Path;
-use std::time::Duration;
 
 use cthulhu_git::git::GitError;
 use tempfile::TempDir;
 
-#[cfg(unix)]
-use crate::support::{
-    SETSID_PIDFILE_VAR, assert_pid_dead, become_setsid_sleeper, fake_git, sidecar, within,
-};
 use crate::support::{git_at, write_executable};
+// The fake git is a shell script, so every case that needs it is Unix-only.
 #[cfg(unix)]
-use cthulhu_git::git::{
-    DiscoverInputs, Git, GraphTip, branch_graph, discover_with, inspect, switch_branch,
+use {
+    crate::support::{
+        SETSID_PIDFILE_VAR, assert_pid_dead, become_setsid_sleeper, fake_git, sidecar, within,
+    },
+    cthulhu_git::git::{
+        DiscoverInputs, Git, GraphTip, branch_graph, discover_with, inspect, switch_branch,
+    },
+    std::path::Path,
+    std::time::Duration,
 };
 
 #[cfg(unix)]
