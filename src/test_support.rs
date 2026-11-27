@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use proptest::test_runner::Config;
 
-use crate::github::{AvatarResolver, GitHubRepo, HttpError, HttpResponse, RepoContext, Transport};
+use crate::github::{
+    AvatarQuery, AvatarResolver, Candidates, GitHubRepo, HttpError, HttpResponse, RepoContext,
+    Transport,
+};
 
 /// Hashes of real objects, for records that need a well-formed oid.
 pub const OID_A: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -121,4 +124,23 @@ pub fn commit_json(sha: &str, email: &str, avatar: Option<&str>) -> String {
 
 pub fn resolver(fake: &Arc<FakeTransport>) -> AvatarResolver {
     AvatarResolver::new(Arc::clone(fake) as Arc<dyn Transport>)
+}
+
+/// Resolves one address in [`context`]'s repository.
+pub fn ask(
+    resolver: &mut AvatarResolver,
+    email: &str,
+    authored: Option<&str>,
+    now: u64,
+) -> Candidates {
+    let emails = [email.to_owned()];
+    let context = context();
+    resolver.resolve(
+        &AvatarQuery {
+            emails: &emails,
+            repo: Some(&context),
+            authored,
+        },
+        now,
+    )
 }
