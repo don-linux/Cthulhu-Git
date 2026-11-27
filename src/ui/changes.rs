@@ -8,8 +8,8 @@ use std::path::Path;
 
 use cthulhu_git::git::{self, CommitFile, DiffKind, DiffLine, FileDiff, Git, GitError};
 use eframe::egui::{
-    self, Align, Color32, CursorIcon, FontId, Frame, Label, Layout, Margin, RichText, ScrollArea,
-    Sense, Stroke, TextStyle, Ui, Vec2,
+    self, Align, Color32, CursorIcon, FontId, Frame, Label, Layout, Margin, RichText, Role,
+    ScrollArea, Sense, Stroke, TextStyle, Ui, Vec2, WidgetInfo,
     text::{LayoutJob, TextFormat},
 };
 
@@ -165,12 +165,8 @@ fn file_row(ui: &mut Ui, palette: &Palette, file: &CommitFile, selected: bool) -
                             let path_width = (ui.available_width() - counts).max(0.0);
                             ui.scope(|ui| {
                                 ui.set_max_width(path_width);
-                                let label = match &file.previous {
-                                    Some(old) => format!("{old} → {}", file.path),
-                                    None => file.path.clone(),
-                                };
                                 ui.add(
-                                    Label::new(RichText::new(label).color(palette.text))
+                                    Label::new(RichText::new(heading(file)).color(palette.text))
                                         .truncate()
                                         .selectable(false),
                                 );
@@ -187,6 +183,15 @@ fn file_row(ui: &mut Ui, palette: &Palette, file: &CommitFile, selected: bool) -
         response.clone().on_hover_cursor(CursorIcon::PointingHand)
     } else {
         response
+    }
+}
+
+/// The file's name in the list and above its patch: `old → new` for a
+/// rename.
+fn heading(file: &CommitFile) -> String {
+    match &file.previous {
+        Some(old) => format!("{old} → {}", file.path),
+        None => file.path.clone(),
     }
 }
 
@@ -219,12 +224,8 @@ fn diff_pane(ui: &mut Ui, changes: &Changes, diffs: &DiffCache, palette: &Palett
             ui.label(RichText::new("No files.").color(palette.text_muted));
             return;
         };
-        let heading = match &file.previous {
-            Some(old) => format!("{old} → {}", file.path),
-            None => file.path.clone(),
-        };
         ui.add(
-            Label::new(RichText::new(heading).strong().color(palette.text))
+            Label::new(RichText::new(heading(file)).strong().color(palette.text))
                 .truncate()
                 .selectable(false),
         );
@@ -263,32 +264,18 @@ fn paint_diff(ui: &mut Ui, diff: &FileDiff, palette: &Palette) {
         .animated(false)
         .show_rows(ui, row_height, diff.lines.len(), |ui, range| {
             ui.set_min_width(width);
-            for index in range {
-                let line = &diff.lines[index];
-                let (rect, _) =
+            for line in &diff.lines[range] {
+                let (rect, response) =
                     ui.allocate_exact_size(Vec2::new(width, row_height), Sense::hover());
-                let fill = match line.kind {
-                    DiffKind::Added => palette.diff_added_fill,
-                    DiffKind::Removed => palette.diff_removed_fill,
-                    DiffKind::Context | DiffKind::Hunk | DiffKind::Meta => Color32::TRANSPARENT,
-                };
+                // The painted galley is not a widget; the row carries the
+                // line's text, so a screen reader and the tests find the words.
+                response.widget_info(|| WidgetInfo::labeled(Role::Label, true, &line.text));
+                let (fill, job) = line_row(line, palette, font.clone(), digits);
                 if fill != Color32::TRANSPARENT {
                     ui.painter().rect_filled(rect, 0.0, fill);
                 }
-                let job = line_job(line, palette, font.clone(), digits);
                 let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
                 ui.painter().galley(rect.left_top(), galley, palette.text);
-                // The painted galley is not a widget, so the line text is also a
-                // label. Tests, and a pointer, can find the words.
-                let _ = ui.put(
-                    rect,
-                    Label::new(
-                        RichText::new(&line.text)
-                            .monospace()
-                            .color(Color32::TRANSPARENT),
-                    )
-                    .selectable(false),
-                );
             }
         });
 }
@@ -306,39 +293,47 @@ fn gutter_digits(diff: &FileDiff) -> usize {
     max_no.to_string().len()
 }
 
-fn line_job(line: &DiffLine, palette: &Palette, font: FontId, digits: usize) -> LayoutJob {
+/// One line's fill and text: both line numbers, the sign, then the line.
+fn line_row(
+    line: &DiffLine,
+    palette: &Palette,
+    font: FontId,
+    digits: usize,
+) -> (Color32, LayoutJob) {
+    let (fill, sign, sign_color, text) = match line.kind {
+        DiffKind::Added => (
+            palette.diff_added_fill,
+            "+",
+            palette.diff_added,
+            palette.text,
+        ),
+        DiffKind::Removed => (
+            palette.diff_removed_fill,
+            "-",
+            palette.diff_removed,
+            palette.text,
+        ),
+        DiffKind::Context => (Color32::TRANSPARENT, " ", palette.text_muted, palette.text),
+        DiffKind::Hunk | DiffKind::Meta => (
+            Color32::TRANSPARENT,
+            " ",
+            palette.text_muted,
+            palette.text_muted,
+        ),
+    };
+    let number = |number: Option<u32>| match number {
+        Some(number) => format!("{number:>digits$}"),
+        None => " ".repeat(digits),
+    };
     let mut job = LayoutJob::default();
-    let muted = text_format(palette.text_muted, font.clone());
-    let body = text_format(palette.text, font.clone());
-    let sign_color = match line.kind {
-        DiffKind::Added => palette.diff_added,
-        DiffKind::Removed => palette.diff_removed,
-        DiffKind::Context | DiffKind::Hunk | DiffKind::Meta => palette.text_muted,
-    };
-    let old = match line.old {
-        Some(number) => format!("{number:>digits$}"),
-        None => " ".repeat(digits),
-    };
-    let new = match line.new {
-        Some(number) => format!("{number:>digits$}"),
-        None => " ".repeat(digits),
-    };
-    job.append(&old, 8.0, muted.clone());
-    job.append(" ", 0.0, muted.clone());
-    job.append(&new, 0.0, muted.clone());
-    job.append(" ", 0.0, muted);
-    let sign = match line.kind {
-        DiffKind::Added => "+",
-        DiffKind::Removed => "-",
-        DiffKind::Context | DiffKind::Hunk | DiffKind::Meta => " ",
-    };
+    job.append(
+        &format!("{} {} ", number(line.old), number(line.new)),
+        8.0,
+        text_format(palette.text_muted, font.clone()),
+    );
     job.append(sign, 0.0, text_format(sign_color, font.clone()));
-    let text_format = match line.kind {
-        DiffKind::Hunk | DiffKind::Meta => text_format(palette.text_muted, font),
-        DiffKind::Context | DiffKind::Added | DiffKind::Removed => body,
-    };
-    job.append(&line.text, 0.0, text_format);
-    job
+    job.append(&line.text, 0.0, text_format(text, font));
+    (fill, job)
 }
 
 fn text_format(color: Color32, font_id: FontId) -> TextFormat {
