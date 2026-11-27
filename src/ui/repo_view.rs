@@ -378,13 +378,7 @@ fn top_bar(
         );
         ui.put(
             name_rect,
-            Label::new(
-                RichText::new(&repo.info.name)
-                    .size(15.0)
-                    .strong()
-                    .color(palette.text),
-            )
-            .truncate(),
+            Label::new(RichText::new(&repo.info.name).size(15.0).strong()).truncate(),
         )
         .on_hover_text(repo.info.root.display().to_string());
     });
@@ -392,17 +386,13 @@ fn top_bar(
 
 fn branches_panel(ui: &mut Ui, repo: &mut OpenedRepo, palette: &Palette) {
     ui.add(
-        Label::new(
-            RichText::new(format!("Branches ({})", repo.branches.len()))
-                .strong()
-                .color(palette.text),
-        )
-        .truncate(),
+        Label::new(RichText::new(format!("Branches ({})", repo.branches.len())).strong())
+            .truncate(),
     );
     ui.add_space(6.0);
 
     if repo.branches.is_empty() {
-        ui.label(RichText::new("No branches.").color(palette.text_muted));
+        ui.label(RichText::new("No branches.").weak());
         return;
     }
 
@@ -435,7 +425,7 @@ fn branch_row(ui: &mut Ui, listed: &mut ListedBranch, lane: Option<usize>, palet
                     palette.graph_color(color),
                 );
             }
-            let mut name = RichText::new(&listed.branch.name).color(palette.text);
+            let mut name = RichText::new(&listed.branch.name);
             if listed.branch.current {
                 name = name.strong();
             }
@@ -462,12 +452,7 @@ fn branch_row(ui: &mut Ui, listed: &mut ListedBranch, lane: Option<usize>, palet
         ui.horizontal(|ui| {
             ui.add_space(indent);
             ui.add(
-                Label::new(
-                    RichText::new(branch_metrics(&listed.branch))
-                        .small()
-                        .color(palette.text_muted),
-                )
-                .truncate(),
+                Label::new(RichText::new(branch_metrics(&listed.branch)).small().weak()).truncate(),
             );
         });
     });
@@ -516,11 +501,11 @@ fn detail_panel(
     } else {
         "Latest commit"
     };
-    ui.add(Label::new(RichText::new(title).strong().color(palette.text)).truncate());
+    ui.add(Label::new(RichText::new(title).strong()).truncate());
     ui.add_space(6.0);
 
     if selected.is_none() && repo.latest.is_none() {
-        ui.label(RichText::new("No commits yet.").color(palette.text_muted));
+        ui.label(RichText::new("No commits yet.").weak());
         return;
     }
     if let Some(oid) = selected
@@ -722,7 +707,7 @@ fn paint_commit(
     });
     hash_block(ui, palette, body.oid, github);
     if let Some(author) = body.author {
-        ui.label(RichText::new("Author").small().color(palette.text_muted));
+        ui.label(RichText::new("Author").small().weak());
         ui.add_space(2.0);
         person_line(
             ui,
@@ -734,11 +719,7 @@ fn paint_commit(
         );
         ui.add_space(10.0);
         if !body.co_authors.is_empty() {
-            ui.label(
-                RichText::new("Co-authors")
-                    .small()
-                    .color(palette.text_muted),
-            );
+            ui.label(RichText::new("Co-authors").small().weak());
             ui.add_space(2.0);
             for person in body.co_authors {
                 person_line(ui, palette, avatars, person, context.as_ref(), None);
@@ -746,7 +727,7 @@ fn paint_commit(
             ui.add_space(10.0);
         }
     }
-    ui.label(RichText::new("Date").small().color(palette.text_muted));
+    ui.label(RichText::new("Date").small().weak());
     ui.add_space(2.0);
     match body.date {
         DetailDate::Known { absolute, unix } => {
@@ -759,10 +740,10 @@ fn paint_commit(
                 }
                 None => absolute.to_owned(),
             };
-            sidebar_text(ui, RichText::new(text).color(palette.text));
+            sidebar_text(ui, RichText::new(text));
         }
         DetailDate::Pending => {
-            ui.label(RichText::new("Loading…").color(palette.text_muted));
+            ui.label(RichText::new("Loading…").weak());
         }
         DetailDate::Failed(message) => {
             sidebar_text(ui, RichText::new(message).color(palette.error));
@@ -773,15 +754,15 @@ fn paint_commit(
         sidebar_text(ui, RichText::new(notice).color(palette.error));
     }
     ui.add_space(10.0);
-    ui.label(RichText::new("Message").small().color(palette.text_muted));
+    ui.label(RichText::new("Message").small().weak());
     ui.add_space(2.0);
     match body.message {
         Some("") => {
-            ui.label(RichText::new("No message.").color(palette.text_muted));
+            ui.label(RichText::new("No message.").weak());
         }
         Some(message) => hover::message_with_links(ui, message, github, palette),
         None => {
-            ui.label(RichText::new("Loading…").color(palette.text_muted));
+            ui.label(RichText::new("Loading…").weak());
         }
     }
     if !body.branches.is_empty() {
@@ -804,7 +785,7 @@ fn paint_commit(
 }
 
 fn view_changes_button(ui: &mut Ui, palette: &Palette) -> egui::Response {
-    let button = Button::new(RichText::new("View changes").color(palette.text))
+    let button = Button::new("View changes")
         .fill(palette.surface)
         .stroke(Stroke::new(1.0, palette.border))
         .corner_radius(widgets::CORNER_RADIUS);
@@ -812,7 +793,7 @@ fn view_changes_button(ui: &mut Ui, palette: &Palette) -> egui::Response {
 }
 
 fn hash_block(ui: &mut Ui, palette: &Palette, oid: &str, github: Option<&GitHubRepo>) {
-    ui.label(RichText::new("Hash").small().color(palette.text_muted));
+    ui.label(RichText::new("Hash").small().weak());
     ui.add_space(2.0);
     let hash = place_sidebar_text(ui, RichText::new(oid).monospace().color(palette.hash), true)
         .on_hover_text("Copy the full commit hash")
@@ -870,7 +851,7 @@ fn person_line(
         );
         ui.vertical(|ui| {
             if !person.name.trim().is_empty() {
-                sidebar_text(ui, RichText::new(&person.name).color(palette.text));
+                sidebar_text(ui, RichText::new(&person.name));
             }
             hover::email_link(ui, &person.email, palette);
         });
@@ -1042,8 +1023,8 @@ fn pick_branch(ui: &mut Ui, repo: &OpenedRepo) -> Option<String> {
 fn branch_text(head: &Head, palette: &Palette) -> (RichText, Color32) {
     let text = RichText::new(head.to_string());
     match head {
-        Head::Branch(_) => (text.strong().color(palette.text), palette.text),
-        Head::Unborn(_) => (text.italics().color(palette.text_muted), palette.text_muted),
+        Head::Branch(_) => (text.strong(), palette.text),
+        Head::Unborn(_) => (text.italics().weak(), palette.text_muted),
         Head::Detached { .. } => (text.color(palette.warning), palette.warning),
     }
 }

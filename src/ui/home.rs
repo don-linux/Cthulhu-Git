@@ -157,20 +157,14 @@ fn remember_brand(
 }
 
 fn brand_block(ui: &mut Ui, state: &HomeState<'_>, action: &mut Option<Action>) {
-    let palette = theme::current(ui.ctx()).palette;
     ui.vertical_centered(|ui| {
         ui.spacing_mut().item_spacing.y = 6.0;
         icons::app_logo(ui, LOGO_SIDE);
         ui.add_space(10.0);
-        ui.label(
-            RichText::new("Cthulhu Git")
-                .size(32.0)
-                .strong()
-                .color(palette.text),
-        );
-        ui.label(RichText::new(env!("CARGO_PKG_VERSION")).color(palette.text_muted));
+        ui.label(RichText::new("Cthulhu Git").size(32.0).strong());
+        ui.label(RichText::new(env!("CARGO_PKG_VERSION")).weak());
         ui.add_space(2.0);
-        ui.label(RichText::new("Open a Git repository to get started.").color(palette.text_muted));
+        ui.label(RichText::new("Open a Git repository to get started.").weak());
         ui.add_space(18.0);
         if widgets::primary_button(ui, "Open repository…", !state.busy).clicked() {
             *action = Some(Action::Browse);
@@ -189,12 +183,7 @@ fn brand_block(ui: &mut Ui, state: &HomeState<'_>, action: &mut Option<Action>) 
 }
 
 fn show_recents(ui: &mut Ui, state: &HomeState<'_>, action: &mut Option<Action>, scroll: bool) {
-    let palette = theme::current(ui.ctx()).palette;
-    ui.label(
-        RichText::new("Recent repositories")
-            .strong()
-            .color(palette.text_muted),
-    );
+    ui.label(RichText::new("Recent repositories").weak());
     ui.add_space(8.0);
     if scroll {
         ScrollArea::vertical()
@@ -207,11 +196,8 @@ fn show_recents(ui: &mut Ui, state: &HomeState<'_>, action: &mut Option<Action>,
 }
 
 fn recent_cards(ui: &mut Ui, state: &HomeState<'_>, action: &mut Option<Action>) {
-    let palette = theme::current(ui.ctx()).palette;
     if state.recent.is_empty() {
-        ui.label(
-            RichText::new("Repositories you open will appear here.").color(palette.text_muted),
-        );
+        ui.label(RichText::new("Repositories you open will appear here.").weak());
         return;
     }
     // Top-aligned wrap. Centering on the cross axis would stretch the first
@@ -305,31 +291,21 @@ fn paint_card(ui: &Ui, rect: Rect, hovered: bool, enabled: bool, palette: &theme
 fn card_body(ui: &mut Ui, path: &Path, facts: Facts<'_>, hovered: bool) {
     let palette = theme::current(ui.ctx()).palette;
     ui.spacing_mut().item_spacing.y = 2.0;
-    card_line(
-        ui,
-        RichText::new(display_name(path))
-            .strong()
-            .color(palette.text),
-    );
-    card_line(
-        ui,
-        RichText::new(path.display().to_string())
-            .small()
-            .color(palette.text_muted),
-    );
+    card_line(ui, RichText::new(display_name(path)).strong());
+    card_line(ui, RichText::new(path.display().to_string()).small().weak());
     ui.add_space(6.0);
     match facts {
         Facts::Pending => {
             branch_line(ui, PENDING, palette.text_muted);
-            card_line(ui, muted_small(PENDING, palette.text_muted));
-            card_line(ui, RichText::new(PENDING).color(palette.text_muted));
-            card_line(ui, muted_small(PENDING, palette.text_muted));
+            card_line(ui, muted_small(PENDING));
+            card_line(ui, RichText::new(PENDING).weak());
+            card_line(ui, muted_small(PENDING));
         }
         Facts::Unreadable => {
             card_line(ui, RichText::new(UNREADABLE).color(palette.error));
-            card_line(ui, muted_small(" ", palette.text_muted));
+            card_line(ui, muted_small(" "));
             card_line(ui, RichText::new(" "));
-            card_line(ui, muted_small(" ", palette.text_muted));
+            card_line(ui, muted_small(" "));
         }
         Facts::Ready(glance) => {
             let branch = if hovered {
@@ -340,25 +316,22 @@ fn card_body(ui: &mut Ui, path: &Path, facts: Facts<'_>, hovered: bool) {
             branch_line(ui, &glance.head.to_string(), branch);
             match glance.upstream {
                 Some(divergence) => {
-                    card_line(
-                        ui,
-                        muted_small(&upstream_line(divergence), palette.text_muted),
-                    );
+                    card_line(ui, muted_small(&upstream_line(divergence)));
                 }
-                None => card_line(ui, muted_small(" ", palette.text_muted)),
+                None => card_line(ui, muted_small(" ")),
             }
             match &glance.latest {
                 Some(line) => {
                     if line.subject.is_empty() {
                         card_line(ui, RichText::new(" "));
                     } else {
-                        card_line(ui, RichText::new(&line.subject).color(palette.text));
+                        card_line(ui, RichText::new(&line.subject));
                     }
-                    card_line(ui, muted_small(&line.when, palette.text_muted));
+                    card_line(ui, muted_small(&line.when));
                 }
                 None => {
                     card_line(ui, RichText::new(" "));
-                    card_line(ui, muted_small(" ", palette.text_muted));
+                    card_line(ui, muted_small(" "));
                 }
             }
         }
@@ -398,8 +371,8 @@ fn truncated_label(text: RichText) -> Label {
         .truncate()
 }
 
-fn muted_small(text: &str, color: Color32) -> RichText {
-    RichText::new(text).small().color(color)
+fn muted_small(text: &str) -> RichText {
+    RichText::new(text).small().weak()
 }
 
 fn upstream_line(divergence: Divergence) -> String {
@@ -413,7 +386,6 @@ fn upstream_line(divergence: Divergence) -> String {
 
 /// Always takes the same height, so the page does not jump while loading.
 fn status_line(ui: &mut Ui, state: &HomeState<'_>) {
-    let palette = theme::current(ui.ctx()).palette;
     let text = match state.opening {
         Some(path) => format!("Opening {}…", display_name(path)),
         None if state.busy => "Waiting for the folder dialog…".to_owned(),
@@ -422,7 +394,7 @@ fn status_line(ui: &mut Ui, state: &HomeState<'_>) {
             return;
         }
     };
-    let galley = egui::WidgetText::from(RichText::new(text).color(palette.text_muted)).into_galley(
+    let galley = egui::WidgetText::from(RichText::new(text).weak()).into_galley(
         ui,
         Some(egui::TextWrapMode::Truncate),
         ui.available_width(),

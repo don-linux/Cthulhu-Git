@@ -138,7 +138,7 @@ pub(super) fn show_clipboard_toast(ctx: &Context) {
                 .corner_radius(CORNER_RADIUS)
                 .inner_margin(Margin::symmetric(12, 8))
                 .show(ui, |ui| {
-                    ui.label(RichText::new(&toast.notice).color(palette.text));
+                    ui.label(&toast.notice);
                 });
         });
 }
