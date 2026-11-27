@@ -17,8 +17,8 @@ use std::path::Path;
 use cthulhu_git::github::{ApiStatus, TOKEN_TEMPLATE_URL};
 use cthulhu_git::settings::{HistoryColumns, sanitize_font_name};
 use eframe::egui::{
-    self, Align, Button, Color32, CursorIcon, FontId, Frame, Id, Key, Label, Layout, Margin,
-    RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, UiBuilder, Vec2,
+    self, Align, Button, CursorIcon, FontId, Frame, Id, Key, Label, Layout, Margin, RichText,
+    ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, UiBuilder, Vec2,
 };
 
 use super::Action;
@@ -353,7 +353,6 @@ fn choice_builtin(ui: &mut Ui, selected: bool) -> egui::Response {
 }
 
 fn specimen_row(ui: &mut Ui, row: Specimen<'_>, selected: bool) -> egui::Response {
-    let palette = theme::current(ui.ctx()).palette;
     let Specimen {
         id,
         title,
@@ -362,34 +361,18 @@ fn specimen_row(ui: &mut Ui, row: Specimen<'_>, selected: bool) -> egui::Respons
         title_font,
         sample_font,
     } = row;
-    let response = ui
-        .scope_builder(UiBuilder::new().id_salt(id).sense(Sense::click()), |ui| {
-            let hovered = ui.response().hovered();
-            let fill = if selected {
-                palette.surface_active
-            } else if hovered {
-                palette.surface_hover
-            } else {
-                Color32::TRANSPARENT
-            };
-            Frame::new()
-                .fill(fill)
-                .corner_radius(widgets::CORNER_RADIUS)
-                .inner_margin(Margin::symmetric(12, 10))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.add(Label::new(RichText::new(title).font(title_font)).selectable(false));
-                        ui.add(Label::new(RichText::new(note).small().weak()).selectable(false));
-                    });
-                    ui.add(
-                        Label::new(RichText::new(sample).font(sample_font).weak())
-                            .selectable(false),
-                    );
-                });
-        })
-        .response;
-    response.on_hover_cursor(CursorIcon::PointingHand)
+    widgets::selectable_row(ui, id, selected, Margin::symmetric(12, 10), |ui| {
+        let name = ui
+            .horizontal(|ui| {
+                let name =
+                    ui.add(Label::new(RichText::new(title).font(title_font)).selectable(false));
+                ui.add(Label::new(RichText::new(note).small().weak()).selectable(false));
+                name
+            })
+            .inner;
+        ui.add(Label::new(RichText::new(sample).font(sample_font).weak()).selectable(false));
+        name
+    })
 }
 
 fn about_page(ui: &mut Ui, palette: &Palette, about: &AboutInfo) {
@@ -689,42 +672,22 @@ fn preview_view_id() -> Id {
 
 fn nav_button(ui: &mut Ui, label: &str, icon: Icon, selected: bool) -> egui::Response {
     let palette = theme::current(ui.ctx()).palette;
-    let response = ui
-        .scope_builder(
-            UiBuilder::new().id_salt(label).sense(Sense::click()),
-            |ui| {
-                let hovered = ui.response().hovered();
-                let fill = if selected {
-                    palette.surface_active
-                } else if hovered {
-                    palette.surface_hover
-                } else {
-                    Color32::TRANSPARENT
-                };
-                Frame::new()
-                    .fill(fill)
-                    .corner_radius(widgets::CORNER_RADIUS)
-                    .inner_margin(Margin::symmetric(14, 12))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            let tint = if selected {
-                                palette.accent
-                            } else {
-                                palette.text
-                            };
-                            icons::icon(ui, icon, tint);
-                            ui.add(
-                                egui::Label::new(RichText::new(label).size(NAV_LABEL_SIZE))
-                                    .selectable(false)
-                                    .truncate(),
-                            );
-                        });
-                    });
-            },
-        )
-        .response;
-    response.on_hover_cursor(CursorIcon::PointingHand)
+    widgets::selectable_row(ui, label, selected, Margin::symmetric(14, 12), |ui| {
+        ui.horizontal(|ui| {
+            let tint = if selected {
+                palette.accent
+            } else {
+                palette.text
+            };
+            icons::icon(ui, icon, tint);
+            ui.add(
+                Label::new(RichText::new(label).size(NAV_LABEL_SIZE))
+                    .selectable(false)
+                    .truncate(),
+            )
+        })
+        .inner
+    })
 }
 
 fn page_id() -> Id {
@@ -806,7 +769,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use eframe::egui::accesskit::Role;
+    use eframe::egui::accesskit::{Role, Toggled};
     use eframe::egui::output::OutputCommand;
     use egui_kittest::Harness;
     use egui_kittest::kittest::{NodeT, Queryable};
@@ -876,31 +839,39 @@ mod tests {
         let unknown = (Some("JetBrains Mono"), Some("Fira Code"));
         let ui_font = |id: &str| Action::SetUiFont(Some(id.to_owned()));
         let terminal_font = |id: &str| Action::SetTerminalFont(Some(id.to_owned()));
-        // (saved faces, page, faces listed, a face not listed, warning, clicked, asked for)
+        // (saved faces, page, faces listed, a face not listed, warning, shown as
+        // selected, clicked, asked for)
         #[rustfmt::skip]
         let cases = [
-            ((None, None), "Appearance", INTERFACE, "Meslo LGS NF", None, "Inter", ui_font("inter")),
-            ((None, None), "Terminal", TERMINAL, "Ubuntu Sans", None, "Departure Mono", terminal_font("departure-mono")),
+            ((None, None), "Appearance", INTERFACE, "Meslo LGS NF", None, ["Appearance", "Ubuntu"], "Inter", ui_font("inter")),
+            ((None, None), "Terminal", TERMINAL, "Ubuntu Sans", None, ["Terminal", "Meslo LGS NF"], "Departure Mono", terminal_font("departure-mono")),
             // Obel Mono is on both pages, and each sets only its own surface.
-            ((Some("ubuntu-sans"), Some("builtin")), "Appearance", INTERFACE, "Meslo LGS NF", None, "Obel Mono", ui_font("obel-mono")),
-            ((Some("obel-mono"), Some("builtin")), "Terminal", TERMINAL, "Ubuntu Sans", None, "Obel Mono", terminal_font("obel-mono")),
+            ((Some("ubuntu-sans"), Some("builtin")), "Appearance", INTERFACE, "Meslo LGS NF", None, ["Appearance", "Ubuntu Sans"], "Obel Mono", ui_font("obel-mono")),
+            ((Some("obel-mono"), Some("builtin")), "Terminal", TERMINAL, "Ubuntu Sans", None, ["Terminal", "Built-in"], "Obel Mono", terminal_font("obel-mono")),
             // A face that is not bundled is reported, not rewritten.
-            (unknown, "Appearance", INTERFACE, "Meslo LGS NF", Some("\"JetBrains Mono\" is not bundled. The interface is using Ubuntu."), "Inter", ui_font("inter")),
-            (unknown, "Terminal", TERMINAL, "Ubuntu Sans", Some("\"Fira Code\" is not bundled. The terminal is using Meslo LGS NF."), "Departure Mono", terminal_font("departure-mono")),
-            ((None, None), "History", NONE, "Inter", None, "Show author avatars", Action::SetAuthorAvatars(false)),
+            (unknown, "Appearance", INTERFACE, "Meslo LGS NF", Some("\"JetBrains Mono\" is not bundled. The interface is using Ubuntu."), ["Appearance", "Ubuntu"], "Inter", ui_font("inter")),
+            (unknown, "Terminal", TERMINAL, "Ubuntu Sans", Some("\"Fira Code\" is not bundled. The terminal is using Meslo LGS NF."), ["Terminal", "Meslo LGS NF"], "Departure Mono", terminal_font("departure-mono")),
+            ((None, None), "History", NONE, "Inter", None, ["History", "Show author avatars"], "Show author avatars", Action::SetAuthorAvatars(false)),
         ];
-        for ((ui, terminal), page, listed, absent, warning, clicked, asked) in cases {
+        for ((ui, terminal), page, listed, absent, warning, selected, clicked, asked) in cases {
             let case = format!("{page} with {ui:?} and {terminal:?}");
             let (mut harness, _github, actions) =
                 settings(ui, terminal, AboutInfo::current("2.43.0"));
             if page != "Appearance" {
                 click(&mut harness, page);
+                // The list was drawn before the click; the next frame shows it.
+                harness.step();
             }
             assert!(
                 actions.borrow().is_empty(),
                 "{case}: {:?}",
                 actions.borrow()
             );
+            let shown: Vec<String> = harness
+                .query_all_by(|node| node.toggled() == Some(Toggled::True))
+                .filter_map(|node| node.accesskit_node().label())
+                .collect();
+            assert_eq!(shown, selected, "{case}: selected rows");
             for face in listed.iter().chain(warning.as_ref()) {
                 harness.get_by_label(face);
             }

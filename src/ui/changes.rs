@@ -8,8 +8,8 @@ use std::path::Path;
 
 use cthulhu_git::git::{self, CommitFile, DiffKind, DiffLine, FileDiff, Git, GitError};
 use eframe::egui::{
-    self, Align, Color32, CursorIcon, FontId, Frame, Label, Layout, Margin, RichText, Role,
-    ScrollArea, Sense, Stroke, TextStyle, Ui, Vec2, WidgetInfo,
+    self, Align, Color32, FontId, Frame, Label, Layout, Margin, RichText, Role, ScrollArea, Sense,
+    Stroke, TextStyle, Ui, Vec2, WidgetInfo,
     text::{LayoutJob, TextFormat},
 };
 
@@ -140,50 +140,27 @@ fn file_list(ui: &mut Ui, changes: &mut Changes, palette: &Palette, height: f32)
 }
 
 fn file_row(ui: &mut Ui, palette: &Palette, file: &CommitFile, selected: bool) -> egui::Response {
-    let response = ui
-        .scope_builder(
-            egui::UiBuilder::new()
-                .id_salt(&file.path)
-                .sense(Sense::click()),
-            |ui| {
-                let hovered = ui.response().hovered();
-                let fill = if selected {
-                    palette.surface_active
-                } else if hovered {
-                    palette.surface_hover
-                } else {
-                    Color32::TRANSPARENT
-                };
-                Frame::new()
-                    .fill(fill)
-                    .corner_radius(widgets::CORNER_RADIUS)
-                    .inner_margin(Margin::symmetric(8, 6))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            let counts = 88.0;
-                            let path_width = (ui.available_width() - counts).max(0.0);
-                            ui.scope(|ui| {
-                                ui.set_max_width(path_width);
-                                ui.add(
-                                    Label::new(RichText::new(heading(file)).color(palette.text))
-                                        .truncate()
-                                        .selectable(false),
-                                );
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                file_counts(ui, file, palette);
-                            });
-                        });
-                    });
-            },
-        )
-        .response;
-    if response.hovered() {
-        response.clone().on_hover_cursor(CursorIcon::PointingHand)
-    } else {
-        response
-    }
+    widgets::selectable_row(ui, &file.path, selected, Margin::symmetric(8, 6), |ui| {
+        ui.horizontal(|ui| {
+            let counts = 88.0;
+            let path_width = (ui.available_width() - counts).max(0.0);
+            let name = ui
+                .scope(|ui| {
+                    ui.set_max_width(path_width);
+                    ui.add(
+                        Label::new(RichText::new(heading(file)).color(palette.text))
+                            .truncate()
+                            .selectable(false),
+                    )
+                })
+                .inner;
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                file_counts(ui, file, palette);
+            });
+            name
+        })
+        .inner
+    })
 }
 
 /// The file's name in the list and above its patch: `old → new` for a

@@ -4,8 +4,8 @@
 use std::time::Duration;
 
 use eframe::egui::{
-    self, Align2, Button, Context, CursorIcon, Frame, Id, Margin, Order, Response, RichText,
-    Stroke, Ui, Vec2,
+    self, Align2, AsIdSalt, Button, Color32, Context, CursorIcon, Frame, Id, InnerResponse, Margin,
+    Order, Response, RichText, Role, Sense, Stroke, Ui, UiBuilder, Vec2, WidgetInfo,
 };
 
 use super::Action;
@@ -70,6 +70,51 @@ pub fn secondary_button(ui: &mut Ui, text: &str, icon: Option<Icon>, enabled: bo
     .corner_radius(CORNER_RADIUS)
     .min_size(ACTION_BUTTON);
     ui.add_enabled(enabled, button)
+        .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// A row that is one click target, like egui's `selectable_label`: filled
+/// while selected or hovered, with `margin` around what `add` draws. `add`
+/// returns the label that names the row, and accessibility reads the row as
+/// a button with that name and its selected state.
+pub fn selectable_row(
+    ui: &mut Ui,
+    id_salt: impl AsIdSalt,
+    selected: bool,
+    margin: Margin,
+    add: impl FnOnce(&mut Ui) -> Response,
+) -> Response {
+    let palette = theme::current(ui.ctx()).palette;
+    let InnerResponse {
+        inner: name,
+        response,
+    } = ui.scope_builder(
+        UiBuilder::new().id_salt(id_salt).sense(Sense::click()),
+        |ui| {
+            let fill = if selected {
+                palette.surface_active
+            } else if ui.response().hovered() {
+                palette.surface_hover
+            } else {
+                Color32::TRANSPARENT
+            };
+            Frame::new()
+                .fill(fill)
+                .corner_radius(CORNER_RADIUS)
+                .inner_margin(margin)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    add(ui)
+                })
+                .inner
+        },
+    );
+    response.widget_info(|| WidgetInfo {
+        selected: Some(selected),
+        ..WidgetInfo::new(Role::Button)
+    });
+    response
+        .labelled_by(name.id)
         .on_hover_cursor(CursorIcon::PointingHand)
 }
 

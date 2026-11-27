@@ -10,12 +10,12 @@ use cthulhu_git::git::{
 };
 use cthulhu_git::github::GitHubRepo;
 use cthulhu_git::settings::HistoryColumns;
-use eframe::egui::accesskit::Role;
+use eframe::egui::accesskit::{Role, Toggled};
 use eframe::egui::output::OutputCommand;
 use eframe::egui::{
     self, Modifiers, MouseWheelSource, MouseWheelUnit, PointerButton, Pos2, TouchPhase,
 };
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::{Harness, HarnessBuilder};
 
 use super::avatars::AvatarService;
@@ -1940,10 +1940,12 @@ fn view_changes_shows_tags_and_a_colored_diff() {
     harness.get_by_label("View changes").click_accesskit();
     harness.step();
     settle(&mut harness);
-    assert!(
-        !label_rects(&harness, "notes/seal.txt").is_empty(),
-        "the file list did not open\n{}",
-        labels(&harness)
+    let file = harness.get_by_role_and_label(Role::Button, "notes/seal.txt");
+    let toggled = file.accesskit_node().toggled();
+    assert_eq!(
+        toggled,
+        Some(Toggled::True),
+        "the shown file is not selected"
     );
     let added = harness.get_by_label("vault door opens").rect();
     let removed = harness.get_by_label("vault door shuts").rect();
