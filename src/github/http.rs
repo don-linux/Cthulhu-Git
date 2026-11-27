@@ -507,100 +507,6 @@ mod tests {
                 "https://Avatars.GitHubUserContent.com/u/1",
             ],
         ),
-        // A downgrade or a foreign host is refused before it is requested.
-        (
-            &[(
-                "https://api.github.com/start",
-                302,
-                &[("Location", "http://api.github.com/start")],
-            )],
-            Err(HttpError::NotAllowed),
-            &["https://api.github.com/start"],
-        ),
-        (
-            &[(
-                "https://api.github.com/start",
-                302,
-                &[("Location", "http://evil.example/collect")],
-            )],
-            Err(HttpError::NotAllowed),
-            &["https://api.github.com/start"],
-        ),
-        (
-            &[(
-                "https://github.com/start",
-                302,
-                &[("Location", "http://github.com/start")],
-            )],
-            Err(HttpError::NotAllowed),
-            &["https://github.com/start"],
-        ),
-        (
-            &[(
-                "https://github.com/leak.png",
-                302,
-                &[("Location", "https://evil.example/collect")],
-            )],
-            Err(HttpError::NotAllowed),
-            &["https://github.com/leak.png"],
-        ),
-        (
-            &[(
-                "https://api.github.com/start",
-                302,
-                &[("Location", "//evil.example/steal")],
-            )],
-            Err(HttpError::NotAllowed),
-            &["https://api.github.com/start"],
-        ),
-        (
-            &[(
-                "https://api.github.com/start",
-                302,
-                &[("Location", "//user:pass@evil.example/x")],
-            )],
-            Err(HttpError::NotAllowed),
-            &["https://api.github.com/start"],
-        ),
-        (
-            &[(
-                "https://api.github.com/start",
-                302,
-                &[("Location", "///evil.example/x")],
-            )],
-            Err(HttpError::NotAllowed),
-            &["https://api.github.com/start"],
-        ),
-        (
-            &[(
-                "https://api.github.com/start",
-                302,
-                &[("Location", "https://api.github.com.evil.example/x")],
-            )],
-            Err(HttpError::NotAllowed),
-            &["https://api.github.com/start"],
-        ),
-        (
-            &[(
-                "https://github.com/start",
-                302,
-                &[("Location", " https://evil.example/x")],
-            )],
-            Err(HttpError::NotAllowed),
-            &["https://github.com/start"],
-        ),
-        (
-            &[(
-                "https://api.github.com/start",
-                302,
-                &[(
-                    "Location",
-                    "https://user:pass@evil example/?access_token=pass",
-                )],
-            )],
-            Err(HttpError::NotAllowed),
-            &["https://api.github.com/start"],
-        ),
         // The first of two locations is the one followed.
         (
             &[(
@@ -629,6 +535,42 @@ mod tests {
             assert_eq!(got, result.clone().map(|()| b"ok".to_vec()), "{start}");
             assert_eq!(fake.urls(), *requested, "{start}");
             assert_token_only_on_api(&fake, &secret, start);
+        }
+
+        // A downgrade or a foreign host is refused before it is requested.
+        for (start, location) in [
+            (
+                "https://api.github.com/start",
+                "http://api.github.com/start",
+            ),
+            (
+                "https://api.github.com/start",
+                "http://evil.example/collect",
+            ),
+            ("https://github.com/start", "http://github.com/start"),
+            (
+                "https://github.com/leak.png",
+                "https://evil.example/collect",
+            ),
+            ("https://api.github.com/start", "//evil.example/steal"),
+            ("https://api.github.com/start", "//user:pass@evil.example/x"),
+            ("https://api.github.com/start", "///evil.example/x"),
+            (
+                "https://api.github.com/start",
+                "https://api.github.com.evil.example/x",
+            ),
+            ("https://github.com/start", " https://evil.example/x"),
+            (
+                "https://api.github.com/start",
+                "https://user:pass@evil example/?access_token=pass",
+            ),
+        ] {
+            let fake = FakeTransport::default();
+            fake.reply(start, 302, &[("Location", location)], b"");
+            let got = get(&fake, start, Some(&secret)).map(|response| response.body);
+            assert_eq!(got, Err(HttpError::NotAllowed), "{location}");
+            assert_eq!(fake.urls(), [start], "{location}");
+            assert_token_only_on_api(&fake, &secret, location);
         }
 
         let fake = FakeTransport::default();
