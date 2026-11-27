@@ -847,84 +847,256 @@ fn parse_log_record(record: &[u8]) -> Option<Commit> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+    use crate::test_support::OID_A;
 
-    const OID_A: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-    const OID_B: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+    /// `git log -z --format=%H%x1f%s` output, and the `(oid, summary)` pairs
+    /// read from it. `None` rejects the whole log.
+    type Log = Option<&'static [(&'static str, &'static str)]>;
 
-    fn record(oid: &str, summary: &[u8]) -> Vec<u8> {
-        let mut out = oid.as_bytes().to_vec();
-        out.push(FIELD_SEPARATOR);
-        out.extend_from_slice(summary);
-        out.push(0);
-        out
+    const LOGS: &[(&[u8], Log)] = &[
+        (
+            b"abcd\x1fAwaken the Old Ones\0ff\x1fInitial commit\0",
+            Some(&[("abcd", "Awaken the Old Ones"), ("ff", "Initial commit")]),
+        ),
+        (b"", Some(&[])),
+        (b"\0\0\0", Some(&[])),
+        (
+            b"abcd\x1fsum\0ff\x1fnext",
+            Some(&[("abcd", "sum"), ("ff", "next")]),
+        ),
+        (b"abcd\x1f\0", Some(&[("abcd", "")])),
+        (b"abcd\x1fa\x1fb\0", Some(&[("abcd", "a\u{1f}b")])),
+        (b"abcd\x1fcaf\xe9\0", Some(&[("abcd", "caf\u{fffd}")])),
+        // `-z` cuts a subject at its NUL. The tail has no separator, so it is
+        // the rest of that subject and not a commit.
+        (
+            b"abcd\x1fsubject with NUL\0 and more\0",
+            Some(&[("abcd", "subject with NUL")]),
+        ),
+        (b"no separator\0", None),
+        (b"\x1fsubject without oid\0", None),
+        (b"not-hex\x1fsubject\0", None),
+        (b"ab\0cd\x1fsum", None),
+    ];
+
+    #[test]
+    fn parse_log_table() {
+        for (stdout, expected) in LOGS {
+            let commits = parse_log(stdout).map(|commits| {
+                commits
+                    .into_iter()
+                    .map(|commit| (commit.oid, commit.summary))
+                    .collect::<Vec<_>>()
+            });
+            let expected = expected.map(|pairs| {
+                pairs
+                    .iter()
+                    .map(|(oid, summary)| ((*oid).to_owned(), (*summary).to_owned()))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(commits, expected, "{stdout:?}");
+        }
     }
 
     #[test]
-    fn parses_records_in_order() {
-        let mut stdout = record(OID_A, b"Awaken the Old Ones");
-        stdout.extend(record(OID_B, b"Initial commit"));
-        assert_eq!(
-            parse_log(&stdout),
-            Some(vec![
-                Commit {
-                    oid: OID_A.to_owned(),
-                    summary: "Awaken the Old Ones".to_owned()
-                },
-                Commit {
-                    oid: OID_B.to_owned(),
-                    summary: "Initial commit".to_owned()
-                },
-            ])
-        );
+    fn short_oid_is_twelve_characters() {
+        let long = OID_A.to_owned();
+        for (oid, short) in [
+            ("", ""),
+            ("abc", "abc"),
+            ("0123456789ab", "0123456789ab"),
+            ("0123456789abc", "0123456789ab"),
+            (long.as_str(), "4b825dc642cb"),
+        ] {
+            let commit = Commit {
+                oid: oid.to_owned(),
+                summary: String::new(),
+            };
+            assert_eq!(commit.short_oid(), short, "{oid:?}");
+        }
+    }
+
+    const ADA_AND_GRACE: &[(&str, &str)] =
+        &[("Ada", "ada@example.com"), ("Grace", "grace@example.com")];
+
+    /// Trailer text, and the `(name, email)` pairs read from it in order.
+    const CO_AUTHORS: &[(&str, &[(&str, &str)])] = &[
+        ("", &[]),
+        ("Co-authored", &[]),
+        // `concat!` keeps the leading spaces; a `\` line continuation would strip them.
+        (
+            concat!(
+                "Co-authored-by: Ada Voss <ada@miskatonic.test>\r\n",
+                "CO-AUTHORED-BY:\tHerb\tWest\t<west@arkham.test>\t\r\n",
+                "Co-authored-by: Ada Voss <ADA@miskatonic.test>\n",
+                "Co-authored-by: First <Dup@Example.com>\n",
+                "co-authored-by: Second <dup@example.com>\n",
+                "Co-authored-by: <nameless@arkham.test>\n",
+                "Co-authored-by: <>\n",
+                "Co-authored-by: Nobody <>\n",
+                "Co-authored-by: Nobody < >\n",
+                "Co-authored-by: No Address\n",
+                "Reviewed-by: Someone <someone@arkham.test>\n",
+                "Co-authored-by: Odd <Name> <odd@arkham.test>\n",
+                "Co-authored-by: Tagged <user<host@example.com>\n",
+                "  Co-authored-by: Indented <in@example.com>\n",
+                "Co-authored-by: Ünïcödé Ñame <unicode@arkham.test>",
+            ),
+            &[
+                ("Ada Voss", "ada@miskatonic.test"),
+                ("Herb\tWest", "west@arkham.test"),
+                ("First", "Dup@Example.com"),
+                ("Odd <Name>", "odd@arkham.test"),
+                ("Tagged", "user<host@example.com"),
+                ("Ünïcödé Ñame", "unicode@arkham.test"),
+            ],
+        ),
+        // The key starts the line, in any case. Whitespace may follow the
+        // address; text may not.
+        ("  Co-authored-by: A <a@b.co>", &[]),
+        ("prefix Co-authored-by: Name <a@b.co>", &[]),
+        ("Co-authored-by: Name <a@b.co> trailing", &[]),
+        (
+            "cO-AuThOrEd-By:Herbert West   <west@arkham.test> \t ",
+            &[("Herbert West", "west@arkham.test")],
+        ),
+        // A bare CR and the Unicode separators end a line, as in VS Code.
+        (
+            "Co-authored-by: Ada <ada@example.com>\rCo-authored-by: Grace <grace@example.com>",
+            ADA_AND_GRACE,
+        ),
+        (
+            "Co-authored-by: Ada <ada@example.com>\n\rCo-authored-by: Grace <grace@example.com>",
+            ADA_AND_GRACE,
+        ),
+        (
+            "Co-authored-by: Ada <ada@example.com>\u{2028}Co-authored-by: Grace <grace@example.com>",
+            ADA_AND_GRACE,
+        ),
+        (
+            "Co-authored-by: Ada <ada@example.com>\u{2029}Co-authored-by: Grace <grace@example.com>",
+            ADA_AND_GRACE,
+        ),
+    ];
+
+    fn people(pairs: &[(&str, &str)]) -> Vec<Person> {
+        pairs
+            .iter()
+            .map(|(name, email)| Person::new(*name, *email))
+            .collect()
     }
 
     #[test]
-    fn empty_output_is_an_empty_history() {
-        assert_eq!(parse_log(b""), Some(Vec::new()));
+    fn parse_co_authors_table() {
+        for (text, expected) in CO_AUTHORS {
+            assert_eq!(parse_co_authors(text), people(expected), "{text:?}");
+        }
     }
 
     #[test]
-    fn missing_trailing_nul_is_accepted() {
-        let mut stdout = record(OID_A, b"Last");
-        stdout.pop();
-        assert_eq!(parse_log(&stdout).map(|commits| commits.len()), Some(1));
+    fn parse_co_authors_stays_linear_on_huge_trailers() {
+        let name = "N".repeat(60_000);
+        let email = format!("{}@x.test", "e".repeat(20_000));
+        let line = format!("Co-authored-by: {name} <{email}>");
+        assert_eq!(parse_co_authors(&line), [Person::new(name, email)]);
+        assert!(parse_co_authors(&"a".repeat(100_000)).is_empty());
+
+        // A megabyte of `<` before the closing `>`, and thousands of distinct
+        // co-authors, come from a repository and must parse in linear time.
+        let brackets = format!("Co-authored-by: a {}>b>", "<".repeat(1 << 20));
+        assert!(parse_co_authors(&brackets).is_empty());
+        let many: String = (0..20_000)
+            .map(|n| format!("Co-authored-by: N{n} <n{n}@x.test>\n"))
+            .collect();
+        assert_eq!(parse_co_authors(&many).len(), 20_000);
     }
 
-    #[test]
-    fn empty_subject_is_kept() {
-        let commits = parse_log(&record(OID_A, b"")).expect("parsable");
-        assert_eq!(commits[0].summary, "");
+    proptest! {
+        #![proptest_config(crate::test_support::proptest_config())]
+
+        #[test]
+        fn parse_co_authors_never_panics(text in "(?s).{0,200}") {
+            let _ = parse_co_authors(&text);
+        }
     }
 
-    #[test]
-    fn subject_may_contain_the_separator() {
-        let commits = parse_log(&record(OID_A, b"a\x1fb")).expect("parsable");
-        assert_eq!(commits[0].summary, "a\u{1f}b");
-    }
+    /// The author as recorded (no `.mailmap`), the co-author trailers, and
+    /// the author's aliases and the co-authors kept after folding.
+    type Fold = (
+        (&'static str, &'static str),
+        &'static [(&'static str, &'static str)],
+        &'static [&'static str],
+        &'static [(&'static str, &'static str)],
+    );
+
+    const FOLDS: &[Fold] = &[
+        // The author's address in any case or padding is the author. The
+        // author's name with another address is an alias, once.
+        (
+            ("Ada Lovelace", "Ada@Example.com"),
+            &[
+                ("Someone", "ada@example.com"),
+                ("Other Name", "  ADA@example.com  "),
+                ("ada lovelace", "Alt@Example.com"),
+                ("ADA LOVELACE", "alt@example.com"),
+                ("Ada Lovelace", "second@example.com"),
+                ("Grace Hopper", "grace@example.com"),
+            ],
+            &["Alt@Example.com", "second@example.com"],
+            &[("Grace Hopper", "grace@example.com")],
+        ),
+        // An empty or blank name is no alias key.
+        (
+            ("", "author@example.com"),
+            &[
+                ("", "other@example.com"),
+                ("   ", "space@example.com"),
+                ("Author", "author@example.com"),
+            ],
+            &[],
+            &[("", "other@example.com"), ("   ", "space@example.com")],
+        ),
+        (
+            ("   ", "ada@example.com"),
+            &[("Ada", "alt@example.com")],
+            &[],
+            &[("Ada", "alt@example.com")],
+        ),
+        // Names match trimmed, and the author keeps the name as written.
+        (
+            ("Ada ", "ada@example.com"),
+            &[("ada", "alt@example.com")],
+            &["alt@example.com"],
+            &[],
+        ),
+        // Without an address, a blank trailer address is the author's.
+        (
+            ("Ada", ""),
+            &[
+                ("Grace", "grace@example.com"),
+                ("Blank", "  "),
+                ("ada", "alt@example.com"),
+            ],
+            &["alt@example.com"],
+            &[("Grace", "grace@example.com")],
+        ),
+    ];
 
     #[test]
-    fn nul_in_subject_keeps_the_prefix_and_the_commit() {
-        let mut stdout = OID_A.as_bytes().to_vec();
-        stdout.push(FIELD_SEPARATOR);
-        stdout.extend_from_slice(b"subject with NUL\0 and more\0");
-        let commits = parse_log(&stdout).expect("a NUL in the subject must not drop the history");
-        assert_eq!(commits.len(), 1);
-        assert_eq!(commits[0].oid, OID_A);
-        assert_eq!(commits[0].summary, "subject with NUL");
-    }
-
-    #[test]
-    fn non_utf8_subject_is_replaced_not_rejected() {
-        let commits = parse_log(&record(OID_A, b"caf\xe9")).expect("parsable");
-        assert_eq!(commits[0].summary, "caf\u{fffd}");
-    }
-
-    #[test]
-    fn malformed_records_are_rejected() {
-        assert_eq!(parse_log(b"no separator\0"), None);
-        assert_eq!(parse_log(b"\x1fsubject without oid\0"), None);
-        assert_eq!(parse_log(b"not-hex\x1fsubject\0"), None);
+    fn fold_with_recorded_table() {
+        for &((name, email), co_authors, aliases, kept) in FOLDS {
+            let mut author = Person::new(name, email);
+            let recorded = author.clone();
+            let got = fold_with_recorded(&mut author, &recorded, people(co_authors));
+            let expected = Person {
+                aliases: aliases.iter().map(|alias| (*alias).to_owned()).collect(),
+                ..recorded
+            };
+            assert_eq!((author, got), (expected, people(kept)), "{name:?}");
+        }
     }
 
     /// What `%(trailers:only)` prints for these test messages: their
@@ -958,13 +1130,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_commit_detail_and_keeps_a_separator_in_the_message() {
+    fn parses_commit_detail_and_keeps_separators_and_nul_in_the_message() {
         let stdout = detail_record(
             OID_A,
             "cthulhu",
             "cthulhu@example.invalid",
             "2026-10-07 18:43",
-            b"Second\n\nThe body\x1f stays.",
+            b"Second\n\nThe body\x1f stays.\x00 and more",
         );
         assert_eq!(
             parse_commit_detail(&stdout),
@@ -973,7 +1145,7 @@ mod tests {
                 author: Person::new("cthulhu", "cthulhu@example.invalid"),
                 co_authors: Vec::new(),
                 authored_at: "2026-10-07 18:43".to_owned(),
-                message: "Second\n\nThe body\u{1f} stays.".to_owned(),
+                message: "Second\n\nThe body\u{1f} stays.\u{0} and more".to_owned(),
             })
         );
     }
@@ -1005,50 +1177,6 @@ mod tests {
                 "don-linux@users.noreply.github.com"
             ]
         );
-    }
-
-    #[test]
-    fn co_author_lines_follow_the_vs_code_rule() {
-        let text = "Co-authored-by: Ada Voss <ada@miskatonic.test>\n\
-                    CO-AUTHORED-BY:Herbert West   <west@arkham.test>   \n\
-                    Co-authored-by: Ada Voss <ADA@miskatonic.test>\n\
-                    Co-authored-by: <nameless@arkham.test>\n\
-                    Co-authored-by: No Address\n\
-                    Co-authored-by: Empty <>\n\
-                    Reviewed-by: Someone <someone@arkham.test>\n\
-                    Co-authored-by: Odd <Name> <odd@arkham.test>\n\
-                    Co-authored-by: Ünïcödé Ñame <unicode@arkham.test>";
-        let people = parse_co_authors(text);
-        assert_eq!(
-            people,
-            [
-                Person::new("Ada Voss", "ada@miskatonic.test"),
-                Person::new("Herbert West", "west@arkham.test"),
-                Person::new("Odd <Name>", "odd@arkham.test"),
-                Person::new("Ünïcödé Ñame", "unicode@arkham.test"),
-            ]
-        );
-    }
-
-    #[test]
-    fn co_author_key_must_start_the_line() {
-        assert!(parse_co_authors("  Co-authored-by: A <a@b>").is_empty());
-        assert!(parse_co_authors("Co-authored").is_empty());
-        assert!(parse_co_authors("").is_empty());
-    }
-
-    #[test]
-    fn commit_detail_keeps_a_nul_inside_the_message() {
-        let stdout = detail_record(
-            OID_A,
-            "cthulhu",
-            "cthulhu@example.invalid",
-            "2026-10-07 18:43",
-            b"subject with NUL\x00 and more",
-        );
-        let detail = parse_commit_detail(&stdout).expect("parsable");
-        assert!(detail.message.contains('\u{0}'));
-        assert!(detail.message.contains("and more"));
     }
 
     #[test]
@@ -1187,26 +1315,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_numstat_is_an_empty_file_list() {
-        assert_eq!(parse_numstat(b""), Some(Vec::new()));
-        assert_eq!(parse_numstat(b"\n"), Some(Vec::new()));
-        let empty = hover_record(b"Merge branch 'topic'\n", b"\n");
-        let hover = parse_commit_hover(&empty).expect("empty");
-        assert!(hover.files.is_empty());
-        assert_eq!(hover.stats, None);
-    }
-
-    #[test]
-    fn malformed_numstat_is_rejected() {
-        assert_eq!(parse_numstat(b"\nno tabs"), None);
-        assert_eq!(parse_numstat(b"\n1\t0\t\0only-old\0"), None);
-        assert_eq!(
-            parse_commit_hover(&hover_record(b"m", b"\nnot-numstat")),
-            None
-        );
-    }
-
-    #[test]
     fn tag_names_keep_a_comma_and_skip_empty_records() {
         assert_eq!(
             parse_tag_names(b"v1,0\nv0.0.1\n"),
@@ -1333,9 +1441,27 @@ mod tests {
     }
 
     #[test]
-    fn malformed_hover_records_are_rejected() {
+    fn empty_and_malformed_hover_records() {
+        for (numstat, files) in [
+            (&b""[..], Some(0)),
+            (b"\n", Some(0)),
+            (b"\nno tabs", None),
+            (b"\n1\t0\t\0only-old\0", None),
+        ] {
+            let parsed = parse_numstat(numstat).map(|files| files.len());
+            assert_eq!(parsed, files, "{numstat:?}");
+        }
+        let merge = parse_commit_hover(&hover_record(b"Merge branch 'topic'\n", b"\n"))
+            .expect("a merge with no changes");
+        assert!(merge.files.is_empty());
+        assert_eq!(merge.stats, None);
+
         assert_eq!(parse_commit_hover(b""), None);
         assert_eq!(parse_commit_hover(b"no record end"), None);
+        assert_eq!(
+            parse_commit_hover(&hover_record(b"m", b"\nnot-numstat")),
+            None
+        );
         let mut bad_time = hover_record(b"m", b"");
         let at = bad_time
             .windows(10)
@@ -1343,15 +1469,5 @@ mod tests {
             .expect("time");
         bad_time[at] = b'x';
         assert_eq!(parse_commit_hover(&bad_time), None);
-    }
-
-    #[test]
-    fn short_oid_is_twelve_characters() {
-        let commit = Commit {
-            oid: OID_A.to_owned(),
-            summary: String::new(),
-        };
-        assert_eq!(commit.short_oid(), "4b825dc642cb");
-        assert_eq!(short_oid("abc"), "abc");
     }
 }

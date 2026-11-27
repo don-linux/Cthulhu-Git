@@ -13,48 +13,11 @@ use std::path::PathBuf;
 
 use proptest::prelude::*;
 
-use super::log::{SHORT_OID_LEN, parse_log, short_oid};
 use crate::settings::{FILE_NAME, HistoryColumns, MAX_RECENT_REPOSITORIES, Settings};
 
 fn arb_text(max_chars: usize) -> impl Strategy<Value = String> {
     prop::collection::vec(any::<char>(), 0..=max_chars)
         .prop_map(|chars| chars.into_iter().collect())
-}
-
-fn arb_bytes() -> impl Strategy<Value = Vec<u8>> {
-    prop::collection::vec(any::<u8>(), 0..4096)
-}
-
-fn arb_hex_oid() -> impl Strategy<Value = String> {
-    prop::collection::vec(
-        prop::sample::select(b"0123456789abcdefABCDEF".to_vec()),
-        1..64,
-    )
-    .prop_map(|bytes| String::from_utf8(bytes).expect("hex is ascii"))
-}
-
-fn arb_log_records() -> impl Strategy<Value = Vec<u8>> {
-    prop::collection::vec(
-        (arb_hex_oid(), prop::collection::vec(any::<u8>(), 0..48)),
-        0..6,
-    )
-    .prop_map(|records| {
-        let mut out = Vec::new();
-        for (oid, summary) in records {
-            out.extend(oid.as_bytes());
-            out.push(0x1f);
-            out.extend(summary);
-            out.push(0);
-        }
-        out
-    })
-}
-
-fn arb_log_bytes() -> impl Strategy<Value = Vec<u8>> {
-    prop_oneof![
-        3 => arb_bytes(),
-        2 => arb_log_records(),
-    ]
 }
 
 fn arb_path_string() -> impl Strategy<Value = String> {
@@ -111,34 +74,6 @@ fn assert_recents_normalized(recents: &[PathBuf]) {
 
 proptest! {
     #![proptest_config(crate::test_support::proptest_config())]
-
-    #[test]
-    fn parse_log_never_panics_and_oids_are_hex(bytes in arb_log_bytes()) {
-        let parsed = parse_log(&bytes);
-        if let Some(commits) = &parsed {
-            for commit in commits {
-                assert!(!commit.oid.is_empty());
-                assert!(commit.oid.bytes().all(|byte| byte.is_ascii_hexdigit()));
-                assert!(std::str::from_utf8(commit.summary.as_bytes()).is_ok());
-                let short = commit.short_oid();
-                assert!(commit.oid.starts_with(short));
-                assert!(short.len() <= SHORT_OID_LEN);
-                assert!(short.len() <= commit.oid.len());
-                assert_eq!(short.len(), SHORT_OID_LEN.min(commit.oid.len()));
-            }
-        }
-    }
-
-    #[test]
-    fn short_oid_is_a_char_safe_prefix(text in arb_text(80)) {
-        let got = short_oid(&text);
-        assert!(text.starts_with(got));
-        let end = SHORT_OID_LEN.min(text.len());
-        if text.is_char_boundary(end) {
-            assert_eq!(got, &text[..end]);
-            assert_eq!(got.len(), end);
-        }
-    }
 
     #[test]
     fn settings_round_trip_normalizes_recents(
@@ -340,48 +275,4 @@ proptest! {
             assert_eq!(*value, if index == which { fallback[index] } else { good });
         }
     }
-}
-
-#[test]
-fn parse_log_empty_and_interior_nul() {
-    assert_eq!(parse_log(b""), Some(Vec::new()));
-    assert_eq!(parse_log(&[0, 0, 0]), Some(Vec::new()));
-    assert_eq!(parse_log(b"ab\0cd\x1fsum"), None);
-
-    let commits = parse_log(b"abcd\x1fsum\0ff\x1fnext").expect("log");
-    assert_eq!(commits.len(), 2);
-    assert_eq!(commits[0].oid, "abcd");
-    assert_eq!(commits[0].summary, "sum");
-    assert_eq!(commits[0].short_oid(), "abcd");
-    assert!(std::str::from_utf8(commits[0].summary.as_bytes()).is_ok());
-    assert_eq!(commits[1].oid, "ff");
-    assert_eq!(commits[1].summary, "next");
-    assert!(commits[1].short_oid().len() <= commits[1].oid.len());
-    assert!(commits[1].short_oid().len() <= SHORT_OID_LEN);
-}
-
-#[test]
-fn short_oid_ascii_len_is_min_twelve() {
-    let long = "deadbeef".repeat(8);
-    for text in ["", "a", "0123456789ab", "0123456789abc", long.as_str()] {
-        let got = short_oid(text);
-        assert!(text.starts_with(got));
-        assert_eq!(got.len(), SHORT_OID_LEN.min(text.len()));
-    }
-}
-
-/// Candidate bug G1. `str::get` refuses to split a multibyte character, and the
-/// fallback returns the whole string instead of a shorter prefix.
-#[test]
-fn short_oid_mid_character_returns_the_entire_string() {
-    let oid = format!("{}é", "a".repeat(11));
-    assert_eq!(oid.len(), 13);
-    assert!(!oid.is_char_boundary(SHORT_OID_LEN));
-    assert_eq!(short_oid(&oid), oid);
-    assert_eq!(short_oid(&oid).len(), 13);
-
-    let mut long = oid;
-    long.push_str(&"z".repeat(100));
-    assert_eq!(short_oid(&long), long);
-    assert_eq!(short_oid(&long).len(), 113);
 }

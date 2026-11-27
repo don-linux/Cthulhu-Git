@@ -9,15 +9,8 @@ use proptest::prelude::*;
 use proptest::string::string_regex;
 
 use super::graph::parse_graph_log;
-use super::log::fold_with_recorded;
 use super::remotes::parse_remote_config;
 use super::*;
-
-/// Folding when `.mailmap` left the author as recorded.
-fn fold_unmapped(author: &mut Person, co_authors: Vec<Person>) -> Vec<Person> {
-    let recorded = author.clone();
-    fold_with_recorded(author, &recorded, co_authors)
-}
 
 const COAUTHOR_KEY: &str = "co-authored-by:";
 
@@ -216,20 +209,6 @@ fn arb_email_addr() -> impl Strategy<Value = String> {
     string_regex("[a-z]{1,8}@[a-z]{1,8}\\.[a-z]{2,3}").unwrap()
 }
 
-fn arb_key() -> impl Strategy<Value = String> {
-    prop::collection::vec(any::<bool>(), COAUTHOR_KEY.len()).prop_map(|uppers| {
-        COAUTHOR_KEY
-            .chars()
-            .zip(uppers)
-            .map(
-                |(ch, upper)| {
-                    if upper { ch.to_ascii_uppercase() } else { ch }
-                },
-            )
-            .collect()
-    })
-}
-
 fn arb_field_name() -> impl Strategy<Value = String> {
     prop_oneof![
         1 => Just(String::new()),
@@ -311,66 +290,6 @@ fn arb_commit() -> impl Strategy<Value = GeneratedCommit> {
                 alias_author_name,
             },
         )
-}
-
-fn arb_coauthor_line() -> impl Strategy<Value = String> {
-    prop_oneof![
-        4 => (
-            arb_key(),
-            prop::sample::select(vec![" ", "\t", " \t", ""]),
-            arb_words(),
-            arb_email_addr(),
-            prop::sample::select(vec!["", " ", "\t", "   "]),
-        )
-            .prop_map(|(key, before, name, email, after)| {
-                format!("{key}{before}{name} <{email}>{after}")
-            }),
-        1 => (arb_words(), arb_words(), arb_email_addr()).prop_map(|(name, inner, email)| {
-            format!("Co-authored-by: {name} <{inner}> <{email}>")
-        }),
-        1 => (
-            arb_words(),
-            string_regex("[a-z]{1,6}").unwrap(),
-            arb_email_addr(),
-        )
-            .prop_map(|(name, local, email)| {
-                format!("Co-authored-by: {name} <{local}<{email}>")
-            }),
-        1 => prop::sample::select(vec![
-            "Co-authored-by: First <Dup@Example.com>\nCo-authored-by: Second <dup@example.com>"
-                .to_owned(),
-            "CO-AUTHORED-BY: First <Dup@Example.com>\r\nco-authored-by: Second <DUP@example.com>"
-                .to_owned(),
-        ]),
-        2 => prop::sample::select(vec![
-            "  Co-authored-by: A <a@b.co>".to_owned(),
-            "Co-authored-by: <>".to_owned(),
-            "Co-authored-by: Nobody <>".to_owned(),
-            "Co-authored-by: Nobody < >".to_owned(),
-            "Co-authored-by: Name <a@b.co> trailing".to_owned(),
-            "Reviewed-by: Name <a@b.co>".to_owned(),
-            "Co-authored-by: no-address".to_owned(),
-            "prefix Co-authored-by: Name <a@b.co>".to_owned(),
-        ]),
-        2 => string_regex("[A-Za-z0-9 .,:@<>_-]{0,40}").unwrap(),
-    ]
-}
-
-fn arb_person() -> impl Strategy<Value = Person> {
-    (
-        prop_oneof![
-            1 => Just(String::new()),
-            1 => Just("   ".to_owned()),
-            1 => Just("\t".to_owned()),
-            3 => arb_words(),
-        ],
-        prop_oneof![
-            1 => Just(String::new()),
-            1 => Just("  ".to_owned()),
-            4 => arb_email_addr(),
-        ],
-    )
-        .prop_map(|(name, email)| Person::new(name, email))
 }
 
 fn arb_remote_name() -> impl Strategy<Value = String> {
@@ -458,157 +377,6 @@ Co-authored-by: Other Person <other@example.com>\n";
     assert_eq!(commits[1].summary, "root");
     assert!(commits[1].co_authors.is_empty());
     assert!(commits[1].author.aliases.is_empty());
-}
-
-#[test]
-fn parse_co_authors_crlf_tabs_case_duplicates_and_brackets() {
-    // `concat!` keeps the leading spaces; a `\` line continuation would strip them.
-    let text = concat!(
-        "Co-authored-by: Ada Voss <ada@miskatonic.test>\r\n",
-        "CO-AUTHORED-BY:\tHerb\tWest\t<west@arkham.test>\t\r\n",
-        "Co-authored-by: Ada Voss <ADA@miskatonic.test>\n",
-        "Co-authored-by: First <Dup@Example.com>\n",
-        "Co-authored-by: Second <dup@example.com>\n",
-        "Co-authored-by: <nameless@arkham.test>\n",
-        "Co-authored-by: Nobody <>\n",
-        "Co-authored-by: Nobody < >\n",
-        "Co-authored-by: No Address\n",
-        "Reviewed-by: Someone <someone@arkham.test>\n",
-        "Co-authored-by: Odd <Name> <odd@arkham.test>\n",
-        "Co-authored-by: Tagged <user<host@example.com>\n",
-        "  Co-authored-by: Indented <in@example.com>\n",
-        "Co-authored-by: Ünïcödé Ñame <unicode@arkham.test>",
-    );
-    let expected = vec![
-        Person::new("Ada Voss", "ada@miskatonic.test"),
-        Person::new("Herb\tWest", "west@arkham.test"),
-        Person::new("First", "Dup@Example.com"),
-        Person::new("Odd <Name>", "odd@arkham.test"),
-        Person::new("Tagged", "user<host@example.com"),
-        Person::new("Ünïcödé Ñame", "unicode@arkham.test"),
-    ];
-    assert_eq!(reference_co_authors(text), expected);
-    assert_eq!(parse_co_authors(text), expected);
-    let indented = "  Co-authored-by: Indented <in@example.com>";
-    assert!(reference_co_authors(indented).is_empty());
-    assert!(parse_co_authors(indented).is_empty());
-}
-
-#[test]
-fn parse_co_authors_very_long_line() {
-    let name = "N".repeat(60_000);
-    let local = "e".repeat(20_000);
-    let email = format!("{local}@x.test");
-    let line = format!("Co-authored-by: {name} <{email}>");
-    let parsed = parse_co_authors(&line);
-    assert_eq!(parsed.len(), 1);
-    assert_eq!(parsed[0].name, name);
-    assert_eq!(parsed[0].email, email);
-    assert_eq!(reference_co_authors(&line), parsed);
-
-    let noise = "a".repeat(100_000);
-    assert!(parse_co_authors(&noise).is_empty());
-    assert!(reference_co_authors(&noise).is_empty());
-
-    // A megabyte of `<` before the closing `>`, and thousands of distinct
-    // co-authors, must parse in linear time.
-    let brackets = format!("Co-authored-by: a {}>b>", "<".repeat(1 << 20));
-    assert!(parse_co_authors(&brackets).is_empty());
-    let many: String = (0..20_000)
-        .map(|n| format!("Co-authored-by: N{n} <n{n}@x.test>\n"))
-        .collect();
-    assert_eq!(parse_co_authors(&many).len(), 20_000);
-}
-
-fn bare_cr_coauthor_samples() -> [&'static str; 3] {
-    [
-        "Co-authored-by: Ada <ada@example.com>\rCo-authored-by: Grace <grace@example.com>",
-        "Co-authored-by: Ada <ada@example.com>\u{2028}Co-authored-by: Grace <grace@example.com>",
-        "Co-authored-by: Ada <ada@example.com>\n\rCo-authored-by: Grace <grace@example.com>",
-    ]
-}
-
-#[test]
-fn reference_co_authors_splits_on_bare_cr_like_the_vscode_regex() {
-    let expected = vec![
-        Person::new("Ada", "ada@example.com"),
-        Person::new("Grace", "grace@example.com"),
-    ];
-    for text in bare_cr_coauthor_samples() {
-        assert_eq!(reference_co_authors(text), expected, "{text:?}");
-    }
-}
-
-#[test]
-fn parse_co_authors_splits_on_bare_cr_like_the_vscode_regex() {
-    let expected = vec![
-        Person::new("Ada", "ada@example.com"),
-        Person::new("Grace", "grace@example.com"),
-    ];
-    for text in bare_cr_coauthor_samples() {
-        assert_eq!(parse_co_authors(text), expected, "{text:?}");
-    }
-}
-
-#[test]
-fn fold_co_authors_email_case_name_alias_and_empty_name() {
-    let mut author = Person::new("Ada Lovelace", "Ada@Example.com");
-    let kept = fold_unmapped(
-        &mut author,
-        vec![
-            Person::new("Someone", "ada@example.com"),
-            Person::new("Other Name", "  ADA@example.com  "),
-            Person::new("ada lovelace", "Alt@Example.com"),
-            Person::new("ADA LOVELACE", "alt@example.com"),
-            Person::new("Ada Lovelace", "second@example.com"),
-            Person::new("Grace Hopper", "grace@example.com"),
-        ],
-    );
-    assert_eq!(author.name, "Ada Lovelace");
-    assert_eq!(author.email, "Ada@Example.com");
-    assert_eq!(
-        author.aliases,
-        vec![
-            "Alt@Example.com".to_owned(),
-            "second@example.com".to_owned(),
-        ]
-    );
-    assert_eq!(kept, vec![Person::new("Grace Hopper", "grace@example.com")]);
-
-    let mut blank = Person::new("", "author@example.com");
-    let kept = fold_unmapped(
-        &mut blank,
-        vec![
-            Person::new("", "other@example.com"),
-            Person::new("   ", "space@example.com"),
-            Person::new("Author", "author@example.com"),
-        ],
-    );
-    assert!(
-        blank.aliases.is_empty(),
-        "an empty name is not an alias key"
-    );
-    assert_eq!(
-        kept,
-        vec![
-            Person::new("", "other@example.com"),
-            Person::new("   ", "space@example.com"),
-        ]
-    );
-
-    let mut spaced = Person::new("Ada ", "ada@example.com");
-    let kept = fold_unmapped(&mut spaced, vec![Person::new("ada", "alt@example.com")]);
-    assert!(kept.is_empty());
-    assert_eq!(spaced.aliases, vec!["alt@example.com".to_owned()]);
-    assert_eq!(spaced.name, "Ada ");
-
-    let mut whitespace_name = Person::new("   ", "ada@example.com");
-    let kept = fold_unmapped(
-        &mut whitespace_name,
-        vec![Person::new("Ada", "alt@example.com")],
-    );
-    assert!(whitespace_name.aliases.is_empty());
-    assert_eq!(kept, vec![Person::new("Ada", "alt@example.com")]);
 }
 
 #[test]
@@ -725,65 +493,6 @@ proptest! {
                     .iter()
                     .all(|person| norm_email(&person.email) != "decoy@example.invalid")
             );
-        }
-    }
-
-    #[test]
-    fn parse_co_authors_never_panics(text in prop::collection::vec(any::<char>(), 0..=200)) {
-        let text: String = text.into_iter().collect();
-        let _ = parse_co_authors(&text);
-    }
-
-    #[test]
-    fn parse_co_authors_matches_vscode_regex(
-        lines in prop::collection::vec(arb_coauthor_line(), 0..=8),
-        crlf in any::<bool>(),
-    ) {
-        let nl = if crlf { "\r\n" } else { "\n" };
-        let text = lines.join(nl);
-        assert_eq!(parse_co_authors(&text), reference_co_authors(&text));
-    }
-
-    #[test]
-    fn fold_co_authors_keeps_author_identity(
-        author in arb_person(),
-        co_authors in prop::collection::vec(arb_person(), 0..=6),
-    ) {
-        let mut folded = author.clone();
-        let kept = fold_unmapped(&mut folded, co_authors.clone());
-        assert_eq!(folded.name, author.name);
-        assert_eq!(folded.email, author.email);
-        let author_key = norm_email(&author.email);
-        let author_name = author.name.trim().to_lowercase();
-        if author_name.is_empty() {
-            assert!(folded.aliases.is_empty());
-        }
-        for person in &kept {
-            assert_ne!(person.email_key(), author_key);
-        }
-        for alias in &folded.aliases {
-            let key = norm_email(alias);
-            assert_ne!(key, author_key);
-            assert!(co_authors.iter().any(|person| {
-                norm_email(&person.email) == key
-                    && person.name.trim().to_lowercase() == author_name
-            }));
-        }
-        for person in &co_authors {
-            let key = norm_email(&person.email);
-            if key == author_key {
-                assert!(kept.iter().all(|kept| kept.email_key() != key));
-                assert!(folded.aliases.iter().all(|alias| norm_email(alias) != key));
-                continue;
-            }
-            let same_name =
-                !author_name.is_empty() && person.name.trim().to_lowercase() == author_name;
-            if same_name {
-                assert!(kept.iter().all(|kept| kept.email_key() != key));
-                assert!(folded.aliases.iter().any(|alias| norm_email(alias) == key));
-            } else {
-                assert!(kept.iter().any(|kept| kept.name == person.name && kept.email == person.email));
-            }
         }
     }
 
