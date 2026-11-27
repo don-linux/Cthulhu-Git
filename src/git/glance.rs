@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use super::exec::{Git, GitError};
+use super::exec::{Cr, Git, GitError, trim_eol};
 use super::log;
 use super::repo::Head;
 
@@ -68,15 +68,7 @@ fn commit_glance(git: &Git, root: &Path, head: &Head) -> Result<Option<CommitGla
         "HEAD",
         "--",
     ];
-    let output = git.require_ok(root, &args)?;
-    parse_commit_glance(&output.stdout)
-        .ok_or_else(|| {
-            super::exec::rejected(
-                &format!("git {}", args.join(" ")),
-                "unrecognized log output",
-            )
-        })
-        .map(Some)
+    git.read(root, &args, "log", parse_commit_glance).map(Some)
 }
 
 fn upstream_divergence(git: &Git, root: &Path) -> Result<Option<Divergence>, GitError> {
@@ -98,14 +90,7 @@ fn parse_commit_glance(stdout: &[u8]) -> Option<CommitGlance> {
     if stdout.is_empty() {
         return None;
     }
-    let mut record = stdout.to_vec();
-    if record.last() == Some(&b'\n') {
-        record.pop();
-        if record.last() == Some(&b'\r') {
-            record.pop();
-        }
-    }
-    let [when, subject] = log::split_fields(&record)?;
+    let [when, subject] = log::split_fields(trim_eol(stdout, Cr::AfterLf))?;
     if !is_local_stamp(when) {
         return None;
     }
@@ -140,17 +125,11 @@ fn is_local_stamp(stamp: &[u8]) -> bool {
 }
 
 fn parse_divergence(stdout: &[u8]) -> Option<Divergence> {
-    let mut record = stdout.to_vec();
-    if record.last() == Some(&b'\n') {
-        record.pop();
-        if record.last() == Some(&b'\r') {
-            record.pop();
-        }
-    }
+    let record = trim_eol(stdout, Cr::AfterLf);
     if record.is_empty() || record.contains(&b'\n') || record.contains(&b'\r') {
         return None;
     }
-    let text = std::str::from_utf8(&record).ok()?;
+    let text = std::str::from_utf8(record).ok()?;
     let (ahead, behind) = text.split_once('\t')?;
     if ahead.is_empty() || behind.is_empty() || behind.contains('\t') {
         return None;
@@ -174,6 +153,15 @@ mod tests {
                 Some(("2026-11-10 01:23", "Awaken\u{1f}the sleeper")),
             ),
             (b"2026-11-10 01:23\x1f\n", Some(("2026-11-10 01:23", ""))),
+            // Only the CR of a CRLF is git's line ending.
+            (
+                b"2026-11-10 01:23\x1fA\r\n",
+                Some(("2026-11-10 01:23", "A")),
+            ),
+            (
+                b"2026-11-10 01:23\x1fA\r",
+                Some(("2026-11-10 01:23", "A\r")),
+            ),
             (b"2026-11-10 01:23\n", None),
             (b"\x1fAwaken\n", None),
             (b"yesterday\x1fAwaken\n", None),

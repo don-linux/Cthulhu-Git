@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use super::exec::{Git, GitError};
+use super::exec::{Cr, Git, GitError, trim_eol};
 use super::repo::Head;
 
 const FIELD_SEPARATOR: u8 = 0x1f;
@@ -67,13 +67,7 @@ pub fn branches(git: &Git, root: &Path, head: &Head) -> Result<Vec<Branch>, GitE
         "--format=%(refname:lstrip=2){separator}%(objectname){separator}%(upstream:short){separator}%(upstream){separator}%(upstream:track){separator}%(committerdate:unix)"
     );
     let args = ["for-each-ref", format.as_str(), "refs/heads"];
-    let output = git.require_ok(root, &args)?;
-    let refs = parse_refs(&output.stdout).ok_or_else(|| {
-        super::exec::rejected(
-            &format!("git {}", args.join(" ")),
-            "unrecognized for-each-ref output",
-        )
-    })?;
+    let refs = git.read(root, &args, "for-each-ref", parse_refs)?;
 
     let mut rows = Vec::with_capacity(refs.len());
     for parsed in refs {
@@ -95,28 +89,20 @@ fn commit_count(git: &Git, root: &Path, name: &str) -> Result<u64, GitError> {
     // The revision is a full ref, so it cannot be read as an option. `--`
     // belongs after the revision; putting it first makes git treat the ref as
     // a path and reject the command.
-    let args = ["rev-list", "--count", spec.as_str()];
-    let output = git.require_ok(root, &args)?;
-    parse_count(&output.stdout).ok_or_else(|| {
-        super::exec::rejected(
-            &format!("git {}", args.join(" ")),
-            "unrecognized rev-list output",
-        )
-    })
+    git.read(
+        root,
+        &["rev-list", "--count", spec.as_str()],
+        "rev-list",
+        parse_count,
+    )
 }
 
 fn parse_count(stdout: &[u8]) -> Option<u64> {
-    let mut bytes = stdout.to_vec();
-    if bytes.last() == Some(&b'\n') {
-        bytes.pop();
-    }
-    if bytes.last() == Some(&b'\r') {
-        bytes.pop();
-    }
+    let bytes = trim_eol(stdout, Cr::Any);
     if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    std::str::from_utf8(&bytes).ok()?.parse().ok()
+    std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
 /// `name SEP oid SEP upstream SEP upstream-ref SEP track SEP committer-time`,

@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use super::exec::{Git, GitError};
+use super::exec::{Cr, Git, GitError, trim_eol};
 use super::log::short_oid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,7 +67,7 @@ fn repository_root(git: &Git, dir: &Path) -> Result<PathBuf, GitError> {
 
     if stdout_text(&bare.stdout) == "true" {
         let git_dir = git.require_ok(dir, &["rev-parse", "--absolute-git-dir"])?;
-        return git_path(git_dir.stdout);
+        return git_path(&git_dir.stdout);
     }
 
     show_toplevel(git, dir)
@@ -75,20 +75,15 @@ fn repository_root(git: &Git, dir: &Path) -> Result<PathBuf, GitError> {
 
 fn show_toplevel(git: &Git, dir: &Path) -> Result<PathBuf, GitError> {
     let output = git.require_ok(dir, &["rev-parse", "--show-toplevel"])?;
-    git_path(output.stdout)
+    git_path(&output.stdout)
 }
 
-fn git_path(stdout: Vec<u8>) -> Result<PathBuf, GitError> {
-    let mut stdout = stdout;
-    // Git adds one trailing newline (`\n` on Unix, `\r\n` on Windows). A
-    // directory whose name itself ends in CR or LF must keep that byte.
-    if stdout.last() == Some(&b'\n') {
-        stdout.pop();
-    }
-    #[cfg(windows)]
-    if stdout.last() == Some(&b'\r') {
-        stdout.pop();
-    }
+/// Git ends a line with `\n` on Unix and `\r\n` on Windows. A directory whose
+/// name itself ends in CR or LF must keep that byte.
+const LINE_CR: Cr = if cfg!(windows) { Cr::Any } else { Cr::Kept };
+
+fn git_path(stdout: &[u8]) -> Result<PathBuf, GitError> {
+    let stdout = trim_eol(stdout, LINE_CR);
     if stdout.is_empty() {
         return Err(super::exec::rejected("git rev-parse", "empty output"));
     }
@@ -143,26 +138,18 @@ fn detached_head(git: &Git, root: &Path) -> Result<Head, GitError> {
 }
 
 fn stdout_text(stdout: &[u8]) -> String {
-    let mut bytes = stdout.to_vec();
-    if bytes.last() == Some(&b'\n') {
-        bytes.pop();
-    }
-    #[cfg(windows)]
-    if bytes.last() == Some(&b'\r') {
-        bytes.pop();
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
+    String::from_utf8_lossy(trim_eol(stdout, LINE_CR)).into_owned()
 }
 
 #[cfg(unix)]
-fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
-    use std::os::unix::ffi::OsStringExt;
-    PathBuf::from(std::ffi::OsString::from_vec(bytes))
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
 }
 
 #[cfg(not(unix))]
-fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 #[cfg(test)]

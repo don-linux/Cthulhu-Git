@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use super::exec::{Git, GitError};
+use super::exec::{Cr, Git, GitError, trim_eol};
 use super::repo::Head;
 
 /// Hash prefix length shown everywhere in the UI. Twelve hex digits is the
@@ -260,28 +260,13 @@ pub fn latest_commit(
         "HEAD",
         "--",
     ];
-    let output = git.require_ok(root, &args)?;
-    parse_commit_detail(&output.stdout)
-        .ok_or_else(|| {
-            super::exec::rejected(
-                &format!("git {}", args.join(" ")),
-                "unrecognized log output",
-            )
-        })
-        .map(Some)
+    git.read(root, &args, "log", parse_commit_detail).map(Some)
 }
 
 /// Parses `git log -1` with [`COMMIT_FORMAT`]. Only git's record newline
 /// leaves the message, and the date must be there.
 pub(crate) fn parse_commit_detail(stdout: &[u8]) -> Option<CommitDetail> {
-    let mut record = stdout.to_vec();
-    if record.last() == Some(&b'\n') {
-        record.pop();
-        if record.last() == Some(&b'\r') {
-            record.pop();
-        }
-    }
-    let commit = parse_commit(&record)?;
+    let commit = parse_commit(trim_eol(stdout, Cr::AfterLf))?;
     if commit.authored_at.is_empty() {
         return None;
     }
@@ -384,13 +369,7 @@ pub fn commit_hover(git: &Git, root: &Path, oid: &str) -> Result<CommitHover, Gi
         oid,
         "--",
     ];
-    let output = git.require_ok(root, &args)?;
-    let mut hover = parse_commit_hover(&output.stdout).ok_or_else(|| {
-        super::exec::rejected(
-            &format!("git {}", args.join(" ")),
-            "unrecognized show output",
-        )
-    })?;
+    let mut hover = git.read(root, &args, "show", parse_commit_hover)?;
     hover.tags = commit_tags(git, root, &hover.oid);
     Ok(hover)
 }

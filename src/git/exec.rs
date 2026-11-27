@@ -238,6 +238,53 @@ impl Git {
 
         Err(classify_failure(cwd, args, output.status, &output.stderr))
     }
+
+    /// [`Git::require_ok`], then `parse` on stdout. Output that `parse`
+    /// refuses is [`GitError::Rejected`] as unrecognized `what` output.
+    pub(crate) fn read<T>(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        what: &str,
+        parse: impl FnOnce(&[u8]) -> Option<T>,
+    ) -> Result<T, GitError> {
+        let output = self.require_ok(cwd, args)?;
+        parse(&output.stdout).ok_or_else(|| {
+            rejected(
+                &format!("git {}", args.join(" ")),
+                format!("unrecognized {what} output"),
+            )
+        })
+    }
+}
+
+/// Which CR [`trim_eol`] removes once git's LF is gone.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Cr {
+    /// A CR at the end, whether or not an LF followed it.
+    Any,
+    /// Only the CR of a CRLF.
+    AfterLf,
+    /// None: a directory whose name ends in CR keeps it.
+    Kept,
+}
+
+/// `bytes` without git's line ending: one LF, then one CR as `cr` says.
+pub(crate) fn trim_eol(bytes: &[u8], cr: Cr) -> &[u8] {
+    let (rest, had_lf) = match bytes.strip_suffix(b"\n") {
+        Some(rest) => (rest, true),
+        None => (bytes, false),
+    };
+    let strip_cr = match cr {
+        Cr::Any => true,
+        Cr::AfterLf => had_lf,
+        Cr::Kept => false,
+    };
+    if strip_cr {
+        rest.strip_suffix(b"\r").unwrap_or(rest)
+    } else {
+        rest
+    }
 }
 
 impl GitVersion {

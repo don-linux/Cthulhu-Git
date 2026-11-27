@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use super::exec::{Git, GitError};
+use super::exec::{Cr, Git, GitError, trim_eol};
 use super::log::{Person, author_and_co_authors, is_oid, split_fields};
 
 /// Between the subject and the trailer block: a different byte from the
@@ -140,25 +140,15 @@ struct ExtraParent {
 /// Full hash of `HEAD`. Used when HEAD is detached, so that commit stays in
 /// the graph with no branch checkbox of its own.
 pub fn head_commit_oid(git: &Git, root: &Path) -> Result<String, GitError> {
-    let args = ["rev-parse", "--verify", "HEAD"];
-    let output = git.require_ok(root, &args)?;
-    parse_oid(&output.stdout).ok_or_else(|| {
-        super::exec::rejected(
-            &format!("git {}", args.join(" ")),
-            "unrecognized rev-parse output",
-        )
-    })
-}
-
-fn parse_oid(stdout: &[u8]) -> Option<String> {
-    let mut bytes = stdout.to_vec();
-    if bytes.last() == Some(&b'\n') {
-        bytes.pop();
-    }
-    if bytes.last() == Some(&b'\r') {
-        bytes.pop();
-    }
-    is_oid(&bytes).then(|| String::from_utf8_lossy(&bytes).into_owned())
+    git.read(
+        root,
+        &["rev-parse", "--verify", "HEAD"],
+        "rev-parse",
+        |stdout| {
+            let oid = trim_eol(stdout, Cr::Any);
+            is_oid(oid).then(|| String::from_utf8_lossy(oid).into_owned())
+        },
+    )
 }
 
 /// Checked branches, in sidebar order, plus detached `HEAD`.
@@ -298,13 +288,7 @@ pub fn branch_graph(
     owned.push("--".to_owned());
     let args: Vec<&str> = owned.iter().map(String::as_str).collect();
 
-    let output = git.require_ok(root, &args)?;
-    let mut commits = parse_graph_log(&output.stdout).ok_or_else(|| {
-        super::exec::rejected(
-            &format!("git {}", args.join(" ")),
-            "unrecognized log output",
-        )
-    })?;
+    let mut commits = git.read(root, &args, "log", parse_graph_log)?;
     let truncated = commits.len() > limit;
     commits.truncate(limit);
 
