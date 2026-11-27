@@ -211,17 +211,7 @@ impl Git {
     ) -> Result<GitOutput, GitError> {
         let command_line = format!("git {}", args.join(" "));
         capture(
-            command(&self.path)
-                .current_dir(cwd)
-                .arg("--no-optional-locks")
-                .arg("--no-pager")
-                .arg("--no-replace-objects")
-                // Empty, not `false`: Git 2.16–2.35 read the value as a hook
-                // program and would run a command named `false` on every
-                // index read. Empty turns fsmonitor off in every version.
-                .args(["-c", "core.fsmonitor="])
-                .args(["-c", "log.showSignature=false"])
-                .args(args),
+            harden(&mut command(&self.path), cwd, args),
             timeout,
             &command_line,
             Some(cwd),
@@ -356,6 +346,35 @@ fn apply_child_path(command: &mut Command, parent_path: Option<&OsStr>, extras: 
 /// The single place where git processes are built, so every invocation
 /// (including `--version`) gets the same environment and window flags.
 fn command(program: &Path) -> Command {
+    // Finder's PATH is `/usr/bin:/bin:/usr/sbin:/sbin`, which hides Homebrew
+    // helpers such as `git-credential-manager` and a Homebrew `ssh`. Append
+    // those directories on macOS only, after the user's entries.
+    let path_extras = if cfg!(target_os = "macos") {
+        macos_gui_path_dirs(|dir| dir.is_dir())
+    } else {
+        Vec::new()
+    };
+    command_with_env(program, std::env::vars_os(), &path_extras)
+}
+
+/// [`command`] for a parent whose environment is `parent_env`, with
+/// `path_extras` appended to its PATH.
+///
+/// The child still inherits the real environment of this process: only the
+/// changes against `parent_env` are recorded on the command, which is why
+/// [`command`] passes `std::env::vars_os()`.
+fn command_with_env(
+    program: &Path,
+    parent_env: impl IntoIterator<Item = (OsString, OsString)>,
+    path_extras: &[PathBuf],
+) -> Command {
+    let parent_env: Vec<(OsString, OsString)> = parent_env.into_iter().collect();
+    let inherited = |name: &str| {
+        parent_env
+            .iter()
+            .find(|(key, _)| key.to_str().is_some_and(|key| env_names_match(key, name)))
+            .map(|(_, value)| value.as_os_str())
+    };
     let mut command = Command::new(program);
     command
         .stdin(Stdio::null())
@@ -364,7 +383,7 @@ fn command(program: &Path) -> Command {
 
     // Remove inherited names before setting the ones this process owns.
     // `env_remove` after `env` would drop `GIT_TERMINAL_PROMPT` too.
-    for (key, _) in std::env::vars_os() {
+    for (key, _) in &parent_env {
         if key.to_str().is_some_and(inherited_git_var_is_cleared) {
             command.env_remove(key);
         }
@@ -382,24 +401,13 @@ fn command(program: &Path) -> Command {
     // Put a user-set value back unchanged. Otherwise disable lazy fetches of
     // promisor objects. Git 2.15 does not read the name; unknown environment
     // variables are unused, so the assignment is safe on the version floor.
-    match std::env::var_os("GIT_NO_LAZY_FETCH") {
-        Some(value) => {
-            command.env("GIT_NO_LAZY_FETCH", value);
-        }
-        None => {
-            command.env("GIT_NO_LAZY_FETCH", "1");
-        }
-    }
+    command.env(
+        "GIT_NO_LAZY_FETCH",
+        inherited("GIT_NO_LAZY_FETCH").unwrap_or(OsStr::new("1")),
+    );
 
-    // Finder's PATH is `/usr/bin:/bin:/usr/sbin:/sbin`, which hides Homebrew
-    // helpers such as `git-credential-manager` and a Homebrew `ssh`. Append
-    // those directories on macOS only, after the user's entries.
-    let extras = if cfg!(target_os = "macos") {
-        macos_gui_path_dirs(|dir| dir.is_dir())
-    } else {
-        Vec::new()
-    };
-    apply_child_path(&mut command, std::env::var_os("PATH").as_deref(), &extras);
+    // Windows spells it `Path`; `inherited` compares names as the platform does.
+    apply_child_path(&mut command, inherited("PATH"), path_extras);
 
     #[cfg(unix)]
     {
@@ -417,6 +425,23 @@ fn command(program: &Path) -> Command {
     }
 
     command
+}
+
+/// Points `command` at `cwd` and puts `args` after the options every
+/// [`Git::run`] gets. Command-line options win over any config file, so a
+/// repository cannot turn these back on.
+fn harden<'a>(command: &'a mut Command, cwd: &Path, args: &[&str]) -> &'a mut Command {
+    command
+        .current_dir(cwd)
+        .arg("--no-optional-locks")
+        .arg("--no-pager")
+        .arg("--no-replace-objects")
+        // Empty, not `false`: Git 2.16–2.35 read the value as a hook
+        // program and would run a command named `false` on every
+        // index read. Empty turns fsmonitor off in every version.
+        .args(["-c", "core.fsmonitor="])
+        .args(["-c", "log.showSignature=false"])
+        .args(args)
 }
 
 struct CappedRead {
@@ -1011,41 +1036,6 @@ mod tests {
     }
 
     #[test]
-    fn kept_git_variables_are_ssh_and_askpass_only() {
-        for cleared in [
-            "GIT_DIR",
-            "GIT_EXEC_PATH",
-            "GIT_CONFIG_COUNT",
-            "GIT_CONFIG_KEY_0",
-            "GIT_CONFIG_PARAMETERS",
-            "GIT_TRACE",
-        ] {
-            assert!(inherited_git_var_is_cleared(cleared), "{cleared}");
-        }
-        for other_case in ["Git_Dir", "git_work_tree"] {
-            assert_eq!(
-                inherited_git_var_is_cleared(other_case),
-                cfg!(windows),
-                "{other_case}"
-            );
-        }
-        for kept in [
-            "GIT_SSH",
-            "GIT_SSH_COMMAND",
-            "GIT_SSH_VARIANT",
-            "GIT_ASKPASS",
-            "git_ssh_command",
-            "GITHUB_TOKEN",
-            "SSH_AUTH_SOCK",
-            "PATH",
-            "HOME",
-            "GH_TOKEN",
-        ] {
-            assert!(!inherited_git_var_is_cleared(kept), "{kept}");
-        }
-    }
-
-    #[test]
     fn error_messages_name_the_override_variable() {
         let error = GitError::BadOverride(PathBuf::from("/nope"));
         assert_eq!(
@@ -1063,90 +1053,183 @@ mod tests {
         }
     }
 
-    fn joined(dirs: &[String]) -> OsString {
+    fn joined(dirs: &[&str]) -> OsString {
         std::env::join_paths(dirs).expect("PATH")
     }
 
+    /// What a built command does to one variable: `None` leaves the inherited
+    /// value, `Some(None)` removes it, `Some(Some(value))` sets it.
+    type EnvChange = Option<Option<OsString>>;
+
+    const INHERITED: EnvChange = None;
+    const REMOVED: EnvChange = Some(None);
+
+    fn set(value: impl Into<OsString>) -> EnvChange {
+        Some(Some(value.into()))
+    }
+
+    fn env_change(command: &Command, name: &str) -> EnvChange {
+        command
+            .get_envs()
+            .find(|(key, _)| key.to_str().is_some_and(|key| env_names_match(key, name)))
+            .map(|(_, value)| value.map(OsStr::to_os_string))
+    }
+
     #[test]
-    fn git_child_path_drops_relative_entries_and_appends_missing_extras() {
-        let [usr, bin, custom, brew] = ["/usr/bin", "/bin", "/custom/bin", "/brew/bin"].map(abs);
+    fn git_runs_behind_the_hardening_prefix() {
+        const PREFIX: [&str; 7] = [
+            "--no-optional-locks",
+            "--no-pager",
+            "--no-replace-objects",
+            "-c",
+            "core.fsmonitor=",
+            "-c",
+            "log.showSignature=false",
+        ];
+        let cwd = Path::new("repo");
+        // `switch_branch` runs through `Git::run`. A branch named like an
+        // option stays one argument after `--`, behind the prefix.
+        for case in [
+            "-switch",
+            "--upload-pack=evil",
+            "--force",
+            "-f",
+            "--detach",
+            "--orphan",
+            "--guess",
+            "-B",
+        ] {
+            let request = crate::git::sync::switch_request((2, 43, 0), case)
+                .unwrap_or_else(|| panic!("{case:?}"));
+            let mut command = Command::new("git");
+            harden(&mut command, cwd, &request.args());
+            let expected: Vec<&OsStr> = PREFIX
+                .into_iter()
+                .chain(["switch", "--no-guess", "--", case])
+                .map(OsStr::new)
+                .collect();
+            assert_eq!(command.get_args().collect::<Vec<_>>(), expected, "{case:?}");
+            assert_eq!(command.get_current_dir(), Some(cwd), "{case:?}");
+        }
+    }
+
+    #[test]
+    fn git_env_drops_inherited_git_vars_and_relative_path_entries() {
+        let other_case = if cfg!(windows) { REMOVED } else { INHERITED };
+        // Every case inherits all of these, each set to a hostile value.
+        let hostile = [
+            ("GIT_DIR", REMOVED),
+            ("GIT_EXEC_PATH", REMOVED),
+            ("GIT_CONFIG_COUNT", REMOVED),
+            ("GIT_CONFIG_KEY_0", REMOVED),
+            ("GIT_CONFIG_VALUE_0", REMOVED),
+            ("GIT_CONFIG_PARAMETERS", REMOVED),
+            ("GIT_TRACE", REMOVED),
+            // Git for Windows reads these as `GIT_WORK_TREE` and `GIT_INDEX_FILE`.
+            ("Git_Work_Tree", other_case.clone()),
+            ("git_index_file", other_case),
+            // ssh, askpass and tokens keep working.
+            ("GIT_SSH", INHERITED),
+            ("GIT_SSH_COMMAND", INHERITED),
+            ("GIT_SSH_VARIANT", INHERITED),
+            ("GIT_ASKPASS", INHERITED),
+            ("git_ssh_command", INHERITED),
+            ("GITHUB_TOKEN", INHERITED),
+            ("GH_TOKEN", INHERITED),
+            ("SSH_AUTH_SOCK", INHERITED),
+            ("HOME", INHERITED),
+            // Owned names replace the inherited value.
+            ("GIT_TERMINAL_PROMPT", set("0")),
+            ("GIT_OPTIONAL_LOCKS", set("0")),
+            ("GIT_PAGER", set("cat")),
+            ("LC_ALL", set("C")),
+            ("LANGUAGE", set("C")),
+        ];
+        let dirs = ["/usr/bin", "/bin", "/custom/bin", "/brew/bin"].map(abs);
+        let [usr, bin, custom, brew] = dirs.each_ref().map(String::as_str);
         let homebrew = macos_gui_path_dirs(|_| true);
-        let [brew_dir, local_dir] = [MACOS_HOMEBREW_BIN, MACOS_USR_LOCAL_BIN].map(String::from);
-        for (parent, extras, expected) in [
+        let on_windows =
+            |windows: EnvChange, elsewhere| if cfg!(windows) { windows } else { elsewhere };
+        // (also inherited, PATH extras, PATH, GIT_NO_LAZY_FETCH)
+        let cases = [
+            (vec![], vec![], INHERITED, set("1")),
+            // A clean PATH and the user's lazy-fetch choice are inherited.
+            (
+                vec![("PATH", joined(&[usr])), ("GIT_NO_LAZY_FETCH", "0".into())],
+                vec![],
+                INHERITED,
+                set("0"),
+            ),
             // Finder's PATH gains Homebrew after the user's entries.
             (
-                vec![usr.clone(), bin.clone()],
-                homebrew.clone(),
-                vec![usr.clone(), bin.clone(), brew_dir, local_dir],
+                vec![("PATH", joined(&[usr, bin]))],
+                homebrew,
+                set(joined(&[usr, bin, MACOS_HOMEBREW_BIN, MACOS_USR_LOCAL_BIN])),
+                set("1"),
             ),
             // An entry already on PATH keeps its place.
             (
-                vec![custom.clone(), brew.clone(), usr.clone()],
-                vec![PathBuf::from(&brew)],
-                vec![custom, brew.clone(), usr.clone()],
+                vec![("PATH", joined(&[custom, brew, usr]))],
+                vec![brew.into()],
+                INHERITED,
+                set("1"),
             ),
             // Empty and relative entries would resolve inside the repository.
             (
-                vec![
-                    usr.clone(),
-                    String::new(),
-                    "./bin".to_owned(),
-                    "bin".to_owned(),
-                    bin.clone(),
-                ],
-                vec![PathBuf::from(&brew)],
-                vec![usr.clone(), bin.clone(), brew.clone()],
+                vec![("PATH", joined(&[usr, "", "./bin", "bin", bin]))],
+                vec![brew.into()],
+                set(joined(&[usr, bin, brew])),
+                set("1"),
             ),
-            (vec![String::new()], vec![PathBuf::from(&brew)], vec![brew]),
-            (vec![".".to_owned(), usr.clone()], Vec::new(), vec![usr]),
-        ] {
-            let path = git_child_path(&joined(&parent), &extras);
-            assert_eq!(
-                std::env::split_paths(&path).collect::<Vec<_>>(),
-                expected.iter().map(PathBuf::from).collect::<Vec<_>>(),
-                "{parent:?} + {extras:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn apply_child_path_sets_only_a_path_that_changes() {
-        let usr = abs("/usr/bin");
-        let brew = [PathBuf::from(abs("/brew/bin"))];
-        let clean = joined(std::slice::from_ref(&usr));
-        let dirty = joined(&[".".to_owned(), usr.clone()]);
-        let with_brew = joined(&[usr.clone(), abs("/brew/bin")]);
-        let only_relative = joined(&[".".to_owned(), String::new()]);
-        // `None`: inherited. `Some(None)`: removed. `Some(Some(path))`: set.
-        for (parent, extras, expected) in [
-            (Some(&clean), &[][..], None),
-            (None, &[][..], None),
-            (Some(&dirty), &[][..], Some(Some(clean.clone()))),
-            (Some(&only_relative), &[][..], Some(None)),
-            (Some(&clean), &brew[..], Some(Some(with_brew))),
-            (None, &brew[..], Some(Some(joined(&[abs("/brew/bin")])))),
-        ] {
-            let mut command = Command::new("git");
-            apply_child_path(&mut command, parent.map(OsString::as_os_str), extras);
-            let path = command
-                .get_envs()
-                .find(|(key, _)| *key == "PATH")
-                .map(|(_, value)| value.map(OsStr::to_os_string));
-            assert_eq!(path, expected, "{parent:?} + {extras:?}");
-        }
-    }
-
-    #[test]
-    fn command_sets_or_keeps_git_no_lazy_fetch() {
-        let built = command(Path::new("git"));
-        let value = built
-            .get_envs()
-            .find(|(key, _)| *key == "GIT_NO_LAZY_FETCH")
-            .and_then(|(_, value)| value)
-            .expect("GIT_NO_LAZY_FETCH");
-        match std::env::var_os("GIT_NO_LAZY_FETCH") {
-            Some(parent) => assert_eq!(value, parent.as_os_str()),
-            None => assert_eq!(value, OsStr::new("1")),
+            (
+                vec![("PATH", joined(&[".", usr]))],
+                vec![],
+                set(joined(&[usr])),
+                set("1"),
+            ),
+            (
+                vec![("PATH", joined(&[""]))],
+                vec![brew.into()],
+                set(joined(&[brew])),
+                set("1"),
+            ),
+            (vec![], vec![brew.into()], set(joined(&[brew])), set("1")),
+            // An empty PATH would search the working directory.
+            (
+                vec![("PATH", joined(&[".", ""]))],
+                vec![],
+                REMOVED,
+                set("1"),
+            ),
+            // `Path` is the usual Windows spelling.
+            (
+                vec![
+                    ("Path", joined(&[".", usr])),
+                    ("Git_No_Lazy_Fetch", "0".into()),
+                ],
+                vec![],
+                on_windows(set(joined(&[usr])), INHERITED),
+                on_windows(set("0"), set("1")),
+            ),
+        ];
+        for case in cases {
+            let (also_inherited, path_extras, path, lazy_fetch) = &case;
+            let parent_env = hostile
+                .iter()
+                .map(|(name, _)| (OsString::from(name), OsString::from("evil")))
+                .chain(
+                    also_inherited
+                        .iter()
+                        .map(|(name, value)| (OsString::from(name), value.clone())),
+                );
+            let command = command_with_env(Path::new("git"), parent_env, path_extras);
+            let expected = hostile.iter().cloned().chain([
+                ("PATH", path.clone()),
+                ("GIT_NO_LAZY_FETCH", lazy_fetch.clone()),
+            ]);
+            for (name, change) in expected {
+                assert_eq!(env_change(&command, name), change, "{case:?}: {name}");
+            }
         }
     }
 }
