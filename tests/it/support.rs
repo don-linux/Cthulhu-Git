@@ -34,7 +34,7 @@ const KEPT_GIT_VARS: &[&str] = &[
     "GIT_ASKPASS",
 ];
 
-/// Set by the fake git whose `--version` calls `setsid`. The value is the pid file.
+/// Set by the fake git in `setsid` mode. The value is the pid file.
 pub const SETSID_PIDFILE_VAR: &str = "CTHULHU_HARNESS_SETSID_PIDFILE";
 
 const SETSID_SLEEP: Duration = Duration::from_secs(30);
@@ -279,7 +279,6 @@ if [ "${1-}" = --version ]; then
     broken) exit 1 ;;
     garbage) printf 'this is not git version output\n\377\376' ;;
     sleep) sleep 30 & echo $! > "$0.pid"; wait ;;
-    setsid) CTHULHU_HARNESS_SETSID_PIDFILE="$0.pid" @TEST_EXE@ --exact process::harness_setsid_sleeper --include-ignored --test-threads=1 ;;
     *) printf 'git version %s\n' "$version" ;;
   esac
   exit 0
@@ -289,6 +288,8 @@ case $mode in
   slow) sleep 120 & echo $! > "$0.pid"; wait ;;
   # 9 MiB, over the 8 MiB output cap.
   bomb) dd if=/dev/zero bs=1048576 count=9 2>/dev/null | tr '\0' A & echo $! > "$0.pid"; wait ;;
+  # A grandchild that leaves the process group, then sleeps.
+  setsid) CTHULHU_HARNESS_SETSID_PIDFILE="$0.pid" @TEST_EXE@ --exact process::harness_setsid_sleeper --include-ignored --test-threads=1 ;;
   # Exits while a grandchild keeps stdout open.
   writer) sleep 30 & echo $! > "$0.pid" ;;
   fail) cat "$0.stderr" >&2; exit 128 ;;
