@@ -19,14 +19,12 @@ mod harness;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
-#[cfg(unix)]
 use std::fs;
 use std::io::ErrorKind;
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(unix)]
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use std::thread;
