@@ -294,6 +294,9 @@ asks for, so nothing is scaled from a bitmap:
 
 - **Window icon** (title bar and taskbar on Linux and Windows): `build.rs`
   renders a 256 px PNG that is embedded in the binary.
+- **Inside the window** (home screen, About): the binary embeds the SVG and
+  draws it with [`egui_extras`](https://crates.io/crates/egui_extras), at
+  the size and display scale it is shown at.
 - **Windows `.exe`** (Explorer, Start menu, taskbar): `build.rs` builds an
   `.ico` with 16, 20, 24, 32, 40, 48, 64 and 256 px images and embeds it,
   together with the version information shown in the file's properties, with
@@ -309,12 +312,13 @@ asks for, so nothing is scaled from a bitmap:
 
 To change the icon, edit `assets/icon.svg` and rebuild.
 
-The interface icons (`panel-left`, `house`, `folder`, `git-branch`, `github`, `info`, `key-round`, …) are unmodified
+The interface icons (`panel-left`, `house`, `folder`, `git-branch`, `github`, `info`, `key-round`, …) are
 [Lucide](https://lucide.dev) SVGs in [`assets/icons/`](assets/icons), under
-the license in [`assets/icons/LICENSE`](assets/icons/LICENSE). `build.rs`
-renders them white at 64 px and the app tints them with the theme's colors.
-To add one, put the SVG there, then list it in `UI_ICONS` in `build.rs` and in
-`Icon` in `src/ui/icons.rs`.
+the license in [`assets/icons/LICENSE`](assets/icons/LICENSE), with
+`currentColor` replaced by white. The app draws them the same way as the logo
+and tints them with the theme's colors. To add one, put the SVG there with
+every `currentColor` set to `#ffffff`, then add it to `Icon` in
+`src/ui/icons.rs`.
 
 ## Releases
 

@@ -7,6 +7,8 @@ name: Build
 # The icon comes from assets/icon.svg. build.rs renders it with resvg for the
 # window icon and the Windows .exe; the jobs below render the Linux and macOS
 # sizes with the resvg CLI of the same version, so every PNG is identical.
+# Inside the window the app draws the SVG itself, with the resvg egui_extras
+# depends on.
 on:
   workflow_call:
     inputs:

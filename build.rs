@@ -1,9 +1,7 @@
-//! Renders the SVGs under `assets/`.
+//! Renders `assets/icon.svg`, the single source of the application icon.
 //!
-//! - Every target: `OUT_DIR/icon-256.png` from `assets/icon.svg`, the single
-//!   source of the application icon, embedded by `main.rs` as the window icon.
-//! - Every target: `OUT_DIR/icons/<name>.rgba` for each Lucide interface icon
-//!   in `assets/icons/`, embedded by `src/ui/icons.rs`.
+//! - Every target: `OUT_DIR/icon-256.png`, embedded by `main.rs` as the
+//!   window icon. Inside the window, `src/ui/icons.rs` draws the SVG itself.
 //! - Windows targets: a multi-size `.ico` plus `VERSIONINFO`, compiled into the
 //!   executable so Explorer, the taskbar and Task Manager show the icon and name.
 
@@ -27,34 +25,8 @@ const GIT_PROGRAM: &str = "git";
 /// high-DPI scaling.
 const WINDOWS_ICON_SIZES: [u32; 8] = [16, 20, 24, 32, 40, 48, 64, 256];
 
-const UI_ICONS_DIR: &str = "assets/icons";
-
-/// Interface icons, by file name without `.svg`. Must match `src/ui/icons.rs`.
-const UI_ICONS: [&str; 15] = [
-    "panel-left",
-    "panel-right",
-    "house",
-    "git-branch",
-    "terminal",
-    "type",
-    "settings",
-    "arrow-left",
-    "cloud-download",
-    "arrow-down-to-line",
-    "circle-user-round",
-    "key-round",
-    "folder",
-    "github",
-    "info",
-];
-
-/// Side of the rendered interface icons. Drawn at about 18 points, this stays
-/// sharp up to 3x display scaling.
-const UI_ICON_SIZE: u32 = 64;
-
 fn main() {
     println!("cargo::rerun-if-changed={ICON_SVG}");
-    println!("cargo::rerun-if-changed={UI_ICONS_DIR}");
     println!("cargo::rerun-if-changed=build.rs");
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
@@ -65,7 +37,6 @@ fn main() {
         .expect("encode the window icon as PNG");
     fs::write(out_dir.join("icon-256.png"), png).expect("write icon-256.png");
 
-    render_ui_icons(&out_dir);
     embed_source_revision();
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
@@ -78,23 +49,7 @@ fn load_svg(path: &str, data: Vec<u8>) -> usvg::Tree {
         .unwrap_or_else(|error| panic!("parse {path}: {error}"))
 }
 
-/// Lucide strokes with `currentColor`, which resvg draws black. Rendered
-/// white instead, the app tints each icon with a palette color.
-fn render_ui_icons(out_dir: &Path) {
-    let icons_dir = out_dir.join("icons");
-    fs::create_dir_all(&icons_dir).expect("create OUT_DIR/icons");
-    for name in UI_ICONS {
-        let path = format!("{UI_ICONS_DIR}/{name}.svg");
-        let svg = fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
-        let tree = load_svg(&path, svg.replace("currentColor", "#ffffff").into_bytes());
-        let rgba = straight_rgba(&render(&tree, UI_ICON_SIZE));
-        fs::write(icons_dir.join(format!("{name}.rgba")), rgba)
-            .unwrap_or_else(|error| panic!("write the {name} icon: {error}"));
-    }
-}
-
-/// tiny-skia keeps premultiplied alpha; ICO files and egui textures want
-/// straight RGBA.
+/// tiny-skia keeps premultiplied alpha; ICO files want straight RGBA.
 fn straight_rgba(pixmap: &tiny_skia::Pixmap) -> Vec<u8> {
     pixmap
         .pixels()

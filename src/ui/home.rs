@@ -373,7 +373,7 @@ fn branch_line(ui: &mut Ui, text: &str, color: Color32) {
         egui::pos2(rect.min.x + BRANCH_ICON * 0.5, rect.center().y),
         Vec2::splat(BRANCH_ICON),
     );
-    icons::paint_icon(ui.painter(), ui.ctx(), icon_rect, Icon::GitBranch, color);
+    icons::paint_icon(ui.painter(), icon_rect, Icon::GitBranch, color);
     let text_rect = Rect::from_min_max(
         egui::pos2(rect.min.x + BRANCH_ICON + 6.0, rect.min.y),
         rect.max,

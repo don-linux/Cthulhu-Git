@@ -1,17 +1,18 @@
-//! Lucide interface icons (`assets/icons/`, ISC license). `build.rs` renders
-//! each SVG white; drawing tints it with a palette color, so the icons follow
-//! the theme.
+//! Lucide interface icons (`assets/icons/`, ISC license). Each SVG is drawn
+//! white; drawing tints it with a palette color, so the icons follow the
+//! theme. egui_extras renders an SVG at the size and pixel density it is drawn
+//! at, so the icons stay sharp at any display scale.
 //!
-//! [`app_logo`] is the application mark from the same build, in color. It is
+//! [`app_logo`] is the application mark (`assets/icon.svg`), in color. It is
 //! not one of the tinted interface icons.
 
+use eframe::egui::emath::GuiRounding as _;
+use eframe::egui::load::{SizeHint, TexturePoll};
 use eframe::egui::{
-    Button, Color32, ColorImage, Context, CursorIcon, Frame, Id, Image, Painter, Pos2, Rect,
-    Response, RichText, TextStyle, TextureHandle, TextureOptions, Tooltip, Ui, Vec2,
+    Button, Color32, Context, CursorIcon, Frame, Image, ImageSource, Painter, Pos2, Rect, Response,
+    RichText, TextStyle, TextureOptions, Tooltip, Ui, Vec2, include_image,
 };
-
-/// Side of the textures written by `build.rs` (`UI_ICON_SIZE`).
-const TEXTURE_SIZE: usize = 64;
+use egui_extras::loaders::svg_loader::SvgLoader;
 
 /// Side an icon is drawn at, in points.
 const ICON_SIZE: f32 = 18.0;
@@ -40,73 +41,40 @@ pub enum Icon {
 }
 
 impl Icon {
-    /// The file name under `assets/icons/`, without `.svg`.
-    fn name(self) -> &'static str {
+    fn source(self) -> ImageSource<'static> {
         match self {
-            Self::PanelLeft => "panel-left",
-            Self::PanelRight => "panel-right",
-            Self::House => "house",
-            Self::GitBranch => "git-branch",
-            Self::Terminal => "terminal",
-            Self::Type => "type",
-            Self::Settings => "settings",
-            Self::ArrowLeft => "arrow-left",
-            Self::CloudDownload => "cloud-download",
-            Self::ArrowDownToLine => "arrow-down-to-line",
-            Self::CircleUserRound => "circle-user-round",
-            Self::KeyRound => "key-round",
-            Self::Folder => "folder",
-            Self::GitHub => "github",
-            Self::Info => "info",
+            Self::PanelLeft => include_image!("../../assets/icons/panel-left.svg"),
+            Self::PanelRight => include_image!("../../assets/icons/panel-right.svg"),
+            Self::House => include_image!("../../assets/icons/house.svg"),
+            Self::GitBranch => include_image!("../../assets/icons/git-branch.svg"),
+            Self::Terminal => include_image!("../../assets/icons/terminal.svg"),
+            Self::Type => include_image!("../../assets/icons/type.svg"),
+            Self::Settings => include_image!("../../assets/icons/settings.svg"),
+            Self::ArrowLeft => include_image!("../../assets/icons/arrow-left.svg"),
+            Self::CloudDownload => include_image!("../../assets/icons/cloud-download.svg"),
+            Self::ArrowDownToLine => include_image!("../../assets/icons/arrow-down-to-line.svg"),
+            Self::CircleUserRound => include_image!("../../assets/icons/circle-user-round.svg"),
+            Self::KeyRound => include_image!("../../assets/icons/key-round.svg"),
+            Self::Folder => include_image!("../../assets/icons/folder.svg"),
+            Self::GitHub => include_image!("../../assets/icons/github.svg"),
+            Self::Info => include_image!("../../assets/icons/info.svg"),
         }
-    }
-
-    fn rgba(self) -> &'static [u8] {
-        match self {
-            Self::PanelLeft => include_bytes!(concat!(env!("OUT_DIR"), "/icons/panel-left.rgba")),
-            Self::PanelRight => include_bytes!(concat!(env!("OUT_DIR"), "/icons/panel-right.rgba")),
-            Self::House => include_bytes!(concat!(env!("OUT_DIR"), "/icons/house.rgba")),
-            Self::GitBranch => include_bytes!(concat!(env!("OUT_DIR"), "/icons/git-branch.rgba")),
-            Self::Terminal => include_bytes!(concat!(env!("OUT_DIR"), "/icons/terminal.rgba")),
-            Self::Type => include_bytes!(concat!(env!("OUT_DIR"), "/icons/type.rgba")),
-            Self::Settings => include_bytes!(concat!(env!("OUT_DIR"), "/icons/settings.rgba")),
-            Self::ArrowLeft => include_bytes!(concat!(env!("OUT_DIR"), "/icons/arrow-left.rgba")),
-            Self::CloudDownload => {
-                include_bytes!(concat!(env!("OUT_DIR"), "/icons/cloud-download.rgba"))
-            }
-            Self::ArrowDownToLine => {
-                include_bytes!(concat!(env!("OUT_DIR"), "/icons/arrow-down-to-line.rgba"))
-            }
-            Self::CircleUserRound => {
-                include_bytes!(concat!(env!("OUT_DIR"), "/icons/circle-user-round.rgba"))
-            }
-            Self::KeyRound => include_bytes!(concat!(env!("OUT_DIR"), "/icons/key-round.rgba")),
-            Self::Folder => include_bytes!(concat!(env!("OUT_DIR"), "/icons/folder.rgba")),
-            Self::GitHub => include_bytes!(concat!(env!("OUT_DIR"), "/icons/github.rgba")),
-            Self::Info => include_bytes!(concat!(env!("OUT_DIR"), "/icons/info.rgba")),
-        }
-    }
-
-    /// Uploaded to the GPU on first use and kept for the life of the context.
-    fn texture(self, ctx: &Context) -> TextureHandle {
-        let id = Id::unique(("cthulhu-git-icon", self.name()));
-        if let Some(texture) = ctx.data(|data| data.get_temp::<TextureHandle>(id)) {
-            return texture;
-        }
-        let image = ColorImage::from_rgba_unmultiplied([TEXTURE_SIZE, TEXTURE_SIZE], self.rgba());
-        let texture = ctx.load_texture(
-            format!("icon-{}", self.name()),
-            image,
-            TextureOptions::LINEAR,
-        );
-        ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
-        texture
     }
 
     fn image(self, ctx: &Context, tint: Color32) -> Image<'static> {
-        Image::new(&self.texture(ctx))
+        install_svg_loader(ctx);
+        Image::new(self.source())
             .fit_to_exact_size(Vec2::splat(ICON_SIZE))
             .tint(tint)
+    }
+}
+
+/// Every drawing path installs egui_extras' SVG loader, so a `Ui` that did
+/// not come through `CthulhuApp::new`, such as a test harness's, draws the
+/// icons too.
+fn install_svg_loader(ctx: &Context) {
+    if !ctx.is_loader_installed(SvgLoader::ID) {
+        egui_extras::install_image_loaders(ctx);
     }
 }
 
@@ -153,14 +121,30 @@ pub fn icon(ui: &mut Ui, icon: Icon, tint: Color32) -> Response {
 
 /// Draws `icon` into `rect`, tinted. Used where the icon sits inside a painted
 /// row rather than as its own widget.
-pub fn paint_icon(painter: &Painter, ctx: &Context, rect: Rect, icon: Icon, tint: Color32) {
-    let texture = icon.texture(ctx);
-    painter.image(
-        texture.id(),
-        rect,
-        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-        tint,
-    );
+///
+/// Rendered at the pixel size of `rect`, as `Image::paint_at` does, so it
+/// stays sharp. The painter keeps the row's clip, which `paint_at` would not.
+pub fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, tint: Color32) {
+    let ctx = painter.ctx();
+    install_svg_loader(ctx);
+    let rect = rect.round_to_pixels(painter.pixels_per_point());
+    let pixels = (rect.size() * painter.pixels_per_point()).round();
+    let size_hint = SizeHint::Size {
+        width: pixels.x as u32,
+        height: pixels.y as u32,
+        maintain_aspect_ratio: false,
+    };
+    if let Ok(TexturePoll::Ready { texture }) =
+        icon.source()
+            .load(ctx, TextureOptions::default(), size_hint)
+    {
+        painter.image(
+            texture.id,
+            rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            tint,
+        );
+    }
 }
 
 /// Icon with a word beside it. The whole control is one click, and the frame
@@ -241,44 +225,27 @@ fn hover_tip_frame(ui: &Ui) -> Frame {
     Frame::popup(ui.style()).fill(ui.visuals().extreme_bg_color)
 }
 
-/// Shared by the home screen and About, so the icon is uploaded once.
-const LOGO_TEXTURE_ID: &str = "cthulhu-git-about-logo";
+const LOGO: ImageSource<'static> = include_image!("../../assets/icon.svg");
 
 /// Draws the application icon at `size` points on a side, unchanged.
 pub fn app_logo(ui: &mut Ui, size: f32) -> Response {
-    let texture = logo_texture(ui.ctx());
+    install_svg_loader(ui.ctx());
     ui.add(
-        Image::new(&texture)
+        Image::new(LOGO)
             .fit_to_exact_size(Vec2::splat(size))
             .alt_text("Cthulhu-Git logo"),
     )
-}
-
-/// Uploaded once and kept for the life of the context, same as the interface icons.
-fn logo_texture(ctx: &Context) -> TextureHandle {
-    let id = Id::unique(LOGO_TEXTURE_ID);
-    if let Some(texture) = ctx.data(|data| data.get_temp(id)) {
-        return texture;
-    }
-    let rgba = image::load_from_memory(include_bytes!(concat!(env!("OUT_DIR"), "/icon-256.png")))
-        .expect("icon-256.png rendered by build.rs")
-        .into_rgba8();
-    let image = ColorImage::from_rgba_unmultiplied(
-        [rgba.width() as usize, rgba.height() as usize],
-        rgba.as_raw(),
-    );
-    let texture = ctx.load_texture(LOGO_TEXTURE_ID, image, TextureOptions::LINEAR);
-    ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
-    texture
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// resvg draws `currentColor` black, and a tint multiplies black into
+    /// black, so the icons are drawn white for the tint to color them.
     #[test]
-    fn rendered_icons_have_the_texture_size() {
-        for icon in [
+    fn no_svg_draws_with_current_color() {
+        let icons = [
             Icon::PanelLeft,
             Icon::PanelRight,
             Icon::House,
@@ -294,13 +261,13 @@ mod tests {
             Icon::Folder,
             Icon::GitHub,
             Icon::Info,
-        ] {
-            assert_eq!(
-                icon.rgba().len(),
-                TEXTURE_SIZE * TEXTURE_SIZE * 4,
-                "{}",
-                icon.name()
-            );
+        ];
+        for source in icons.map(Icon::source).into_iter().chain([LOGO]) {
+            let ImageSource::Bytes { uri, bytes } = source else {
+                panic!("{source:?} is not bundled");
+            };
+            let svg = std::str::from_utf8(&bytes).expect("UTF-8 SVG");
+            assert!(!svg.contains("currentColor"), "{uri}");
         }
     }
 }

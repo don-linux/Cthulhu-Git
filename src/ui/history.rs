@@ -1430,7 +1430,7 @@ fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette, lit: boo
             4.0,
             chip_fill(palette, chip.color, chip.current, lit),
         );
-        icons::paint_icon(&painter, ui.ctx(), icon_rect, Icon::GitBranch, color);
+        icons::paint_icon(&painter, icon_rect, Icon::GitBranch, color);
         let text_x = icon_rect.right() + CHIP_PAD;
         painter.galley(
             Pos2::new(text_x, chip.rect.center().y - chip.text.size().y / 2.0),

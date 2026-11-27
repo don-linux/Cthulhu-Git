@@ -19,6 +19,9 @@ eframe = { version = "0.37.0", features = ["persistence"] }
 # monochrome emoji fonts again, so emoji look the same on every system
 # instead of coming from the system's color emoji font.
 egui = { version = "0.37.0", default-features = false, features = ["monochrome_emoji_fonts"] }
+# The SVG loader alone: the interface icons and the logo are rendered at the
+# size and scale they are drawn at.
+egui_extras = { version = "0.37.0", default-features = false, features = ["svg"] }
 # Author avatars. Already in the tree through eframe; only these decoders.
 # No GIF: its decoder allocates up to 50 MB before image's limits apply.
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
@@ -45,7 +48,8 @@ egui_kittest = { version = "0.37.0", features = ["eframe"] }
 keyring-core = "1.1.0"
 proptest = "1.12.0"
 
-# build.rs renders assets/icon.svg; none of these end up in the binary.
+# build.rs renders assets/icon.svg for the window icon and the Windows .exe.
+# None of these end up in the binary; the resvg in it comes with egui_extras.
 [build-dependencies]
 embed-resource = "3.0.12"
 ico = "0.6.0"
