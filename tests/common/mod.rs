@@ -103,7 +103,7 @@ pub fn isolate(command: &mut Command, scratch: &Path) {
             "-c",
             "commit.gpgSign=false",
             "-c",
-            "core.fsmonitor=false",
+            "core.fsmonitor=",
             "-c",
             "credential.helper=",
             "-c",

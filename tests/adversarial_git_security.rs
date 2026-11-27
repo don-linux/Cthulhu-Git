@@ -2042,7 +2042,7 @@ const SWITCH_EXEC_PREFIX: &[&str] = &[
     "--no-pager",
     "--no-replace-objects",
     "-c",
-    "core.fsmonitor=false",
+    "core.fsmonitor=",
     "-c",
     "log.showSignature=false",
 ];

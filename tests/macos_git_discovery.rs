@@ -174,20 +174,18 @@ fn finder_path_child_sees_homebrew_bin() {
     );
 }
 
-/// `core.fsmonitor=false` is what every `Git::run` passes today.
-///
-/// `core.fsmonitor=` (empty) would keep Git 2.15–2.35 from `execvp("false")`.
-/// `tests/adversarial_git_security.rs` still matches the literal `false`, so
-/// this argv stays until that suite is updated.
+/// fsmonitor is turned off with an empty value. `false` is read as a hook
+/// program by Git 2.16–2.35, which then runs a command named `false` on every
+/// index read; empty means "off" in every version.
 #[cfg(unix)]
 #[test]
-fn fsmonitor_argv_documents_the_false_sentinel() {
+fn fsmonitor_is_turned_off_with_an_empty_value() {
     let recorded = record_git_run(&["status"]);
     assert!(
         recorded
             .argv
             .windows(2)
-            .any(|pair| pair == ["-c", "core.fsmonitor=false"]),
+            .any(|pair| pair == ["-c", "core.fsmonitor="]),
         "argv was {:?}",
         recorded.argv
     );

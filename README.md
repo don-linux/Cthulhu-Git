@@ -185,7 +185,7 @@ does not stop the search.
 
 - arguments are passed as argv, never through a shell;
 - `--no-optional-locks`, `--no-pager`, `--no-replace-objects`,
-  `core.fsmonitor=false`, and `GIT_TERMINAL_PROMPT=0` so Git does not wait
+  `core.fsmonitor=` (empty, off), and `GIT_TERMINAL_PROMPT=0` so Git does not wait
   for input or follow replace refs. Optional locks are skipped; a fast-forward
   pull still updates the index and working tree;
 - `LC_ALL=C` so the messages the app matches on stay in English;

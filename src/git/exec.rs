@@ -205,11 +205,10 @@ impl Git {
                 .arg("--no-optional-locks")
                 .arg("--no-pager")
                 .arg("--no-replace-objects")
-                // Empty `core.fsmonitor=` would stop Git 2.15–2.35 from
-                // execvp("false") (the value is a program name). Leave `false`:
-                // tests/adversarial_git_security.rs asserts that literal in
-                // SWITCH_EXEC_PREFIX and the fixture's own git argv.
-                .args(["-c", "core.fsmonitor=false"])
+                // Empty, not `false`: Git 2.16–2.35 read the value as a hook
+                // program and would run a command named `false` on every
+                // index read. Empty turns fsmonitor off in every version.
+                .args(["-c", "core.fsmonitor="])
                 .args(["-c", "log.showSignature=false"])
                 .args(args),
             timeout,
