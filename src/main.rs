@@ -76,25 +76,36 @@ fn window_icon() -> egui::IconData {
 mod tests {
     use super::*;
 
+    /// Finder's `-psn_…` and every other leading dash is not a folder; a
+    /// relative folder is taken from the directory the app started in.
     #[test]
-    fn finder_process_serial_number_is_not_a_repository_path() {
-        assert!(startup_folder(None).is_none());
-        assert!(startup_folder(Some("-psn_0_12345".into())).is_none());
-        assert!(startup_folder(Some("--help".into())).is_none());
+    fn startup_folder_is_absolute_and_never_a_flag() {
+        let cwd = env::current_dir().expect("current directory");
+        for (arg, folder) in [
+            (None, None),
+            (Some("-psn_0_12345"), None),
+            (Some("--help"), None),
+            // main checks version_flag first.
+            (Some("--version"), None),
+            (Some("-V"), None),
+            (Some("repo"), Some(cwd.join("repo"))),
+        ] {
+            assert_eq!(startup_folder(arg.map(Into::into)), folder, "{arg:?}");
+        }
     }
 
     #[test]
     fn version_flag_is_exact_so_main_can_exit_before_the_leading_dash_rule() {
-        use std::ffi::OsStr;
-
-        assert!(version_flag(Some(OsStr::new("--version"))));
-        assert!(version_flag(Some(OsStr::new("-V"))));
-        assert!(!version_flag(Some(OsStr::new("--help"))));
-        assert!(!version_flag(Some(OsStr::new("-v"))));
-        assert!(!version_flag(Some(OsStr::new("-psn_0_12345"))));
-        assert!(!version_flag(None));
-        // A leading dash is still "not a folder". main checks version_flag first.
-        assert!(startup_folder(Some("--version".into())).is_none());
-        assert!(startup_folder(Some("-V".into())).is_none());
+        for (arg, version) in [
+            (Some("--version"), true),
+            (Some("-V"), true),
+            (Some("--help"), false),
+            (Some("-v"), false),
+            (Some("-psn_0_12345"), false),
+            (None, false),
+        ] {
+            let arg = arg.map(std::ffi::OsStr::new);
+            assert_eq!(version_flag(arg), version, "{arg:?}");
+        }
     }
 }

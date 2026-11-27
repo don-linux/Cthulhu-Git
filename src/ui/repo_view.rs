@@ -1138,32 +1138,52 @@ mod tests {
         }
     }
 
+    /// (head, the listed branch's upstream, fetch branch, pull, fetch hover,
+    /// pull hover). Fetch needs a remote-tracking upstream; pull needs one
+    /// that still exists, remote or local. An unborn branch is a branch. A
+    /// head whose branch is not listed, or that is no branch, offers neither.
     #[test]
     fn sync_offer_fetches_a_remote_upstream_and_pulls_while_it_exists() {
         const FETCH: &str = "Fetch current branch";
         const LOCAL: &str = "The upstream is a local branch; there is nothing to fetch.";
         const PULL: &str = "Pull current branch (fast-forward only)";
         const GONE: &str = "The upstream branch is gone.";
-        let tracking = |remote| Upstream::Tracking {
-            name: "origin/main".to_owned(),
-            remote,
-            ahead: 0,
-            behind: 1,
+        const NO_UPSTREAM: &str = "This branch has no upstream.";
+        const NEEDS_UPSTREAM: &str = "Pull needs a branch with an upstream.";
+        const DETACHED: &str = "Detached HEAD has no branch to fetch.";
+        let main = || Head::Branch("main".to_owned());
+        let tracking = |remote| {
+            Some(Upstream::Tracking {
+                name: "origin/main".to_owned(),
+                remote,
+                ahead: 0,
+                behind: 1,
+            })
         };
-        let gone = |remote| Upstream::Gone {
-            name: "origin/main".to_owned(),
-            remote,
+        let gone = |remote| {
+            Some(Upstream::Gone {
+                name: "origin/main".to_owned(),
+                remote,
+            })
         };
-        for (upstream, fetch, pull, fetch_hover, pull_hover) in [
-            (tracking(true), Some("main"), true, FETCH, PULL),
-            (gone(true), Some("main"), false, FETCH, GONE),
-            (tracking(false), None, true, LOCAL, PULL),
-            (gone(false), None, false, LOCAL, GONE),
-        ] {
-            let offer = sync_offer(
-                &Head::Branch("main".to_owned()),
-                &[listed(upstream.clone())],
-            );
+        let unborn = Head::Unborn("main".to_owned());
+        let detached = Head::Detached {
+            short_oid: "abc".to_owned(),
+        };
+        #[rustfmt::skip]
+        let cases = [
+            (main(), tracking(true), Some("main"), true, FETCH, PULL),
+            (main(), gone(true), Some("main"), false, FETCH, GONE),
+            (main(), tracking(false), None, true, LOCAL, PULL),
+            (main(), gone(false), None, false, LOCAL, GONE),
+            (unborn, tracking(true), Some("main"), true, FETCH, PULL),
+            (main(), Some(Upstream::None), None, false, NO_UPSTREAM, NEEDS_UPSTREAM),
+            (main(), None, None, false, NO_UPSTREAM, NEEDS_UPSTREAM),
+            (detached, None, None, false, DETACHED, NEEDS_UPSTREAM),
+        ];
+        for (head, upstream, fetch, pull, fetch_hover, pull_hover) in cases {
+            let branches: Vec<_> = upstream.clone().map(listed).into_iter().collect();
+            let offer = sync_offer(&head, &branches);
             assert_eq!(
                 (
                     offer.fetch_branch.as_deref(),
@@ -1172,28 +1192,8 @@ mod tests {
                     offer.pull_hover
                 ),
                 (fetch, pull, fetch_hover, pull_hover),
-                "{upstream:?}"
+                "{head:?} with {upstream:?}"
             );
         }
-    }
-
-    #[test]
-    fn sync_offer_disables_both_without_an_upstream_or_a_branch() {
-        let none = sync_offer(&Head::Branch("main".to_owned()), &[listed(Upstream::None)]);
-        assert!(none.fetch_branch.is_none());
-        assert!(!none.pull);
-
-        let detached = sync_offer(
-            &Head::Detached {
-                short_oid: "abc".to_owned(),
-            },
-            &[],
-        );
-        assert!(detached.fetch_branch.is_none());
-        assert!(!detached.pull);
-        assert_eq!(
-            detached.fetch_hover,
-            "Detached HEAD has no branch to fetch."
-        );
     }
 }

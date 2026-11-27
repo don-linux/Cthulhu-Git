@@ -189,7 +189,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn theme_ids_are_unique() {
+    fn each_theme_is_found_by_its_own_id_and_anything_else_is_the_default() {
         for (index, theme) in THEMES.iter().enumerate() {
             assert!(
                 THEMES[index + 1..].iter().all(|other| other.id != theme.id),
@@ -197,17 +197,9 @@ mod tests {
                 theme.id
             );
         }
-    }
-
-    #[test]
-    fn default_theme_is_registered() {
-        assert_eq!(by_id(DEFAULT_THEME.id), Some(DEFAULT_THEME));
-    }
-
-    #[test]
-    fn unknown_or_missing_id_falls_back_to_default() {
-        assert_eq!(resolve(None), DEFAULT_THEME);
-        assert_eq!(resolve(Some("no-such-theme")), DEFAULT_THEME);
+        assert_eq!(by_id("dark"), Some(DEFAULT_THEME));
+        assert_eq!(resolve(None).id, "dark");
+        assert_eq!(resolve(Some("no-such-theme")).id, "dark");
     }
 
     #[test]
