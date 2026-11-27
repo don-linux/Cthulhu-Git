@@ -253,16 +253,11 @@ fn finish(mut branches: Vec<Branch>, head: &Head) -> Vec<Branch> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-
-    fn line(name: &str, upstream: &str, track: &str) -> Vec<u8> {
-        line_with_oid(name, OID, upstream, track, "1700000000")
-    }
+    use crate::test_support::OID_A;
 
     /// The upstream ref is derived from the short name: with a `/` it is a
     /// remote-tracking ref, without one a local branch.
-    fn line_with_oid(name: &str, oid: &str, upstream: &str, track: &str, when: &str) -> Vec<u8> {
+    fn line(name: &str, oid: &str, upstream: &str, track: &str, when: &str) -> Vec<u8> {
         let full = match upstream {
             "" => String::new(),
             short if short.contains('/') => format!("refs/remotes/{short}"),
@@ -277,183 +272,173 @@ mod tests {
         out
     }
 
-    fn parsed(stdout: &[u8]) -> Vec<ParsedRef> {
-        parse_refs(stdout).expect("parsable")
+    fn tracked(name: &str, upstream: &str, track: &str) -> Vec<u8> {
+        line(name, OID_A, upstream, track, "1700000000")
+    }
+
+    fn tracking(name: &str, remote: bool, ahead: u64, behind: u64) -> Upstream {
+        Upstream::Tracking {
+            name: name.to_owned(),
+            remote,
+            ahead,
+            behind,
+        }
     }
 
     #[test]
-    fn parses_ahead_behind_gone_and_in_sync() {
-        let mut stdout = line("feature", "main", "[ahead 1, behind 2]");
-        stdout.extend(line("topic", "origin/topic", "[ahead 4]"));
-        stdout.extend(line("old", "origin/old", "[behind 3]"));
-        stdout.extend(line("even", "origin/even", ""));
-        stdout.extend(line("local", "", ""));
-        stdout.extend(line("missing", "origin/missing", "[gone]"));
-
-        let refs = parsed(&stdout);
-        assert_eq!(refs.len(), 6);
-        assert_eq!(refs[0].oid.as_deref(), Some(OID));
-        assert_eq!(
-            refs[0].upstream,
-            Upstream::Tracking {
-                name: "main".to_owned(),
-                remote: false,
-                ahead: 1,
-                behind: 2
-            }
-        );
-        assert_eq!(
-            refs[1].upstream,
-            Upstream::Tracking {
-                name: "origin/topic".to_owned(),
-                remote: true,
-                ahead: 4,
-                behind: 0
-            }
-        );
-        assert_eq!(
-            refs[2].upstream,
-            Upstream::Tracking {
-                name: "origin/old".to_owned(),
-                remote: true,
-                ahead: 0,
-                behind: 3
-            }
-        );
-        assert_eq!(
-            refs[3].upstream,
-            Upstream::Tracking {
-                name: "origin/even".to_owned(),
-                remote: true,
-                ahead: 0,
-                behind: 0
-            }
-        );
-        assert_eq!(refs[4].upstream, Upstream::None);
-        assert_eq!(
-            refs[5].upstream,
-            Upstream::Gone {
-                name: "origin/missing".to_owned(),
-                remote: true,
-            }
-        );
-    }
-
-    #[test]
-    fn empty_output_is_no_branches() {
-        assert_eq!(parse_refs(b"").map(|refs| refs.len()), Some(0));
-        assert_eq!(parse_refs(b"\n").map(|refs| refs.len()), Some(0));
-    }
-
-    #[test]
-    fn windows_carriage_return_is_stripped() {
-        let mut stdout = line("feature", "main", "[ahead 1]");
-        stdout.pop();
-        stdout.extend_from_slice(b"\r\n");
-        let refs = parsed(&stdout);
-        assert_eq!(refs[0].name, "feature");
-        assert_eq!(
-            refs[0].upstream,
-            Upstream::Tracking {
-                name: "main".to_owned(),
-                remote: false,
-                ahead: 1,
-                behind: 0
-            }
-        );
-    }
-
-    #[test]
-    fn malformed_lines_are_rejected() {
-        assert!(parse_refs(b"no separators\n").is_none());
-        assert!(parse_refs(b"\x1fmain\x1f\n").is_none());
-        assert!(parse_refs(&line("feature", "main", "[ahead]")).is_none());
-        assert!(parse_refs(&line("feature", "main", "ahead 1")).is_none());
-        assert!(parse_refs(&line("feature", "main", "[behind 1, ahead 2]")).is_none());
-        assert!(parse_refs(&line_with_oid("feature", "not-hex", "main", "", "1")).is_none());
-        assert!(parse_refs(&line_with_oid("feature", OID, "", "", "yesterday")).is_none());
-        // A record from before the committer time was added is no longer complete.
-        assert!(
-            parse_refs(b"feature\x1f4b825dc642cb6eb9a060e54bf8d69288fbee4904\x1f\x1f\n").is_none()
-        );
-        assert!(parse_refs(b"feature\x1fmain\x1f\n").is_none());
-    }
-
-    #[test]
-    fn committer_time_is_unix_seconds_or_absent() {
-        let dated = parsed(&line_with_oid("feature", OID, "", "", "1700000000"));
-        assert_eq!(dated[0].committer_time, Some(1_700_000_000));
-        let ancient = parsed(&line_with_oid("old", OID, "", "", "-10"));
-        assert_eq!(ancient[0].committer_time, Some(-10));
-        let unborn = parsed(&line_with_oid("main", "", "", "", ""));
-        assert_eq!(unborn[0].oid, None);
-        assert_eq!(unborn[0].committer_time, None);
-    }
-
-    #[test]
-    fn empty_oid_is_a_branch_with_no_commit() {
-        let refs = parsed(&line_with_oid("main", "", "", "", ""));
-        assert_eq!(refs[0].oid, None);
-        assert_eq!(refs[0].committer_time, None);
+    fn parse_refs_table() {
+        let dated = Some(1_700_000_000);
+        let mut crlf = tracked("feature", "main", "[ahead 1]");
+        crlf.pop();
+        crlf.extend_from_slice(b"\r\n");
+        let cases = [
+            (
+                [
+                    tracked("feature", "main", "[ahead 1, behind 2]"),
+                    tracked("topic", "origin/topic", "[ahead 4]"),
+                    tracked("old", "origin/old", "[behind 3]"),
+                    tracked("even", "origin/even", ""),
+                    tracked("local", "", ""),
+                    tracked("missing", "origin/missing", "[gone]"),
+                ]
+                .concat(),
+                Some(vec![
+                    ("feature", Some(OID_A), dated, tracking("main", false, 1, 2)),
+                    (
+                        "topic",
+                        Some(OID_A),
+                        dated,
+                        tracking("origin/topic", true, 4, 0),
+                    ),
+                    (
+                        "old",
+                        Some(OID_A),
+                        dated,
+                        tracking("origin/old", true, 0, 3),
+                    ),
+                    (
+                        "even",
+                        Some(OID_A),
+                        dated,
+                        tracking("origin/even", true, 0, 0),
+                    ),
+                    ("local", Some(OID_A), dated, Upstream::None),
+                    (
+                        "missing",
+                        Some(OID_A),
+                        dated,
+                        Upstream::Gone {
+                            name: "origin/missing".to_owned(),
+                            remote: true,
+                        },
+                    ),
+                ]),
+            ),
+            (b"".to_vec(), Some(vec![])),
+            (b"\n".to_vec(), Some(vec![])),
+            (
+                crlf,
+                Some(vec![(
+                    "feature",
+                    Some(OID_A),
+                    dated,
+                    tracking("main", false, 1, 0),
+                )]),
+            ),
+            (
+                line("old", OID_A, "", "", "-10"),
+                Some(vec![("old", Some(OID_A), Some(-10), Upstream::None)]),
+            ),
+            // A branch with no commit yet has no oid and no time.
+            (
+                line("main", "", "", "", ""),
+                Some(vec![("main", None, None, Upstream::None)]),
+            ),
+            (b"no separators\n".to_vec(), None),
+            (b"\x1fmain\x1f\n".to_vec(), None),
+            (tracked("feature", "main", "[ahead]"), None),
+            (tracked("feature", "main", "ahead 1"), None),
+            (tracked("feature", "main", "[behind 1, ahead 2]"), None),
+            (line("feature", "not-hex", "main", "", "1"), None),
+            (line("feature", OID_A, "", "", "yesterday"), None),
+            // A record from before the committer time was added is incomplete.
+            (format!("feature\x1f{OID_A}\x1f\x1f\n").into_bytes(), None),
+            (b"feature\x1fmain\x1f\n".to_vec(), None),
+        ];
+        for (stdout, expected) in cases {
+            let parsed = parse_refs(&stdout).map(|refs| {
+                refs.into_iter()
+                    .map(|parsed| {
+                        (
+                            parsed.name,
+                            parsed.oid,
+                            parsed.committer_time,
+                            parsed.upstream,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let expected = expected.map(|refs| {
+                refs.into_iter()
+                    .map(|(name, oid, time, upstream)| {
+                        (name.to_owned(), oid.map(str::to_owned), time, upstream)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(parsed, expected, "{stdout:?}");
+        }
     }
 
     #[test]
     fn counts_are_unsigned_integers() {
-        assert_eq!(parse_count(b"12\n"), Some(12));
-        assert_eq!(parse_count(b"0\r\n"), Some(0));
-        assert_eq!(parse_count(b"\n"), None);
-        assert_eq!(parse_count(b"12 commits\n"), None);
+        for (stdout, count) in [
+            (&b"12\n"[..], Some(12)),
+            (b"0\r\n", Some(0)),
+            (b"\n", None),
+            (b"12 commits\n", None),
+        ] {
+            assert_eq!(parse_count(stdout), count, "{stdout:?}");
+        }
     }
 
-    fn sample(name: &str, count: u64) -> Branch {
+    fn branch(name: &str, count: u64, current: bool) -> Branch {
         Branch {
             name: name.to_owned(),
             oid: None,
             committer_time: None,
             commit_count: count,
             upstream: Upstream::None,
-            current: false,
+            current,
         }
     }
 
+    /// The current branch comes first, an unborn one is added, and
+    /// detached `HEAD` marks none; the rest keep name order.
     #[test]
-    fn current_branch_is_first_and_unborn_is_inserted() {
-        let rows = vec![sample("feature", 2), sample("main", 1)];
-        let finished = finish(rows, &Head::Branch("feature".to_owned()));
-        assert_eq!(finished[0].name, "feature");
-        assert!(finished[0].current);
-        assert_eq!(finished[1].name, "main");
-        assert!(!finished[1].current);
-
-        let unborn = finish(Vec::new(), &Head::Unborn("main".to_owned()));
-        assert_eq!(
-            unborn,
-            vec![Branch {
-                name: "main".to_owned(),
-                oid: None,
-                committer_time: None,
-                commit_count: 0,
-                upstream: Upstream::None,
-                current: true,
-            }]
-        );
-    }
-
-    #[test]
-    fn detached_head_marks_no_branch_current() {
-        let finished = finish(
-            vec![sample("zeta", 1), sample("alpha", 3)],
-            &Head::Detached {
-                short_oid: "0123456789ab".to_owned(),
-            },
-        );
-        assert_eq!(
-            finished
-                .iter()
-                .map(|branch| branch.name.as_str())
-                .collect::<Vec<_>>(),
-            ["alpha", "zeta"]
-        );
-        assert!(finished.iter().all(|branch| !branch.current));
+    fn finish_puts_the_current_branch_first() {
+        // `alpha` comes in marked current from an earlier listing.
+        let rows = || vec![branch("zeta", 1, false), branch("alpha", 3, true)];
+        for (head, expected) in [
+            (
+                Head::Branch("zeta".to_owned()),
+                vec![branch("zeta", 1, true), branch("alpha", 3, false)],
+            ),
+            (
+                Head::Unborn("main".to_owned()),
+                vec![
+                    branch("main", 0, true),
+                    branch("alpha", 3, false),
+                    branch("zeta", 1, false),
+                ],
+            ),
+            (
+                Head::Detached {
+                    short_oid: "0123456789ab".to_owned(),
+                },
+                vec![branch("alpha", 3, false), branch("zeta", 1, false)],
+            ),
+        ] {
+            assert_eq!(finish(rows(), &head), expected, "{head:?}");
+        }
     }
 }
