@@ -101,9 +101,7 @@ pub enum Action {
     Home,
     OpenSettings,
     CloseSettings,
-    ToggleBranchesSidebar,
-    ToggleDetailSidebar,
-    ToggleTerminal,
+    SetPanels(repo_view::Panels),
     SetUiFont(Option<String>),
     SetTerminalFont(Option<String>),
     /// The local branch whose upstream is fetched.
@@ -615,9 +613,11 @@ impl eframe::App for CthulhuApp {
                     repo,
                     &repo_view::ViewState {
                         error: self.error.as_deref(),
-                        branches_open: !self.settings.branches_sidebar_hidden,
-                        detail_open: !self.settings.detail_sidebar_hidden,
-                        terminal_open: !self.settings.terminal_hidden,
+                        panels: repo_view::Panels {
+                            branches: !self.settings.branches_sidebar_hidden,
+                            detail: !self.settings.detail_sidebar_hidden,
+                            terminal: !self.settings.terminal_hidden,
+                        },
                         syncing,
                         columns: self.settings.history_columns,
                         history_loading,
@@ -666,19 +666,10 @@ impl CthulhuApp {
             Action::CloseSettings => {
                 self.settings_screen = None;
             }
-            Action::ToggleBranchesSidebar => {
-                self.settings.branches_sidebar_hidden = !self.settings.branches_sidebar_hidden;
-                self.save_settings();
-            }
-            Action::ToggleDetailSidebar => {
-                self.settings.detail_sidebar_hidden = !self.settings.detail_sidebar_hidden;
-                self.save_settings();
-            }
-            Action::ToggleTerminal => {
-                self.settings.terminal_hidden = !self.settings.terminal_hidden;
-                if !self.settings.terminal_hidden {
-                    self.settings.detail_sidebar_hidden = false;
-                }
+            Action::SetPanels(panels) => {
+                self.settings.branches_sidebar_hidden = !panels.branches;
+                self.settings.detail_sidebar_hidden = !panels.detail;
+                self.settings.terminal_hidden = !panels.terminal;
                 self.save_settings();
             }
             Action::SetUiFont(name) => {
@@ -1007,6 +998,7 @@ mod tests {
 
     use super::avatars::AvatarService;
     use super::home::Glance;
+    use super::repo_view::Panels;
     use super::task::Task;
     use super::test_support::{absent_git, commit, listed, opened};
     use super::{
@@ -1085,7 +1077,7 @@ mod tests {
 
     /// Each action that changes a saved setting, in order, and fields the
     /// file holds after it.
-    fn persisting_actions() -> [(Action, serde_json::Value); 7] {
+    fn persisting_actions() -> [(Action, serde_json::Value); 5] {
         let columns = HistoryColumns {
             branch: 5,
             graph: 300,
@@ -1093,17 +1085,15 @@ mod tests {
         };
         [
             (
-                Action::ToggleBranchesSidebar,
-                json!({ "history_sidebar_hidden": true }),
-            ),
-            (
-                Action::ToggleDetailSidebar,
-                json!({ "detail_sidebar_hidden": true }),
-            ),
-            // Showing the terminal opens the sidebar that holds it.
-            (
-                Action::ToggleTerminal,
-                json!({ "terminal_hidden": false, "detail_sidebar_hidden": false }),
+                Action::SetPanels(Panels {
+                    branches: false,
+                    detail: true,
+                    terminal: true,
+                }),
+                json!({
+                    "history_sidebar_hidden": true, "detail_sidebar_hidden": false,
+                    "terminal_hidden": false
+                }),
             ),
             (
                 Action::SetUiFont(Some("inter".to_owned())),

@@ -51,8 +51,8 @@ of writing through it). On Unix the file is private to the user (mode 0600).
 | `src/ui/mod.rs` | `CthulhuApp::new` | Loads settings, applies the theme, picks the startup screen |
 | `src/ui/mod.rs` | `load_settings` | The settings and `save_path`: a file that could not be read leaves no save path, so nothing is written over it |
 | `src/ui/mod.rs` | `CthulhuApp::finish_open` | Remembers a repository on success; forgets `last_repository` when it fails to open |
-| `src/ui/mod.rs` | `CthulhuApp::ui`, `Action::ToggleBranchesSidebar`, `Action::ToggleDetailSidebar` | Flips `branches_sidebar_hidden` (saved as `history_sidebar_hidden`) or `detail_sidebar_hidden` when the repository view asks |
-| `src/ui/mod.rs` | `CthulhuApp::ui`, `Action::ToggleTerminal` | Flips `terminal_hidden` when the repository view asks. Showing the terminal also opens the right sidebar |
+| `src/ui/repo_view.rs` | `show`, `Panels` | The panel toggles and a sidebar dragged shut change which panels are open; showing the terminal also opens the right sidebar |
+| `src/ui/mod.rs` | `CthulhuApp::ui`, `Action::SetPanels` | Stores `branches_sidebar_hidden` (saved as `history_sidebar_hidden`), `detail_sidebar_hidden` and `terminal_hidden` from the panels the repository view reports, and saves |
 | `src/settings.rs` | `HistoryColumns`, `HistoryColumns::normalized` | Width of each history column, validated field by field |
 | `src/ui/history.rs` | `show`, `header`, `drag_column`, `reset_column` | `header` draws the column dividers; `show` reads them: a drag goes through `drag_column`, a double click through `reset_column`, and a release or double click returns the new widths |
 | `src/ui/mod.rs` | `Action::SetHistoryColumns` | Stores `history_columns` (normalized) and saves, only when it changed |

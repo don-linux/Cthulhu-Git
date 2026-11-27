@@ -32,12 +32,18 @@ const SIDEBAR_MIN_WIDTH: f32 = 220.0;
 const SIDEBAR_MAX_WIDTH: f32 = 560.0;
 const DETAIL_AVATAR: f32 = 28.0;
 
+/// Which sidebars and the terminal strip are open.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Panels {
+    pub branches: bool,
+    pub detail: bool,
+    pub terminal: bool,
+}
+
 /// What the repository screen reads besides the repository itself.
 pub struct ViewState<'a> {
     pub error: Option<&'a str>,
-    pub branches_open: bool,
-    pub detail_open: bool,
-    pub terminal_open: bool,
+    pub panels: Panels,
     pub syncing: Option<SyncKind>,
     pub columns: HistoryColumns,
     /// This repository's history graph is still being read.
@@ -56,13 +62,8 @@ pub fn show(
     let mut actions = Vec::new();
     repo.diffs.poll(ui.ctx(), &repo.git, &repo.info.root);
     // The toggle buttons and dragging a sidebar edge past its minimum width
-    // both flip these; the app saves the change.
-    let branches_were_open = state.branches_open;
-    let detail_was_open = state.detail_open;
-    let terminal_was_open = state.terminal_open;
-    let mut branches_open = state.branches_open;
-    let mut detail_open = state.detail_open;
-    let mut terminal_open = state.terminal_open;
+    // both change these; the app saves the change.
+    let mut panels = state.panels;
     let sidebar_default =
         (ui.available_width() * SIDEBAR_DEFAULT_SHARE).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
     // Replies from the shell have to land even while the strip is hidden.
@@ -72,20 +73,13 @@ pub fn show(
     egui::Panel::top("repo-top-bar")
         .frame(widgets::bar_frame(&palette))
         .show(ui, |ui| {
-            top_bar(ui, repo, &palette, &mut branches_open, &mut detail_open);
+            top_bar(ui, repo, &palette, &mut panels);
         });
 
     egui::Panel::bottom("repo-bottom-bar")
         .frame(widgets::bar_frame(&palette))
         .show(ui, |ui| {
-            bottom_bar(
-                ui,
-                repo,
-                state,
-                &palette,
-                (&mut terminal_open, &mut detail_open),
-                &mut actions,
-            );
+            bottom_bar(ui, repo, state, &palette, &mut panels, &mut actions);
         });
 
     let side = side_frame(&palette);
@@ -94,7 +88,7 @@ pub fn show(
         .default_size(sidebar_default)
         .size_range(SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH)
         .frame(side)
-        .show_collapsible(ui, &mut branches_open, |ui| {
+        .show_collapsible(ui, &mut panels.branches, |ui| {
             branches_panel(ui, repo, &palette);
         });
 
@@ -103,8 +97,8 @@ pub fn show(
         .default_size(sidebar_default)
         .size_range(SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH)
         .frame(side)
-        .show_collapsible(ui, &mut detail_open, |ui| {
-            detail_column(ui, repo, &palette, terminal_open, avatars);
+        .show_collapsible(ui, &mut panels.detail, |ui| {
+            detail_column(ui, repo, &palette, panels.terminal, avatars);
         });
 
     egui::CentralPanel::default()
@@ -127,16 +121,13 @@ pub fn show(
             }
             // Choosing a commit opens the sidebar. A commit that is already
             // chosen does not, so closing the panel by hand stays closed.
-            if history.reveal_detail && !detail_open {
-                detail_open = true;
+            if history.reveal_detail {
+                panels.detail = true;
             }
         });
 
-    if branches_open != branches_were_open {
-        actions.push(Action::ToggleBranchesSidebar);
-    }
-    if detail_open != detail_was_open && !(terminal_open && !terminal_was_open) {
-        actions.push(Action::ToggleDetailSidebar);
+    if panels != state.panels {
+        actions.push(Action::SetPanels(panels));
     }
     close_changes_for_other_commit(repo);
     if let Some(mut changes) = repo.changes.take() {
@@ -153,10 +144,7 @@ pub fn show(
         }
     }
 
-    if terminal_open != terminal_was_open {
-        actions.push(Action::ToggleTerminal);
-    }
-    if !terminal_open || !detail_open {
+    if !panels.terminal || !panels.detail {
         terminal::surrender_focus(ui.ctx(), repo.view_id);
     }
     widgets::show_clipboard_toast(ui.ctx());
@@ -206,16 +194,14 @@ fn detail_column(
 
 /// Home, the folder dialog and Settings; the current branch, whose menu
 /// switches to another; Fetch and Pull; the terminal toggle at the right end.
-/// `panels` is (terminal open, detail open).
 fn bottom_bar(
     ui: &mut Ui,
     repo: &OpenedRepo,
     state: &ViewState<'_>,
     palette: &Palette,
-    panels: (&mut bool, &mut bool),
+    panels: &mut Panels,
     actions: &mut Vec<Action>,
 ) {
-    let (terminal_open, detail_open) = panels;
     ui.horizontal(|ui| {
         widgets::home_and_folder(ui, state.busy, actions);
         if icons::icon_button(ui, Icon::Settings, palette.text, "Settings").clicked() {
@@ -230,7 +216,7 @@ fn bottom_bar(
         let branch_hover = state
             .syncing
             .map_or("Switch branch", SyncKind::progress_label);
-        let (terminal_tint, terminal_hover) = if *terminal_open {
+        let (terminal_tint, terminal_hover) = if panels.terminal {
             (palette.accent, "Hide terminal")
         } else {
             (palette.text_muted, "Show terminal")
@@ -282,10 +268,10 @@ fn bottom_bar(
             })
             .inner;
         if terminal_toggle.clicked() {
-            *terminal_open = !*terminal_open;
+            panels.terminal = !panels.terminal;
             // The strip lives in the right sidebar, so showing it opens that too.
-            if *terminal_open {
-                *detail_open = true;
+            if panels.terminal {
+                panels.detail = true;
             }
         }
     });
@@ -311,15 +297,9 @@ fn side_frame(palette: &Palette) -> Frame {
 /// The branch toggle on the left, the detail toggle on the right, and the name
 /// centered on the window. The name is truncated before it would reach either
 /// toggle.
-fn top_bar(
-    ui: &mut Ui,
-    repo: &OpenedRepo,
-    palette: &Palette,
-    branches_open: &mut bool,
-    detail_open: &mut bool,
-) {
+fn top_bar(ui: &mut Ui, repo: &OpenedRepo, palette: &Palette, panels: &mut Panels) {
     ui.horizontal(|ui| {
-        let (branches_tint, branches_hover) = if *branches_open {
+        let (branches_tint, branches_hover) = if panels.branches {
             (palette.accent, "Hide branches")
         } else {
             (palette.text_muted, "Show branches")
@@ -327,10 +307,10 @@ fn top_bar(
         let branches_toggle =
             icons::icon_button(ui, Icon::PanelLeft, branches_tint, branches_hover);
         if branches_toggle.clicked() {
-            *branches_open = !*branches_open;
+            panels.branches = !panels.branches;
         }
 
-        let (detail_tint, detail_hover) = if *detail_open {
+        let (detail_tint, detail_hover) = if panels.detail {
             (palette.accent, "Hide commit details")
         } else {
             (palette.text_muted, "Show commit details")
@@ -341,7 +321,7 @@ fn top_bar(
             })
             .inner;
         if detail_toggle.clicked() {
-            *detail_open = !*detail_open;
+            panels.detail = !panels.detail;
         }
 
         let row = ui.max_rect();

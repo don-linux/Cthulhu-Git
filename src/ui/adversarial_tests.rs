@@ -30,7 +30,7 @@ use tempfile::TempDir;
 use super::avatars::AvatarService;
 use super::github_auth::GitHubAuth;
 use super::home::{self, CARD_SIZE, Glance, HomeState};
-use super::repo_view::{self, ViewState};
+use super::repo_view::{self, Panels, ViewState};
 use super::settings::{self, AboutInfo, SettingsView};
 use super::test_support::{commit, listed, opened, painted_texts, tree_text};
 use super::theme;
@@ -269,31 +269,37 @@ fn branch_names_git_shortens_ambiguously_still_open() {
 }
 
 #[test]
-fn history_sidebar_toggle_is_saved() {
+fn sidebar_toggles_are_saved() {
     let sandbox = Sandbox::new();
     let repo = fixtures::Repo::init("sidebar-repo");
     repo.commit("Awaken");
     let mut harness = sandbox.app(Some(repo.root.clone()));
     settle_open(&mut harness);
-    assert_shows(&harness, "Branches", "open");
     let before = sandbox.json();
-    assert_eq!(before["history_sidebar_hidden"], false);
-
-    harness
-        .get_by_role_and_label(Role::Button, "Hide branches")
-        .click();
-    harness.step();
-
-    let after = sandbox.json();
-    assert_eq!(
-        after["history_sidebar_hidden"], true,
-        "the toggle was not saved"
-    );
-    assert_eq!(
-        after["last_repository"], before["last_repository"],
-        "toggling the sidebar changed last_repository"
-    );
-    assert!(!shows(&harness, "Branches"), "the sidebar is still open");
+    // (toggle, saved field, a title only that sidebar shows)
+    for (toggle, field, title) in [
+        ("Hide branches", "history_sidebar_hidden", "Branches"),
+        (
+            "Hide commit details",
+            "detail_sidebar_hidden",
+            "Latest commit",
+        ),
+    ] {
+        assert_shows(&harness, title, "open");
+        assert_eq!(before[field], false, "{toggle}");
+        harness.get_by_role_and_label(Role::Button, toggle).click();
+        harness.step();
+        let after = sandbox.json();
+        assert_eq!(after[field], true, "{toggle} was not saved");
+        assert_eq!(
+            after["last_repository"], before["last_repository"],
+            "{toggle} changed last_repository"
+        );
+        assert!(
+            !shows(&harness, title),
+            "{toggle}: the sidebar is still open"
+        );
+    }
     assert_shows(&harness, "Commit history", "closed");
 }
 
@@ -340,9 +346,11 @@ fn repo_screen(
     draw(WINDOW_SIZE, move |ui| {
         let view = ViewState {
             error: None,
-            branches_open: sidebars,
-            detail_open: sidebars,
-            terminal_open: false,
+            panels: Panels {
+                branches: sidebars,
+                detail: sidebars,
+                terminal: false,
+            },
             syncing,
             columns: HistoryColumns::default(),
             history_loading: false,
@@ -400,11 +408,16 @@ fn browse_is_disabled_while_busy() {
             Action::OpenSettings,
         ),
         ("settings", "Open a folder", "Back", Action::CloseSettings),
+        // Showing the terminal opens the sidebar that holds it.
         (
             "repository",
             "Open a folder",
             "Show terminal",
-            Action::ToggleTerminal,
+            Action::SetPanels(Panels {
+                branches: false,
+                detail: true,
+                terminal: true,
+            }),
         ),
     ];
     for (screen, browse, other, other_action) in cases {

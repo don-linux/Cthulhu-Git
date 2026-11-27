@@ -22,7 +22,7 @@ use egui_kittest::{Harness, HarnessBuilder};
 
 use super::avatars::AvatarService;
 use super::hover::HoverCache;
-use super::repo_view::{self, ViewState};
+use super::repo_view::{self, Panels, ViewState};
 use super::theme;
 use super::{Action, ListedBranch, OpenedRepo};
 
@@ -39,8 +39,7 @@ const TITLES: [&str; 5] = ["Branch", "Graph", "Commit Hash", "Commit Message", "
 struct Screen {
     repo: OpenedRepo,
     columns: HistoryColumns,
-    branches_open: bool,
-    detail_open: bool,
+    panels: Panels,
     /// This repository's history graph is still being read.
     history_loading: bool,
     actions: Vec<Action>,
@@ -69,8 +68,11 @@ fn screen(
     Screen {
         repo,
         columns,
-        branches_open,
-        detail_open,
+        panels: Panels {
+            branches: branches_open,
+            detail: detail_open,
+            terminal: false,
+        },
         history_loading: false,
         actions: Vec::new(),
     }
@@ -98,9 +100,7 @@ fn harness_from(
                     &mut screen.repo,
                     &ViewState {
                         error: None,
-                        branches_open: screen.branches_open,
-                        detail_open: screen.detail_open,
-                        terminal_open: false,
+                        panels: screen.panels,
                         syncing: None,
                         columns: screen.columns,
                         history_loading: screen.history_loading,
@@ -111,9 +111,7 @@ fn harness_from(
                 for action in &produced {
                     match action {
                         Action::SetHistoryColumns(columns) => screen.columns = *columns,
-                        Action::ToggleDetailSidebar => {
-                            screen.detail_open = !screen.detail_open;
-                        }
+                        Action::SetPanels(panels) => screen.panels = *panels,
                         _ => {}
                     }
                 }
@@ -1584,10 +1582,10 @@ fn assert_latest(harness: &Harness<'_, Screen>) {
     );
 }
 
-fn detail_toggles(actions: &[Action]) -> usize {
+fn panel_changes(actions: &[Action]) -> usize {
     actions
         .iter()
-        .filter(|action| matches!(action, Action::ToggleDetailSidebar))
+        .filter(|action| matches!(action, Action::SetPanels(_)))
         .count()
 }
 
@@ -1628,7 +1626,7 @@ fn each_click_in_the_history_picks_keeps_or_releases_the_commit() {
         "a single hash click copied {:?}",
         copied_texts(&harness)
     );
-    assert_eq!(detail_toggles(&harness.state().actions[closed..]), 1);
+    assert_eq!(panel_changes(&harness.state().actions[closed..]), 1);
     settle(&mut harness);
     assert_selected(&harness, &newer);
     let open = harness.state().actions.len();
@@ -1668,7 +1666,7 @@ fn each_click_in_the_history_picks_keeps_or_releases_the_commit() {
         "the selection fill is not on the older commit"
     );
     assert_eq!(
-        detail_toggles(&harness.state().actions[open..]),
+        panel_changes(&harness.state().actions[open..]),
         0,
         "choosing a commit closed or opened a sidebar that was already open"
     );
@@ -1781,7 +1779,7 @@ fn double_clicking_the_hash_copies_it_and_keeps_the_commit() {
     settle(&mut harness);
     assert_selected(&harness, &newer);
     harness.get_by_label(&copied_notice(&newer));
-    assert_eq!(detail_toggles(&harness.state().actions[before..]), 0);
+    assert_eq!(panel_changes(&harness.state().actions[before..]), 0);
     assert!(
         !harness.state().actions[before..]
             .iter()
@@ -1797,7 +1795,7 @@ fn double_clicking_the_hash_copies_it_and_keeps_the_commit() {
     );
     settle(&mut harness);
     assert_selected(&harness, &newer);
-    assert_eq!(detail_toggles(&harness.state().actions[before..]), 0);
+    assert_eq!(panel_changes(&harness.state().actions[before..]), 0);
     harness.get_by_label(&copied_notice(&newer));
 }
 

@@ -506,7 +506,7 @@ mod tests {
 
     use super::*;
     use crate::ui::async_cache::MAX_ENTRIES;
-    use crate::ui::repo_view::{self, ViewState};
+    use crate::ui::repo_view::{self, Panels, ViewState};
     use crate::ui::test_support::{
         absent_git, commit, opened, painted_texts, proptest_config, tree_text,
     };
@@ -758,9 +758,7 @@ mod tests {
                 theme::apply(ui.ctx(), theme::DEFAULT_THEME);
                 let view = ViewState {
                     error: None,
-                    branches_open: false,
-                    detail_open: false,
-                    terminal_open: false,
+                    panels: Panels::default(),
                     syncing: None,
                     columns: HistoryColumns::default(),
                     history_loading: false,
