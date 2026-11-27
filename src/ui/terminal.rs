@@ -2527,8 +2527,8 @@ END
                 .memory(|memory| memory.has_focus(focus_id(view_id)))
         };
         assert!(focused(&harness), "a click focuses the terminal");
-        // Text and Enter reach the shell: the command and its output.
-        harness.event(Event::Text("echo cthulhu-typed".to_owned()));
+        // Text and Enter reach the shell: only the command's output has 42.
+        harness.event(Event::Text("echo cthulhu-$((6 * 7))".to_owned()));
         harness.key_press(Key::Enter);
         let shown = |harness: &egui_kittest::Harness<'_, Option<Terminal>>| match harness.state() {
             Some(Terminal::Live(session)) => {
@@ -2538,12 +2538,29 @@ END
             }
             _ => String::new(),
         };
-        while shown(&harness).matches("cthulhu-typed").count() < 2 {
+        while !shown(&harness).contains("cthulhu-42") {
             let late = started.elapsed() > Duration::from_secs(10);
             assert!(!late, "{}", shown(&harness));
             harness.step();
             thread::sleep(Duration::from_millis(10));
         }
+        // A drag over the screen's top rows selects their text.
+        for (at, pressed) in [(Pos2::new(20.0, 40.0), true), (inside, false)] {
+            harness.hover_at(at);
+            harness.step();
+            harness.event(Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            });
+            harness.step();
+        }
+        let selected = match harness.state() {
+            Some(Terminal::Live(session)) => session.term.lock().selection_to_string(),
+            _ => None,
+        };
+        assert!(selected.is_some_and(|text| text.contains("cthulhu-42")));
         for key in [Key::Escape, Key::Tab, Key::ArrowUp, Key::ArrowLeft] {
             harness.key_press(key);
             harness.step();
@@ -2651,6 +2668,22 @@ END
                 expected,
                 "{index}"
             );
+        }
+    }
+
+    /// (column, row, wide, cell) for 8x16 cells from (100, 50). A wide
+    /// character takes two columns.
+    #[test]
+    fn cells_are_laid_out_from_the_origin() {
+        let metrics = grid_metrics(80, 24, 8.0, 16.0);
+        for (col, row, wide, [left, top, right]) in [
+            (0, 0, false, [100.0, 50.0, 108.0]),
+            (3, 2, false, [124.0, 82.0, 132.0]),
+            (3, 2, true, [124.0, 82.0, 140.0]),
+        ] {
+            let cell = cell_rect(Pos2::new(100.0, 50.0), &metrics, col, row, wide);
+            let expected = Rect::from_x_y_ranges(left..=right, top..=top + 16.0);
+            assert_eq!(cell, expected, "{col},{row} wide {wide}");
         }
     }
 
