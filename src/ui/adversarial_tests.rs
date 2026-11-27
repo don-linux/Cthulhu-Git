@@ -768,62 +768,19 @@ fn assert_in_window(rect: egui::Rect, what: &str) {
     );
 }
 
-fn describe_action(action: &Action) -> String {
-    match action {
-        Action::Browse => "Browse".to_owned(),
-        Action::Open(path) => format!("Open({})", path.display()),
-        Action::Home => "Home".to_owned(),
-        Action::OpenSettings => "OpenSettings".to_owned(),
-        Action::CloseSettings => "CloseSettings".to_owned(),
-        Action::ToggleBranchesSidebar => "ToggleBranchesSidebar".to_owned(),
-        Action::ToggleDetailSidebar => "ToggleDetailSidebar".to_owned(),
-        Action::ToggleTerminal => "ToggleTerminal".to_owned(),
-        Action::SetUiFont(name) => format!("SetUiFont({name:?})"),
-        Action::SetTerminalFont(name) => format!("SetTerminalFont({name:?})"),
-        Action::Fetch(branch) => format!("Fetch({branch})"),
-        Action::Pull => "Pull".to_owned(),
-        Action::Checkout(name) => format!("Checkout({name})"),
-        Action::SetHistoryColumns(_) => "SetHistoryColumns".to_owned(),
-        Action::SetAuthorAvatars(on) => format!("SetAuthorAvatars({on})"),
-    }
-}
-
-fn describe_actions(actions: &[Action]) -> String {
-    if actions.is_empty() {
-        return "[]".to_owned();
-    }
-    actions
-        .iter()
-        .map(describe_action)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn assert_exact(actions: &[Action], expected: &[&str]) {
-    let got: Vec<String> = actions.iter().map(describe_action).collect();
-    let expected: Vec<String> = expected.iter().copied().map(str::to_owned).collect();
-    assert_eq!(got, expected, "actions");
-}
-
 fn assert_no_checkout(actions: &[Action]) {
     assert!(
         actions
             .iter()
             .all(|action| !matches!(action, Action::Checkout(_))),
-        "unexpected checkout: {}",
-        describe_actions(actions)
+        "unexpected checkout: {actions:?}"
     );
 }
 
 fn assert_only_checkout(actions: &[Action], name: &str) {
-    assert_eq!(
-        actions.len(),
-        1,
-        "expected one Checkout, got {}",
-        describe_actions(actions)
-    );
+    assert_eq!(actions.len(), 1, "expected one Checkout, got {actions:?}");
     let Action::Checkout(got) = &actions[0] else {
-        panic!("expected Checkout, got {}", describe_actions(actions));
+        panic!("expected Checkout, got {actions:?}");
     };
     assert_eq!(got.as_bytes(), name.as_bytes(), "checkout payload bytes");
 }
@@ -1302,11 +1259,11 @@ fn the_home_screen_shows_the_version_browses_and_opens_settings() {
 
     click_labeled(&harness, "Open repository…");
     harness.step();
-    assert_eq!(home_action(&actions), "Browse");
+    assert_eq!(*actions.borrow(), Some(Action::Browse));
 
     click_labeled(&harness, "Settings");
     harness.step();
-    assert_eq!(home_action(&actions), "OpenSettings");
+    assert_eq!(*actions.borrow(), Some(Action::OpenSettings));
 
     {
         let row = harness
@@ -1316,7 +1273,10 @@ fn the_home_screen_shows_the_version_browses_and_opens_settings() {
         row.click();
     }
     harness.step();
-    assert_eq!(home_action(&actions), "Open(/repos/rlyeh)");
+    assert_eq!(
+        *actions.borrow(),
+        Some(Action::Open(PathBuf::from("/repos/rlyeh")))
+    );
 
     *busy.borrow_mut() = true;
     harness.step();
@@ -1340,13 +1300,13 @@ fn the_home_screen_shows_the_version_browses_and_opens_settings() {
     harness.step();
     assert!(
         actions.borrow().is_none(),
-        "busy open click emitted {}",
-        home_action(&actions)
+        "busy open click emitted {:?}",
+        actions.borrow()
     );
 
     click_labeled(&harness, "Settings");
     harness.step();
-    assert_eq!(home_action(&actions), "OpenSettings");
+    assert_eq!(*actions.borrow(), Some(Action::OpenSettings));
 }
 
 #[test]
@@ -1518,14 +1478,6 @@ fn count_exact<State>(harness: &Harness<'_, State>, exact: &str) -> usize {
         .query_all_by_role(Role::Label)
         .filter(|node| node.value().as_deref() == Some(exact))
         .count()
-}
-
-fn home_action(actions: &RefCell<Option<Action>>) -> String {
-    actions
-        .borrow()
-        .as_ref()
-        .map(describe_action)
-        .unwrap_or_else(|| "None".to_owned())
 }
 
 fn click_labeled<State>(harness: &Harness<'_, State>, label: &str) {
@@ -1900,7 +1852,7 @@ fn the_folder_button_browses_once_and_ignores_a_second_click_while_busy() {
         button_covering(&harness, row[home_index + 1]).click();
     }
     harness.step();
-    assert_exact(&actions.borrow(), &["Browse"]);
+    assert_eq!(*actions.borrow(), [Action::Browse]);
 
     drive.borrow_mut().busy = true;
     harness.step();
@@ -1913,8 +1865,8 @@ fn the_folder_button_browses_once_and_ignores_a_second_click_while_busy() {
     harness.step();
     assert!(
         actions.borrow().is_empty(),
-        "busy folder click emitted {}",
-        describe_actions(&actions.borrow())
+        "busy folder click emitted {:?}",
+        actions.borrow()
     );
     let row = bottom_bar_buttons(&harness);
     assert!(
@@ -1956,7 +1908,7 @@ fn the_settings_folder_button_sits_right_of_home_and_browses() {
     );
     button_covering(&harness, row[2]).click();
     harness.step();
-    assert_exact(&actions.borrow(), &["Browse"]);
+    assert_eq!(*actions.borrow(), [Action::Browse]);
 
     *busy.borrow_mut() = true;
     harness.step();
@@ -1969,8 +1921,8 @@ fn the_settings_folder_button_sits_right_of_home_and_browses() {
     harness.step();
     assert!(
         actions.borrow().is_empty(),
-        "busy settings folder click emitted {}",
-        describe_actions(&actions.borrow())
+        "busy settings folder click emitted {:?}",
+        actions.borrow()
     );
     let row = top_bar_buttons(&harness);
     assert!(
@@ -2022,8 +1974,8 @@ fn the_branch_menu_checks_out_another_branch_and_not_the_current_one() {
     click_selected_row(&mut harness, "main");
     assert!(
         actions.borrow().is_empty(),
-        "clicking the current branch emitted {}",
-        describe_actions(&actions.borrow())
+        "clicking the current branch emitted {:?}",
+        actions.borrow()
     );
     assert!(
         buttons_labeled(&harness, "feature").is_empty(),
@@ -2120,8 +2072,8 @@ fn detached_and_unborn_heads_still_list_other_branches() {
             .borrow()
             .iter()
             .all(|action| !matches!(action, Action::Checkout(_))),
-        "clicking the unborn row emitted {}",
-        describe_actions(&actions.borrow())
+        "clicking the unborn row emitted {:?}",
+        actions.borrow()
     );
     assert!(
         buttons_labeled(&harness, "feature").is_empty(),

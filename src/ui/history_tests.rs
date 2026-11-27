@@ -578,26 +578,6 @@ fn double_click_at(harness: &mut Harness<'_, Screen>, at: Pos2) {
     click_at(harness, at);
 }
 
-fn action_name(action: &Action) -> String {
-    match action {
-        Action::Browse => "Browse".to_owned(),
-        Action::Open(path) => format!("Open({})", path.display()),
-        Action::Home => "Home".to_owned(),
-        Action::OpenSettings => "OpenSettings".to_owned(),
-        Action::CloseSettings => "CloseSettings".to_owned(),
-        Action::ToggleBranchesSidebar => "ToggleBranchesSidebar".to_owned(),
-        Action::ToggleDetailSidebar => "ToggleDetailSidebar".to_owned(),
-        Action::ToggleTerminal => "ToggleTerminal".to_owned(),
-        Action::SetUiFont(font) => format!("SetUiFont({font:?})"),
-        Action::SetTerminalFont(font) => format!("SetTerminalFont({font:?})"),
-        Action::Fetch(branch) => format!("Fetch({branch})"),
-        Action::Pull => "Pull".to_owned(),
-        Action::Checkout(name) => format!("Checkout({name})"),
-        Action::SetHistoryColumns(columns) => format!("SetHistoryColumns({columns:?})"),
-        Action::SetAuthorAvatars(on) => format!("SetAuthorAvatars({on})"),
-    }
-}
-
 fn take_column_change(harness: &mut Harness<'_, Screen>) -> HistoryColumns {
     let actions = std::mem::take(&mut harness.state_mut().actions);
     let changes: Vec<_> = actions
@@ -607,25 +587,18 @@ fn take_column_change(harness: &mut Harness<'_, Screen>) -> HistoryColumns {
             _ => None,
         })
         .collect();
-    let described = actions
-        .iter()
-        .map(action_name)
-        .collect::<Vec<_>>()
-        .join(", ");
     assert_eq!(
         changes.len(),
         1,
-        "expected one SetHistoryColumns, actions: {described}"
+        "expected one SetHistoryColumns, actions: {actions:?}"
     );
     let others: Vec<_> = actions
         .iter()
         .filter(|action| !matches!(action, Action::SetHistoryColumns(_)))
-        .map(action_name)
         .collect();
     assert!(
         others.is_empty(),
-        "unexpected actions beside SetHistoryColumns: {}",
-        others.join(", ")
+        "unexpected actions beside SetHistoryColumns: {others:?}"
     );
     changes[0]
 }

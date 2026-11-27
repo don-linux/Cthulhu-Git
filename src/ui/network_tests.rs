@@ -643,26 +643,6 @@ fn password_display(harness: &Harness<'_, ()>) -> String {
     field.children().filter_map(|child| child.value()).collect()
 }
 
-fn action_label(action: &Action) -> String {
-    match action {
-        Action::Browse => "Browse".to_owned(),
-        Action::Open(path) => format!("Open({})", path.display()),
-        Action::Home => "Home".to_owned(),
-        Action::OpenSettings => "OpenSettings".to_owned(),
-        Action::CloseSettings => "CloseSettings".to_owned(),
-        Action::ToggleBranchesSidebar => "ToggleBranchesSidebar".to_owned(),
-        Action::ToggleDetailSidebar => "ToggleDetailSidebar".to_owned(),
-        Action::ToggleTerminal => "ToggleTerminal".to_owned(),
-        Action::SetUiFont(name) => format!("SetUiFont({name:?})"),
-        Action::SetTerminalFont(name) => format!("SetTerminalFont({name:?})"),
-        Action::Fetch(branch) => format!("Fetch({branch})"),
-        Action::Pull => "Pull".to_owned(),
-        Action::Checkout(name) => format!("Checkout({name})"),
-        Action::SetHistoryColumns(_) => "SetHistoryColumns".to_owned(),
-        Action::SetAuthorAvatars(on) => format!("SetAuthorAvatars({on})"),
-    }
-}
-
 /// The settings harness, the GitHub Auth state it edits, and the actions it returned.
 type SettingsHarness = (
     Harness<'static, ()>,
@@ -811,8 +791,7 @@ fn settings_hides_the_token_and_history_toggles_avatars() {
         checkbox.click();
     }
     harness.step();
-    let got: Vec<_> = actions.borrow().iter().map(action_label).collect();
-    assert_eq!(got, vec!["SetAuthorAvatars(false)".to_owned()], "{got:?}");
+    assert_eq!(*actions.borrow(), [Action::SetAuthorAvatars(false)]);
 }
 
 #[test]
@@ -977,11 +956,9 @@ fn appearance_and_terminal_offer_different_bundled_faces() {
     );
 
     click_label(&mut harness, "Inter");
-    let got: Vec<_> = actions.borrow().iter().map(action_label).collect();
     assert_eq!(
-        got,
-        vec!["SetUiFont(Some(\"inter\"))".to_owned()],
-        "{got:?}"
+        *actions.borrow(),
+        [Action::SetUiFont(Some("inter".to_owned()))]
     );
 
     click_label(&mut harness, "Terminal");
@@ -995,11 +972,9 @@ fn appearance_and_terminal_offer_different_bundled_faces() {
     );
 
     click_label(&mut harness, "Departure Mono");
-    let got: Vec<_> = actions.borrow().iter().map(action_label).collect();
     assert_eq!(
-        got,
-        vec!["SetTerminalFont(Some(\"departure-mono\"))".to_owned()],
-        "{got:?}"
+        *actions.borrow(),
+        [Action::SetTerminalFont(Some("departure-mono".to_owned()))]
     );
 }
 
@@ -1055,8 +1030,10 @@ fn obel_on_one_surface_does_not_change_the_other() {
     let (mut harness, actions, chosen) =
         open_font_settings(Some("ubuntu-sans".to_owned()), Some("builtin".to_owned()));
     click_label(&mut harness, "Obel Mono");
-    let got: Vec<_> = actions.borrow().iter().map(action_label).collect();
-    assert_eq!(got, vec!["SetUiFont(Some(\"obel-mono\"))".to_owned()]);
+    assert_eq!(
+        *actions.borrow(),
+        [Action::SetUiFont(Some("obel-mono".to_owned()))]
+    );
     chosen.borrow_mut().0 = Some("obel-mono".to_owned());
     harness.step();
     assert!(
@@ -1072,18 +1049,12 @@ fn obel_on_one_surface_does_not_change_the_other() {
             .iter()
             .all(|action| !matches!(action, Action::SetUiFont(_))),
         "opening Terminal changed the interface face: {:?}",
-        actions
-            .borrow()
-            .iter()
-            .map(action_label)
-            .collect::<Vec<_>>()
+        actions.borrow()
     );
     click_label(&mut harness, "Obel Mono");
-    let got: Vec<_> = actions.borrow().iter().map(action_label).collect();
     assert_eq!(
-        got,
-        vec!["SetTerminalFont(Some(\"obel-mono\"))".to_owned()],
-        "{got:?}"
+        *actions.borrow(),
+        [Action::SetTerminalFont(Some("obel-mono".to_owned()))]
     );
     assert_eq!(chosen.borrow().0.as_deref(), Some("obel-mono"));
 }
@@ -1097,11 +1068,7 @@ fn unknown_font_name_is_reported_and_does_not_pick_a_bundled_id() {
     assert!(
         actions.borrow().is_empty(),
         "opening Appearance rewrote the font: {:?}",
-        actions
-            .borrow()
-            .iter()
-            .map(action_label)
-            .collect::<Vec<_>>()
+        actions.borrow()
     );
     harness.get_by_label("\"JetBrains Mono\" is not bundled. The interface is using Ubuntu.");
     assert!(
@@ -1114,11 +1081,7 @@ fn unknown_font_name_is_reported_and_does_not_pick_a_bundled_id() {
     assert!(
         actions.borrow().is_empty(),
         "opening Terminal rewrote the font: {:?}",
-        actions
-            .borrow()
-            .iter()
-            .map(action_label)
-            .collect::<Vec<_>>()
+        actions.borrow()
     );
     harness.get_by_label("\"Fira Code\" is not bundled. The terminal is using Meslo LGS NF.");
     assert_eq!(chosen.borrow().0.as_deref(), Some("JetBrains Mono"));

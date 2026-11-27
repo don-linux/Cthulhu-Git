@@ -81,6 +81,7 @@ pub struct ListedBranch {
 }
 
 /// What a screen asks the app to do after drawing itself.
+#[derive(Debug, PartialEq)]
 pub enum Action {
     Browse,
     Open(PathBuf),
