@@ -102,6 +102,7 @@ fn url_without_credentials(url: &str) -> String {
 
 fn classify_ureq(error: ureq::Error) -> HttpError {
     match error {
+        ureq::Error::BodyExceedsLimit(_) => HttpError::TooLarge,
         ureq::Error::Timeout(_) => HttpError::TimedOut,
         ureq::Error::ConnectionFailed | ureq::Error::HostNotFound => HttpError::Connect,
         ureq::Error::Tls(message) => HttpError::Tls(message.to_owned()),
@@ -112,6 +113,14 @@ fn classify_ureq(error: ureq::Error) -> HttpError {
 }
 
 fn classify_io(error: &std::io::Error) -> HttpError {
+    // The body reader reports ureq's own errors wrapped in an io::Error.
+    if let Some(inner) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+        && matches!(inner, ureq::Error::BodyExceedsLimit(_))
+    {
+        return HttpError::TooLarge;
+    }
     match error.kind() {
         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => HttpError::TimedOut,
         std::io::ErrorKind::ConnectionRefused
@@ -167,8 +176,8 @@ impl Transport for UreqTransport {
                     .map(|value| (name.as_str().to_ascii_lowercase(), value.to_owned()))
             })
             .collect();
-        // ureq's limit counts the bytes on the wire, before gzip is undone,
-        // so the decompressed body is capped here.
+        // ureq applies the limit to the decoded body (after gzip). read_capped
+        // keeps the same cap for any reader handed to it.
         let mut reader = response.body_mut().with_config().limit(MAX_BODY).reader();
         let body = read_capped(&mut reader, MAX_BODY as usize)?;
         Ok(HttpResponse {
@@ -329,6 +338,18 @@ pub(crate) mod fake {
 mod tests {
     use super::fake::FakeTransport;
     use super::*;
+
+    #[test]
+    fn a_body_over_the_limit_is_too_large_not_a_transport_error() {
+        // ureq 3.5 reports the decoded-body limit through the reader as an
+        // io::Error wrapping its own error.
+        let error = ureq::Error::BodyExceedsLimit(MAX_BODY).into_io();
+        assert_eq!(classify_io(&error), HttpError::TooLarge);
+        assert_eq!(
+            classify_ureq(ureq::Error::BodyExceedsLimit(MAX_BODY)),
+            HttpError::TooLarge
+        );
+    }
 
     #[test]
     fn only_https_on_known_hosts_and_default_port() {
