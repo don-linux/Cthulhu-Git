@@ -255,6 +255,8 @@ pub fn show(
         hover,
         github,
         view_id,
+        selected_commit,
+        lit_branch: lit_name,
         ..
     } = repo;
     let rows = &graph.rows;
@@ -272,13 +274,12 @@ pub fn show(
         .truncate(),
     );
     ui.add_space(6.0);
+    // A reload that has not landed yet keeps the commit the user chose.
+    retain_selected(ui.ctx(), selected_commit, rows, loading);
+    let lit = lit_branch(lit_name, rows);
     if rows.is_empty() {
         // The column between the sidebars can be narrower than these sentences.
         // Wrap inside it; truncating would drop the line the loading state shows.
-        ui.ctx()
-            .data_mut(|data| data.remove::<String>(lit_branch_id(*view_id)));
-        // A reload that has not landed yet keeps the commit the user chose.
-        retain_selected(ui, *view_id, rows, loading);
         ui.add(Label::new(text::wrapped(
             ui,
             RichText::new(empty).color(palette.text_muted),
@@ -288,8 +289,6 @@ pub fn show(
             reveal_detail: false,
         };
     }
-    retain_selected(ui, *view_id, rows, loading);
-    let selected = selected_commit(ui.ctx(), *view_id);
     if graph.truncated {
         ui.label(
             RichText::new(format!("Showing the latest {} commits.", rows.len()))
@@ -355,13 +354,12 @@ pub fn show(
         repo: repo.clone(),
         head: rows[0].oid.clone(),
     });
-    let lit = lit_branch(ui, *view_id, rows);
     let time = ui.input(|input| input.time);
     if lit.is_some() {
         ui.ctx().request_repaint_after(GLOW_FRAME);
     }
 
-    let reveal_detail = ui
+    let click = ui
         .scope(|ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             let (header_rect, _) =
@@ -374,11 +372,10 @@ pub fn show(
                 repo: context.as_ref(),
                 text_font,
                 mono_font,
-                view_id: *view_id,
                 lit,
                 time,
-                selected,
-                reveal_detail: false,
+                selected: selected_commit.as_deref(),
+                click: None,
             };
             // Where the rows were placed this frame. The scroll area's returned
             // offset already includes this frame's wheel and scrollbar input,
@@ -398,9 +395,14 @@ pub fn show(
             ui.ctx()
                 .data_mut(|data| data.insert_temp(origin_id, origin_x));
             header(ui, header_rect, origin_x, &layout, *view_id, palette);
-            cells.reveal_detail
+            cells.click
         })
         .inner;
+    let reveal_detail = click.is_some_and(|click| {
+        // The sidebar and the lanes are already drawn. One more frame shows the click.
+        ui.ctx().request_repaint();
+        apply_click(click, selected_commit, lit_name)
+    });
 
     let columns = if let Some(columns) = done {
         ui.ctx()
@@ -564,13 +566,23 @@ struct RowContext<'a> {
     repo: Option<&'a RepoContext>,
     text_font: FontId,
     mono_font: FontId,
-    view_id: Id,
     lit: Option<LitBranch>,
     time: f64,
     /// Commit whose row stays filled. `None` is the latest commit in the sidebar.
-    selected: Option<String>,
-    /// Set when this frame chooses a commit that was not already chosen.
-    reveal_detail: bool,
+    selected: Option<&'a str>,
+    /// This frame's click, applied once every row is drawn, so the whole
+    /// table paints the state the frame started with.
+    click: Option<RowClick>,
+}
+
+enum RowClick {
+    /// A hash or message cell: that commit goes to the sidebar.
+    Commit(String),
+    /// The author cell: the sidebar goes back to the latest commit.
+    Author,
+    /// A branch tag: its lane lights or goes out, and the sidebar goes back
+    /// to the latest commit.
+    Branch(String),
 }
 
 /// Branch whose lane is lit. The name is what the tag toggles; the color is
@@ -607,7 +619,7 @@ fn history_row(
     let palette = cx.palette;
     // The pointer, not a hover widget: the hash and message click sensors sit
     // on top of the row and must not take this highlight away.
-    let selected = cx.selected.as_deref() == Some(row.oid.as_str());
+    let selected = cx.selected == Some(row.oid.as_str());
     let hovered = ui.rect_contains_pointer(rect);
     let fill = if selected {
         palette.selection
@@ -658,7 +670,9 @@ fn history_row(
     }
     if let Some(chip) = &chip {
         let lit = cx.lit.as_ref().is_some_and(|lit| lit.name == chip.name);
-        paint_branch_chip(ui, chip, palette, lit, cx.view_id);
+        if paint_branch_chip(ui, chip, palette, lit) {
+            cx.click = Some(RowClick::Branch(chip.name.clone()));
+        }
     }
 
     text_cell(
@@ -695,7 +709,7 @@ fn history_row(
         Sense::CLICK,
     );
     if author.clicked() {
-        clear_selected_commit(ui, cx.view_id);
+        cx.click = Some(RowClick::Author);
     }
     hover::show_card(
         &author,
@@ -713,22 +727,22 @@ fn history_row(
     // the whole column, padding included, and nothing outside it. A later
     // click on the same commit changes nothing else. Only the hash column
     // copies, and only on a double click.
-    if click_commit(
+    let hash = click_commit(
         ui,
         layout.cell(rect, Column::Hash),
         row_id.with("pick-hash"),
         &row.oid,
-        cx.view_id,
         true,
-    ) || click_commit(
+    );
+    let message = click_commit(
         ui,
         layout.cell(rect, Column::Message),
         row_id.with("pick-message"),
         &row.oid,
-        cx.view_id,
         false,
-    ) {
-        cx.reveal_detail = true;
+    );
+    if hash || message {
+        cx.click = Some(RowClick::Commit(row.oid.clone()));
     }
 }
 
@@ -1211,74 +1225,49 @@ fn add_crest_disc(mesh: &mut Mesh, center: Pos2, radius: f32, color: Color32, lo
     }
 }
 
-fn lit_branch_id(view_id: Id) -> Id {
-    view_id.with("history-lit-branch")
-}
-
-fn selected_commit_id(view_id: Id) -> Id {
-    view_id.with("history-selected-commit")
-}
-
-/// The commit the sidebar is showing instead of the latest one.
-pub(super) fn selected_commit(ctx: &egui::Context, view_id: Id) -> Option<String> {
-    ctx.data(|data| data.get_temp(selected_commit_id(view_id)))
-}
-
-/// Remembers `oid` when it is not already the chosen commit.
-///
-/// Returns whether the choice changed. A second click on the same commit
-/// does not.
-fn select_commit(ui: &Ui, view_id: Id, oid: &str) -> bool {
-    let id = selected_commit_id(view_id);
-    let current: Option<String> = ui.ctx().data(|data| data.get_temp(id));
-    if current.as_deref() == Some(oid) {
-        return false;
+/// Returns whether a different commit was chosen. A second click on the
+/// chosen commit changes nothing.
+fn apply_click(click: RowClick, selected: &mut Option<String>, lit: &mut Option<String>) -> bool {
+    match click {
+        RowClick::Commit(oid) => {
+            let chosen = selected.as_ref() != Some(&oid);
+            *selected = Some(oid);
+            chosen
+        }
+        RowClick::Author => {
+            *selected = None;
+            false
+        }
+        RowClick::Branch(name) => {
+            toggle_lit(lit, &name);
+            *selected = None;
+            false
+        }
     }
-    ui.ctx()
-        .data_mut(|data| data.insert_temp(id, oid.to_owned()));
-    ui.ctx().request_repaint();
-    true
-}
-
-fn clear_selected_commit(ui: &Ui, view_id: Id) {
-    let id = selected_commit_id(view_id);
-    let present = ui.ctx().data(|data| data.get_temp::<String>(id).is_some());
-    if !present {
-        return;
-    }
-    ui.ctx().data_mut(|data| data.remove::<String>(id));
-    ui.ctx().request_repaint();
 }
 
 /// Forgets a chosen commit that is no longer in `rows`. An empty table that
 /// is still loading keeps it, so a reload does not snap back to the latest.
-fn retain_selected(ui: &Ui, view_id: Id, rows: &[GraphRow], loading: bool) {
-    let id = selected_commit_id(view_id);
-    let Some(oid) = ui.ctx().data(|data| data.get_temp::<String>(id)) else {
-        return;
-    };
-    if rows.iter().any(|row| row.oid == oid) || (loading && rows.is_empty()) {
-        return;
+/// The sidebar is already drawn, so forgetting takes one more frame.
+fn retain_selected(
+    ctx: &egui::Context,
+    selected: &mut Option<String>,
+    rows: &[GraphRow],
+    loading: bool,
+) {
+    let kept =
+        |oid: &mut String| rows.iter().any(|row| row.oid == *oid) || (loading && rows.is_empty());
+    if selected.take_if(|oid| !kept(oid)).is_some() {
+        ctx.request_repaint();
     }
-    ui.ctx().data_mut(|data| data.remove::<String>(id));
-    ui.ctx().request_repaint();
 }
 
-/// Click target for one hash or message cell.
+/// Click target for one hash or message cell. Returns whether it was clicked.
 ///
-/// Returns whether this click chose a different commit. A repeat click on the
-/// chosen commit returns false, so the sidebar and the accent stay put.
 /// `copy_on_double_click` copies the full hash on the second click of a double
 /// click. That second click is also a normal click, and it finds the commit
 /// already chosen.
-fn click_commit(
-    ui: &mut Ui,
-    cell: Rect,
-    id: Id,
-    oid: &str,
-    view_id: Id,
-    copy_on_double_click: bool,
-) -> bool {
+fn click_commit(ui: &mut Ui, cell: Rect, id: Id, oid: &str, copy_on_double_click: bool) -> bool {
     if cell.width() <= 0.0 {
         return false;
     }
@@ -1293,7 +1282,7 @@ fn click_commit(
     if copy_on_double_click && response.double_clicked() {
         widgets::copy_commit_hash(ui.ctx(), oid);
     }
-    response.clicked() && select_commit(ui, view_id, oid)
+    response.clicked()
 }
 
 /// Lights `name`, or puts it out when it is the lit branch.
@@ -1305,34 +1294,21 @@ fn toggle_lit(lit: &mut Option<String>, name: &str) {
     };
 }
 
-fn toggle_lit_branch(ui: &Ui, view_id: Id, name: &str) {
-    let id = lit_branch_id(view_id);
-    ui.ctx().data_mut(|data| {
-        let mut lit = data.remove_temp::<String>(id);
-        toggle_lit(&mut lit, name);
-        if let Some(lit) = lit {
-            data.insert_temp(id, lit);
-        }
+/// The lit branch and its lane color. A branch no row carries is forgotten.
+fn lit_branch(name: &mut Option<String>, rows: &[GraphRow]) -> Option<LitBranch> {
+    let found = name.as_ref().and_then(|name| {
+        rows.iter()
+            .flat_map(|row| &row.branches)
+            .find(|branch| branch.name == *name)
     });
-    // The lanes for this frame are already drawn. One more frame shows the change.
-    ui.ctx().request_repaint();
-}
-
-/// The stored name, when that branch is still on a row. A missing branch is forgotten.
-fn lit_branch(ui: &Ui, view_id: Id, rows: &[GraphRow]) -> Option<LitBranch> {
-    let id = lit_branch_id(view_id);
-    let name: String = ui.ctx().data(|data| data.get_temp(id))?;
-    let color = rows.iter().find_map(|row| {
-        row.branches
-            .iter()
-            .find(|branch| branch.name == name)
-            .map(|branch| branch.color)
-    });
-    let Some(color) = color else {
-        ui.ctx().data_mut(|data| data.remove::<String>(id));
+    let Some(branch) = found else {
+        *name = None;
         return None;
     };
-    Some(LitBranch { name, color })
+    Some(LitBranch {
+        name: branch.name.clone(),
+        color: branch.color,
+    })
 }
 
 /// Checked-out branch first, then the sidebar order the row already has.
@@ -1405,7 +1381,8 @@ fn branch_chip(
     })
 }
 
-fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette, lit: bool, view_id: Id) {
+/// `true` when the tag was clicked.
+fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette, lit: bool) -> bool {
     let color = palette.graph_color(chip.color);
     let icon_rect = Rect::from_center_size(
         Pos2::new(
@@ -1449,11 +1426,8 @@ fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette, lit: boo
             Sense::click(),
         )
         .on_hover_cursor(CursorIcon::PointingHand);
-    if response.clicked() {
-        toggle_lit_branch(ui, view_id, &chip.name);
-        clear_selected_commit(ui, view_id);
-    }
     response.widget_info(|| WidgetInfo::labeled(Role::Label, true, chip.names.as_str()));
+    response.clicked()
 }
 
 fn chip_fill(palette: &Palette, color: usize, current: bool, lit: bool) -> Color32 {

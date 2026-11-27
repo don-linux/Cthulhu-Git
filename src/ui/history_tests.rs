@@ -192,6 +192,8 @@ fn opened(name: &str, commits: &[(String, String)], truncated: bool) -> OpenedRe
             authored_at: "2026-01-01 00:00".to_owned(),
             message: summary.clone(),
         }),
+        selected_commit: None,
+        lit_branch: None,
         view_id: egui::Id::unique(("agent-history", name)),
         terminal: None,
         github: None,
@@ -1699,6 +1701,20 @@ fn each_click_in_the_history_picks_keeps_or_releases_the_commit() {
         (1..=2).contains(&shown),
         "the latest hash should be on the sidebar, found {shown}"
     );
+
+    // A reload keeps the chosen commit while the table is empty and loading.
+    // Rows that do not carry it, or the lit branch, forget them.
+    pick_hash(&mut harness, short);
+    let older = harness.state().repo.graph.rows[1].clone();
+    let screen = harness.state_mut();
+    (screen.history_loading, screen.repo.graph.rows) = (true, Vec::new());
+    harness.step();
+    let repo = &harness.state().repo;
+    assert_eq!(repo.selected_commit.as_deref(), Some(newer.as_str()));
+    assert_eq!(repo.lit_branch, None, "no row carries the lit branch");
+    harness.state_mut().repo.graph.rows.push(older);
+    harness.step();
+    assert_eq!(harness.state().repo.selected_commit, None);
 }
 
 #[test]

@@ -96,6 +96,8 @@ pub fn opened(name: &str, commit: GraphCommit) -> OpenedRepo {
         detached_oid: None,
         branches: vec![main],
         latest: Some(latest),
+        selected_commit: None,
+        lit_branch: None,
         view_id: egui::Id::unique(("test-repo", name)),
         terminal: None,
         github: None,

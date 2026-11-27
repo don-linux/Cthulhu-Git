@@ -67,6 +67,11 @@ pub struct OpenedRepo {
     pub detached_oid: Option<String>,
     pub branches: Vec<ListedBranch>,
     pub latest: Option<CommitDetail>,
+    /// The commit the detail sidebar shows instead of the latest one, picked
+    /// from its hash or message in the history.
+    pub selected_commit: Option<String>,
+    /// The branch whose lane glows, picked from its tag in the history.
+    pub lit_branch: Option<String>,
     /// New on every open, so the history starts scrolled to the top each time.
     pub view_id: egui::Id,
     /// Shell for this repository. `None` until the terminal strip is shown.
@@ -445,6 +450,8 @@ impl CthulhuApp {
                         })
                         .collect(),
                     latest: refreshed.latest,
+                    selected_commit: None,
+                    lit_branch: None,
                     view_id: egui::Id::unique(("repo-view", self.opened_count)),
                     terminal: None,
                     github: refreshed.github,

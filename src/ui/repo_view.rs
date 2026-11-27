@@ -138,7 +138,7 @@ pub fn show(
     if detail_open != detail_was_open && !(terminal_open && !terminal_was_open) {
         actions.push(Action::ToggleDetailSidebar);
     }
-    close_changes_for_other_commit(ui.ctx(), repo);
+    close_changes_for_other_commit(repo);
     if let Some(mut changes) = repo.changes.take() {
         let close = changes::show(
             ui.ctx(),
@@ -475,7 +475,7 @@ fn detail_panel(
     palette: &Palette,
     avatars: &mut AvatarService,
 ) {
-    let selected = history::selected_commit(ui.ctx(), repo.view_id);
+    let selected = repo.selected_commit.clone();
     let title = if selected.is_some() {
         "Selected commit"
     } else {
@@ -484,7 +484,7 @@ fn detail_panel(
     ui.add(Label::new(RichText::new(title).strong()).truncate());
     ui.add_space(6.0);
 
-    let Some(shown) = shown_oid(ui.ctx(), repo) else {
+    let Some(shown) = shown_oid(repo) else {
         ui.label(RichText::new("No commits yet.").weak());
         return;
     };
@@ -513,14 +513,15 @@ fn detail_panel(
 /// The commit in the sidebar: the one chosen in the history, else the
 /// latest. A click in the history changes it within the frame, so it is
 /// read where it is needed.
-fn shown_oid(ctx: &egui::Context, repo: &OpenedRepo) -> Option<String> {
-    history::selected_commit(ctx, repo.view_id)
+fn shown_oid(repo: &OpenedRepo) -> Option<String> {
+    repo.selected_commit
+        .clone()
         .or_else(|| repo.latest.as_ref().map(|commit| commit.oid.clone()))
 }
 
 /// Drops the diff modal when the sidebar moves to a different commit.
-fn close_changes_for_other_commit(ctx: &egui::Context, repo: &mut OpenedRepo) {
-    let shown = shown_oid(ctx, repo);
+fn close_changes_for_other_commit(repo: &mut OpenedRepo) {
+    let shown = shown_oid(repo);
     if repo
         .changes
         .as_ref()
