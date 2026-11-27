@@ -1766,14 +1766,15 @@ fn encode_key(session: &ShellSession, key: Key, modifiers: Modifiers) -> Option<
         }
         return None;
     }
-    if let Some(bytes) = special_key(session, key, modifiers) {
+    let app_cursor = session.term.lock().mode().contains(TermMode::APP_CURSOR);
+    if let Some(bytes) = special_key(key, modifiers, app_cursor) {
         return Some(bytes);
     }
     letter_key(key, modifiers)
 }
 
-fn special_key(session: &ShellSession, key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
-    let app_cursor = session.term.lock().mode().contains(TermMode::APP_CURSOR);
+/// `app_cursor` is the terminal's application cursor mode (DECCKM).
+fn special_key(key: Key, modifiers: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
     let modified = xterm_mod(modifiers);
     let bytes = match key {
         Key::Enter => enter_bytes(modified),
@@ -1977,127 +1978,82 @@ fn clamp_fraction(fraction: f32, usable: f32) -> f32 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn shell_argv_follows_shell_login_and_unset() {
-        let bash =
-            shell_argv(HostOs::Linux, Some(OsStr::new("/bin/bash")), None, &[]).expect("bash");
-        assert_eq!(bash.program, "/bin/bash");
-        assert!(bash.args.is_empty());
-
-        let login =
-            shell_argv(HostOs::Macos, Some(OsStr::new("/bin/bash")), None, &[]).expect("login");
-        assert_eq!(login.program, "/bin/bash");
-        assert_eq!(login.args, ["-l"]);
-
-        let scrubbed = shell_argv(
-            HostOs::Macos,
-            Some(OsStr::new("/bin/bash")),
-            None,
-            &["GIT_DIR", "GH_TOKEN"],
-        )
-        .expect("scrubbed");
-        assert_eq!(scrubbed.program, "/usr/bin/env");
-        assert_eq!(
-            scrubbed.args,
-            ["-u", "GIT_DIR", "-u", "GH_TOKEN", "--", "/bin/bash", "-l"]
-        );
-
-        let passwd =
-            shell_argv(HostOs::Linux, None, Some("/bin/bash"), &["GIT_EXEC_PATH"]).expect("passwd");
-        assert_eq!(passwd.program, "/usr/bin/env");
-        assert_eq!(passwd.args, ["-u", "GIT_EXEC_PATH", "--", "/bin/bash"]);
-
-        let fallback =
-            shell_argv(HostOs::Linux, Some(OsStr::new("")), None, &[]).expect("fallback");
-        assert_eq!(fallback.program, "/bin/sh");
-
-        let windows = shell_argv(
-            HostOs::Windows,
-            Some(OsStr::new("/bin/bash")),
-            None,
-            &["GIT_DIR"],
-        );
-        assert_windows_shell(windows);
+    /// Program, then arguments.
+    fn argv(
+        host: HostOs,
+        shell: Option<&OsStr>,
+        passwd: Option<&str>,
+        unset: &[&str],
+    ) -> Vec<String> {
+        let argv = shell_argv(host, shell, passwd, unset).expect("argv");
+        std::iter::once(argv.program).chain(argv.args).collect()
     }
 
+    /// macOS logs in, Linux does not. Names are unset through `env -u`, and
+    /// an unsafe name is skipped. A relative `SHELL` is never run: an
+    /// absolute passwd shell comes next, then `/bin/sh`.
     #[test]
-    fn shell_argv_skips_an_unsafe_unset_name() {
-        let argv = shell_argv(
-            HostOs::Linux,
-            Some(OsStr::new("/bin/sh")),
-            None,
-            &["GIT_DIR;touch /tmp/x", "GH_TOKEN"],
-        )
-        .expect("argv");
-        assert_eq!(argv.args, ["-u", "GH_TOKEN", "--", "/bin/sh"]);
-    }
-
-    #[test]
-    fn shell_argv_rejects_a_relative_shell() {
-        for relative in ["./sh", "bash", "bin/zsh", "../sh"] {
-            let argv =
-                shell_argv(HostOs::Linux, Some(OsStr::new(relative)), None, &[]).expect("relative");
-            assert_eq!(argv.program, "/bin/sh", "{relative}");
-            assert!(argv.args.iter().all(|arg| arg != relative), "{relative}");
-
-            let wrapped = shell_argv(
-                HostOs::Linux,
-                Some(OsStr::new(relative)),
-                None,
-                &["GIT_DIR"],
-            )
-            .expect("wrapped");
-            assert_eq!(wrapped.program, "/usr/bin/env", "{relative}");
-            let rendered = format!("{} {}", wrapped.program, wrapped.args.join(" "));
-            assert!(
-                !rendered.contains(relative),
-                "{relative} leaked into {rendered}"
-            );
+    fn shell_argv_runs_an_absolute_shell_without_the_unset_names() {
+        // Case, host, `SHELL`, passwd shell, names to unset, program then arguments.
+        type Row = (
+            &'static str,
+            HostOs,
+            Option<&'static str>,
+            Option<&'static str>,
+            &'static [&'static str],
+            &'static [&'static str],
+        );
+        const ENV: &str = "/usr/bin/env";
+        #[rustfmt::skip]
+        const SHELLS: &[Row] = &[
+            ("bash", HostOs::Linux, Some("/bin/bash"), None, &[], &["/bin/bash"]),
+            ("login", HostOs::Macos, Some("/bin/bash"), None, &[], &["/bin/bash", "-l"]),
+            ("scrubbed login", HostOs::Macos, Some("/bin/bash"), None, &["GIT_DIR", "GH_TOKEN"],
+                &[ENV, "-u", "GIT_DIR", "-u", "GH_TOKEN", "--", "/bin/bash", "-l"]),
+            ("scrubbed bash", HostOs::Linux, Some("/bin/bash"), None, &["GIT_DIR"],
+                &[ENV, "-u", "GIT_DIR", "--", "/bin/bash"]),
+            ("passwd shell", HostOs::Linux, None, Some("/bin/bash"), &["GIT_EXEC_PATH"],
+                &[ENV, "-u", "GIT_EXEC_PATH", "--", "/bin/bash"]),
+            ("empty SHELL", HostOs::Linux, Some(""), None, &[], &["/bin/sh"]),
+            ("unsafe name", HostOs::Linux, Some("/bin/sh"), None,
+                &["GIT_DIR;touch /tmp/x", "GH_TOKEN"], &[ENV, "-u", "GH_TOKEN", "--", "/bin/sh"]),
+            ("relative SHELL", HostOs::Linux, Some("./sh"), Some("/bin/bash"), &[], &["/bin/bash"]),
+            ("relative passwd", HostOs::Linux, Some("bash"), Some("bin/zsh"), &[], &["/bin/sh"]),
+        ];
+        for &(case, host, shell, passwd, unset, expected) in SHELLS {
             assert_eq!(
-                wrapped.args,
-                ["-u", "GIT_DIR", "--", "/bin/sh"],
-                "{relative}"
+                argv(host, shell.map(OsStr::new), passwd, unset),
+                expected,
+                "{case}"
             );
         }
-
-        let bash =
-            shell_argv(HostOs::Linux, Some(OsStr::new("/bin/bash")), None, &[]).expect("bash");
-        assert_eq!(bash.program, "/bin/bash");
-        let wrapped_bash = shell_argv(
-            HostOs::Linux,
-            Some(OsStr::new("/bin/bash")),
-            None,
-            &["GIT_DIR"],
-        )
-        .expect("wrapped bash");
-        assert_eq!(wrapped_bash.program, "/usr/bin/env");
-        assert_eq!(wrapped_bash.args, ["-u", "GIT_DIR", "--", "/bin/bash"]);
-
-        let passwd = shell_argv(
-            HostOs::Linux,
-            Some(OsStr::new("./sh")),
-            Some("/bin/bash"),
-            &[],
-        )
-        .expect("passwd");
-        assert_eq!(passwd.program, "/bin/bash");
-
-        let relative_passwd = shell_argv(
-            HostOs::Linux,
-            Some(OsStr::new("bash")),
-            Some("bin/zsh"),
-            &[],
-        )
-        .expect("relative passwd");
-        assert_eq!(relative_passwd.program, "/bin/sh");
-
-        let windows = shell_argv(
-            HostOs::Windows,
-            Some(OsStr::new("./sh")),
-            None,
-            &["GIT_DIR"],
-        );
-        assert_windows_shell(windows);
+        for relative in ["./sh", "bash", "bin/zsh", "../sh"] {
+            let shell = Some(OsStr::new(relative));
+            assert_eq!(
+                argv(HostOs::Linux, shell, None, &[]),
+                ["/bin/sh"],
+                "{relative}"
+            );
+            assert_eq!(
+                argv(HostOs::Linux, shell, None, &["GIT_DIR"]),
+                [ENV, "-u", "GIT_DIR", "--", "/bin/sh"],
+                "{relative} with a name to unset"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = Some(OsStr::from_bytes(b"\xff"));
+            assert_eq!(
+                argv(HostOs::Linux, raw, None, &[]),
+                ["/bin/sh"],
+                "non-Unicode SHELL"
+            );
+        }
+        for shell in ["/bin/bash", "./sh"] {
+            let windows = shell_argv(HostOs::Windows, Some(OsStr::new(shell)), None, &["GIT_DIR"]);
+            assert_windows_shell(windows);
+        }
     }
 
     fn assert_windows_shell(argv: Result<ShellArgv, String>) {
@@ -2434,38 +2390,98 @@ END
         assert!(error.contains("Cannot enter"), "{error}");
     }
 
+    /// (alacritty terminfo installed, LANG, LC_ALL, LC_CTYPE, TERM, LANG for
+    /// the shell). A Dock launch has no locale, so the shell gets UTF-8; a
+    /// locale that is set is inherited.
     #[test]
-    fn term_name_prefers_alacritty_when_that_terminfo_exists() {
-        assert_eq!(term_name(true), "alacritty");
-        assert_eq!(term_name(false), "xterm-256color");
+    fn shell_env_names_the_terminal_and_fills_a_missing_locale() {
+        const UTF8: Option<&str> = Some("en_US.UTF-8");
+        #[rustfmt::skip]
+        let cases = [
+            (true, None, None, None, "alacritty", UTF8),
+            (false, None, None, None, "xterm-256color", UTF8),
+            (false, Some("fr_FR.UTF-8"), None, None, "xterm-256color", None),
+            (false, None, Some("C"), None, "xterm-256color", None),
+            (false, None, None, UTF8, "xterm-256color", None),
+        ];
+        for (alacritty, lang, lc_all, lc_ctype, term, given) in cases {
+            let env = shell_env_from(alacritty, lang, lc_all, lc_ctype);
+            let case = format!("{alacritty} {lang:?} {lc_all:?} {lc_ctype:?}");
+            assert_eq!(env.get("TERM").map(String::as_str), Some(term), "{case}");
+            assert_eq!(env.get("LANG").map(String::as_str), given, "{case}");
+        }
     }
 
+    /// (key, modifiers, application cursor mode, bytes), as xterm sends them.
+    /// A plain letter is text, not a key, so it sends nothing here.
     #[test]
-    fn ctrl_l_is_form_feed() {
-        assert_eq!(
-            letter_key(
-                Key::L,
-                Modifiers {
-                    ctrl: true,
-                    ..Modifiers::NONE
-                }
-            ),
-            Some(vec![0x0c])
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn shell_program_ignores_non_unicode_shell() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-        let raw = OsString::from_vec(vec![0xff]);
-        assert_eq!(
-            shell_argv(HostOs::Linux, Some(raw.as_os_str()), None, &[])
-                .expect("argv")
-                .program,
-            "/bin/sh"
-        );
+    fn keys_send_the_xterm_sequences() {
+        const NONE: Modifiers = Modifiers::NONE;
+        const SHIFT: Modifiers = Modifiers::SHIFT;
+        const ALT: Modifiers = Modifiers::ALT;
+        const CTRL: Modifiers = Modifiers::CTRL;
+        #[rustfmt::skip]
+        const KEYS: &[(Key, Modifiers, bool, &[u8])] = &[
+            (Key::Enter, NONE, false, b"\r"),
+            (Key::Enter, CTRL.plus(ALT).plus(SHIFT), false, b"\x1b[27;8;13~"),
+            (Key::Backspace, NONE, false, b"\x7f"),
+            (Key::Backspace, ALT, false, b"\x1b\x7f"),
+            (Key::Tab, NONE, false, b"\t"),
+            (Key::Tab, SHIFT, false, b"\x1b[Z"),
+            (Key::Tab, CTRL, false, b"\x1b[27;5;9~"),
+            (Key::Escape, NONE, false, b"\x1b"),
+            (Key::ArrowUp, NONE, false, b"\x1b[A"),
+            (Key::ArrowDown, NONE, true, b"\x1bOB"),
+            (Key::ArrowRight, NONE, false, b"\x1b[C"),
+            (Key::ArrowLeft, NONE, true, b"\x1bOD"),
+            (Key::ArrowLeft, CTRL, true, b"\x1b[1;5D"),
+            (Key::Home, NONE, false, b"\x1b[H"),
+            (Key::Home, NONE, true, b"\x1b[H"),
+            (Key::End, NONE, true, b"\x1b[F"),
+            (Key::End, SHIFT, false, b"\x1b[1;2F"),
+            (Key::PageUp, NONE, false, b"\x1b[5~"),
+            (Key::PageDown, ALT, false, b"\x1b[6;3~"),
+            (Key::Delete, NONE, false, b"\x1b[3~"),
+            (Key::Insert, NONE, false, b"\x1b[2~"),
+            (Key::F1, NONE, false, b"\x1bOP"),
+            (Key::F2, NONE, false, b"\x1bOQ"),
+            (Key::F3, NONE, false, b"\x1bOR"),
+            (Key::F4, NONE, false, b"\x1bOS"),
+            (Key::F5, NONE, false, b"\x1b[15~"),
+            (Key::F6, NONE, false, b"\x1b[17~"),
+            (Key::F7, NONE, false, b"\x1b[18~"),
+            (Key::F8, NONE, false, b"\x1b[19~"),
+            (Key::F9, NONE, false, b"\x1b[20~"),
+            (Key::F10, NONE, false, b"\x1b[21~"),
+            (Key::F11, NONE, false, b"\x1b[23~"),
+            (Key::F12, CTRL.plus(SHIFT), false, b"\x1b[24;6~"),
+            (Key::A, CTRL.plus(ALT), false, b"\x1b\x01"),
+            (Key::B, ALT, false, b"\x1bb"),
+            (Key::B, ALT.plus(SHIFT), false, b"\x1bB"),
+            (Key::C, NONE, false, b""),
+            (Key::Space, NONE, false, b""),
+        ];
+        for &(key, modifiers, app_cursor, expected) in KEYS {
+            let bytes =
+                special_key(key, modifiers, app_cursor).or_else(|| letter_key(key, modifiers));
+            assert_eq!(
+                bytes.unwrap_or_default(),
+                expected,
+                "{key:?} {modifiers:?}, application cursor {app_cursor}"
+            );
+        }
+        // Ctrl and a letter is that letter's control code, A as 1 through Z as 26.
+        let letters: Vec<(Key, u8)> = Key::ALL
+            .iter()
+            .filter_map(|key| match key.name().as_bytes() {
+                [byte] if byte.is_ascii_uppercase() => Some((*key, byte - b'@')),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(letters.len(), 26);
+        for (key, code) in letters {
+            assert_eq!(letter_key(key, CTRL), Some(vec![code]), "Ctrl+{key:?}");
+        }
     }
 
     fn grid_metrics(cols: usize, rows: usize, cell_w: f32, cell_h: f32) -> Metrics {
@@ -2547,19 +2563,6 @@ END
         assert!(windows_taskkill_path(Some("Windows"), present).is_err());
         assert!(windows_taskkill_path(None, present).is_err());
         assert!(windows_taskkill_path(Some(r"C:\Windows"), |_| false).is_err());
-    }
-
-    #[test]
-    fn dock_launch_shell_gets_utf8_locale() {
-        let env = shell_env_from(false, None, None, None);
-        assert_eq!(env.get("LANG").map(String::as_str), Some("en_US.UTF-8"));
-
-        let kept = shell_env_from(false, Some("fr_FR.UTF-8"), None, None);
-        assert_eq!(kept.get("LANG"), None);
-        let lc_all = shell_env_from(false, None, Some("C"), None);
-        assert_eq!(lc_all.get("LANG"), None);
-        let lc_ctype = shell_env_from(false, None, None, Some("en_US.UTF-8"));
-        assert_eq!(lc_ctype.get("LANG"), None);
     }
 
     #[cfg(unix)]
@@ -2674,7 +2677,6 @@ END
         // "hi" is aGk= in standard base64.
         parser.advance(&mut term, b"\x1b]52;c;aGk=\x07");
         assert!(copies.lock().expect("clipboard").is_empty());
-        assert_eq!(term_config().osc52, Osc52::Disabled);
 
         let accepted = Arc::new(Mutex::new(Vec::new()));
         let mut copying = Term::new(
@@ -2878,61 +2880,35 @@ END
         }
     }
 
-    fn prompt_on_screen(columns: usize, screen_lines: usize, bytes: &[u8]) -> Range<usize> {
-        let grid = GridSize {
-            columns,
-            screen_lines,
-        };
-        let mut term = Term::new(
-            term_config(),
-            &grid,
-            alacritty_terminal::event::VoidListener,
-        );
-        let mut parser = alacritty_terminal::vte::ansi::Processor::<
-            alacritty_terminal::vte::ansi::StdSyncHandler,
-        >::new();
-        parser.advance(&mut term, bytes);
-        prompt_span(&term)
-    }
-
+    /// (case, screen columns, bytes, prompt rows). A blank row ends the
+    /// prompt above the cursor; a colored or inverse space does not. A block
+    /// taller than the preview keeps the rows nearest the cursor.
     #[test]
-    fn prompt_span_keeps_a_one_line_prompt() {
-        assert_eq!(prompt_on_screen(40, 16, b"$ "), 0..1);
-    }
-
-    #[test]
-    fn prompt_span_skips_the_blank_line_above_a_two_line_prompt() {
-        let bytes = b"\r\n~/repo on main\r\n> ";
-        assert_eq!(prompt_on_screen(40, 16, bytes), 1..3);
-    }
-
-    #[test]
-    fn prompt_span_counts_a_colored_space() {
-        let bytes = b"\x1b[41m \x1b[0m\r\n>";
-        assert_eq!(prompt_on_screen(40, 16, bytes), 0..2);
-    }
-
-    #[test]
-    fn prompt_span_counts_an_inverse_space() {
-        let bytes = b"\x1b[7m \x1b[0m\r\n>";
-        assert_eq!(prompt_on_screen(40, 16, bytes), 0..2);
-    }
-
-    #[test]
-    fn prompt_span_keeps_the_rows_nearest_the_cursor() {
-        let mut bytes = Vec::new();
-        for row in 0..10 {
-            if row > 0 {
-                bytes.extend_from_slice(b"\r\n");
-            }
-            bytes.push(b'x');
+    fn prompt_span_is_the_block_that_ends_at_the_cursor() {
+        #[rustfmt::skip]
+        let cases: [(&str, usize, &[u8], Range<usize>); 6] = [
+            ("one-line prompt", 40, b"$ ", 0..1),
+            ("blank line above", 40, b"\r\n~/repo on main\r\n> ", 1..3),
+            ("colored space", 40, b"\x1b[41m \x1b[0m\r\n>", 0..2),
+            ("inverse space", 40, b"\x1b[7m \x1b[0m\r\n>", 0..2),
+            ("ten rows", 8, b"x\r\nx\r\nx\r\nx\r\nx\r\nx\r\nx\r\nx\r\nx\r\nx", 2..10),
+            ("output, blank, prompt", 40, b"hello\r\n\r\n$ ", 2..3),
+        ];
+        for (case, columns, bytes, expected) in cases {
+            let grid = GridSize {
+                columns,
+                screen_lines: 16,
+            };
+            let mut term = Term::new(
+                term_config(),
+                &grid,
+                alacritty_terminal::event::VoidListener,
+            );
+            let mut parser = alacritty_terminal::vte::ansi::Processor::<
+                alacritty_terminal::vte::ansi::StdSyncHandler,
+            >::new();
+            parser.advance(&mut term, bytes);
+            assert_eq!(prompt_span(&term), expected, "{case}");
         }
-        assert_eq!(prompt_on_screen(8, 16, &bytes), 2..10);
-    }
-
-    #[test]
-    fn prompt_span_stops_at_a_blank_line_above_the_prompt() {
-        let bytes = b"hello\r\n\r\n$ ";
-        assert_eq!(prompt_on_screen(40, 16, bytes), 2..3);
     }
 }
