@@ -64,34 +64,59 @@ pub(crate) fn parse_remote_config(stdout: &[u8]) -> Vec<Remote> {
 mod tests {
     use super::*;
 
-    fn remote(name: &str, url: &str) -> Remote {
-        Remote {
-            name: name.to_owned(),
-            url: url.to_owned(),
+    /// `git config -z --get-regexp` output, and the `(name, url)` remotes
+    /// read from it in config order.
+    type Remotes = &'static [(&'static str, &'static str)];
+
+    const CONFIGS: &[(&[u8], Remotes)] = &[
+        // A remote name may contain dots.
+        (
+            b"remote.origin.url\ngit@github.com:don-linux/Cthulhu-Git.git\0\
+              remote.my.fork.url\nhttps://github.com/someone/fork\0\
+              remote.a.b.c.url\nhttps://example.invalid/a b.git\0",
+            &[
+                ("origin", "git@github.com:don-linux/Cthulhu-Git.git"),
+                ("my.fork", "https://github.com/someone/fork"),
+                ("a.b.c", "https://example.invalid/a b.git"),
+            ],
+        ),
+        // A value is trimmed, a CR included; a CR or newline inside stays.
+        (
+            b"remote.fork.url\nhttps://github.com/someone/fork\r\0\
+              remote.ssh.url\ngit@github.com:org/repo.git\r\nmore\0\
+              remote.origin.url\n  https://example.invalid/spaced  \0\
+              remote.cr.mid.url\nhttps://example.invalid/a\rb\0",
+            &[
+                ("fork", "https://github.com/someone/fork"),
+                ("ssh", "git@github.com:org/repo.git\r\nmore"),
+                ("origin", "https://example.invalid/spaced"),
+                ("cr.mid", "https://example.invalid/a\rb"),
+            ],
+        ),
+        // Entries that are not a remote URL are skipped, not fatal.
+        (
+            b"\xff\xfe\0core.bare\nfalse\0remote.origin.url\nhttps://example.invalid/x\0",
+            &[("origin", "https://example.invalid/x")],
+        ),
+        (b"", &[]),
+        (b"remote.origin.url\0", &[]),
+        (b"remote..url\nx\0", &[]),
+        (b"remote.origin.url\n\0", &[]),
+        (b"remote.origin.url\n  \0", &[]),
+        (b"core.editor\nvim\0", &[]),
+    ];
+
+    #[test]
+    fn parse_remote_config_table() {
+        for (stdout, expected) in CONFIGS {
+            let expected: Vec<Remote> = expected
+                .iter()
+                .map(|(name, url)| Remote {
+                    name: (*name).to_owned(),
+                    url: (*url).to_owned(),
+                })
+                .collect();
+            assert_eq!(parse_remote_config(stdout), expected, "{stdout:?}");
         }
-    }
-
-    #[test]
-    fn parses_names_with_dots_and_keeps_config_order() {
-        let stdout = b"remote.origin.url\ngit@github.com:don-linux/Cthulhu-Git.git\0\
-                       remote.my.fork.url\nhttps://github.com/someone/fork\0\
-                       remote.upstream.url\nhttps://example.invalid/a b.git\0";
-        assert_eq!(
-            parse_remote_config(stdout),
-            [
-                remote("origin", "git@github.com:don-linux/Cthulhu-Git.git"),
-                remote("my.fork", "https://github.com/someone/fork"),
-                remote("upstream", "https://example.invalid/a b.git"),
-            ]
-        );
-    }
-
-    #[test]
-    fn skips_malformed_entries() {
-        assert!(parse_remote_config(b"").is_empty());
-        assert!(parse_remote_config(b"remote.origin.url\0").is_empty());
-        assert!(parse_remote_config(b"remote..url\nx\0").is_empty());
-        assert!(parse_remote_config(b"remote.origin.url\n\0").is_empty());
-        assert!(parse_remote_config(b"core.editor\nvim\0").is_empty());
     }
 }

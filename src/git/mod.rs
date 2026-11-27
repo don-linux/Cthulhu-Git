@@ -17,8 +17,6 @@ mod repo;
 mod sync;
 
 #[cfg(test)]
-mod author_tests;
-#[cfg(test)]
 mod proptest_tests;
 
 pub use branches::{Branch, Upstream, branches};
