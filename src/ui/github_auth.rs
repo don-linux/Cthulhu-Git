@@ -3,14 +3,14 @@
 //! Keychain reads and writes, `gh auth token` and the `GET /user` check all
 //! run on a worker thread: each can block, and a keychain may show a prompt.
 
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cthulhu_git::github::{
     self, ApiError, GitHubUser, RateLimit, Token, TokenStoreError, UreqTransport,
 };
 use eframe::egui::{Context, Id, TextEdit};
+
+use super::task::Task;
 
 /// The token field, so its undo history can be cleared.
 pub fn token_field_id() -> Id {
@@ -57,7 +57,7 @@ pub struct GitHubAuth {
     notice: Option<Notice>,
     user: Option<String>,
     rate: Option<RateLimit>,
-    task: Option<Receiver<Outcome>>,
+    task: Option<Task<Outcome>>,
 }
 
 impl Default for GitHubAuth {
@@ -100,13 +100,7 @@ impl GitHubAuth {
     }
 
     fn run(&mut self, ctx: &Context, work: impl FnOnce() -> Outcome + Send + 'static) {
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
-        thread::spawn(move || {
-            let _ = sender.send(work());
-            ctx.request_repaint();
-        });
-        self.task = Some(receiver);
+        self.task = Some(Task::spawn(ctx, work));
     }
 
     /// Reads the token saved by an earlier session.
@@ -181,21 +175,16 @@ impl GitHubAuth {
     }
 
     pub fn poll(&mut self, ctx: &Context) -> Vec<Change> {
-        let Some(receiver) = &self.task else {
+        let Some(done) = self.task.as_ref().and_then(Task::poll) else {
             return Vec::new();
         };
-        let outcome = match receiver.try_recv() {
-            Ok(outcome) => outcome,
-            Err(TryRecvError::Empty) => return Vec::new(),
-            Err(TryRecvError::Disconnected) => {
-                self.task = None;
-                self.notice = Some(Notice::Error(
-                    "The request stopped unexpectedly.".to_owned(),
-                ));
-                return Vec::new();
-            }
-        };
         self.task = None;
+        let Ok(outcome) = done else {
+            self.notice = Some(Notice::Error(
+                "The request stopped unexpectedly.".to_owned(),
+            ));
+            return Vec::new();
+        };
         let mut changes = Vec::new();
         match outcome {
             Outcome::Loaded(Ok(Some(token))) => {
@@ -343,12 +332,10 @@ mod tests {
         ];
         let ctx = Context::default();
         for (case, outcome, stored, handed_on, notice) in cases {
-            let (sender, receiver) = mpsc::channel();
-            sender.send(outcome).expect("send");
             let mut auth = GitHubAuth {
                 token: Some(token()),
                 stored: Stored::Keychain,
-                task: Some(receiver),
+                task: Some(Task::ready(outcome)),
                 ..GitHubAuth::default()
             };
             let changes = auth.poll(&ctx);

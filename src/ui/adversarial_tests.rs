@@ -120,7 +120,7 @@ fn assert_screen(harness: &Harness<'_, CthulhuApp>, repo: bool, case: &str) {
     let app = harness.state();
     assert!(app.opening.is_none(), "{case}: still opening");
     assert_eq!(
-        matches!(app.screen, Screen::Repo(_)),
+        matches!(app.screen, Screen::Repo { .. }),
         repo,
         "{case}: error={:?}",
         app.error

@@ -22,6 +22,7 @@ mod hover;
 mod icons;
 mod repo_view;
 mod settings;
+mod task;
 mod terminal;
 #[cfg(test)]
 mod test_support;
@@ -31,7 +32,7 @@ mod widgets;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use cthulhu_git::git::{
@@ -43,8 +44,8 @@ use cthulhu_git::settings::{HistoryColumns, Settings, SettingsError};
 use eframe::egui;
 
 use avatars::AvatarService;
-use folder_picker::FolderPicker;
 use github_auth::GitHubAuth;
+use task::{Stopped, Task};
 
 /// Newest commits read for the branch graph; the view says when there are more.
 const HISTORY_LIMIT: usize = 1000;
@@ -114,27 +115,52 @@ pub enum SyncKind {
     Checkout,
 }
 
+/// The work a screen starts belongs to it, so leaving the screen drops that
+/// work and a late result cannot land on another screen.
 enum Screen {
-    Home,
-    Repo(Box<OpenedRepo>),
+    Home(HomeScan),
+    Repo {
+        repo: Box<OpenedRepo>,
+        graph_load: Option<GraphLoad>,
+        sync: Option<SyncJob>,
+    },
 }
-
-type OpenResult = Result<Refreshed, String>;
 
 struct Opening {
     path: PathBuf,
-    receiver: Receiver<OpenResult>,
+    task: Task<Result<Refreshed, GitError>>,
 }
 
-/// One home-screen scan. Dropping it disconnects the worker, which stops
-/// after the git command it is already in.
-struct GlanceScan {
-    receiver: Receiver<GlanceMsg>,
+/// Branch and latest commit of each recent repository, read one after
+/// another on one thread. Dropping the scan disconnects that thread, which
+/// stops once the repository it is reading is done.
+#[derive(Default)]
+struct HomeScan {
+    /// Missing means the scan has not reported that path yet.
+    glances: HashMap<PathBuf, home::Glance>,
+    receiver: Option<Receiver<(PathBuf, home::Glance)>>,
 }
 
-struct GlanceMsg {
-    path: PathBuf,
-    glance: home::Glance,
+impl HomeScan {
+    fn start(ctx: &egui::Context, find_git: &FindGit, paths: Vec<PathBuf>) -> Self {
+        if paths.is_empty() {
+            return Self::default();
+        }
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        let find_git = Arc::clone(find_git);
+        thread::spawn(move || scan_glances(&find_git, paths, &sender, &ctx));
+        Self {
+            glances: HashMap::new(),
+            receiver: Some(receiver),
+        }
+    }
+
+    fn poll(&mut self) {
+        if let Some(receiver) = &self.receiver {
+            self.glances.extend(receiver.try_iter());
+        }
+    }
 }
 
 pub struct CthulhuApp {
@@ -147,7 +173,8 @@ pub struct CthulhuApp {
     loaded_ok: bool,
     screen: Screen,
     opening: Option<Opening>,
-    picker: Option<FolderPicker>,
+    /// The folder dialog: the chosen folder, or `None` when it was cancelled.
+    picker: Option<Task<Option<PathBuf>>>,
     error: Option<String>,
     opened_count: u64,
     /// Covers the current screen. A repository underneath stays open.
@@ -157,23 +184,13 @@ pub struct CthulhuApp {
     /// terminal so the preview size does not resize that session. Dropped when
     /// settings closes; not saved.
     font_preview: Option<terminal::Terminal>,
-    graph_load: Option<GraphLoad>,
-    graph_generation: u64,
-    sync_job: Option<SyncJob>,
     avatars: AvatarService,
     github: GitHubAuth,
     find_git: FindGit,
-    /// `git --version` for the About page. `None` until Settings has asked.
+    /// `git --version` for the About page, once the probe started by the
+    /// first visit to Settings has answered.
     git_version: Option<String>,
-    git_probe: Option<Receiver<String>>,
-    /// Branch and latest commit for the recent list. Missing means the scan
-    /// has not reported that path yet.
-    glances: HashMap<PathBuf, home::Glance>,
-    /// Paths the current or previous home scan was started with, in order.
-    glance_paths: Vec<PathBuf>,
-    glance_scan: Option<GlanceScan>,
-    /// The previous frame was Home. Returning to it scans again.
-    was_home: bool,
+    git_probe: Option<Task<Result<String, GitError>>>,
 }
 
 /// Downloaded avatars, beside the settings in the per-user cache folder.
@@ -239,7 +256,7 @@ impl CthulhuApp {
             settings,
             settings_path,
             loaded_ok,
-            screen: Screen::Home,
+            screen: Screen::Home(HomeScan::default()),
             opening: None,
             picker: None,
             error,
@@ -247,18 +264,11 @@ impl CthulhuApp {
             settings_open: false,
             fonts,
             font_preview: None,
-            graph_load: None,
-            graph_generation: 0,
-            sync_job: None,
             avatars,
             github,
             find_git,
             git_version: None,
             git_probe: None,
-            glances: HashMap::new(),
-            glance_paths: Vec::new(),
-            glance_scan: None,
-            was_home: false,
         };
         if let Some(path) = first_open {
             // The window stays hidden until the first frame is painted.
@@ -267,10 +277,11 @@ impl CthulhuApp {
             // follows on the worker and is not part of that wait. A later
             // open stays on a worker thread: the window is visible then,
             // and blocking it would freeze the UI.
-            let result = load(&app.find_git, &path);
-            if app.finish_open(path, result) {
-                app.start_open_graph(ctx);
-            }
+            let result = load(&app.find_git, &path).map_err(|error| error.to_string());
+            app.finish_open(ctx, path, result);
+        }
+        if let Screen::Home(scan) = &mut app.screen {
+            *scan = HomeScan::start(ctx, &app.find_git, app.settings.recent_repositories.clone());
         }
         app
     }
@@ -280,89 +291,29 @@ impl CthulhuApp {
         if self.git_version.is_some() || self.git_probe.is_some() {
             return;
         }
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
         let find_git = Arc::clone(&self.find_git);
-        thread::spawn(move || {
-            let text = match find_git() {
-                Ok(git) => git.version.to_string(),
-                Err(_) => "Not found".to_owned(),
-            };
-            let _ = sender.send(text);
-            ctx.request_repaint();
-        });
-        self.git_probe = Some(receiver);
+        self.git_probe = Some(Task::spawn(ctx, move || {
+            find_git().map(|git| git.version.to_string())
+        }));
     }
 
     fn poll_git_version(&mut self) {
-        let Some(probe) = &self.git_probe else {
+        let Some(done) = self.git_probe.as_ref().and_then(Task::poll) else {
             return;
         };
-        let text = match probe.try_recv() {
-            Ok(text) => text,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => "Not found".to_owned(),
-        };
-        self.git_version = Some(text);
         self.git_probe = None;
+        self.git_version = Some(match done {
+            Ok(Ok(version)) => version,
+            Ok(Err(_)) | Err(Stopped) => "Not found".to_owned(),
+        });
     }
 
-    /// Starts a scan when Home appears or the recent list changes. Repos are
-    /// read one after another on one thread, and each result repaints.
-    fn sync_glances(&mut self, ctx: &egui::Context) {
-        self.poll_glances();
-        let on_home = matches!(self.screen, Screen::Home);
-        let entered = on_home && !self.was_home;
-        self.was_home = on_home;
-        if !on_home {
-            return;
-        }
-        if !entered && self.settings.recent_repositories == self.glance_paths {
-            return;
-        }
-        self.start_glance(ctx);
-    }
-
-    fn start_glance(&mut self, ctx: &egui::Context) {
-        let paths = self.settings.recent_repositories.clone();
-        self.glances.clear();
-        self.glance_paths.clone_from(&paths);
-        // Drop the previous receiver before the new thread starts, so the old
-        // worker notices and does not keep reading after the list changed.
-        self.glance_scan = None;
-        if paths.is_empty() {
-            return;
-        }
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
-        let find_git = Arc::clone(&self.find_git);
-        thread::spawn(move || scan_glances(&find_git, paths, sender, ctx));
-        self.glance_scan = Some(GlanceScan { receiver });
-    }
-
-    fn poll_glances(&mut self) {
-        let Some(scan) = &self.glance_scan else {
-            return;
-        };
-        let mut incoming = Vec::new();
-        let mut disconnected = false;
-        loop {
-            match scan.receiver.try_recv() {
-                Ok(msg) => incoming.push(msg),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-        if disconnected {
-            self.glance_scan = None;
-        }
-        for msg in incoming {
-            if self.glance_paths.iter().any(|path| path == &msg.path) {
-                self.glances.insert(msg.path, msg.glance);
-            }
+    /// Home, with a scan of the recent list. Home already on screen keeps
+    /// the scan it has.
+    fn go_home(&mut self, ctx: &egui::Context) {
+        if !matches!(self.screen, Screen::Home(_)) {
+            let recent = self.settings.recent_repositories.clone();
+            self.screen = Screen::Home(HomeScan::start(ctx, &self.find_git, recent));
         }
     }
 
@@ -384,50 +335,42 @@ impl CthulhuApp {
     /// window. The history graph is a second worker, started once this open
     /// has installed the repository.
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
-        self.graph_generation = self.graph_generation.wrapping_add(1);
-        self.graph_load = None;
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
-        let worker_path = path.clone();
         let find_git = Arc::clone(&self.find_git);
-        thread::spawn(move || {
-            let _ = sender.send(load(&find_git, &worker_path));
-            ctx.request_repaint();
-        });
-        self.opening = Some(Opening { path, receiver });
+        let worker_path = path.clone();
+        let task = Task::spawn(ctx, move || load(&find_git, &worker_path));
+        self.opening = Some(Opening { path, task });
     }
 
     fn poll_opening(&mut self, ctx: &egui::Context) {
-        let Some(opening) = &self.opening else {
-            return;
-        };
-        let result = match opening.receiver.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => {
-                Err("Opening stopped unexpectedly. Try again.".to_owned())
-            }
-        };
         let Some(opening) = self.opening.take() else {
             return;
         };
-        if self.finish_open(opening.path, result) {
-            self.start_open_graph(ctx);
-        }
+        let Some(done) = opening.task.poll() else {
+            self.opening = Some(opening);
+            return;
+        };
+        let result = outcome(done, "Opening stopped unexpectedly. Try again.");
+        self.finish_open(ctx, opening.path, result);
     }
 
-    /// Installs the repository, or Home when opening failed.
+    /// Installs the repository and starts reading its history graph, or goes
+    /// Home when opening failed.
     ///
     /// The history graph is not part of this result. A later log failure stays
     /// on the repository screen and keeps `last_repository`.
-    fn finish_open(&mut self, path: PathBuf, result: OpenResult) -> bool {
+    fn finish_open(
+        &mut self,
+        ctx: &egui::Context,
+        path: PathBuf,
+        result: Result<Refreshed, String>,
+    ) {
         match result {
             Ok(refreshed) => {
                 self.error = None;
                 self.settings.remember_repository(&refreshed.info.root);
                 self.save_settings();
                 self.opened_count += 1;
-                self.screen = Screen::Repo(Box::new(OpenedRepo {
+                let repo = Box::new(OpenedRepo {
                     git: refreshed.git,
                     info: refreshed.info,
                     // Empty until the history worker reports. Filling
@@ -455,8 +398,16 @@ impl CthulhuApp {
                     hover: hover::HoverCache::default(),
                     diffs: changes::DiffCache::default(),
                     changes: None,
-                }));
-                true
+                });
+                // No tips means an unborn repository, so the center stays
+                // "No commits yet."
+                let tips = selected_tips(&repo.branches, repo.detached_oid.as_deref());
+                let graph_load = (!tips.is_empty()).then(|| GraphLoad::start(ctx, &repo, tips));
+                self.screen = Screen::Repo {
+                    repo,
+                    graph_load,
+                    sync: None,
+                };
             }
             Err(message) => {
                 self.error = Some(message);
@@ -464,34 +415,18 @@ impl CthulhuApp {
                     self.settings.forget_last_repository();
                     self.save_settings();
                 }
-                self.screen = Screen::Home;
-                false
+                self.go_home(ctx);
             }
         }
     }
 
-    /// One history worker for the repository just installed, when it has commits.
-    ///
-    /// No tips means an unborn repository, so the center stays "No commits yet."
-    fn start_open_graph(&mut self, ctx: &egui::Context) {
-        let tips = {
-            let Screen::Repo(repo) = &self.screen else {
-                return;
-            };
-            selected_tips(&repo.branches, repo.detached_oid.as_deref())
-        };
-        if tips.is_empty() {
-            return;
-        }
-        self.start_graph_load(ctx, tips);
-    }
-
     fn poll_picker(&mut self, ctx: &egui::Context) {
-        let Some(choice) = self.picker.as_ref().and_then(FolderPicker::poll) else {
+        let Some(done) = self.picker.as_ref().and_then(Task::poll) else {
             return;
         };
         self.picker = None;
-        if let Some(path) = choice {
+        // A dialog that failed opens nothing, like a cancelled one.
+        if let Ok(Some(path)) = done {
             self.open(ctx, path);
         }
     }
@@ -523,6 +458,11 @@ impl CthulhuApp {
             .recent_repositories
             .first()
             .and_then(|recent| recent.parent())
+    }
+
+    /// A folder dialog or an open is running, so another one cannot start.
+    fn busy(&self) -> bool {
+        self.opening.is_some() || self.picker.is_some()
     }
 }
 
@@ -562,20 +502,23 @@ impl eframe::App for CthulhuApp {
             self.ensure_git_version(ui.ctx());
         }
         self.poll_git_version();
-        self.sync_glances(ui.ctx());
+        if let Screen::Home(scan) = &mut self.screen {
+            scan.poll();
+        }
 
         let syncing = self.sync_for_open_repo();
         let history_loading = self.history_loading();
+        let busy = self.busy();
         let actions = if self.settings_open {
             // The repository stays underneath. Keep the shell alive and take
             // keystrokes away from the hidden terminal.
-            if let Screen::Repo(repo) = &mut self.screen {
+            if let Screen::Repo { repo, .. } = &mut self.screen {
                 terminal::service(ui.ctx(), &mut repo.terminal);
                 terminal::surrender_focus(ui.ctx(), repo.view_id);
             }
             let cwd = match &self.screen {
-                Screen::Repo(repo) => Some(repo.info.root.clone()),
-                Screen::Home => None,
+                Screen::Repo { repo, .. } => Some(repo.info.root.clone()),
+                Screen::Home(_) => None,
             };
             terminal::service(ui.ctx(), &mut self.font_preview);
             let git_label = self
@@ -589,7 +532,7 @@ impl eframe::App for CthulhuApp {
             let view = settings::SettingsView {
                 author_avatars: self.settings.author_avatars,
                 api_status: self.avatars.api_status(),
-                busy: self.opening.is_some() || self.picker.is_some(),
+                busy,
                 about: settings::AboutInfo::current(git_label),
             };
             settings::show(
@@ -603,19 +546,19 @@ impl eframe::App for CthulhuApp {
             )
         } else {
             match &mut self.screen {
-                Screen::Home => home::show(
+                Screen::Home(scan) => home::show(
                     ui,
                     &home::HomeState {
                         recent: &self.settings.recent_repositories,
-                        glances: &self.glances,
-                        busy: self.opening.is_some() || self.picker.is_some(),
+                        glances: &scan.glances,
+                        busy,
                         opening: self.opening.as_ref().map(|opening| opening.path.as_path()),
                         error: self.error.as_deref(),
                     },
                 )
                 .into_iter()
                 .collect(),
-                Screen::Repo(repo) => repo_view::show(
+                Screen::Repo { repo, .. } => repo_view::show(
                     ui,
                     repo,
                     &repo_view::ViewState {
@@ -626,7 +569,7 @@ impl eframe::App for CthulhuApp {
                         syncing,
                         columns: self.settings.history_columns,
                         history_loading,
-                        busy: self.opening.is_some() || self.picker.is_some(),
+                        busy,
                     },
                     &mut self.avatars,
                 ),
@@ -637,10 +580,10 @@ impl eframe::App for CthulhuApp {
             match action {
                 // The folder dialog needs the window's frame.
                 Action::Browse => {
-                    if self.picker.is_none() && self.opening.is_none() {
+                    if !self.busy() {
                         self.error = None;
                         self.picker =
-                            Some(FolderPicker::open(ui.ctx(), frame, self.browse_start()));
+                            Some(folder_picker::open(ui.ctx(), frame, self.browse_start()));
                     }
                 }
                 action => self.apply_action(ui.ctx(), action),
@@ -664,7 +607,7 @@ impl CthulhuApp {
                 self.error = None;
                 self.settings_open = false;
                 self.font_preview = None;
-                self.screen = Screen::Home;
+                self.go_home(ctx);
             }
             Action::OpenSettings => {
                 self.settings_open = true;
@@ -730,13 +673,23 @@ struct Refreshed {
     github: Option<GitHubRepo>,
 }
 
-/// One repository at a time. A dropped receiver stops the loop; the git
-/// command already running is left to finish under its own time limit.
+/// A finished git job as the screen shows it: the error as text, and
+/// `stopped` when the worker died without an answer.
+fn outcome<T>(done: Result<Result<T, GitError>, Stopped>, stopped: &str) -> Result<T, String> {
+    match done {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(Stopped) => Err(stopped.to_owned()),
+    }
+}
+
+/// One repository at a time. A dropped receiver stops the loop once the
+/// repository being read is done; each of its git commands keeps its own
+/// time limit.
 fn scan_glances(
     find_git: &FindGit,
     paths: Vec<PathBuf>,
-    sender: Sender<GlanceMsg>,
-    ctx: egui::Context,
+    sender: &Sender<(PathBuf, home::Glance)>,
+    ctx: &egui::Context,
 ) {
     let git = find_git().ok();
     for path in paths {
@@ -747,7 +700,7 @@ fn scan_glances(
             },
             None => home::Glance::Unreadable,
         };
-        if sender.send(GlanceMsg { path, glance }).is_err() {
+        if sender.send((path, glance)).is_err() {
             break;
         }
         ctx.request_repaint();
@@ -756,21 +709,17 @@ fn scan_glances(
 
 /// Repository chrome. The history graph is not built here, so a log failure
 /// does not reject the open or forget the repository.
-fn load(find_git: &FindGit, path: &Path) -> OpenResult {
-    let git = find_git().map_err(|error| error.to_string())?;
-    reload_repo(&git, path)
+fn load(find_git: &FindGit, path: &Path) -> Result<Refreshed, GitError> {
+    reload_repo(&find_git()?, path)
 }
 
 /// HEAD, branches and the latest commit, without rebuilding the graph.
-fn reload_repo(git: &Git, path: &Path) -> Result<Refreshed, String> {
-    let info = git::inspect(git, path).map_err(|error| error.to_string())?;
-    let branches = git::branches(git, &info.root, &info.head).map_err(|error| error.to_string())?;
-    let latest =
-        git::latest_commit(git, &info.root, &info.head).map_err(|error| error.to_string())?;
+fn reload_repo(git: &Git, path: &Path) -> Result<Refreshed, GitError> {
+    let info = git::inspect(git, path)?;
+    let branches = git::branches(git, &info.root, &info.head)?;
+    let latest = git::latest_commit(git, &info.root, &info.head)?;
     let detached_oid = match &info.head {
-        Head::Detached { .. } => {
-            Some(git::head_commit_oid(git, &info.root).map_err(|error| error.to_string())?)
-        }
+        Head::Detached { .. } => Some(git::head_commit_oid(git, &info.root)?),
         Head::Branch(_) | Head::Unborn(_) => None,
     };
     // Remotes only enable avatars and links, so an unreadable config is not an error.
@@ -794,22 +743,15 @@ enum SyncCommand {
 }
 
 struct SyncJob {
-    view_id: egui::Id,
     kind: SyncKind,
-    receiver: Receiver<Result<Refreshed, String>>,
+    task: Task<Result<Refreshed, GitError>>,
 }
 
-fn run_sync(git: &Git, root: &Path, command: SyncCommand) -> Result<Refreshed, String> {
+fn run_sync(git: &Git, root: &Path, command: SyncCommand) -> Result<Refreshed, GitError> {
     match &command {
-        SyncCommand::Fetch(branch) => {
-            git::fetch(git, root, branch).map_err(|error| error.to_string())?;
-        }
-        SyncCommand::Pull => {
-            git::pull_ff_only(git, root).map_err(|error| error.to_string())?;
-        }
-        SyncCommand::Checkout(name) => {
-            git::switch_branch(git, root, name).map_err(|error| error.to_string())?;
-        }
+        SyncCommand::Fetch(branch) => git::fetch(git, root, branch)?,
+        SyncCommand::Pull => git::pull_ff_only(git, root)?,
+        SyncCommand::Checkout(name) => git::switch_branch(git, root, name)?,
     }
     reload_repo(git, root)
 }
@@ -854,46 +796,47 @@ fn selected_tips(branches: &[ListedBranch], detached_oid: Option<&str>) -> Vec<G
     git::graph_tips(&candidates, detached_oid)
 }
 
+/// The history graph being read for `selection`.
 struct GraphLoad {
-    generation: u64,
-    view_id: egui::Id,
     selection: Vec<GraphTip>,
-    receiver: Receiver<Result<HistoryGraph, String>>,
+    task: Task<Result<HistoryGraph, GitError>>,
+}
+
+impl GraphLoad {
+    fn start(ctx: &egui::Context, repo: &OpenedRepo, selection: Vec<GraphTip>) -> Self {
+        let (git, root, tips) = (repo.git.clone(), repo.info.root.clone(), selection.clone());
+        let task = Task::spawn(ctx, move || {
+            git::branch_graph(&git, &root, &tips, HISTORY_LIMIT)
+        });
+        Self { selection, task }
+    }
 }
 
 impl CthulhuApp {
-    /// This view's history worker is in flight. A load for another repository
-    /// does not change the line in the center.
     fn history_loading(&self) -> bool {
-        let Screen::Repo(repo) = &self.screen else {
-            return false;
-        };
-        self.graph_load
-            .as_ref()
-            .is_some_and(|load| load.view_id == repo.view_id)
+        matches!(
+            self.screen,
+            Screen::Repo {
+                graph_load: Some(_),
+                ..
+            }
+        )
     }
 
     fn sync_for_open_repo(&self) -> Option<SyncKind> {
-        let Screen::Repo(repo) = &self.screen else {
-            return None;
-        };
-        self.sync_job
-            .as_ref()
-            .and_then(|job| (job.view_id == repo.view_id).then_some(job.kind))
+        match &self.screen {
+            Screen::Repo { sync, .. } => sync.as_ref().map(|job| job.kind),
+            Screen::Home(_) => None,
+        }
     }
 
     fn start_sync(&mut self, ctx: &egui::Context, command: SyncCommand) {
-        let Screen::Repo(repo) = &self.screen else {
+        let Screen::Repo { repo, sync, .. } = &mut self.screen else {
             return;
         };
-        if self
-            .sync_job
-            .as_ref()
-            .is_some_and(|job| job.view_id == repo.view_id)
-        {
+        if sync.is_some() {
             return;
         }
-        let view_id = repo.view_id;
         let root = repo.info.root.clone();
         let git = repo.git.clone();
         let kind = match &command {
@@ -901,48 +844,27 @@ impl CthulhuApp {
             SyncCommand::Pull => SyncKind::Pull,
             SyncCommand::Checkout(_) => SyncKind::Checkout,
         };
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
-        thread::spawn(move || {
-            let result = run_sync(&git, &root, command);
-            let _ = sender.send(result);
-            ctx.request_repaint();
-        });
+        let task = Task::spawn(ctx, move || run_sync(&git, &root, command));
+        *sync = Some(SyncJob { kind, task });
         self.error = None;
-        self.sync_job = Some(SyncJob {
-            view_id,
-            kind,
-            receiver,
-        });
     }
 
-    /// Applies a finished fetch or pull. A result for a repository that is no
-    /// longer on screen is dropped, including when the user went Home.
+    /// Applies a finished fetch, pull or checkout.
     fn poll_sync(&mut self) {
-        let Some(job) = &self.sync_job else {
+        let Screen::Repo { repo, sync, .. } = &mut self.screen else {
             return;
         };
-        let result = match job.receiver.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => {
-                Err("The Git command stopped unexpectedly. Try again.".to_owned())
-            }
-        };
-        let Some(job) = self.sync_job.take() else {
+        let Some(job) = sync.take() else {
             return;
         };
-        let Screen::Repo(repo) = &mut self.screen else {
+        let Some(done) = job.task.poll() else {
+            *sync = Some(job);
             return;
         };
-        if repo.view_id != job.view_id {
-            return;
-        }
-        match result {
+        match outcome(done, "The Git command stopped unexpectedly. Try again.") {
             Ok(refreshed) => {
-                let switched = job.kind == SyncKind::Checkout;
                 apply_refresh(repo, refreshed);
-                if switched {
+                if job.kind == SyncKind::Checkout {
                     for listed in &mut repo.branches {
                         if listed.branch.current {
                             listed.checked = true;
@@ -955,158 +877,83 @@ impl CthulhuApp {
         }
     }
 
+    /// A graph read for checkboxes that changed since is dropped;
+    /// [`Self::sync_graph`] asks for the new selection.
     fn poll_graph(&mut self) {
-        if !matches!(self.screen, Screen::Repo(_)) {
-            if self.graph_load.is_some() {
-                self.graph_generation = self.graph_generation.wrapping_add(1);
-                self.graph_load = None;
-            }
-            return;
-        }
-
-        let result = {
-            let Some(load) = &self.graph_load else {
-                return;
-            };
-            match load.receiver.try_recv() {
-                Ok(result) => result,
-                Err(TryRecvError::Empty) => return,
-                Err(TryRecvError::Disconnected) => {
-                    Err("The history graph stopped unexpectedly. Try again.".to_owned())
-                }
-            }
-        };
-        let Some(load) = self.graph_load.take() else {
+        let Screen::Repo {
+            repo, graph_load, ..
+        } = &mut self.screen
+        else {
             return;
         };
-        if load.generation != self.graph_generation {
+        let Some(load) = graph_load.take() else {
+            return;
+        };
+        let Some(done) = load.task.poll() else {
+            *graph_load = Some(load);
+            return;
+        };
+        if selected_tips(&repo.branches, repo.detached_oid.as_deref()) != load.selection {
             return;
         }
-
-        let mut clear_error = false;
-        let mut failure = None;
-        if let Screen::Repo(repo) = &mut self.screen
-            && repo.view_id == load.view_id
-            && selected_tips(&repo.branches, repo.detached_oid.as_deref()) == load.selection
-        {
-            match result {
-                Ok(graph) => {
-                    repo.graph = graph;
-                    repo.graph_selection = load.selection.clone();
-                    repo.graph_requested = load.selection;
-                    clear_error = true;
-                }
-                Err(message) => {
-                    repo.graph_requested = load.selection;
-                    failure = Some(message);
-                }
+        match outcome(done, "The history graph stopped unexpectedly. Try again.") {
+            Ok(graph) => {
+                repo.graph = graph;
+                repo.graph_selection = load.selection.clone();
+                repo.graph_requested = load.selection;
+                self.error = None;
             }
-        }
-        if clear_error {
-            self.error = None;
-        }
-        if let Some(message) = failure {
-            self.error = Some(message);
+            Err(message) => {
+                repo.graph_requested = load.selection;
+                self.error = Some(message);
+            }
         }
     }
 
+    /// Reads the graph again when the checkboxes changed. Neither the
+    /// selection in flight nor the last one that failed is asked again.
     fn sync_graph(&mut self, ctx: &egui::Context) {
-        enum Next {
-            Ignore,
-            Drop,
-            Clear,
-            Start(Vec<GraphTip>),
-        }
-
-        let next = match &self.screen {
-            Screen::Repo(repo) => {
-                let desired = selected_tips(&repo.branches, repo.detached_oid.as_deref());
-                if desired == repo.graph_selection {
-                    Next::Ignore
-                } else if desired.is_empty() {
-                    Next::Clear
-                } else if self
-                    .graph_load
-                    .as_ref()
-                    .is_some_and(|load| load.selection == desired)
-                    || (desired == repo.graph_requested && self.graph_load.is_none())
-                {
-                    Next::Ignore
-                } else {
-                    Next::Start(desired)
-                }
-            }
-            Screen::Home => {
-                if self.graph_load.is_some() {
-                    Next::Drop
-                } else {
-                    Next::Ignore
-                }
-            }
+        let Screen::Repo {
+            repo, graph_load, ..
+        } = &mut self.screen
+        else {
+            return;
         };
-
-        match next {
-            Next::Ignore => {}
-            Next::Drop => {
-                self.graph_generation = self.graph_generation.wrapping_add(1);
-                self.graph_load = None;
-            }
-            Next::Clear => {
-                self.graph_generation = self.graph_generation.wrapping_add(1);
-                self.graph_load = None;
-                if let Screen::Repo(repo) = &mut self.screen {
-                    repo.graph = HistoryGraph::default();
-                    repo.graph_selection.clear();
-                    repo.graph_requested.clear();
-                }
-            }
-            Next::Start(tips) => self.start_graph_load(ctx, tips),
+        let desired = selected_tips(&repo.branches, repo.detached_oid.as_deref());
+        if desired == repo.graph_selection {
+            return;
+        }
+        if desired.is_empty() {
+            *graph_load = None;
+            repo.graph = HistoryGraph::default();
+            repo.graph_selection.clear();
+            repo.graph_requested.clear();
+            return;
+        }
+        let asked = match graph_load {
+            Some(load) => load.selection == desired,
+            None => desired == repo.graph_requested,
+        };
+        if !asked {
+            *graph_load = Some(GraphLoad::start(ctx, repo, desired));
         }
     }
-
-    fn start_graph_load(&mut self, ctx: &egui::Context, tips: Vec<GraphTip>) {
-        let (git, root, view_id) = {
-            let Screen::Repo(repo) = &self.screen else {
-                return;
-            };
-            (repo.git.clone(), repo.info.root.clone(), repo.view_id)
-        };
-        self.graph_generation = self.graph_generation.wrapping_add(1);
-        let generation = self.graph_generation;
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
-        let requested = tips.clone();
-        thread::spawn(move || {
-            let result = reload_graph(&git, &root, &requested);
-            let _ = sender.send(result);
-            ctx.request_repaint();
-        });
-        self.graph_load = Some(GraphLoad {
-            generation,
-            view_id,
-            selection: tips,
-            receiver,
-        });
-    }
-}
-
-fn reload_graph(git: &Git, root: &Path, tips: &[GraphTip]) -> Result<HistoryGraph, String> {
-    git::branch_graph(git, root, tips, HISTORY_LIMIT).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{Arc, mpsc};
+    use std::sync::Arc;
 
-    use cthulhu_git::git::HistoryGraph;
+    use cthulhu_git::git::{GitError, HistoryGraph};
     use cthulhu_git::settings::HistoryColumns;
     use eframe::egui;
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::avatars::AvatarService;
+    use super::task::Task;
     use super::test_support::{absent_git, commit, listed, opened};
     use super::{Action, CthulhuApp, GraphLoad, Opening, Screen, Startup, selected_tips};
 
@@ -1248,9 +1095,9 @@ mod tests {
     fn an_open_waits_for_its_worker() {
         let ctx = egui::Context::default();
         let mut app = app(&ctx, None);
-        let (sender, receiver) = mpsc::channel();
+        let (task, sender) = Task::pending();
         let path = PathBuf::from("/repos/slow");
-        app.opening = Some(Opening { path, receiver });
+        app.opening = Some(Opening { path, task });
         app.poll_opening(&ctx);
         assert!(app.opening.is_some(), "the open ended before its worker");
         drop(sender);
@@ -1258,7 +1105,7 @@ mod tests {
         assert!(app.opening.is_none(), "a dead worker left the open running");
         let error = app.error.as_deref();
         assert_eq!(error, Some("Opening stopped unexpectedly. Try again."));
-        assert!(matches!(app.screen, Screen::Home));
+        assert!(matches!(app.screen, Screen::Home(_)));
     }
 
     /// What happens on screen while the history worker reads the graph.
@@ -1267,7 +1114,7 @@ mod tests {
         Nothing,
         OpenAnother,
         GoHome,
-        AnotherView,
+        CheckTopic,
         UncheckFeature,
         UncheckAll,
     }
@@ -1298,7 +1145,7 @@ mod tests {
     }
 
     const EARLIER: &str = "an earlier error";
-    const FAILED: &str = "fatal: the log failed";
+    const FAILED: &str = "`git log` failed (rejected): the log failed";
     const STOPPED: &str = "The history graph stopped unexpectedly. Try again.";
 
     /// Meanwhile, worker, loading, graph, error, requested, load.
@@ -1317,9 +1164,10 @@ mod tests {
             (Meanwhile::Nothing, Worker::Dies, true, Graph::Kept, Some(STOPPED), true, Load::Idle),
             // The same selection is not asked twice while it is in flight.
             (Meanwhile::Nothing, Worker::Busy, true, Graph::Kept, Some(EARLIER), false, Load::Same),
-            (Meanwhile::OpenAnother, Worker::Sends, false, Graph::Kept, None, false, Load::Restarted),
+            // The repository on screen keeps its load while another one opens.
+            (Meanwhile::OpenAnother, Worker::Sends, true, Graph::Applied, None, true, Load::Idle),
             (Meanwhile::GoHome, Worker::Sends, false, Graph::Kept, None, false, Load::Idle),
-            (Meanwhile::AnotherView, Worker::Sends, false, Graph::Kept, Some(EARLIER), false, Load::Restarted),
+            (Meanwhile::CheckTopic, Worker::Busy, true, Graph::Kept, Some(EARLIER), false, Load::Restarted),
             (Meanwhile::UncheckFeature, Worker::Sends, true, Graph::Kept, Some(EARLIER), false, Load::Idle),
             (Meanwhile::UncheckAll, Worker::Sends, true, Graph::Cleared, Some(EARLIER), false, Load::Idle),
         ];
@@ -1338,17 +1186,13 @@ mod tests {
             feature.branch.oid = Some("b".repeat(40));
             repo.branches.push(feature);
             let selection = selected_tips(&repo.branches, None);
-            let (sender, receiver) = mpsc::channel();
-            app.graph_generation += 1;
-            let generation = app.graph_generation;
-            app.graph_load = Some(GraphLoad {
-                generation,
-                view_id: repo.view_id,
-                selection: selection.clone(),
-                receiver,
-            });
             match meanwhile {
-                Meanwhile::AnotherView => repo.view_id = egui::Id::unique("another view"),
+                Meanwhile::CheckTopic => {
+                    let mut topic = listed("topic", false);
+                    topic.checked = true;
+                    topic.branch.oid = Some("c".repeat(40));
+                    repo.branches.push(topic);
+                }
                 Meanwhile::UncheckFeature => repo.branches[1].checked = false,
                 Meanwhile::UncheckAll => {
                     for branch in &mut repo.branches {
@@ -1357,7 +1201,16 @@ mod tests {
                 }
                 _ => {}
             }
-            app.screen = Screen::Repo(Box::new(repo));
+            let (task, sender) = Task::pending();
+            let graph_load = Some(GraphLoad {
+                selection: selection.clone(),
+                task,
+            });
+            app.screen = Screen::Repo {
+                repo: Box::new(repo),
+                graph_load,
+                sync: None,
+            };
             match meanwhile {
                 Meanwhile::OpenAnother => {
                     app.apply_action(&ctx, Action::Open(PathBuf::from("/repos/another")));
@@ -1371,31 +1224,52 @@ mod tests {
             }
             assert_eq!(app.history_loading(), loading, "{case}");
 
-            let result = match worker {
-                Worker::Sends => Some(Ok(HistoryGraph {
-                    truncated: true,
-                    ..HistoryGraph::default()
-                })),
-                Worker::Fails => Some(Err(FAILED.to_owned())),
-                Worker::Dies | Worker::Busy => None,
+            // A dropped load has no receiver left, so a send may fail.
+            let sender = match worker {
+                Worker::Sends => {
+                    let graph = HistoryGraph {
+                        truncated: true,
+                        ..HistoryGraph::default()
+                    };
+                    let _ = sender.send(Ok(graph));
+                    Some(sender)
+                }
+                Worker::Fails => {
+                    let _ = sender.send(Err(GitError::Rejected {
+                        command: "git log".to_owned(),
+                        reason: "the log failed".to_owned(),
+                    }));
+                    Some(sender)
+                }
+                Worker::Dies => {
+                    drop(sender);
+                    None
+                }
+                Worker::Busy => Some(sender),
             };
-            if let Some(result) = result {
-                // A dropped load has no receiver left.
-                let _ = sender.send(result);
-            }
-            let _running = matches!(worker, Worker::Busy).then_some(sender);
             app.poll_graph();
             app.sync_graph(&ctx);
 
             assert_eq!(app.error.as_deref(), error, "{case}");
-            let now = match &app.graph_load {
-                None => Load::Idle,
-                Some(running) if running.generation == generation => Load::Same,
-                Some(_) => Load::Restarted,
+            // The task the test holds the sender of still listens.
+            let same =
+                sender.is_some_and(|sender| sender.send(Ok(HistoryGraph::default())).is_ok());
+            let now = match &app.screen {
+                Screen::Repo {
+                    graph_load: Some(_),
+                    ..
+                } => {
+                    if same {
+                        Load::Same
+                    } else {
+                        Load::Restarted
+                    }
+                }
+                _ => Load::Idle,
             };
             assert_eq!(now, load, "{case}");
             match &app.screen {
-                Screen::Repo(repo) => {
+                Screen::Repo { repo, .. } => {
                     let shown = if repo.graph.truncated {
                         Graph::Applied
                     } else if repo.graph.rows.is_empty() {
@@ -1406,7 +1280,7 @@ mod tests {
                     assert_eq!(shown, graph, "{case}");
                     assert_eq!(repo.graph_requested == selection, requested, "{case}");
                 }
-                Screen::Home => assert_eq!(meanwhile, Meanwhile::GoHome, "{case}"),
+                Screen::Home(_) => assert_eq!(meanwhile, Meanwhile::GoHome, "{case}"),
             }
             // Leaving the repository keeps it for the next launch, and nothing
             // here is a reason to write the settings.
