@@ -49,7 +49,7 @@ of writing through it). On Unix the file is private to the user (mode 0600).
 | `src/settings.rs` | `SettingsError` | Read / parse / write errors shown to the user |
 | `src/ui/mod.rs` | `CthulhuApp::new` | Loads settings, applies the theme, picks the startup screen |
 | `src/ui/mod.rs` | `CthulhuApp::poll_opening` | Remembers a repository on success; forgets `last_repository` when it fails to open |
-| `src/ui/mod.rs` | `CthulhuApp::ui`, `Action::ToggleBranchesSidebar`, `Action::ToggleDetailSidebar` | Flips `history_sidebar_hidden` or `detail_sidebar_hidden` when the repository view asks |
+| `src/ui/mod.rs` | `CthulhuApp::ui`, `Action::ToggleBranchesSidebar`, `Action::ToggleDetailSidebar` | Flips `branches_sidebar_hidden` (saved as `history_sidebar_hidden`) or `detail_sidebar_hidden` when the repository view asks |
 | `src/ui/mod.rs` | `CthulhuApp::ui`, `Action::ToggleTerminal` | Flips `terminal_hidden` when the repository view asks. Showing the terminal also opens the right sidebar |
 | `src/settings.rs` | `HistoryColumns`, `HistoryColumns::normalized` | Width of each history column, validated field by field |
 | `src/ui/history.rs` | `show`, `header` | Dragging a column divider; releasing it or double-clicking it returns the new widths |
@@ -101,7 +101,7 @@ For manual tests on Linux, point `XDG_CONFIG_HOME` at a temp folder.
 | `theme` | Theme id (`docs/THEMES.md`); `null` or unknown means the default theme | `null` |
 | `last_repository` | Repository root reopened on launch | `null` |
 | `recent_repositories` | Repository roots, newest first, no duplicates, at most 10 | `[]` |
-| `history_sidebar_hidden` | The branches sidebar is hidden (toggled with the left panel button in the top bar). The JSON name is historical: this flag used to hide the commit list, which is now the center of the window. Negated so a missing field shows the sidebar | `false` |
+| `history_sidebar_hidden` | The branches sidebar is hidden (toggled with the left panel button in the top bar). The Rust field is `branches_sidebar_hidden`; the key keeps this name so existing files load. Negated so a missing field shows the sidebar | `false` |
 | `detail_sidebar_hidden` | The latest-commit sidebar on the right is hidden (toggled with the right panel button). Negated so a missing field shows the sidebar | `false` |
 | `terminal_hidden` | The terminal strip at the bottom of the right sidebar is hidden (toggled with the terminal button in the bottom bar). A missing field keeps it hidden. Showing it also opens the right sidebar. Its height is not saved | `true` |
 | `ui_font` | Interface typeface. `null`, blank, or an unknown id keeps Ubuntu. An id from the bundled catalog (`docs/FONTS.md`), not a file path or a system family. A missing field keeps the default | `null` |

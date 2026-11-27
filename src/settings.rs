@@ -26,10 +26,10 @@ pub struct Settings {
     #[serde(deserialize_with = "null_as_default")]
     pub recent_repositories: Vec<PathBuf>,
     /// Whether the branches sidebar of the repository view is hidden.
-    /// The JSON name is historical: this flag used to hide the commit list,
-    /// which is now the center of the window. Stored negated so the sidebar
-    /// shows when the field is missing.
-    pub history_sidebar_hidden: bool,
+    /// Stored negated so the sidebar shows when the field is missing, under
+    /// the key that existing files use.
+    #[serde(rename = "history_sidebar_hidden")]
+    pub branches_sidebar_hidden: bool,
     /// Whether the latest-commit sidebar on the right is hidden.
     /// Stored negated so the sidebar shows when the field is missing.
     pub detail_sidebar_hidden: bool,
@@ -162,7 +162,7 @@ impl Default for Settings {
             theme: None,
             last_repository: None,
             recent_repositories: Vec::new(),
-            history_sidebar_hidden: false,
+            branches_sidebar_hidden: false,
             detail_sidebar_hidden: false,
             terminal_hidden: true,
             ui_font: None,
@@ -413,7 +413,7 @@ mod tests {
         Settings {
             last_repository: Some("/src/readme.txt".into()),
             recent_repositories: vec!["rel/repo".into(), r"C:\repo".into()],
-            history_sidebar_hidden: true,
+            branches_sidebar_hidden: true,
             ..Settings::default()
         }
     }
@@ -491,7 +491,7 @@ mod tests {
                     theme: None,
                     last_repository: None,
                     recent_repositories: Vec::new(),
-                    history_sidebar_hidden: false,
+                    branches_sidebar_hidden: false,
                     detail_sidebar_hidden: false,
                     terminal_hidden: true,
                     ui_font: None,
@@ -525,7 +525,7 @@ mod tests {
                 Some(Settings {
                     last_repository: Some("/src/rlyeh".into()),
                     recent_repositories: vec!["/src/rlyeh".into(), "/src/innsmouth".into()],
-                    history_sidebar_hidden: true,
+                    branches_sidebar_hidden: true,
                     ..abyss()
                 }),
             ),
@@ -643,7 +643,7 @@ mod tests {
         let cases = [
             (
                 Settings {
-                    history_sidebar_hidden: true,
+                    branches_sidebar_hidden: true,
                     ..abyss()
                 },
                 None,
@@ -890,7 +890,7 @@ mod tests {
             flags in any::<[bool; 5]>(),
             widths in any::<[u16; 5]>(),
         ) {
-            let [history, detail, terminal, avatars, in_keyring] = flags;
+            let [branches, detail, terminal, avatars, in_keyring] = flags;
             let [branch, graph, hash, message, author] = widths;
             let mut recent_repositories = recents;
             if !recent_repositories.is_empty() {
@@ -901,7 +901,7 @@ mod tests {
                 theme,
                 last_repository: last,
                 recent_repositories,
-                history_sidebar_hidden: history,
+                branches_sidebar_hidden: branches,
                 detail_sidebar_hidden: detail,
                 terminal_hidden: terminal,
                 history_columns: HistoryColumns { branch, graph, hash, message, author },

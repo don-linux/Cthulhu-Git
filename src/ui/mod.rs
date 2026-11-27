@@ -620,7 +620,7 @@ impl eframe::App for CthulhuApp {
                     repo,
                     &repo_view::ViewState {
                         error: self.error.as_deref(),
-                        branches_open: !self.settings.history_sidebar_hidden,
+                        branches_open: !self.settings.branches_sidebar_hidden,
                         detail_open: !self.settings.detail_sidebar_hidden,
                         terminal_open: !self.settings.terminal_hidden,
                         syncing,
@@ -674,7 +674,7 @@ impl CthulhuApp {
                 self.font_preview = None;
             }
             Action::ToggleBranchesSidebar => {
-                self.settings.history_sidebar_hidden = !self.settings.history_sidebar_hidden;
+                self.settings.branches_sidebar_hidden = !self.settings.branches_sidebar_hidden;
                 self.save_settings();
             }
             Action::ToggleDetailSidebar => {
