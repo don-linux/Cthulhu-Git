@@ -1150,7 +1150,9 @@ fn child_missing_recent() {
                 .query_all_by_label_contains("gone-recent-rlyeh")
                 .next()
                 .expect("recent row");
-            row.click();
+            // At the minimum window the card sits below the fold, where a
+            // pointer click lands outside the scroll area's visible rect.
+            row.click_accesskit();
         }
         settle_open(&mut harness);
         assert_home(&harness);
