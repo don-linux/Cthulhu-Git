@@ -1,6 +1,7 @@
 //! User settings, stored as one JSON file in the per-user config folder of
 //! each OS. The map for changing this module is `docs/SETTINGS.md`.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -277,14 +278,9 @@ impl Settings {
 
     /// A hand-edited file may repeat or pile up entries.
     fn normalize_recent(&mut self) {
-        let mut seen = Vec::with_capacity(self.recent_repositories.len());
-        self.recent_repositories.retain(|path| {
-            let new = !seen.contains(path);
-            if new {
-                seen.push(path.clone());
-            }
-            new
-        });
+        let mut seen = HashSet::new();
+        self.recent_repositories
+            .retain(|path| seen.insert(path.clone()));
         self.recent_repositories.truncate(MAX_RECENT_REPOSITORIES);
     }
 
@@ -320,7 +316,7 @@ pub fn sanitize_font_name(name: &str) -> Option<String> {
     if stripped.is_empty() {
         None
     } else {
-        Some(truncate_to_bytes(stripped, MAX_FONT_NAME_BYTES))
+        Some(stripped[..stripped.floor_char_boundary(MAX_FONT_NAME_BYTES)].to_owned())
     }
 }
 
@@ -330,17 +326,6 @@ fn has_interior_newline(name: &str) -> bool {
 
 fn is_bidi_control(ch: char) -> bool {
     matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
-}
-
-fn truncate_to_bytes(text: &str, max: usize) -> String {
-    if text.len() <= max {
-        return text.to_owned();
-    }
-    let mut end = max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_owned()
 }
 
 /// Replaces `path` with `bytes`, creating its folder. The bytes go to a temp
