@@ -3,8 +3,6 @@ use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -481,68 +479,14 @@ fn harden<'a>(command: &'a mut Command, cwd: &Path, args: &[&str]) -> &'a mut Co
         .args(args)
 }
 
-struct CappedRead {
-    bytes: Vec<u8>,
-    exceeded: bool,
-    /// A read error is not EOF. Treating it as EOF would accept a partial
-    /// `rev-parse` as a repository root.
-    error: Option<io::Error>,
-}
-
-fn read_capped(mut reader: impl Read, limit: usize, exceeded_flag: &AtomicBool) -> CappedRead {
+/// `reader` to its end, or `None` once it has more than `limit` bytes. A read
+/// error is not the end: a partial `rev-parse` would pass for a repository root.
+fn read_capped(reader: impl Read, limit: usize) -> io::Result<Option<Vec<u8>>> {
     let mut bytes = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        let room = limit.saturating_sub(bytes.len());
-        if room == 0 {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    exceeded_flag.store(true, Ordering::Relaxed);
-                    return CappedRead {
-                        bytes,
-                        exceeded: true,
-                        error: None,
-                    };
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    return CappedRead {
-                        bytes,
-                        exceeded: false,
-                        error: Some(error),
-                    };
-                }
-            }
-        }
-        let read = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => {
-                return CappedRead {
-                    bytes,
-                    exceeded: false,
-                    error: Some(error),
-                };
-            }
-        };
-        if read > room {
-            bytes.extend_from_slice(&buf[..room]);
-            exceeded_flag.store(true, Ordering::Relaxed);
-            return CappedRead {
-                bytes,
-                exceeded: true,
-                error: None,
-            };
-        }
-        bytes.extend_from_slice(&buf[..read]);
-    }
-    CappedRead {
-        bytes,
-        exceeded: false,
-        error: None,
-    }
+    reader
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    Ok((bytes.len() <= limit).then_some(bytes))
 }
 
 fn output_limit(command_name: &str) -> GitError {
@@ -582,6 +526,18 @@ fn classify_spawn_error(command: &Command, error: io::Error, workdir: Option<&Pa
 /// stdout cannot pin the caller.
 const READER_BUDGET: Duration = Duration::from_millis(200);
 
+/// What one pipe gave: [`read_capped`] of stdout (slot 0) or stderr (slot 1).
+type Drained = io::Result<Option<Vec<u8>>>;
+
+/// Reads `pipe` on its own thread and sends the result tagged with `slot`.
+fn drain(slot: usize, pipe: impl Read + Send + 'static, tx: &mpsc::Sender<(usize, Drained)>) {
+    let tx = tx.clone();
+    thread::spawn(move || {
+        // A send fails only once `capture` has returned without it.
+        let _ = tx.send((slot, read_capped(pipe, MAX_GIT_OUTPUT)));
+    });
+}
+
 fn capture(
     command: &mut Command,
     timeout: Duration,
@@ -593,126 +549,72 @@ fn capture(
         Err(error) => return Err(classify_spawn_error(command, error, workdir)),
     };
     let pid = child.id();
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| GitError::Spawn(io::Error::other("git stdout was not piped")))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| GitError::Spawn(io::Error::other("git stderr was not piped")))?;
-    let exceeded = Arc::new(AtomicBool::new(false));
-    let stdout_exceeded = Arc::clone(&exceeded);
-    let stderr_exceeded = Arc::clone(&exceeded);
-    let stdout_thread =
-        thread::spawn(move || read_capped(stdout, MAX_GIT_OUTPUT, &stdout_exceeded));
-    let stderr_thread =
-        thread::spawn(move || read_capped(stderr, MAX_GIT_OUTPUT, &stderr_exceeded));
+    let (tx, rx) = mpsc::channel();
+    // `command` pipes both streams, so neither `take` can come back empty.
+    drain(0, child.stdout.take().expect("git stdout is piped"), &tx);
+    drain(1, child.stderr.take().expect("git stderr is piped"), &tx);
+    let mut slots: [Option<Drained>; 2] = [None, None];
+    let past_cap =
+        |slots: &[Option<Drained>; 2]| slots.iter().any(|slot| matches!(slot, Some(Ok(None))));
 
     let started = Instant::now();
     let status = loop {
-        if exceeded.load(Ordering::Relaxed) {
+        if past_cap(&slots) {
+            // Stop git now instead of waiting for it to write the rest.
             stop_group(pid, &mut child);
-            let _ = finish_reader(stdout_thread, READER_BUDGET);
-            let _ = finish_reader(stderr_thread, READER_BUDGET);
             return Err(output_limit(command_name));
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() >= timeout => {
                 stop_group(pid, &mut child);
-                let _ = finish_reader(stdout_thread, READER_BUDGET);
-                let _ = finish_reader(stderr_thread, READER_BUDGET);
                 return Err(timed_out(command_name, timeout));
             }
-            Ok(None) => thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {}
             Err(error) => {
                 stop_group(pid, &mut child);
-                let _ = finish_reader(stdout_thread, READER_BUDGET);
-                let _ = finish_reader(stderr_thread, READER_BUDGET);
                 return Err(GitError::Spawn(error));
             }
         }
+        // This thread still holds `tx`, so the channel never disconnects:
+        // once both readers are done this waits 5 ms instead of spinning.
+        if let Ok((slot, drained)) = rx.recv_timeout(Duration::from_millis(5)) {
+            slots[slot] = Some(drained);
+        }
     };
 
-    let (stdout, stderr) = finish_both(stdout_thread, stderr_thread, pid);
-    if let Some(error) = stdout.error.or(stderr.error) {
-        // The child already exited. A grandchild may still hold a pipe.
-        stop_group(pid, &mut child);
-        return Err(GitError::Spawn(error));
-    }
-    if stdout.exceeded || stderr.exceeded {
-        stop_group(pid, &mut child);
-        return Err(output_limit(command_name));
-    }
-
-    Ok(GitOutput {
-        stdout: stdout.bytes,
-        stderr: String::from_utf8_lossy(&stderr.bytes).trim().to_owned(),
-        status,
-    })
-}
-
-fn finish_both(
-    stdout_thread: thread::JoinHandle<CappedRead>,
-    stderr_thread: thread::JoinHandle<CappedRead>,
-    pid: u32,
-) -> (CappedRead, CappedRead) {
-    let stdout_pending = pending_reader(stdout_thread);
-    let stderr_pending = pending_reader(stderr_thread);
-    match (
-        recv_reader(&stdout_pending, READER_BUDGET),
-        recv_reader(&stderr_pending, READER_BUDGET),
-    ) {
-        (Some(stdout), Some(stderr)) => (stdout, stderr),
-        (stdout, stderr) => {
-            // The direct child has exited, but a grandchild still holds a pipe.
-            // `setsid` may have moved that grandchild out of the child's group.
-            super::reap::reap_process_tree(pid);
-            let stdout = stdout.unwrap_or_else(|| {
-                recv_reader(&stdout_pending, READER_BUDGET).unwrap_or_else(reader_abandoned)
-            });
-            let stderr = stderr.unwrap_or_else(|| {
-                recv_reader(&stderr_pending, READER_BUDGET).unwrap_or_else(reader_abandoned)
-            });
-            (stdout, stderr)
+    // git has exited, but a grandchild can still hold a pipe. Give the
+    // readers a moment, stop the tree, and give them one more.
+    let mut stopped = false;
+    while slots.iter().any(Option::is_none) {
+        match rx.recv_timeout(READER_BUDGET) {
+            Ok((slot, drained)) => slots[slot] = Some(drained),
+            Err(_) if !stopped => {
+                // `setsid` may have moved that grandchild out of git's group.
+                super::reap::reap_process_tree(pid);
+                stopped = true;
+            }
+            Err(_) => break,
         }
     }
-}
-
-struct PendingRead {
-    rx: mpsc::Receiver<thread::Result<CappedRead>>,
-}
-
-fn pending_reader(handle: thread::JoinHandle<CappedRead>) -> PendingRead {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(handle.join());
+    let [stdout, stderr] = slots.map(|slot| {
+        slot.unwrap_or_else(|| Err(io::Error::other("git output reader did not finish")))
     });
-    PendingRead { rx }
-}
-
-fn recv_reader(pending: &PendingRead, budget: Duration) -> Option<CappedRead> {
-    match pending.rx.recv_timeout(budget) {
-        Ok(Ok(read)) => Some(read),
-        Ok(Err(_)) => Some(CappedRead {
-            bytes: Vec::new(),
-            exceeded: false,
-            error: Some(io::Error::other("git output reader panicked")),
+    match (stdout, stderr) {
+        (Ok(Some(stdout)), Ok(Some(stderr))) => Ok(GitOutput {
+            stdout,
+            stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
+            status,
         }),
-        Err(_) => None,
-    }
-}
-
-fn finish_reader(handle: thread::JoinHandle<CappedRead>, budget: Duration) -> Option<CappedRead> {
-    recv_reader(&pending_reader(handle), budget)
-}
-
-fn reader_abandoned() -> CappedRead {
-    CappedRead {
-        bytes: Vec::new(),
-        exceeded: false,
-        error: Some(io::Error::other("git output reader did not finish")),
+        (Err(error), _) | (_, Err(error)) => {
+            // The child already exited. A grandchild may still hold a pipe.
+            stop_group(pid, &mut child);
+            Err(GitError::Spawn(error))
+        }
+        _ => {
+            stop_group(pid, &mut child);
+            Err(output_limit(command_name))
+        }
     }
 }
 
@@ -1092,34 +994,52 @@ mod tests {
         }
     }
 
+    /// A pipe that answers each `read` with the next step, then EOF.
+    struct Steps(&'static [Result<&'static [u8], io::ErrorKind>]);
+
+    impl Read for Steps {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some((step, rest)) = self.0.split_first() else {
+                return Ok(0);
+            };
+            self.0 = rest;
+            let bytes = step.map_err(io::Error::from)?;
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    /// The reads of a pipe, the limit, and what `read_capped` returns:
+    /// the bytes, `None` past the limit, or `Err` for a read error.
+    type ReadCase = (
+        &'static [Result<&'static [u8], io::ErrorKind>],
+        usize,
+        Result<Option<&'static [u8]>, ()>,
+    );
+
+    const READS: &[ReadCase] = &[
+        (&[Ok(b"ab"), Ok(b"cd")], 4, Ok(Some(b"abcd"))),
+        (&[Ok(b"abcd"), Ok(b"e")], 4, Ok(None)),
+        (&[Ok(b"abcde")], 4, Ok(None)),
+        (&[], 0, Ok(Some(b""))),
+        // A mid-read error is not EOF; retrying it would end "cleanly".
+        (&[Ok(b"x"), Err(io::ErrorKind::Other)], 64, Err(())),
+        (&[Ok(b"abcd"), Err(io::ErrorKind::Other)], 4, Err(())),
+        // An interrupted read is retried, also with the limit reached.
+        (
+            &[Ok(b"abcd"), Err(io::ErrorKind::Interrupted)],
+            4,
+            Ok(Some(b"abcd")),
+        ),
+    ];
+
     #[test]
-    fn a_read_error_is_not_an_empty_success() {
-        /// One byte, one error, then EOF: a reader that retried the error
-        /// would end cleanly instead of hanging.
-        struct ThenBoom {
-            reads: usize,
+    fn read_capped_table() {
+        for &(steps, limit, expected) in READS {
+            let got = read_capped(Steps(steps), limit).map_err(drop);
+            let expected = expected.map(|bytes| bytes.map(<[u8]>::to_vec));
+            assert_eq!(got, expected, "{steps:?} {limit}");
         }
-        impl Read for ThenBoom {
-            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-                self.reads += 1;
-                match self.reads {
-                    1 => {
-                        buf[0] = b'x';
-                        Ok(1)
-                    }
-                    2 => Err(io::Error::other("mid-read")),
-                    _ => Ok(0),
-                }
-            }
-        }
-        let flag = AtomicBool::new(false);
-        let read = read_capped(ThenBoom { reads: 0 }, 64, &flag);
-        assert!(
-            read.error.is_some(),
-            "a mid-read error must not look like EOF"
-        );
-        assert!(!read.exceeded);
-        assert!(!flag.load(Ordering::Relaxed));
     }
 
     #[test]
