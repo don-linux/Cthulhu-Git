@@ -10,8 +10,8 @@ use cthulhu_git::git::{Branch, CommitFile, CommitStats, GraphBranch, Head, Perso
 use cthulhu_git::github::{GitHubRepo, RepoContext};
 use cthulhu_git::settings::HistoryColumns;
 use eframe::egui::{
-    self, Align, Button, Color32, CursorIcon, FontSelection, Frame, Label, Layout, Margin, Pos2,
-    Rect, RichText, ScrollArea, Sense, Stroke, Ui, Vec2, WidgetText, containers::menu::MenuButton,
+    self, Align, Button, Color32, CursorIcon, Frame, Label, Layout, Margin, Pos2, Rect, RichText,
+    ScrollArea, Sense, Stroke, Ui, Vec2, WidgetText, containers::menu::MenuButton,
 };
 
 use super::avatars::{self, AvatarService};
@@ -20,6 +20,7 @@ use super::history;
 use super::hover::{self, CachedCommit};
 use super::icons::{self, Icon};
 use super::terminal;
+use super::text;
 use super::theme::{self, Palette};
 use super::widgets;
 use super::{Action, ListedBranch, OpenedRepo, SyncKind};
@@ -755,7 +756,12 @@ fn view_changes_button(ui: &mut Ui, palette: &Palette) -> egui::Response {
 fn hash_block(ui: &mut Ui, palette: &Palette, oid: &str, github: Option<&GitHubRepo>) {
     ui.label(RichText::new("Hash").small().weak());
     ui.add_space(2.0);
-    let hash = place_sidebar_text(ui, RichText::new(oid).monospace().color(palette.hash), true)
+    // The click is the action, so the text is not selectable.
+    let hash = sidebar_label(ui, RichText::new(oid).monospace().color(palette.hash))
+        .selectable(false)
+        .sense(Sense::click());
+    let hash = ui
+        .add(hash)
         .on_hover_text("Copy the full commit hash")
         .on_hover_cursor(CursorIcon::PointingHand);
     if hash.clicked() {
@@ -818,35 +824,17 @@ fn person_line(
     });
 }
 
-fn sidebar_text(ui: &mut Ui, text: impl Into<WidgetText>) {
-    let _ = place_sidebar_text(ui, text, false);
-}
-
-/// Draws `text` inside the width this sidebar was given.
+/// `text` inside the width this sidebar was given.
 ///
 /// A commit hash and a name with an address are single tokens. Letting either extend
 /// grows the sidebar up to the remaining window and leaves the history column
 /// with no room. Breaking inside the token keeps the whole string visible.
-///
-/// `clickable` makes the line a click target and turns text selection off, so
-/// the click is the action.
-fn place_sidebar_text(ui: &mut Ui, text: impl Into<WidgetText>, clickable: bool) -> egui::Response {
-    let width = ui.available_width().max(0.0);
-    let mut job = std::sync::Arc::unwrap_or_clone(text.into().into_layout_job(
-        ui.style(),
-        FontSelection::Default,
-        ui.text_valign(),
-    ));
-    job.wrap.max_width = width;
-    job.wrap.break_anywhere = true;
-    job.wrap.max_rows = usize::MAX;
-    job.wrap.overflow_character = None;
-    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-    let mut label = Label::new(galley);
-    if clickable {
-        label = label.selectable(false).sense(Sense::click());
-    }
-    ui.add(label)
+fn sidebar_label(ui: &Ui, text: impl Into<WidgetText>) -> Label {
+    Label::new(text::wrapped(ui, text))
+}
+
+fn sidebar_text(ui: &mut Ui, text: impl Into<WidgetText>) {
+    ui.add(sidebar_label(ui, text));
 }
 
 struct SyncOffer {
