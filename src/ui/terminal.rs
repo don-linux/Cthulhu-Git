@@ -1781,12 +1781,12 @@ fn special_key(key: Key, modifiers: Modifiers, app_cursor: bool) -> Option<Vec<u
         Key::Backspace => backspace_bytes(modifiers),
         Key::Tab => tab_bytes(modified),
         Key::Escape => vec![0x1b],
-        Key::ArrowUp => arrow(b'A', modified, app_cursor),
-        Key::ArrowDown => arrow(b'B', modified, app_cursor),
-        Key::ArrowRight => arrow(b'C', modified, app_cursor),
-        Key::ArrowLeft => arrow(b'D', modified, app_cursor),
-        Key::Home => csi_tilde_or_letter(b'H', modified),
-        Key::End => csi_tilde_or_letter(b'F', modified),
+        Key::ArrowUp => cursor_key(b'A', modified, app_cursor),
+        Key::ArrowDown => cursor_key(b'B', modified, app_cursor),
+        Key::ArrowRight => cursor_key(b'C', modified, app_cursor),
+        Key::ArrowLeft => cursor_key(b'D', modified, app_cursor),
+        Key::Home => cursor_key(b'H', modified, app_cursor),
+        Key::End => cursor_key(b'F', modified, app_cursor),
         Key::PageUp => csi_tilde(5, modified),
         Key::PageDown => csi_tilde(6, modified),
         Key::Delete => csi_tilde(3, modified),
@@ -1834,21 +1834,16 @@ fn tab_bytes(modified: u8) -> Vec<u8> {
     }
 }
 
-fn arrow(letter: u8, modified: u8, app_cursor: bool) -> Vec<u8> {
+/// The arrows, Home and End, as xterm sends them: `CSI <letter>`, or SS3
+/// (`ESC O <letter>`) in application cursor mode. With modifiers,
+/// `CSI 1;<mod> <letter>` in either mode.
+fn cursor_key(letter: u8, modified: u8, app_cursor: bool) -> Vec<u8> {
     if modified == 1 {
         if app_cursor {
             vec![0x1b, b'O', letter]
         } else {
             vec![0x1b, b'[', letter]
         }
-    } else {
-        format!("\x1b[1;{modified}{}", letter as char).into_bytes()
-    }
-}
-
-fn csi_tilde_or_letter(letter: u8, modified: u8) -> Vec<u8> {
-    if modified == 1 {
-        vec![0x1b, b'[', letter]
     } else {
         format!("\x1b[1;{modified}{}", letter as char).into_bytes()
     }
@@ -2436,8 +2431,10 @@ END
             (Key::ArrowLeft, NONE, true, b"\x1bOD"),
             (Key::ArrowLeft, CTRL, true, b"\x1b[1;5D"),
             (Key::Home, NONE, false, b"\x1b[H"),
-            (Key::Home, NONE, true, b"\x1b[H"),
-            (Key::End, NONE, true, b"\x1b[F"),
+            (Key::Home, NONE, true, b"\x1bOH"),
+            (Key::End, NONE, true, b"\x1bOF"),
+            (Key::End, NONE, false, b"\x1b[F"),
+            (Key::Home, CTRL, true, b"\x1b[1;5H"),
             (Key::End, SHIFT, false, b"\x1b[1;2F"),
             (Key::PageUp, NONE, false, b"\x1b[5~"),
             (Key::PageDown, ALT, false, b"\x1b[6;3~"),
