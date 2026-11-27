@@ -86,7 +86,7 @@ pub struct GitOutput {
 pub enum GitError {
     #[error("{}", format_not_found(tried))]
     NotFound { tried: Vec<PathBuf> },
-    #[error("CTHULHU_GIT is set to {path}, which is not an executable file.", path = display_path(.0))]
+    #[error("CTHULHU_GIT is set to {0}, which is not an executable file.")]
     BadOverride(PathBuf),
     #[error(
         "Git {0} is too old; version {major}.{minor}.{patch} or newer is required.",
@@ -95,11 +95,15 @@ pub enum GitError {
         patch = MIN_GIT_VERSION.2
     )]
     TooOld(GitVersion),
-    #[error("{path} is not a directory.", path = display_path(.0))]
+    #[error("{0} is not a directory.")]
     NotADirectory(PathBuf),
-    #[error("{path} is not inside a Git repository.", path = display_path(.0))]
+    #[error("{0} is not inside a Git repository.")]
     NotARepository(PathBuf),
-    #[error("{}", format_unsafe(.0))]
+    #[error(
+        "Git refuses to open {0} because it is owned by another user. \
+         If you trust it, run: git config --global --add safe.directory {quoted}",
+        quoted = shell_single_quote(&.0.to_string_lossy())
+    )]
     UnsafeRepository(PathBuf),
     #[error("Could not run git: {0}")]
     Spawn(#[source] io::Error),
@@ -107,18 +111,15 @@ pub enum GitError {
     TimedOut { command: String, limit: Duration },
     #[error("`{command}` failed (output limit): git output exceeded the limit")]
     OutputLimit { command: String },
-    #[error("`{command}` failed (rejected): {stderr}")]
-    Rejected { command: String, stderr: String },
+    /// Git succeeded, but this app refuses its output or the request.
+    #[error("`{command}` failed (rejected): {reason}")]
+    Rejected { command: String, reason: String },
     #[error("`{command}` failed ({status}){suffix}", suffix = stderr_suffix(stderr))]
     Command {
         command: String,
         status: ExitStatus,
         stderr: String,
     },
-}
-
-fn display_path(path: &Path) -> String {
-    path.display().to_string()
 }
 
 fn format_not_found(tried: &[PathBuf]) -> String {
@@ -135,15 +136,6 @@ fn format_not_found(tried: &[PathBuf]) -> String {
     message
 }
 
-fn format_unsafe(path: &Path) -> String {
-    format!(
-        "Git refuses to open {0} because it is owned by another user. \
-         If you trust it, run: git config --global --add safe.directory {1}",
-        path.display(),
-        shell_single_quote(&path.to_string_lossy())
-    )
-}
-
 fn stderr_suffix(stderr: &str) -> String {
     if stderr.is_empty() {
         String::new()
@@ -152,10 +144,10 @@ fn stderr_suffix(stderr: &str) -> String {
     }
 }
 
-pub(crate) fn rejected(command: &str, stderr: impl Into<String>) -> GitError {
+pub(crate) fn rejected(command: &str, reason: impl Into<String>) -> GitError {
     GitError::Rejected {
         command: command.to_owned(),
-        stderr: stderr.into(),
+        reason: reason.into(),
     }
 }
 
