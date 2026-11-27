@@ -31,8 +31,8 @@ mod widgets;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
 use cthulhu_git::git::{
@@ -142,7 +142,7 @@ struct HomeScan {
 }
 
 impl HomeScan {
-    fn start(ctx: &egui::Context, find_git: &FindGit, paths: Vec<PathBuf>) -> Self {
+    fn start(ctx: &egui::Context, find_git: &Arc<GitFinder>, paths: Vec<PathBuf>) -> Self {
         if paths.is_empty() {
             return Self::default();
         }
@@ -181,7 +181,7 @@ pub struct CthulhuApp {
     fonts: fonts::FontService,
     avatars: AvatarService,
     github: GitHubAuth,
-    find_git: FindGit,
+    find_git: Arc<GitFinder>,
     /// `git --version` for the About page, once the probe started by the
     /// first visit to Settings has answered.
     git_version: Option<String>,
@@ -210,12 +210,68 @@ pub struct Startup {
     pub settings_path: Option<PathBuf>,
     /// Builds the avatar service once the settings say whether avatars are on.
     pub avatars: fn(enabled: bool) -> AvatarService,
-    /// Finds git for each open, the recent list and the About page.
-    pub find_git: FindGit,
+    /// Finds git for opens, the recent list and the About page.
+    /// [`Git::discover`] reads `CTHULHU_GIT` and `PATH`.
+    pub find_git: fn() -> Result<Git, GitError>,
 }
 
-/// How the app finds git. [`Git::discover`] reads `CTHULHU_GIT` and `PATH`.
-pub type FindGit = Arc<dyn Fn() -> Result<Git, GitError> + Send + Sync>;
+/// The git found first, kept so each open does not search and probe again.
+/// A git that a command could not start (moved or uninstalled) is looked
+/// for again on the next find.
+struct GitFinder {
+    find: fn() -> Result<Git, GitError>,
+    found: Mutex<Option<Git>>,
+}
+
+impl GitFinder {
+    fn new(find: fn() -> Result<Git, GitError>) -> Self {
+        Self {
+            find,
+            found: Mutex::new(None),
+        }
+    }
+
+    /// The lock is not held while searching, so the UI thread never waits
+    /// for a search running on a worker.
+    fn git(&self) -> Result<Git, GitError> {
+        if let Some(git) = self.found().clone() {
+            return Ok(git);
+        }
+        let git = (self.find)()?;
+        *self.found() = Some(git.clone());
+        Ok(git)
+    }
+
+    fn forget_if_gone(&self, error: &GitError) {
+        if matches!(error, GitError::Spawn(_)) {
+            *self.found() = None;
+        }
+    }
+
+    /// The text the UI shows for `error`.
+    fn describe(&self, error: GitError) -> String {
+        self.forget_if_gone(&error);
+        error.to_string()
+    }
+
+    /// A finished git job as the screen shows it: the error as text, and
+    /// `stopped` when the worker died without an answer.
+    fn outcome<T>(
+        &self,
+        done: Result<Result<T, GitError>, Stopped>,
+        stopped: &str,
+    ) -> Result<T, String> {
+        match done {
+            Ok(result) => result.map_err(|error| self.describe(error)),
+            Err(Stopped) => Err(stopped.to_owned()),
+        }
+    }
+
+    fn found(&self) -> std::sync::MutexGuard<'_, Option<Git>> {
+        // A panic elsewhere cannot leave a half-written `Option<Git>` behind.
+        self.found.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 impl Startup {
     /// The user's settings file and avatars from the network.
@@ -224,7 +280,7 @@ impl Startup {
             command_line,
             settings_path: Settings::default_path(),
             avatars: |enabled| AvatarService::new(avatar_cache_dir(), enabled),
-            find_git: Arc::new(Git::discover),
+            find_git: Git::discover,
         }
     }
 }
@@ -265,7 +321,7 @@ impl CthulhuApp {
             fonts,
             avatars,
             github,
-            find_git,
+            find_git: Arc::new(GitFinder::new(find_git)),
             git_version: None,
             git_probe: None,
         };
@@ -273,7 +329,7 @@ impl CthulhuApp {
             // The window stays hidden until its first frame is painted, so
             // opening here makes that frame the repository or the home
             // screen with the error, never a home screen that then flips.
-            let result = load(&app.find_git, &path).map_err(|error| error.to_string());
+            let result = load(&app.find_git, &path).map_err(|error| app.find_git.describe(error));
             app.finish_open(ctx, path, result);
         }
         // Home, with no first open or a failed one, scans from the start.
@@ -290,7 +346,7 @@ impl CthulhuApp {
         }
         let find_git = Arc::clone(&self.find_git);
         self.git_probe = Some(Task::spawn(ctx, move || {
-            find_git().map(|git| git.version.to_string())
+            find_git.git().map(|git| git.version.to_string())
         }));
     }
 
@@ -344,7 +400,9 @@ impl CthulhuApp {
             self.opening = Some(opening);
             return;
         };
-        let result = outcome(done, "Opening stopped unexpectedly. Try again.");
+        let result = self
+            .find_git
+            .outcome(done, "Opening stopped unexpectedly. Try again.");
         self.finish_open(ctx, opening.path, result);
     }
 
@@ -655,30 +713,24 @@ struct Refreshed {
     github: Option<GitHubRepo>,
 }
 
-/// A finished git job as the screen shows it: the error as text, and
-/// `stopped` when the worker died without an answer.
-fn outcome<T>(done: Result<Result<T, GitError>, Stopped>, stopped: &str) -> Result<T, String> {
-    match done {
-        Ok(result) => result.map_err(|error| error.to_string()),
-        Err(Stopped) => Err(stopped.to_owned()),
-    }
-}
-
 /// One repository at a time. A dropped receiver stops the loop once the
 /// repository being read is done; each of its git commands keeps its own
 /// time limit.
 fn scan_glances(
-    find_git: &FindGit,
+    find_git: &GitFinder,
     paths: Vec<PathBuf>,
     sender: &Sender<(PathBuf, home::Glance)>,
     ctx: &egui::Context,
 ) {
-    let git = find_git().ok();
+    let git = find_git.git().ok();
     for path in paths {
         let glance = match &git {
             Some(git) => match git::glance(git, &path) {
                 Ok(ready) => home::Glance::Ready(ready),
-                Err(_) => home::Glance::Unreadable,
+                Err(error) => {
+                    find_git.forget_if_gone(&error);
+                    home::Glance::Unreadable
+                }
             },
             None => home::Glance::Unreadable,
         };
@@ -691,8 +743,8 @@ fn scan_glances(
 
 /// Repository chrome. The history graph is read later, so a log failure
 /// stays on the repository screen and keeps `last_repository`.
-fn load(find_git: &FindGit, path: &Path) -> Result<Refreshed, GitError> {
-    reload_repo(&find_git()?, path)
+fn load(find_git: &GitFinder, path: &Path) -> Result<Refreshed, GitError> {
+    reload_repo(&find_git.git()?, path)
 }
 
 /// HEAD, branches and the latest commit, without rebuilding the graph.
@@ -843,7 +895,10 @@ impl CthulhuApp {
             *sync = Some(job);
             return;
         };
-        match outcome(done, "The Git command stopped unexpectedly. Try again.") {
+        match self
+            .find_git
+            .outcome(done, "The Git command stopped unexpectedly. Try again.")
+        {
             Ok(refreshed) => {
                 apply_refresh(repo, refreshed);
                 if job.kind == SyncKind::Checkout {
@@ -878,7 +933,10 @@ impl CthulhuApp {
         if selected_tips(&repo.branches, repo.detached_oid.as_deref()) != load.selection {
             return;
         }
-        match outcome(done, "The history graph stopped unexpectedly. Try again.") {
+        match self
+            .find_git
+            .outcome(done, "The history graph stopped unexpectedly. Try again.")
+        {
             Ok(graph) => {
                 repo.graph = graph;
                 repo.graph_selection = load.selection.clone();
@@ -925,10 +983,11 @@ impl CthulhuApp {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use cthulhu_git::git::{GitError, HistoryGraph};
+    use cthulhu_git::git::{Git, GitError, HistoryGraph};
     use cthulhu_git::settings::HistoryColumns;
     use eframe::egui;
     use serde_json::json;
@@ -937,7 +996,9 @@ mod tests {
     use super::avatars::AvatarService;
     use super::task::Task;
     use super::test_support::{absent_git, commit, listed, opened};
-    use super::{Action, CthulhuApp, GraphLoad, Opening, Screen, Startup, selected_tips};
+    use super::{
+        Action, CthulhuApp, GitFinder, GraphLoad, Opening, Screen, Startup, selected_tips,
+    };
 
     /// The app as it starts on `settings_path`, with a git that is installed nowhere.
     fn app(ctx: &egui::Context, settings_path: Option<PathBuf>) -> CthulhuApp {
@@ -947,9 +1008,40 @@ mod tests {
                 command_line: None,
                 settings_path,
                 avatars: |_| AvatarService::disabled(),
-                find_git: Arc::new(|| Ok(absent_git())),
+                find_git: || Ok(absent_git()),
             },
         )
+    }
+
+    /// Git is looked for once, and again only after a command could not
+    /// start it.
+    #[test]
+    fn git_is_searched_again_only_once_it_cannot_start() {
+        static SEARCHES: AtomicUsize = AtomicUsize::new(0);
+        fn search() -> Result<Git, GitError> {
+            SEARCHES.fetch_add(1, Ordering::SeqCst);
+            Ok(absent_git())
+        }
+        let rejected = || GitError::Rejected {
+            command: "git log".to_owned(),
+            reason: "refused".to_owned(),
+        };
+        let gone = || GitError::Spawn(io::ErrorKind::NotFound.into());
+        // (the error a command returned before this find, searches so far)
+        let cases: [(Option<GitError>, usize); 4] = [
+            (None, 1),
+            (None, 1),
+            (Some(rejected()), 1),
+            (Some(gone()), 2),
+        ];
+        let finder = GitFinder::new(search);
+        for (step, (error, searches)) in cases.into_iter().enumerate() {
+            if let Some(error) = error {
+                finder.describe(error);
+            }
+            assert!(finder.git().is_ok(), "step {step}");
+            assert_eq!(SEARCHES.load(Ordering::SeqCst), searches, "step {step}");
+        }
     }
 
     #[test]

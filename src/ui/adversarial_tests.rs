@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -74,7 +73,7 @@ impl Sandbox {
             command_line,
             settings_path: Some(self.settings.clone()),
             avatars: |_| AvatarService::disabled(),
-            find_git: Arc::new(Git::discover),
+            find_git: Git::discover,
         };
         builder(WINDOW_SIZE).build_eframe(|cc| CthulhuApp::new(&cc.egui_ctx, startup))
     }
