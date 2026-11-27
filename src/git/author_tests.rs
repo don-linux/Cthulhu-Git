@@ -511,6 +511,15 @@ fn parse_co_authors_very_long_line() {
     let noise = "a".repeat(100_000);
     assert!(parse_co_authors(&noise).is_empty());
     assert!(reference_co_authors(&noise).is_empty());
+
+    // Many `<` before the closing `>`: a scan per bracket was quadratic, and
+    // so were thousands of distinct co-authors. Both stay linear.
+    let brackets = format!("Co-authored-by: a {}>b>", "<".repeat(1 << 20));
+    assert!(parse_co_authors(&brackets).is_empty());
+    let many: String = (0..20_000)
+        .map(|n| format!("Co-authored-by: N{n} <n{n}@x.test>\n"))
+        .collect();
+    assert_eq!(parse_co_authors(&many).len(), 20_000);
 }
 
 fn bare_cr_coauthor_samples() -> [&'static str; 3] {

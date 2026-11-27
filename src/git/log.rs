@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use super::exec::{Git, GitError};
@@ -100,6 +101,7 @@ pub fn email_key(email: &str) -> String {
 pub fn parse_co_authors(text: &str) -> Vec<Person> {
     const KEY: &str = "co-authored-by:";
     let mut found: Vec<Person> = Vec::new();
+    let mut seen = HashSet::new();
     // A bare CR and the Unicode separators end a line too, as they do for
     // the `m` flag of VS Code's regular expression.
     for line in text.split(['\n', '\r', '\u{2028}', '\u{2029}']) {
@@ -112,8 +114,7 @@ pub fn parse_co_authors(text: &str) -> Vec<Person> {
         let Some(person) = parse_name_and_email(&line[KEY.len()..]) else {
             continue;
         };
-        let key = person.email_key();
-        if !found.iter().any(|known| known.email_key() == key) {
+        if seen.insert(person.email_key()) {
             found.push(person);
         }
     }
@@ -124,11 +125,10 @@ pub fn parse_co_authors(text: &str) -> Vec<Person> {
 fn parse_name_and_email(value: &str) -> Option<Person> {
     let value = value.trim();
     let inner = value.strip_suffix('>')?;
-    let open = inner
-        .char_indices()
-        .filter(|(_, c)| *c == '<')
-        .map(|(index, _)| index)
-        .find(|&index| !inner[index + 1..].contains('>'))?;
+    // The first `<` after the last `>`. One pass each way: the trailer comes
+    // from the repository, so it can be megabytes of brackets.
+    let from = inner.rfind('>').map_or(0, |index| index + 1);
+    let open = from + inner[from..].find('<')?;
     let name = inner[..open].trim();
     let email = inner[open + 1..].trim();
     if name.is_empty() || email.is_empty() {
