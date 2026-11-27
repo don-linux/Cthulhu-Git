@@ -1,0 +1,17 @@
+# cargo-nextest: https://nexte.st/docs/configuration/
+nextest-version = { recommended = "0.9.152" }
+
+[profile.default]
+# Git-backed tests spawn real processes; a hung one is killed instead of
+# stalling the run.
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[profile.ci]
+fail-fast = false
+failure-output = "immediate-final"
+
+# Used by cargo-mutants (NEXTEST_PROFILE=mutants): stop at the first failure,
+# that already proves the mutant is caught.
+[profile.mutants]
+fail-fast = true
+slow-timeout = { period = "30s", terminate-after = 2 }

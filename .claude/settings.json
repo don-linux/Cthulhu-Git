@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Edit(*.rs)",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo fmt --all",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/clippy-gate.sh",
+            "timeout": 600,
+            "statusMessage": "cargo clippy"
+          }
+        ]
+      }
+    ]
+  }
+}

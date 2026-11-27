@@ -1,0 +1,33 @@
+# cargo-deny: https://embarkstudios.github.io/cargo-deny/
+[graph]
+all-features = false
+
+[licenses]
+# Every license in Cargo.lock. The font licenses come from egui's bundled
+# fonts (epaint_default_fonts); their notices ship with the packages.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "MPL-2.0",              # option-ext
+    "CDLA-Permissive-2.0",  # webpki-roots
+    "OFL-1.1",              # epaint_default_fonts
+    "Ubuntu-font-1.0",      # epaint_default_fonts
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

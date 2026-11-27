@@ -1,0 +1,13 @@
+# cargo-mutants: https://mutants.rs/
+# Select the nextest profile with NEXTEST_PROFILE=mutants (`profile` here would
+# be a Cargo build profile).
+test_tool = "nextest"
+exclude_globs = [
+    "src/main.rs",
+    "src/ui/theme/**",
+    "src/ui/icons.rs",
+    "src/ui/fonts.rs",
+    "src/**/*_tests.rs",
+    "src/**/test_support.rs",
+]
+exclude_re = ["impl (Debug|Display)"]
