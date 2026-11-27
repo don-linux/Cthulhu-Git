@@ -59,32 +59,35 @@ fn assert_switched_to(case: &str, repo: &Repo, name: &str) {
         "{case:?}: {rows:?}"
     );
     assert_eq!(rows.iter().filter(|row| row.current).count(), 1, "{case:?}");
+    // One row per branch ref: no row left over from an unborn branch.
+    let refs = repo.git(&["for-each-ref", "refs/heads"]);
+    assert_eq!(rows.len(), refs.lines().count(), "{case:?}: {rows:?}");
     let detail = latest_commit(&repo.git, &repo.root, &info.head)
         .expect(case)
         .expect(case);
     assert_eq!(detail.oid, repo.git(&["rev-parse", &expected]), "{case:?}");
 }
 
+/// Each switch also leaves nothing staged, and the files as `files` says:
+/// the branch's content, and an edit the switch did not need to touch.
 #[test]
 fn switch_attaches_head_to_the_named_branch() {
-    // (case, branch, setup, extra check)
-    type Step = fn(&Repo);
-    let cases: [(&str, &str, Step, Step); 8] = [
-        (
-            "a plain branch",
-            "other",
-            |_| {},
-            |repo| {
-                assert_eq!(read(repo, "a.txt"), "other");
-            },
-        ),
+    // (case, branch, setup, files afterwards)
+    type Case = (
+        &'static str,
+        &'static str,
+        fn(&Repo),
+        &'static [(&'static str, &'static str)],
+    );
+    let cases: [Case; 8] = [
+        ("a plain branch", "other", |_| {}, &[("a.txt", "other")]),
         (
             "a nested name",
             "feature/foo",
             |repo| {
                 repo.git(&["branch", "feature/foo"]);
             },
-            |_| {},
+            &[("a.txt", "base")],
         ),
         // `git branch` refuses these names; the refs are still branches.
         (
@@ -93,7 +96,7 @@ fn switch_attaches_head_to_the_named_branch() {
             |repo| {
                 repo.git(&["update-ref", "refs/heads/-switch", "HEAD"]);
             },
-            |_| {},
+            &[],
         ),
         (
             "a name like a dangerous option",
@@ -101,21 +104,13 @@ fn switch_attaches_head_to_the_named_branch() {
             |repo| {
                 repo.git(&["update-ref", "refs/heads/--upload-pack=evil", "other"]);
             },
-            |_| {},
+            &[("a.txt", "other")],
         ),
         (
             "an edit the switch does not touch",
             "other",
-            |repo| {
-                repo.write("keep.txt", "edited");
-            },
-            |repo| {
-                assert_eq!(read(repo, "keep.txt"), "edited");
-                assert_eq!(repo.git(&["diff", "--cached", "--", "keep.txt"]), "");
-                let diff = repo.git(&["diff", "--", "keep.txt"]);
-                assert!(diff.contains("-same") && diff.contains("+edited"), "{diff}");
-                assert_eq!(read(repo, "a.txt"), "other");
-            },
+            |repo| repo.write("keep.txt", "edited"),
+            &[("keep.txt", "edited"), ("a.txt", "other")],
         ),
         (
             "from an unborn orphan",
@@ -123,12 +118,7 @@ fn switch_attaches_head_to_the_named_branch() {
             |repo| {
                 repo.git(&["checkout", "--orphan", "unborn"]);
             },
-            |repo| {
-                assert_eq!(read(repo, "a.txt"), "base");
-                let info = repo.info();
-                let rows = branches(&repo.git, &info.root, &info.head).expect("branches");
-                assert!(rows.iter().all(|row| row.name != "unborn"), "{rows:?}");
-            },
+            &[("a.txt", "base")],
         ),
         (
             "from a detached HEAD",
@@ -136,7 +126,7 @@ fn switch_attaches_head_to_the_named_branch() {
             |repo| {
                 repo.git(&["checkout", "--detach", "HEAD"]);
             },
-            |_| {},
+            &[],
         ),
         (
             "a packed ref",
@@ -145,16 +135,19 @@ fn switch_attaches_head_to_the_named_branch() {
                 repo.git(&["pack-refs", "--all"]);
                 let _ = fs::remove_file(repo.root.join(".git/refs/heads/other"));
             },
-            |_| {},
+            &[],
         ),
     ];
-    for (case, name, setup, check) in cases {
+    for (case, name, setup, files) in cases {
         let repo = diverged();
         setup(&repo);
         switch_branch(&repo.git, &repo.root, name)
             .unwrap_or_else(|error| panic!("{case:?}: {error}"));
         assert_switched_to(case, &repo, name);
-        check(&repo);
+        assert_eq!(repo.git(&["diff", "--cached"]), "", "{case:?}");
+        for (file, contents) in files {
+            assert_eq!(read(&repo, file), *contents, "{case:?}: {file}");
+        }
     }
 }
 
@@ -175,7 +168,7 @@ fn switch_refuses_and_leaves_the_repository_unchanged() {
 
     // (case, branch, setup returning where to switch, expected stderr, extra check)
     type Setup = fn(&Repo) -> PathBuf;
-    type Check = fn(&Repo, &Path);
+    type Check = fn(&str, &Repo, &Path);
     let cases: [(&str, &str, Setup, Option<&str>, Check); 4] = [
         (
             "a dirty file the switch would overwrite",
@@ -186,10 +179,11 @@ fn switch_refuses_and_leaves_the_repository_unchanged() {
                 repo.root.clone()
             },
             Some("would be overwritten"),
-            |repo, _| {
-                assert_eq!(read(repo, "a.txt"), "dirty");
-                assert_eq!(repo.git(&["diff", "--cached", "--", "a.txt"]), "");
-                assert!(!repo.tmp.path().join("ran.log").exists(), "a hook ran");
+            |case, repo, _| {
+                assert_eq!(read(repo, "a.txt"), "dirty", "{case:?}");
+                assert_eq!(repo.git(&["diff", "--cached"]), "", "{case:?}");
+                let ran = repo.tmp.path().join("ran.log");
+                assert!(!ran.exists(), "{case:?}: a hook ran");
             },
         ),
         (
@@ -201,10 +195,10 @@ fn switch_refuses_and_leaves_the_repository_unchanged() {
                 repo.root.clone()
             },
             Some("already used by worktree"),
-            |repo, _| {
+            |case, repo, _| {
                 let linked = repo.tmp.path().join("linked");
                 let head = repo.git_in(&linked, &["symbolic-ref", "--quiet", "HEAD"]);
-                assert_eq!(head, "refs/heads/other");
+                assert_eq!(head, "refs/heads/other", "{case:?}");
             },
         ),
         (
@@ -217,7 +211,7 @@ fn switch_refuses_and_leaves_the_repository_unchanged() {
                 bare
             },
             Some("must be run in a work tree"),
-            |_, bare| {
+            |case, _, bare| {
                 let mut entries: Vec<_> = fs::read_dir(bare)
                     .expect("bare dir")
                     .map(|entry| entry.expect("entry").file_name())
@@ -227,7 +221,7 @@ fn switch_refuses_and_leaves_the_repository_unchanged() {
                     !entries
                         .iter()
                         .any(|name| name == "index" || name == "a.txt"),
-                    "a checkout landed in the bare repository: {entries:?}"
+                    "{case:?}: a checkout landed in it: {entries:?}"
                 );
             },
         ),
@@ -259,9 +253,9 @@ fn switch_refuses_and_leaves_the_repository_unchanged() {
                 repo.root.clone()
             },
             None,
-            |repo, _| {
+            |case, repo, _| {
                 let refs = repo.git(&["for-each-ref", "refs/heads/shared"]);
-                assert_eq!(refs, "", "the switch created a local branch");
+                assert_eq!(refs, "", "{case:?}: the switch created a local branch");
             },
         ),
     ];
@@ -288,7 +282,7 @@ fn switch_refuses_and_leaves_the_repository_unchanged() {
             "{case:?}"
         );
         assert_eq!(repo.git_in(&root, &["rev-parse", "HEAD"]), head, "{case:?}");
-        check(&repo, &root);
+        check(case, &repo, &root);
     }
 }
 
