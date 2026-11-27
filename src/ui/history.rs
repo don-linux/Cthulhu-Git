@@ -437,7 +437,7 @@ fn drag_column(
     panel: f32,
 ) -> HistoryColumns {
     let wanted = width.max(min);
-    let share = if wanted <= min + 0.5 && panel > 0.0 && min / panel * 1000.0 > 1000.0 {
+    let share = if wanted <= min + 0.5 && min > panel {
         *HistoryColumns::RANGE.start()
     } else {
         per_mille_for(wanted, panel)
@@ -1586,6 +1586,8 @@ mod tests {
             // Saving 280/260 as 1000 would make the column fill a wider
             // window later.
             (MESSAGE_MIN, MESSAGE_MIN, 260.0, 20),
+            // A panel exactly as wide as the minimum still fits it.
+            (MESSAGE_MIN, MESSAGE_MIN, MESSAGE_MIN, 1000),
         ] {
             assert_eq!(
                 drag_column(start, Column::Message, width, min, panel),

@@ -738,9 +738,9 @@ mod tests {
         assert!(kept.contains(&0), "the commit on screen was dropped");
     }
 
-    /// The message cell opens no card. The author cell opens one that names
-    /// the co-author from the row while the details are still loading, or
-    /// failed: the fixture's git is installed nowhere.
+    /// The message cell opens no card. The author cell opens one with the
+    /// row's co-author, addresses and message, and the error of the read:
+    /// the fixture's git is installed nowhere.
     #[test]
     fn history_hover_card_names_the_author_and_coauthor() {
         const SUMMARY: &str = "Lanterns for the night expedition";
@@ -776,17 +776,31 @@ mod tests {
                 .unwrap_or_else(|| panic!("no {cell:?} cell\n{}", tree_text(&harness)))
                 .hover();
             harness.run_steps(60);
+            // The read fails at once, and the card says so where the date goes.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while opens && !tree_text(&harness).contains("Could not run git") {
+                assert!(Instant::now() < deadline, "{}", tree_text(&harness));
+                std::thread::sleep(Duration::from_millis(10));
+                harness.step();
+            }
             let text = tree_text(&harness);
             let card = if opens {
                 text.contains("Co-author")
                     && text.contains("Herbert West")
-                    && (text.contains("Loading…") || text.contains("Could not run git"))
+                    && text.contains("<west@arkham.test>")
+                    && text.matches(SUMMARY).count() == 2
             } else {
                 text.contains("Co-author") || text.contains("Loading…")
             };
             assert_eq!(card, opens, "{cell}\n{text}");
         }
-        let fonts: Vec<_> = painted_texts(&harness)
+        let painted = painted_texts(&harness);
+        // Avatars are off in tests, so each person is drawn as initials.
+        for initials in ["AV", "HW"] {
+            let drawn = painted.iter().any(|(_, galley)| galley.text() == initials);
+            assert!(drawn, "no {initials} avatar");
+        }
+        let fonts: Vec<_> = painted
             .into_iter()
             .filter(|(_, galley)| galley.text() == hash)
             .flat_map(|(_, galley)| {

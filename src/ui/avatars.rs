@@ -895,6 +895,38 @@ mod tests {
         }
     }
 
+    /// Holds every request until the test drops the sender, then refuses it.
+    struct Gate(Mutex<mpsc::Receiver<()>>);
+
+    impl Transport for Gate {
+        fn get_once(&self, _: &str, _: &[(&str, String)]) -> Result<HttpResponse, HttpError> {
+            let _ = lock(&self.0).recv();
+            Err(HttpError::NotAllowed)
+        }
+    }
+
+    /// A miss found with the old token is not kept: the new one may reach
+    /// the picture, so the next frame asks again.
+    #[test]
+    fn a_miss_from_before_a_token_change_is_forgotten() {
+        let ctx = Context::default();
+        let (release, gate) = mpsc::channel();
+        let gate: Arc<dyn Transport> = Arc::new(Gate(Mutex::new(gate)));
+        let mut service = AvatarService::with_transport(gate, None, true);
+        let email = "ada@miskatonic.test";
+        let ada = Person::new("Ada", email);
+        assert!(service.texture(&ctx, &ada, None, None).is_none());
+        service.set_token(None);
+        drop(release);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state(service.entries.get(email)) == "pending" {
+            assert!(Instant::now() < deadline, "the lookup never ended");
+            thread::sleep(Duration::from_millis(10));
+            service.poll(&ctx);
+        }
+        assert_eq!(state(service.entries.get(email)), "none");
+    }
+
     /// A symlink planted at the cache path or at a leftover temp name, pointing
     /// outside the cache, is never written through: the outside file keeps its
     /// bytes, the cache path holds the image, and no temp file remains.

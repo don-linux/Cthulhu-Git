@@ -864,15 +864,11 @@ pub fn preview_line_count(terminal: &Option<Terminal>) -> usize {
 /// preview. A block longer than [`PREVIEW_MAX_LINES`] keeps the rows nearest
 /// the cursor.
 fn prompt_span<T: EventListener>(term: &Term<T>) -> Range<usize> {
-    let rows = term.screen_lines();
-    if rows == 0 {
-        return 0..1;
-    }
     let content = term.renderable_content();
     let offset = content.display_offset;
-    let cursor_row =
-        point_to_viewport(offset, content.cursor.point).map_or(0, |point| point.line.min(rows - 1));
-    let mut filled = vec![false; rows];
+    // prompt_rows keeps the row inside the screen.
+    let cursor_row = point_to_viewport(offset, content.cursor.point).map_or(0, |point| point.line);
+    let mut filled = vec![false; term.screen_lines()];
     for indexed in content.display_iter {
         if indexed
             .flags
@@ -881,10 +877,10 @@ fn prompt_span<T: EventListener>(term: &Term<T>) -> Range<usize> {
             continue;
         }
         if let Some(point) = point_to_viewport(offset, indexed.point)
-            && point.line < rows
             && cell_holds_prompt(indexed.cell)
+            && let Some(row) = filled.get_mut(point.line)
         {
-            filled[point.line] = true;
+            *row = true;
         }
     }
     prompt_rows(&filled, cursor_row, PREVIEW_MAX_LINES)
@@ -979,7 +975,7 @@ pub fn show(
                 ui.memory_mut(|memory| memory.set_focus_lock_filter(response.id, shell_keys));
                 handle_keys(ui, session);
             }
-            paint(&painter, session, visible, &metrics, palette);
+            paint(&painter, session, visible.min, &metrics, palette);
         }
         Some(Terminal::Starting(_)) | None => {}
     }
@@ -1013,25 +1009,24 @@ pub fn show_preview(ui: &mut Ui, terminal: &mut Option<Terminal>, cwd: &Path, pa
                 let term = session.term.lock();
                 prompt_span(&term)
             };
-            let origin = Rect::from_min_size(
-                Pos2::new(
-                    visible.min.x,
-                    visible.min.y - span.start as f32 * metrics.cell_h,
-                ),
-                Vec2::new(
-                    visible.width().max(1.0),
-                    metrics.rows as f32 * metrics.cell_h,
-                ),
-            );
-            // A column change reflows the prompt after the box was sized.
-            let reserved = visible.height() / metrics.cell_h;
-            if (reserved - span.len() as f32).abs() > 0.5 {
+            let (origin, resized) = place_prompt(visible, &span, metrics.cell_h);
+            if resized {
                 ui.ctx().request_repaint();
             }
             paint(&painter, session, origin, &metrics, palette);
         }
         Some(Terminal::Starting(_)) | None => {}
     }
+}
+
+/// Where the screen is drawn so the prompt block `span` starts at the top of
+/// `visible`, and whether `visible` is more than half a row off the block's
+/// height. A column change reflows the prompt after the settings page sized
+/// the box, so one more frame is needed.
+fn place_prompt(visible: Rect, span: &Range<usize>, cell_h: f32) -> (Pos2, bool) {
+    let origin = visible.min - Vec2::new(0.0, span.start as f32 * cell_h);
+    let resized = (visible.height() / cell_h - span.len() as f32).abs() > 0.5;
+    (origin, resized)
 }
 
 /// Fills the strip, starts the shell the first time, and says so until it
@@ -1128,10 +1123,11 @@ fn metrics(ui: &Ui, rect: Rect) -> Metrics {
     }
 }
 
+/// The screen, its top-left cell at `origin`.
 fn paint(
     painter: &Painter,
     session: &ShellSession,
-    rect: Rect,
+    origin: Pos2,
     metrics: &Metrics,
     palette: &Palette,
 ) {
@@ -1148,6 +1144,7 @@ fn paint(
         {
             continue;
         }
+        // The grid has the strip's size, and the painter clips to the strip.
         let Some(Point {
             line: row,
             column: Column(col),
@@ -1155,9 +1152,6 @@ fn paint(
         else {
             continue;
         };
-        if row >= metrics.rows || col >= metrics.cols {
-            continue;
-        }
         let selected = selection
             .is_some_and(|range| range.contains_cell(&indexed, cursor.point, cursor.shape));
         let mut fg = resolve_color(indexed.fg, colors, palette);
@@ -1173,7 +1167,7 @@ fn paint(
             std::mem::swap(&mut fg, &mut bg);
         }
         let wide = indexed.flags.contains(Flags::WIDE_CHAR);
-        let cell = cell_rect(rect, metrics, col, row, wide);
+        let cell = cell_rect(origin, metrics, col, row, wide);
         if bg != palette.background || selected || on_cursor {
             painter.rect_filled(cell, 0.0, bg);
         }
@@ -1206,11 +1200,11 @@ fn paint_cursor(painter: &Painter, cell: Rect, cursor: RenderableCursor, color: 
     painter.rect_filled(rect, 0.0, color);
 }
 
-fn cell_rect(origin: Rect, metrics: &Metrics, col: usize, row: usize, wide: bool) -> Rect {
+fn cell_rect(origin: Pos2, metrics: &Metrics, col: usize, row: usize, wide: bool) -> Rect {
     let span = if wide { 2.0 } else { 1.0 };
     let min = Pos2::new(
-        origin.min.x + col as f32 * metrics.cell_w,
-        origin.min.y + row as f32 * metrics.cell_h,
+        origin.x + col as f32 * metrics.cell_w,
+        origin.y + row as f32 * metrics.cell_h,
     );
     Rect::from_min_size(min, Vec2::new(metrics.cell_w * span, metrics.cell_h))
 }
@@ -1320,7 +1314,11 @@ fn handle_pointer(
             input.modifiers,
         )
     });
-    let mouse_mode = session.term.lock().mode().intersects(TermMode::MOUSE_MODE);
+    let (mouse_mode, offset) = {
+        let term = session.term.lock();
+        let mouse_mode = term.mode().intersects(TermMode::MOUSE_MODE);
+        (mouse_mode, term.grid().display_offset())
+    };
     let selecting = !mouse_mode || modifiers.shift;
     let over = response.hovered() || response.dragged();
     let Some(pos) = response
@@ -1335,7 +1333,7 @@ fn handle_pointer(
     if !over && scroll_y == 0.0 && !pressed.iter().any(|pressed| *pressed) && !released[0] {
         return;
     }
-    let hit = hit_at(rect, pos, metrics, session);
+    let hit = hit_at(rect, pos, metrics, offset);
 
     if selecting {
         if pressed[0] {
@@ -1432,12 +1430,13 @@ struct CellHit {
     row: usize,
 }
 
-fn hit_at(rect: Rect, pos: Pos2, metrics: &Metrics, session: &ShellSession) -> CellHit {
+/// The cell under `pos`, clamped to the screen, and its grid point while the
+/// view is scrolled `offset` lines back.
+fn hit_at(rect: Rect, pos: Pos2, metrics: &Metrics, offset: usize) -> CellHit {
     let col = ((pos.x - rect.min.x) / metrics.cell_w).floor();
     let row = ((pos.y - rect.min.y) / metrics.cell_h).floor();
     let col = col.clamp(0.0, (metrics.cols - 1) as f32) as usize;
     let row = row.clamp(0.0, (metrics.rows - 1) as f32) as usize;
-    let offset = session.term.lock().grid().display_offset();
     CellHit {
         point: viewport_to_point(offset, Point::new(row, Column(col))),
         col,
@@ -1942,13 +1941,27 @@ mod tests {
         let escaped = dir.path().join("escaped");
         let ctx = egui::Context::default();
         let metrics = test_metrics();
-        let session = match ShellSession::spawn(dir.path(), &ctx, &metrics) {
+        let mut session = match ShellSession::spawn(dir.path(), &ctx, &metrics) {
             Ok(session) => session,
             Err(error) => panic!("{error}"),
         };
         assert_eq!(std::env::var_os("SHELL"), shell_before);
 
         wait_for_shell_output(&session);
+        // The shell runs in the repository, with the terminal's TERM, and
+        // follows the strip's size.
+        let cwd = std::fs::read_link(format!("/proc/{}/cwd", session.pid));
+        assert_eq!(cwd.ok(), dir.path().canonicalize().ok(), "shell directory");
+        let environ = std::fs::read(format!("/proc/{}/environ", session.pid));
+        let term = b"TERM=xterm-256color".as_slice();
+        let named = environ.is_ok_and(|vars| vars.split(|byte| *byte == 0).any(|var| var == term));
+        assert!(named, "the shell has no TERM=xterm-256color");
+        let taller = Metrics {
+            rows: 40,
+            ..metrics
+        };
+        session.resize(&taller, 1.0);
+        assert_eq!(session.term.lock().screen_lines(), 40);
         // Fork before setsid. An interactive shell makes a background job the
         // process-group leader, and setsid then returns EPERM. The parent
         // perl waits so both sleeps stay descendants of the session leader.
@@ -2444,9 +2457,14 @@ END
         let one = window_size(&metrics, 1.0);
         let two = window_size(&metrics, 2.0);
         assert_eq!((two.num_cols, two.cell_width), (one.num_cols, 17));
+        let wider = WindowSize {
+            cell_width: 9,
+            ..one
+        };
         for (case, size, exited, alive, resize) in [
             ("same size", one, false, true, false),
             ("2x", two, false, true, true),
+            ("wider cells", wider, false, true, true),
             ("exited", two, true, true, false),
             ("hung up", two, false, false, false),
         ] {
@@ -2460,18 +2478,20 @@ END
         }
     }
 
-    /// Escape, Tab and the arrows belong to the shell (vim, completion,
-    /// history), so they must not move focus out of the terminal. Ctrl+Tab
-    /// does, so the keyboard is never trapped.
+    /// Typing reaches the shell. Escape, Tab and the arrows belong to it too
+    /// (vim, completion, history), so they must not move focus out of the
+    /// terminal. Ctrl+Tab does, so the keyboard is never trapped.
     #[cfg(unix)]
     #[test]
     fn focused_terminal_keeps_escape_tab_and_arrows_until_ctrl_tab() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let cwd = dir.path().to_owned();
         let view_id = Id::unique("focus test");
+        // The user's prompt may use glyphs the test fonts lack.
         let mut harness = egui_kittest::Harness::builder()
             .with_size(Vec2::new(640.0, 320.0))
             .with_step_dt(1.0 / 60.0)
+            .allow_missing_glyphs()
             .build_ui_state(
                 move |ui, terminal: &mut Option<Terminal>| {
                     let _ = ui.button("Above");
@@ -2507,6 +2527,23 @@ END
                 .memory(|memory| memory.has_focus(focus_id(view_id)))
         };
         assert!(focused(&harness), "a click focuses the terminal");
+        // Text and Enter reach the shell: the command and its output.
+        harness.event(Event::Text("echo cthulhu-typed".to_owned()));
+        harness.key_press(Key::Enter);
+        let shown = |harness: &egui_kittest::Harness<'_, Option<Terminal>>| match harness.state() {
+            Some(Terminal::Live(session)) => {
+                let term = session.term.lock();
+                let cells = term.renderable_content().display_iter;
+                cells.map(|cell| cell.c).collect::<String>()
+            }
+            _ => String::new(),
+        };
+        while shown(&harness).matches("cthulhu-typed").count() < 2 {
+            let late = started.elapsed() > Duration::from_secs(10);
+            assert!(!late, "{}", shown(&harness));
+            harness.step();
+            thread::sleep(Duration::from_millis(10));
+        }
         for key in [Key::Escape, Key::Tab, Key::ArrowUp, Key::ArrowLeft] {
             harness.key_press(key);
             harness.step();
@@ -2572,8 +2609,14 @@ END
             (Color::Named(NamedColor::DimForeground), palette.text_muted),
             (Color::Named(NamedColor::Background), palette.background),
             (Color::Named(NamedColor::BrightWhite), ansi_color(15)),
-            (Color::Named(NamedColor::DimRed), ansi_color(1)),
-            (Color::Indexed(200), ansi_color(200)),
+            (Color::Named(NamedColor::DimWhite), ansi_color(7)),
+            // The table, the corners of the 6x6x6 cube, one inner step on
+            // each axis (xterm's #5f87af), and the ends of the gray ramp.
+            (Color::Indexed(1), Color32::from_rgb(0xf7, 0x76, 0x8e)),
+            (Color::Indexed(16), Color32::from_rgb(0, 0, 0)),
+            (Color::Indexed(67), Color32::from_rgb(95, 135, 175)),
+            (Color::Indexed(231), Color32::from_rgb(255, 255, 255)),
+            (Color::Indexed(232), Color32::from_gray(8)),
             (Color::Indexed(255), Color32::from_gray(238)),
             (
                 Color::Spec(Rgb { r: 1, g: 2, b: 3 }),
@@ -2609,6 +2652,81 @@ END
                 "{index}"
             );
         }
+    }
+
+    /// (pointer, row, column, grid line) on an 80x24 screen of 8x16 cells
+    /// at (100, 50), scrolled 2 lines back. Outside the screen the hit
+    /// clamps to the nearest cell.
+    #[test]
+    fn a_pointer_hits_the_cell_under_it() {
+        let metrics = grid_metrics(80, 24, 8.0, 16.0);
+        let rect = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(640.0, 390.0));
+        for (x, y, row, col, line) in [
+            (100.0, 50.0, 0, 0, -2),
+            (125.0, 90.0, 2, 3, 0),
+            (0.0, 0.0, 0, 0, -2),
+            (900.0, 437.0, 23, 79, 21),
+        ] {
+            let hit = hit_at(rect, Pos2::new(x, y), &metrics, 2);
+            let point = Point::new(alacritty_terminal::index::Line(line), Column(col));
+            assert_eq!((hit.row, hit.col, hit.point), (row, col, point), "{x},{y}");
+        }
+    }
+
+    /// (box height, prompt rows, top of the screen, repaint), with 16-point
+    /// rows in a box whose top is at 100. The block starts at the top of the
+    /// box; a box more than half a row off its height asks for a frame.
+    #[test]
+    fn the_preview_puts_the_prompt_block_at_the_top() {
+        for (height, span, top, repaint) in [
+            (32.0, 0..2, 100.0, false),
+            (32.0, 3..5, 52.0, false),
+            (40.0, 3..5, 52.0, false),
+            (48.0, 3..5, 52.0, true),
+            (16.0, 3..5, 52.0, true),
+        ] {
+            let visible = Rect::from_min_size(Pos2::new(10.0, 100.0), Vec2::new(200.0, height));
+            let placed = place_prompt(visible, &span, 16.0);
+            let case = format!("{height} {span:?}");
+            assert_eq!(placed, (Pos2::new(10.0, top), repaint), "{case}");
+        }
+    }
+
+    /// The Settings preview runs a real shell, on a screen taller than its
+    /// box so a long prompt is not scrolled away, and draws its prompt.
+    #[cfg(unix)]
+    #[test]
+    fn the_preview_draws_the_prompt_of_a_tall_shell() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let cwd = dir.path().to_owned();
+        // The user's prompt may use glyphs the test fonts lack.
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(Vec2::new(640.0, 120.0))
+            .with_step_dt(1.0 / 60.0)
+            .allow_missing_glyphs()
+            .build_ui_state(
+                move |ui, terminal: &mut Option<Terminal>| {
+                    let palette = super::super::theme::DEFAULT_THEME.palette;
+                    show_preview(ui, terminal, &cwd, &palette);
+                },
+                None,
+            );
+        let started = std::time::Instant::now();
+        let prompt = |harness: &egui_kittest::Harness<'_, Option<Terminal>>| {
+            let texts = crate::ui::test_support::painted_texts(harness);
+            texts
+                .iter()
+                .any(|(_, galley)| galley.text() != "Starting shell…")
+        };
+        while !prompt(&harness) {
+            assert!(started.elapsed() < Duration::from_secs(5), "no prompt");
+            harness.step();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let Some(Terminal::Live(session)) = harness.state() else {
+            panic!("the preview has no live shell");
+        };
+        assert_eq!(session.term.lock().screen_lines(), PREVIEW_SCREEN_ROWS);
     }
 
     /// (case, screen columns, bytes, prompt rows). A blank row ends the

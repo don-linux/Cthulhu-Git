@@ -175,27 +175,22 @@ mod tests {
     use cthulhu_git::git::CommitHover;
 
     use super::*;
+    use crate::ui::test_support::absent_git;
 
     #[test]
     fn only_the_newest_request_waits_while_one_is_running() {
         let mut cache = AsyncCache::<String, CommitHover>::default();
         let (_sender, receiver) = mpsc::channel();
-        let running = "a".repeat(40);
-        cache.insert(running.clone(), State::Loading);
-        cache.inflight = Some((running.clone(), receiver));
-        cache.request(running.as_str());
+        cache.insert("a".to_owned(), State::Loading);
+        cache.inflight = Some(("a".to_owned(), receiver));
+        cache.request("a");
         assert_eq!(cache.wanted, None);
-        cache.request("b".repeat(40).as_str());
-        cache.request("c".repeat(40).as_str());
-        assert_eq!(cache.wanted, Some("c".repeat(40)));
+        cache.request("b");
+        cache.request("c");
+        assert_eq!(cache.wanted.as_deref(), Some("c"));
         // A poll while the read runs keeps it and starts nothing.
-        cache.poll(
-            &Context::default(),
-            &crate::ui::test_support::absent_git(),
-            Path::new("/repos"),
-        );
+        cache.poll(&Context::default(), &absent_git(), Path::new("/repos"));
         let running = cache.inflight.as_ref().map(|(key, _)| key.as_str());
-        assert_eq!(running, Some("a".repeat(40).as_str()));
-        assert_eq!(cache.wanted, Some("c".repeat(40)));
+        assert_eq!((running, cache.wanted.as_deref()), (Some("a"), Some("c")));
     }
 }

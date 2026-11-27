@@ -561,12 +561,19 @@ mod tests {
 
     #[test]
     fn images_are_missing_on_404_and_never_carry_the_token() {
+        const URL: &str = "https://gravatar.com/avatar/abc?s=96&d=404";
+        // (status, body, result). Only a 200 with bytes is a picture.
+        for (status, body, expected) in [
+            (404, &b""[..], Err(FetchError::Missing)),
+            (200, b"", Err(FetchError::Missing)),
+            (500, b"png", Err(FetchError::Missing)),
+            (200, b"png", Ok(b"png".to_vec())),
+        ] {
+            let fake = FakeTransport::default();
+            fake.reply(URL, status, &[], body);
+            assert_eq!(fetch_image(&fake, URL), expected, "{status} {body:?}");
+        }
         let fake = FakeTransport::default();
-        fake.reply("https://gravatar.com/avatar/abc?s=96&d=404", 404, &[], b"");
-        assert_eq!(
-            fetch_image(&fake, "https://gravatar.com/avatar/abc?s=96&d=404"),
-            Err(FetchError::Missing)
-        );
         assert_eq!(
             fetch_image(&fake, "https://evil.example/a.png"),
             Err(FetchError::Missing)

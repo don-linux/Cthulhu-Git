@@ -1708,29 +1708,28 @@ fn selected_commit_shows_the_hover_details() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    repo.hover.store_ready(
-        newer.clone(),
-        CommitHover {
-            oid: newer.clone(),
-            author: person("Ada Lovelace", "ada@example.invalid"),
-            co_authors: vec![person("Grace Hopper", "grace@example.invalid")],
-            authored_unix: now,
-            authored_at: "2024-05-01 09:30".to_owned(),
-            message: "newer estuary note\n\nFixes #12".to_owned(),
-            files: Vec::new(),
-            stats: Some(CommitStats {
-                files: 2,
-                insertions: 4,
-                deletions: 1,
-            }),
-            tags: Vec::new(),
-        },
-    );
+    let hover = CommitHover {
+        oid: newer.clone(),
+        author: person("Ada Lovelace", "ada@example.invalid"),
+        co_authors: vec![person("Grace Hopper", "grace@example.invalid")],
+        // Three hours back: a clock that read 0 would say "just now".
+        authored_unix: now - 3 * 60 * 60,
+        authored_at: "2024-05-01 09:30".to_owned(),
+        message: "newer estuary note\n\nFixes #12".to_owned(),
+        files: Vec::new(),
+        stats: Some(CommitStats {
+            files: 2,
+            insertions: 4,
+            deletions: 1,
+        }),
+        tags: Vec::new(),
+    };
+    repo.hover.store_ready(hover.oid.clone(), hover);
     let mut harness = pick_harness(repo, true);
     pick_hash(&mut harness, &newer[..SHORT_OID_LEN]);
     settle(&mut harness);
     assert_selected(&harness, &newer);
-    harness.get_by_label("just now · 2024-05-01 09:30");
+    harness.get_by_label("3 hours ago · 2024-05-01 09:30");
     harness.get_by_label("2 files changed");
     harness.get_by_label("4 insertions(+)");
     harness.get_by_label("1 deletion(-)");
@@ -1862,29 +1861,27 @@ fn clicking_the_author_card_hash_copies_it() {
 fn view_changes_shows_tags_and_a_colored_diff() {
     let mut repo = one_commit("field notes from the estuary");
     let oid = repo.latest.as_ref().expect("commit").oid.clone();
-    repo.hover.store_ready(
-        oid.clone(),
-        CommitHover {
-            oid: oid.clone(),
-            author: person("Ada Lovelace", "ada@example.invalid"),
-            co_authors: vec![person("Grace Hopper", "grace@example.invalid")],
-            authored_unix: 1_700_000_000,
-            authored_at: "2024-05-01 09:30".to_owned(),
-            message: "field notes from the estuary".to_owned(),
-            files: vec![CommitFile {
-                path: "notes/seal.txt".to_owned(),
-                previous: None,
-                insertions: Some(1),
-                deletions: Some(1),
-            }],
-            stats: Some(CommitStats {
-                files: 1,
-                insertions: 1,
-                deletions: 1,
-            }),
-            tags: vec!["v1,0".to_owned()],
-        },
-    );
+    let hover = CommitHover {
+        oid: oid.clone(),
+        author: person("Ada Lovelace", "ada@example.invalid"),
+        co_authors: vec![person("Grace Hopper", "grace@example.invalid")],
+        authored_unix: 1_700_000_000,
+        authored_at: "2024-05-01 09:30".to_owned(),
+        message: "field notes from the estuary".to_owned(),
+        files: vec![CommitFile {
+            path: "notes/seal.txt".to_owned(),
+            previous: None,
+            insertions: Some(1),
+            deletions: Some(1),
+        }],
+        stats: Some(CommitStats {
+            files: 1,
+            insertions: 1,
+            deletions: 1,
+        }),
+        tags: vec!["v1,0".to_owned()],
+    };
+    repo.hover.store_ready(hover.oid.clone(), hover);
     repo.diffs.store_ready(
         super::changes::DiffKey {
             oid: oid.clone(),
@@ -1918,6 +1915,12 @@ fn view_changes_shows_tags_and_a_colored_diff() {
         .find(|rect| (rect.left() - author_title.left()).abs() < 80.0)
         .expect("history author");
     hover_until(&mut harness, row_author.center(), "Co-author");
+    // The card dates the commit from the read; the sidebar has the row's date.
+    let dated = harness.query_all_by_role(Role::Label).any(|node| {
+        node.value()
+            .is_some_and(|text| text.ends_with(" · 2024-05-01 09:30"))
+    });
+    assert!(dated, "the card has no date\n{}", labels(&harness));
     assert!(
         label_rects(&harness, "v1,0").len() >= 2,
         "the tag should be on the sidebar and the card\n{}",
