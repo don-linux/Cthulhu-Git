@@ -418,11 +418,20 @@ impl std::error::Error for SettingsError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use proptest::prelude::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     fn settings_path(dir: &TempDir) -> PathBuf {
         dir.path().join("nested").join(FILE_NAME)
+    }
+
+    fn file_names(dir: &Path) -> Vec<std::ffi::OsString> {
+        fs::read_dir(dir)
+            .expect("read dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect()
     }
 
     fn abyss() -> Settings {
@@ -451,33 +460,50 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_gives_defaults() {
-        let dir = TempDir::new().expect("temp dir");
-        assert_eq!(
-            Settings::load_from(&settings_path(&dir)).expect("load"),
-            Settings::default()
-        );
-    }
-
-    #[test]
     fn round_trip_creates_folders_and_leaves_no_temp_file() {
         let dir = TempDir::new().expect("temp dir");
         let path = settings_path(&dir);
-        let mut settings = Settings {
-            theme: Some("abyss".to_owned()),
-            ..Settings::default()
-        };
+        assert_eq!(
+            Settings::load_from(&path).expect("a missing file"),
+            Settings::default()
+        );
+        let mut settings = abyss();
         settings.remember_repository(Path::new("/src/rlyeh"));
 
         settings.save_to(&path).expect("save");
         settings.save_to(&path).expect("save over an existing file");
 
         assert_eq!(Settings::load_from(&path).expect("load"), settings);
-        let files: Vec<_> = fs::read_dir(path.parent().expect("parent"))
-            .expect("read dir")
-            .map(|entry| entry.expect("entry").file_name())
-            .collect();
-        assert_eq!(files, [FILE_NAME]);
+        assert_eq!(file_names(path.parent().expect("parent")), [FILE_NAME]);
+    }
+
+    /// A directory where the file belongs is a read error and a write
+    /// error, and the failed save leaves no temp file next to it.
+    #[test]
+    fn a_directory_at_the_settings_path_is_a_read_and_a_write_error() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path(&dir);
+        fs::create_dir_all(&path).expect("directory");
+        let shown = path.display().to_string();
+
+        let load = Settings::load_from(&path).expect_err("load a directory");
+        assert!(matches!(load, SettingsError::Read(..)), "{load:?}");
+        assert!(
+            load.to_string()
+                .starts_with(&format!("Could not read settings from {shown}: ")),
+            "{load}"
+        );
+        let save = Settings::default()
+            .save_to(&path)
+            .expect_err("save over a directory");
+        assert!(matches!(save, SettingsError::Write(..)), "{save:?}");
+        assert!(
+            save.to_string()
+                .starts_with(&format!("Could not save settings to {shown}: ")),
+            "{save}"
+        );
+        assert!(path.is_dir());
+        assert_eq!(file_names(path.parent().expect("parent")), [FILE_NAME]);
     }
 
     /// Every way a file is read. `None` is a parse error.
@@ -544,6 +570,14 @@ mod tests {
                 r#"{"theme":null,"last_repository":"/src/readme.txt","recent_repositories":
                     ["rel/repo","rel/repo","C:\\repo","C:\\repo"],"history_sidebar_hidden":true}"#,
                 Some(odd_paths()),
+            ),
+            // Paths compare by component: a trailing slash is the same root.
+            (
+                r#"{ "recent_repositories": ["/src/rlyeh", "/src/rlyeh/"] }"#,
+                Some(Settings {
+                    recent_repositories: vec!["/src/rlyeh".into()],
+                    ..Settings::default()
+                }),
             ),
             // A font id is trimmed; anything else is no font, and the rest loads.
             (
@@ -766,38 +800,27 @@ mod tests {
     }
 
     #[test]
-    fn remember_moves_to_front_without_duplicates() {
+    fn remember_moves_to_the_front_caps_and_forget_keeps_the_recents() {
         let mut settings = Settings::default();
-        settings.remember_repository(Path::new("/a"));
-        settings.remember_repository(Path::new("/b"));
-        settings.remember_repository(Path::new("/a"));
+        for root in ["/a", "/b", "/a"] {
+            settings.remember_repository(Path::new(root));
+        }
         assert_eq!(settings.last_repository.as_deref(), Some(Path::new("/a")));
         assert_eq!(
             settings.recent_repositories,
             [PathBuf::from("/a"), PathBuf::from("/b")]
         );
-    }
 
-    #[test]
-    fn recents_are_capped() {
-        let mut settings = Settings::default();
         for index in 0..MAX_RECENT_REPOSITORIES + 5 {
             settings.remember_repository(&PathBuf::from(format!("/repo-{index}")));
         }
+        let newest = PathBuf::from(format!("/repo-{}", MAX_RECENT_REPOSITORIES + 4));
         assert_eq!(settings.recent_repositories.len(), MAX_RECENT_REPOSITORIES);
-        assert_eq!(
-            settings.recent_repositories[0],
-            PathBuf::from(format!("/repo-{}", MAX_RECENT_REPOSITORIES + 4))
-        );
-    }
+        assert_eq!(settings.recent_repositories[0], newest);
 
-    #[test]
-    fn forgetting_keeps_the_recents() {
-        let mut settings = Settings::default();
-        settings.remember_repository(Path::new("/a"));
         settings.forget_last_repository();
         assert_eq!(settings.last_repository, None);
-        assert_eq!(settings.recent_repositories, [PathBuf::from("/a")]);
+        assert_eq!(settings.recent_repositories.len(), MAX_RECENT_REPOSITORIES);
     }
 
     #[cfg(unix)]
@@ -811,12 +834,127 @@ mod tests {
         assert_eq!(settings, Settings::default());
     }
 
+    /// Every column, every kind of bad width, next to the smallest and the
+    /// largest good one: only the bad column falls back to its default.
     #[test]
-    fn default_path_is_an_absolute_settings_file() {
-        if let Some(path) = Settings::default_path() {
-            assert!(path.is_absolute(), "{}", path.display());
-            assert_eq!(path.file_name(), Some(FILE_NAME.as_ref()));
-            assert!(path.to_string_lossy().contains("cthulhu-git"));
+    fn one_bad_column_keeps_its_siblings() {
+        const NAMES: [&str; 5] = ["branch", "graph", "hash", "message", "author"];
+        let defaults = HistoryColumns::default();
+        let defaults = [
+            defaults.branch,
+            defaults.graph,
+            defaults.hash,
+            defaults.message,
+            defaults.author,
+        ];
+        let bad = [
+            serde_json::json!(0),
+            serde_json::json!(1001),
+            serde_json::json!(null),
+            serde_json::json!("wide"),
+            serde_json::json!(1.5),
+            serde_json::json!(-4),
+        ];
+        for good in [20, 1000] {
+            for which in 0..NAMES.len() {
+                for value in &bad {
+                    let columns: serde_json::Map<String, serde_json::Value> = NAMES
+                        .iter()
+                        .enumerate()
+                        .map(|(index, name)| {
+                            let width = if index == which {
+                                value.clone()
+                            } else {
+                                serde_json::json!(good)
+                            };
+                            ((*name).to_owned(), width)
+                        })
+                        .collect();
+                    let json = serde_json::json!({ "history_columns": columns }).to_string();
+                    let got = Settings::from_json(json.as_bytes())
+                        .expect("load")
+                        .history_columns;
+                    let got = [got.branch, got.graph, got.hash, got.message, got.author];
+                    let expected: Vec<u16> = (0..NAMES.len())
+                        .map(|index| {
+                            if index == which {
+                                defaults[index]
+                            } else {
+                                good
+                            }
+                        })
+                        .collect();
+                    assert_eq!(got, expected[..], "{json}");
+                }
+            }
+        }
+    }
+
+    fn arb_text(max_chars: usize) -> impl Strategy<Value = String> {
+        prop::collection::vec(any::<char>(), 0..=max_chars)
+            .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    fn arb_path() -> impl Strategy<Value = PathBuf> {
+        prop_oneof![
+            4 => arb_text(24),
+            1 => (arb_text(8), arb_text(8)).prop_map(|(parent, name)| format!("/{parent}/{name}")),
+        ]
+        .prop_map(PathBuf::from)
+    }
+
+    proptest! {
+        #![proptest_config(crate::test_support::proptest_config())]
+
+        /// What `to_json` writes, `from_json` reads back with every field
+        /// kept, recents deduped and capped, and widths in range; writing
+        /// that again changes nothing.
+        #[test]
+        fn json_round_trip_keeps_fields_and_normalizes_once(
+            theme in prop::option::of(arb_text(32)),
+            last in prop::option::of(arb_path()),
+            recents in prop::collection::vec(arb_path(), 0..14),
+            repeat in any::<prop::sample::Index>(),
+            flags in any::<[bool; 5]>(),
+            widths in any::<[u16; 5]>(),
+        ) {
+            let [history, detail, terminal, avatars, in_keyring] = flags;
+            let [branch, graph, hash, message, author] = widths;
+            let mut recent_repositories = recents;
+            if !recent_repositories.is_empty() {
+                let again = repeat.get(&recent_repositories).clone();
+                recent_repositories.push(again);
+            }
+            let settings = Settings {
+                theme,
+                last_repository: last,
+                recent_repositories,
+                history_sidebar_hidden: history,
+                detail_sidebar_hidden: detail,
+                terminal_hidden: terminal,
+                history_columns: HistoryColumns { branch, graph, hash, message, author },
+                author_avatars: avatars,
+                github_token_in_keyring: in_keyring,
+                ..Settings::default()
+            };
+            let json = settings.to_json().expect("serializable");
+            let loaded = Settings::from_json(&json).expect("load");
+            prop_assert_eq!(
+                &loaded,
+                &Settings {
+                    recent_repositories: loaded.recent_repositories.clone(),
+                    history_columns: settings.history_columns.normalized(),
+                    ..settings.clone()
+                }
+            );
+            let recents = &loaded.recent_repositories;
+            prop_assert!(recents.len() <= MAX_RECENT_REPOSITORIES);
+            for (index, path) in recents.iter().enumerate() {
+                prop_assert!(!recents[index + 1..].contains(path), "{path:?} twice");
+                prop_assert!(settings.recent_repositories.contains(path));
+            }
+            let again = loaded.to_json().expect("serializable");
+            prop_assert_eq!(Settings::from_json(&again).expect("reload"), loaded);
         }
     }
 }

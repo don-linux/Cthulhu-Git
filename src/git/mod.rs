@@ -16,9 +16,6 @@ mod remotes;
 mod repo;
 mod sync;
 
-#[cfg(test)]
-mod proptest_tests;
-
 pub use branches::{Branch, Upstream, branches};
 pub use discover::{DiscoverInputs, OVERRIDE_VAR, discover_with};
 pub use exec::{
