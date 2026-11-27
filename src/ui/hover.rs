@@ -114,7 +114,7 @@ fn card(
             });
             match (detail, failed) {
                 (Some(hover), _) => {
-                    let when = relative_time(now_unix(), hover.authored_unix);
+                    let when = relative_time(clock::now_unix(), hover.authored_unix);
                     ui.label(
                         RichText::new(format!("{when} · {}", hover.authored_at))
                             .color(palette.text_muted),
@@ -465,14 +465,11 @@ fn line_with_links(
     });
 }
 
-/// [`clock::now_unix`] as git stores commit times, for [`relative_time`].
-pub(super) fn now_unix() -> i64 {
-    i64::try_from(clock::now_unix()).unwrap_or(i64::MAX)
-}
-
 /// "just now", "5 minutes ago", "3 days ago", "2 years ago". A time in the
-/// future (clock skew) reads as "just now".
-pub(crate) fn relative_time(now: i64, then: i64) -> String {
+/// future (clock skew) reads as "just now". `now` is [`clock::now_unix`];
+/// `then` is signed, as git stores commit times.
+pub(crate) fn relative_time(now: u64, then: i64) -> String {
+    let now = i64::try_from(now).unwrap_or(i64::MAX);
     let seconds = now.saturating_sub(then).max(0);
     let units = [
         (365 * 24 * 60 * 60, "year"),
@@ -543,14 +540,15 @@ mod tests {
             (365 * DAY + 1, "1 year ago"),
             (800 * DAY, "2 years ago"),
         ];
+        let now = NOW.cast_unsigned();
         for (ago, text) in CASES {
-            assert_eq!(relative_time(NOW, NOW - ago), text, "{ago}s ago");
+            assert_eq!(relative_time(now, NOW - ago), text, "{ago}s ago");
         }
-        // The difference saturates instead of overflowing.
+        // A clock past `i64::MAX` reads as it; the difference saturates.
         for (now, then, text) in [
-            (i64::MAX, 0, "292471208677 years ago"),
-            (i64::MAX, i64::MIN, "292471208677 years ago"),
-            (i64::MIN, i64::MAX, "just now"),
+            (u64::MAX, 0, "292471208677 years ago"),
+            (u64::MAX, i64::MIN, "292471208677 years ago"),
+            (0, i64::MAX, "just now"),
         ] {
             assert_eq!(relative_time(now, then), text, "{now} after {then}");
         }
@@ -622,13 +620,13 @@ mod tests {
 
         #[test]
         fn a_longer_gap_never_reads_shorter(
-            now in any::<i64>(),
+            now in 0..=i64::MAX,
             left in 0..=i64::MAX,
             right in 0..=i64::MAX,
         ) {
             let (short, long) = (left.min(right), left.max(right));
-            let earlier = relative_time(now, now.saturating_sub(short));
-            let later = relative_time(now, now.saturating_sub(long));
+            let earlier = relative_time(now.cast_unsigned(), now.saturating_sub(short));
+            let later = relative_time(now.cast_unsigned(), now.saturating_sub(long));
             prop_assert!(
                 rank(&earlier) <= rank(&later),
                 "now {now}: {short}s is {earlier}, {long}s is {later}"

@@ -3,8 +3,6 @@
 //! cells that must stay inside their columns, and the opening line while
 //! history is still loading.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use cthulhu_git::git::{
     Branch, CommitDetail, CommitFile, CommitHover, CommitStats, DiffKind, DiffLine, FileDiff,
     GraphBranch, GraphCommit, GraphRow, GraphTip, Head, HistoryGraph, Person, RepoInfo,
@@ -1718,10 +1716,7 @@ fn each_click_in_the_history_picks_keeps_or_releases_the_commit() {
 #[test]
 fn selected_commit_shows_the_hover_details() {
     let (mut repo, newer, _) = two_commits();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = super::clock::now_unix().cast_signed();
     let hover = CommitHover {
         oid: newer.clone(),
         author: person("Ada Lovelace", "ada@example.invalid"),

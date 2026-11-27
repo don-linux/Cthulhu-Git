@@ -3,13 +3,12 @@
 //! Keychain reads and writes, `gh auth token` and the `GET /user` check all
 //! run on a worker thread: each can block, and a keychain may show a prompt.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use cthulhu_git::github::{
     self, ApiError, GitHubUser, RateLimit, Token, TokenStoreError, UreqTransport,
 };
 use eframe::egui::{Context, Id, TextEdit};
 
+use super::clock;
 use super::task::Task;
 
 /// The token field, so its undo history can be cleared.
@@ -134,14 +133,10 @@ impl GitHubAuth {
         };
         self.notice = Some(Notice::Info("Checking the token with GitHub…".to_owned()));
         self.run(ctx, move || {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_secs())
-                .unwrap_or(0);
             Outcome::Verified(github::authenticated_user(
                 &UreqTransport::default(),
                 &token,
-                now,
+                clock::now_unix(),
             ))
         });
     }

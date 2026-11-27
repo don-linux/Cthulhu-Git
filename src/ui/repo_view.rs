@@ -16,6 +16,7 @@ use eframe::egui::{
 
 use super::avatars::{self, AvatarService};
 use super::changes;
+use super::clock;
 use super::history;
 use super::hover::{self, CachedCommit};
 use super::icons::{self, Icon};
@@ -696,7 +697,7 @@ fn paint_commit(
                 Some(unix) => {
                     format!(
                         "{} · {absolute}",
-                        hover::relative_time(hover::now_unix(), unix)
+                        hover::relative_time(clock::now_unix(), unix)
                     )
                 }
                 None => absolute.to_owned(),

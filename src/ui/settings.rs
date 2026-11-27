@@ -13,7 +13,6 @@
 //! holds the optional read-only token.
 
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use cthulhu_git::github::{ApiStatus, TOKEN_TEMPLATE_URL};
 use cthulhu_git::settings::{HistoryColumns, sanitize_font_name};
@@ -23,6 +22,7 @@ use eframe::egui::{
 };
 
 use super::Action;
+use super::clock;
 use super::fonts::{self, Face};
 use super::github_auth::{GitHubAuth, Notice, Stored, token_field_id};
 use super::icons::{self, Icon};
@@ -587,10 +587,7 @@ fn github_page(ui: &mut Ui, palette: &Palette, github: &mut GitHubAuth, api: &Ap
             );
         }
         if let Some(until) = api.paused_until {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_secs())
-                .unwrap_or(0);
+            let now = clock::now_unix();
             if until > now {
                 let minutes = (until - now).div_ceil(60);
                 ui.colored_label(
