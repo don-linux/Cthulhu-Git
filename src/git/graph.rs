@@ -106,33 +106,33 @@ pub struct GraphTrace {
     pub color: usize,
 }
 
-/// A lane is either holding the principal column open, or waiting for one commit.
+/// A lane is either holding the principal column open, or waiting for the
+/// commit on row `next`.
+#[derive(Clone, Copy)]
 enum Lane {
     Placeholder { color: usize },
-    Waiting { next: String, color: usize },
+    Waiting { next: usize, color: usize },
 }
 
 impl Lane {
-    fn color(&self) -> usize {
+    fn color(self) -> usize {
         match self {
-            Self::Placeholder { color } | Self::Waiting { color, .. } => *color,
+            Self::Placeholder { color } | Self::Waiting { color, .. } => color,
         }
     }
 
-    fn next(&self) -> Option<&str> {
+    fn next(self) -> Option<usize> {
         match self {
-            Self::Waiting { next, .. } => Some(next.as_str()),
+            Self::Waiting { next, .. } => Some(next),
             Self::Placeholder { .. } => None,
         }
     }
-
-    fn is_placeholder(&self) -> bool {
-        matches!(self, Self::Placeholder { .. })
-    }
 }
 
-struct ExtraParent<'a> {
-    parent: &'a str,
+/// A parent after the first: its row, the color of its stroke, and the lane
+/// of the row above that already waits for it.
+struct ExtraParent {
+    parent: usize,
     color: usize,
     into_top: Option<usize>,
 }
@@ -380,35 +380,20 @@ fn parse_parents(bytes: &[u8]) -> Option<Vec<String>> {
 /// from it that no selected branch claimed, uses the principal color. Each
 /// other selected branch keeps the color of its own first-parent chain.
 pub fn layout_graph(commits: &[GraphCommit], tips: &[GraphTip]) -> HistoryGraph {
-    let trunk = trunk_oids(commits, tips);
-    let spine_color = tips
+    let layout = Layout::new(commits, tips);
+    let mut lanes = Vec::new();
+    let rows: Vec<GraphRow> = commits
         .iter()
-        .find(|tip| tip.principal)
-        .map(|tip| tip.color)
-        .unwrap_or(0);
-    let colors = commit_colors(commits, tips, &trunk, spine_color);
-    let mut remaining: HashSet<&str> = commits.iter().map(|commit| commit.oid.as_str()).collect();
-    let mut lanes: Vec<Lane> = Vec::new();
-    let mut rows = Vec::with_capacity(commits.len());
-
-    for commit in commits {
-        remaining.remove(commit.oid.as_str());
-        let on_trunk = trunk.contains(&commit.oid);
-        if !on_trunk && !trunk.is_empty() && lanes.is_empty() {
-            lanes.push(Lane::Placeholder { color: spine_color });
-        }
-        rows.push(layout_row(
-            commit,
-            &mut lanes,
-            &RowCtx {
-                tips,
-                remaining: &remaining,
-                trunk: &trunk,
-                spine_color,
-                colors: &colors,
-            },
-        ));
-    }
+        .enumerate()
+        .map(|(row, commit)| {
+            if layout.has_trunk && !layout.trunk[row] && lanes.is_empty() {
+                lanes.push(Lane::Placeholder {
+                    color: layout.spine_color,
+                });
+            }
+            layout.row(row, commit, &mut lanes)
+        })
+        .collect();
 
     let columns = rows.iter().map(row_span).max().unwrap_or(0);
     HistoryGraph {
@@ -431,212 +416,221 @@ fn row_span(row: &GraphRow) -> usize {
     max.saturating_add(1)
 }
 
-fn trunk_oids(commits: &[GraphCommit], tips: &[GraphTip]) -> HashSet<String> {
-    let Some(start) = tips
-        .iter()
-        .find(|tip| tip.principal)
-        .map(|tip| tip.oid.as_str())
-    else {
-        return HashSet::new();
-    };
-    let mut by_oid: HashMap<&str, &GraphCommit> = HashMap::new();
-    for commit in commits {
-        by_oid.insert(commit.oid.as_str(), commit);
-    }
-    if !by_oid.contains_key(start) {
-        return HashSet::new();
-    }
-    let mut trunk = HashSet::new();
-    let mut cursor = Some(start.to_owned());
-    while let Some(oid) = cursor {
-        if !trunk.insert(oid.clone()) {
-            break;
-        }
-        cursor = by_oid.get(oid.as_str()).and_then(|commit| {
-            commit
-                .parents
-                .first()
-                .filter(|parent| by_oid.contains_key(parent.as_str()))
-                .cloned()
-        });
-    }
-    trunk
-}
-
-/// Lane of `commit_oid`, and whether no line enters that lane from the row above.
-///
-/// A principal commit takes the placeholder that holds lane 0 open. Otherwise
-/// a commit joins the first lane waiting for it, or opens one on the right.
-fn occupy(lanes: &mut Vec<Lane>, commit_oid: &str, on_trunk: bool, color: usize) -> (usize, bool) {
-    let waiting = || Lane::Waiting {
-        next: commit_oid.to_owned(),
-        color,
-    };
-    if on_trunk && lanes.first().is_some_and(Lane::is_placeholder) {
-        lanes[0] = waiting();
-        return (0, true);
-    }
-    if let Some(index) = lanes
-        .iter()
-        .position(|lane| lane.next() == Some(commit_oid))
-    {
-        return (index, false);
-    }
-    lanes.push(waiting());
-    (lanes.len() - 1, true)
-}
-
-struct RowCtx<'a> {
+/// What [`layout_graph`] knows about every commit, which it names by row.
+struct Layout<'a> {
     tips: &'a [GraphTip],
-    remaining: &'a HashSet<&'a str>,
-    trunk: &'a HashSet<String>,
+    /// Parents on a later row, each once, the first parent first. git prints
+    /// every parent after its children, so these are the ones still to come.
+    parents: Vec<Vec<usize>>,
+    /// On the principal tip's first-parent chain.
+    trunk: Vec<bool>,
+    /// The principal tip is in the window, so lane 0 belongs to its chain.
+    has_trunk: bool,
     spine_color: usize,
-    colors: &'a HashMap<String, usize>,
+    colors: Vec<usize>,
 }
 
-/// Lane already expecting `oid`, if joining it would not hide a second branch
-/// behind another side branch that is only waiting for the principal history.
-fn lane_waiting_for(lanes: &[Lane], oid: &str, trunk: &HashSet<String>) -> Option<usize> {
-    let index = lanes.iter().position(|lane| lane.next() == Some(oid))?;
-    if trunk.contains(oid) && index != 0 {
-        None
-    } else {
-        Some(index)
-    }
-}
+impl<'a> Layout<'a> {
+    fn new(commits: &[GraphCommit], tips: &'a [GraphTip]) -> Self {
+        let rows: HashMap<&str, usize> = commits
+            .iter()
+            .enumerate()
+            .map(|(row, commit)| (commit.oid.as_str(), row))
+            .collect();
+        let row_of = |oid: &str| rows.get(oid).copied();
+        let first_raw: Vec<Option<usize>> = commits
+            .iter()
+            .map(|commit| commit.parents.first().and_then(|parent| row_of(parent)))
+            .collect();
+        let parents: Vec<Vec<usize>> = commits
+            .iter()
+            .enumerate()
+            .map(|(row, commit)| {
+                let mut seen = HashSet::new();
+                commit
+                    .parents
+                    .iter()
+                    .filter_map(|parent| row_of(parent))
+                    .filter(|&parent| parent > row && seen.insert(parent))
+                    .collect()
+            })
+            .collect();
 
-fn layout_row(commit: &GraphCommit, lanes: &mut Vec<Lane>, ctx: &RowCtx<'_>) -> GraphRow {
-    let on_trunk = ctx.trunk.contains(&commit.oid);
-    let commit_color = ctx
-        .colors
-        .get(&commit.oid)
-        .copied()
-        .unwrap_or(ctx.spine_color);
-    let (lane_idx, spawned) = occupy(lanes, &commit.oid, on_trunk, commit_color);
-    let top = std::mem::take(lanes);
-
-    let parents = kept_parents(&commit.parents, ctx.remaining);
-    let first = parents.first().copied();
-    // The principal chain keeps its parent. A side branch joins a lane that
-    // already expects its parent, except when that lane is another side branch
-    // waiting for the same principal commit: both stay open until they meet it.
-    let merges_into = if on_trunk {
-        None
-    } else {
-        first.and_then(|parent| {
-            lane_waiting_for(&top, parent, ctx.trunk).filter(|index| *index != lane_idx)
-        })
-    };
-    let extras: Vec<ExtraParent> = parents
-        .iter()
-        .skip(1)
-        .map(|&parent| ExtraParent {
-            parent,
-            // A merge stroke takes the color of the parent it is joining, so
-            // a selected branch stays visible up to the merge commit.
-            color: ctx.colors.get(parent).copied().unwrap_or(ctx.spine_color),
-            into_top: lane_waiting_for(&top, parent, ctx.trunk),
-        })
-        .collect();
-
-    // The bottom lanes are rebuilt in order, each with the stroke that reaches it.
-    let mut traces = Vec::new();
-    let mut top_to_bottom = vec![None; top.len()];
-    let mut merging_from = Vec::new();
-    for (index, lane) in top.into_iter().enumerate() {
-        if index == lane_idx {
-            if merges_into.is_none()
-                && let Some(parent) = first
-            {
-                top_to_bottom[index] = Some(lanes.len());
-                traces.push(GraphTrace {
-                    from_lane: (!spawned).then_some(index),
-                    to_lane: Some(lanes.len()),
-                    color: commit_color,
-                });
-                lanes.push(Lane::Waiting {
-                    next: parent.to_owned(),
-                    color: commit_color,
-                });
-            }
-            for extra in extras.iter().filter(|extra| extra.into_top.is_none()) {
-                traces.push(GraphTrace {
-                    from_lane: None,
-                    to_lane: Some(lanes.len()),
-                    color: extra.color,
-                });
-                lanes.push(Lane::Waiting {
-                    next: extra.parent.to_owned(),
-                    color: extra.color,
-                });
-            }
-        } else if lane.next() == Some(commit.oid.as_str()) {
-            merging_from.push((index, lane.color()));
-        } else {
-            if !lane.is_placeholder() {
-                top_to_bottom[index] = Some(lanes.len());
-                traces.push(GraphTrace {
-                    from_lane: Some(index),
-                    to_lane: Some(lanes.len()),
-                    color: lane.color(),
-                });
-            }
-            lanes.push(lane);
+        let principal = tips.iter().find(|tip| tip.principal);
+        let spine_color = principal.map_or(0, |tip| tip.color);
+        let start = principal.and_then(|tip| row_of(&tip.oid));
+        let mut trunk = vec![false; commits.len()];
+        let mut cursor = start;
+        while let Some(row) = cursor {
+            trunk[row] = true;
+            // Forward only: grafts can list a parent first, even in a cycle.
+            cursor = first_raw[row].filter(|&parent| parent > row);
+        }
+        let claims = tips
+            .iter()
+            .filter(|tip| !tip.principal)
+            .filter_map(|tip| Some((row_of(&tip.oid)?, tip.color)))
+            .collect();
+        let colors = commit_colors(&first_raw, &parents, &trunk, start, spine_color, claims);
+        Self {
+            tips,
+            parents,
+            trunk,
+            has_trunk: start.is_some(),
+            spine_color,
+            colors,
         }
     }
 
-    if let Some(index) = merges_into.and_then(|target| top_to_bottom[target]) {
-        traces.push(GraphTrace {
-            from_lane: None,
-            to_lane: Some(index),
-            color: commit_color,
-        });
+    /// Lane already expecting `row`, if joining it would not hide a second
+    /// branch behind another side branch that only waits for the principal
+    /// history.
+    fn lane_waiting_for(&self, lanes: &[Lane], row: usize) -> Option<usize> {
+        let index = lanes.iter().position(|lane| lane.next() == Some(row))?;
+        if self.trunk[row] && index != 0 {
+            None
+        } else {
+            Some(index)
+        }
     }
-    // The commit's own lane stops at the dot when its parent is elsewhere.
-    if (merges_into.is_some() || first.is_none()) && !spawned {
-        traces.push(GraphTrace {
-            from_lane: Some(lane_idx),
-            to_lane: None,
-            color: commit_color,
-        });
-    }
-    for extra in &extras {
-        if let Some(index) = extra.into_top.and_then(|target| top_to_bottom[target]) {
+
+    fn row(&self, row: usize, commit: &GraphCommit, lanes: &mut Vec<Lane>) -> GraphRow {
+        let on_trunk = self.trunk[row];
+        let commit_color = self.colors[row];
+        let (lane_idx, spawned) = occupy(lanes, row, on_trunk, commit_color);
+        let top = std::mem::take(lanes);
+
+        let first = self.parents[row].first().copied();
+        // The principal chain keeps its parent. A side branch joins a lane that
+        // already expects its parent, except when that lane is another side branch
+        // waiting for the same principal commit: both stay open until they meet it.
+        let merges_into = if on_trunk {
+            None
+        } else {
+            first.and_then(|parent| {
+                self.lane_waiting_for(&top, parent)
+                    .filter(|index| *index != lane_idx)
+            })
+        };
+        let extras: Vec<ExtraParent> = self.parents[row]
+            .iter()
+            .skip(1)
+            .map(|&parent| ExtraParent {
+                parent,
+                // A merge stroke takes the color of the parent it is joining, so
+                // a selected branch stays visible up to the merge commit.
+                color: self.colors[parent],
+                into_top: self.lane_waiting_for(&top, parent),
+            })
+            .collect();
+
+        // The bottom lanes are rebuilt in order, each with the stroke that reaches it.
+        let mut traces = Vec::new();
+        let mut top_to_bottom = vec![None; top.len()];
+        let mut merging_from = Vec::new();
+        for (index, lane) in top.into_iter().enumerate() {
+            if index == lane_idx {
+                if merges_into.is_none()
+                    && let Some(parent) = first
+                {
+                    top_to_bottom[index] = Some(lanes.len());
+                    traces.push(GraphTrace {
+                        from_lane: (!spawned).then_some(index),
+                        to_lane: Some(lanes.len()),
+                        color: commit_color,
+                    });
+                    lanes.push(Lane::Waiting {
+                        next: parent,
+                        color: commit_color,
+                    });
+                }
+                for extra in extras.iter().filter(|extra| extra.into_top.is_none()) {
+                    traces.push(GraphTrace {
+                        from_lane: None,
+                        to_lane: Some(lanes.len()),
+                        color: extra.color,
+                    });
+                    lanes.push(Lane::Waiting {
+                        next: extra.parent,
+                        color: extra.color,
+                    });
+                }
+            } else if lane.next() == Some(row) {
+                merging_from.push((index, lane.color()));
+            } else {
+                if let Lane::Waiting { color, .. } = lane {
+                    top_to_bottom[index] = Some(lanes.len());
+                    traces.push(GraphTrace {
+                        from_lane: Some(index),
+                        to_lane: Some(lanes.len()),
+                        color,
+                    });
+                }
+                lanes.push(lane);
+            }
+        }
+
+        if let Some(index) = merges_into.and_then(|target| top_to_bottom[target]) {
             traces.push(GraphTrace {
                 from_lane: None,
                 to_lane: Some(index),
-                color: extra.color,
+                color: commit_color,
             });
         }
-    }
-    for (from_index, color) in merging_from {
-        traces.push(GraphTrace {
-            from_lane: Some(from_index),
-            to_lane: None,
-            color,
-        });
-    }
+        // The commit's own lane stops at the dot when its parent is elsewhere.
+        if (merges_into.is_some() || first.is_none()) && !spawned {
+            traces.push(GraphTrace {
+                from_lane: Some(lane_idx),
+                to_lane: None,
+                color: commit_color,
+            });
+        }
+        for extra in &extras {
+            if let Some(index) = extra.into_top.and_then(|target| top_to_bottom[target]) {
+                traces.push(GraphTrace {
+                    from_lane: None,
+                    to_lane: Some(index),
+                    color: extra.color,
+                });
+            }
+        }
+        for (from_index, color) in merging_from {
+            traces.push(GraphTrace {
+                from_lane: Some(from_index),
+                to_lane: None,
+                color,
+            });
+        }
 
-    GraphRow {
-        oid: commit.oid.clone(),
-        summary: commit.summary.clone(),
-        author: commit.author.clone(),
-        co_authors: commit.co_authors.clone(),
-        branches: tip_labels(ctx.tips, &commit.oid),
-        commit_lane: lane_idx,
-        commit_color,
-        traces,
+        GraphRow {
+            oid: commit.oid.clone(),
+            summary: commit.summary.clone(),
+            author: commit.author.clone(),
+            co_authors: commit.co_authors.clone(),
+            branches: tip_labels(self.tips, &commit.oid),
+            commit_lane: lane_idx,
+            commit_color,
+            traces,
+        }
     }
 }
 
-/// Parents still to come, each once.
-fn kept_parents<'a>(parents: &'a [String], remaining: &HashSet<&str>) -> Vec<&'a str> {
-    let mut seen = HashSet::new();
-    parents
-        .iter()
-        .map(String::as_str)
-        .filter(|parent| remaining.contains(parent) && seen.insert(*parent))
-        .collect()
+/// Lane of the commit on `row`, and whether no line enters that lane from the
+/// row above.
+///
+/// A principal commit takes the placeholder that holds lane 0 open. Otherwise
+/// a commit joins the first lane waiting for it, or opens one on the right.
+fn occupy(lanes: &mut Vec<Lane>, row: usize, on_trunk: bool, color: usize) -> (usize, bool) {
+    let waiting = Lane::Waiting { next: row, color };
+    if on_trunk && matches!(lanes.first(), Some(Lane::Placeholder { .. })) {
+        lanes[0] = waiting;
+        return (0, true);
+    }
+    if let Some(index) = lanes.iter().position(|lane| lane.next() == Some(row)) {
+        return (index, false);
+    }
+    lanes.push(waiting);
+    (lanes.len() - 1, true)
 }
 
 fn tip_labels(tips: &[GraphTip], oid: &str) -> Vec<GraphBranch> {
@@ -650,81 +644,64 @@ fn tip_labels(tips: &[GraphTip], oid: &str) -> Vec<GraphBranch> {
         .collect()
 }
 
-/// Color of every commit in `commits`.
+/// Color of every row.
 ///
 /// The principal first-parent chain is the spine color. Other selected
-/// branches then claim their own first-parent chain, oldest tip first, and
-/// stop where a commit is already colored: a branch grown from another keeps
-/// only the commits that are its alone. Anything still uncolored but reachable
-/// from the principal (a merged branch that is not selected) takes the spine
-/// color too. A commit that only a side branch brought in inherits the color
-/// of the newest child that names it as a parent.
+/// branches (`claims`: tip row and color) then claim their own first-parent
+/// chain, oldest tip first, and stop where a commit is already colored: a
+/// branch grown from another keeps only the commits that are its alone.
+/// Anything still uncolored but reachable from the `principal` row (a merged
+/// branch that is not selected) takes the spine color too. A commit that only
+/// a side branch brought in inherits the color of the newest child that names
+/// it as a parent.
 fn commit_colors(
-    commits: &[GraphCommit],
-    tips: &[GraphTip],
-    trunk: &HashSet<String>,
+    first_raw: &[Option<usize>],
+    parents: &[Vec<usize>],
+    trunk: &[bool],
+    principal: Option<usize>,
     spine_color: usize,
-) -> HashMap<String, usize> {
-    let mut by_oid: HashMap<&str, &GraphCommit> = HashMap::new();
-    for commit in commits {
-        by_oid.insert(commit.oid.as_str(), commit);
-    }
-    let mut colors: HashMap<String, usize> = HashMap::new();
-    for oid in trunk {
-        colors.insert(oid.clone(), spine_color);
-    }
+    mut claims: Vec<(usize, usize)>,
+) -> Vec<usize> {
+    let mut colors: Vec<Option<usize>> = trunk
+        .iter()
+        .map(|&on_trunk| on_trunk.then_some(spine_color))
+        .collect();
 
-    let mut claim: Vec<&GraphTip> = tips.iter().filter(|tip| !tip.principal).collect();
-    claim.sort_by_key(|tip| {
-        let at = commits
-            .iter()
-            .position(|commit| commit.oid == tip.oid)
-            .unwrap_or(0);
-        std::cmp::Reverse(at)
-    });
-    for tip in claim {
-        let mut cursor = Some(tip.oid.as_str());
-        while let Some(oid) = cursor {
-            if colors.contains_key(oid) || !by_oid.contains_key(oid) {
+    claims.sort_by_key(|&(row, _)| std::cmp::Reverse(row));
+    for (mut row, color) in claims {
+        while colors[row].is_none() {
+            colors[row] = Some(color);
+            let Some(parent) = first_raw[row] else {
                 break;
-            }
-            colors.insert(oid.to_owned(), tip.color);
-            cursor = by_oid
-                .get(oid)
-                .and_then(|commit| commit.parents.first().map(String::as_str));
-        }
-    }
-
-    if let Some(start) = tips.iter().find(|tip| tip.principal) {
-        let mut stack = vec![start.oid.as_str()];
-        let mut seen = HashSet::new();
-        while let Some(oid) = stack.pop() {
-            if !seen.insert(oid) {
-                continue;
-            }
-            let Some(commit) = by_oid.get(oid) else {
-                continue;
             };
-            colors.entry(oid.to_owned()).or_insert(spine_color);
-            for parent in &commit.parents {
-                if by_oid.contains_key(parent.as_str()) {
-                    stack.push(parent.as_str());
-                }
+            row = parent;
+        }
+    }
+
+    let mut reached = vec![false; colors.len()];
+    if let Some(row) = principal {
+        reached[row] = true;
+    }
+    for (row, kept) in parents.iter().enumerate() {
+        if reached[row] {
+            colors[row].get_or_insert(spine_color);
+            for &parent in kept {
+                reached[parent] = true;
             }
         }
     }
 
-    for commit in commits {
-        let Some(&color) = colors.get(&commit.oid) else {
-            continue;
-        };
-        for parent in &commit.parents {
-            if by_oid.contains_key(parent.as_str()) {
-                colors.entry(parent.clone()).or_insert(color);
+    for (row, kept) in parents.iter().enumerate() {
+        if let Some(color) = colors[row] {
+            for &parent in kept {
+                colors[parent].get_or_insert(color);
             }
         }
     }
     colors
+        .into_iter()
+        .map(|color| color.unwrap_or(spine_color))
+        .collect()
 }
 
 #[cfg(test)]
