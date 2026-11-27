@@ -62,7 +62,7 @@ impl std::fmt::Display for HttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotAllowed => {
-                f.write_str("refused to request a URL outside GitHub's HTTPS hosts")
+                f.write_str("refused to request a URL that is not plain HTTPS on a GitHub host")
             }
             Self::TooManyRedirects => f.write_str("too many redirects"),
             Self::TimedOut => f.write_str("the request timed out"),

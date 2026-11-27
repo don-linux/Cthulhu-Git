@@ -512,8 +512,8 @@ fn parse_co_authors_very_long_line() {
     assert!(parse_co_authors(&noise).is_empty());
     assert!(reference_co_authors(&noise).is_empty());
 
-    // Many `<` before the closing `>`: a scan per bracket was quadratic, and
-    // so were thousands of distinct co-authors. Both stay linear.
+    // A megabyte of `<` before the closing `>`, and thousands of distinct
+    // co-authors, must parse in linear time.
     let brackets = format!("Co-authored-by: a {}>b>", "<".repeat(1 << 20));
     assert!(parse_co_authors(&brackets).is_empty());
     let many: String = (0..20_000)
