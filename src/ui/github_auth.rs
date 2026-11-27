@@ -154,7 +154,7 @@ impl GitHubAuth {
     /// Fills the field from `GH_TOKEN` or `GITHUB_TOKEN`. Saving stays the
     /// user's choice.
     pub fn use_env(&mut self) {
-        if let Some((name, token)) = github::token_from_env() {
+        if let Some((name, token)) = github::token_from_env(|name| std::env::var_os(name)) {
             self.draft = token.expose().to_owned();
             self.notice = Some(Notice::Info(format!(
                 "Filled from {name}. Press Save to keep it."

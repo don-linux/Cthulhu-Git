@@ -1,6 +1,7 @@
 //! The optional GitHub token: read-only, kept in the system keychain, never
 //! in `settings.json`, logs or the accessibility tree.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -307,14 +308,15 @@ pub fn delete_token() -> Result<(), TokenStoreError> {
     system_keychain().delete()
 }
 
-/// `GH_TOKEN`, then `GITHUB_TOKEN`, the names GitHub CLI reads.
+/// `GH_TOKEN`, then `GITHUB_TOKEN`, the names GitHub CLI reads, from the
+/// environment `var` reads.
 ///
 /// The copy read here is not wiped: the environment holds the same value for
 /// the life of the process.
-pub fn token_from_env() -> Option<(&'static str, Token)> {
+pub fn token_from_env(var: impl Fn(&str) -> Option<OsString>) -> Option<(&'static str, Token)> {
     ["GH_TOKEN", "GITHUB_TOKEN"].into_iter().find_map(|name| {
-        let value = std::env::var(name).ok()?;
-        Token::parse(&value).map(|token| (name, token))
+        let value = var(name)?;
+        Token::parse(value.to_str()?).map(|token| (name, token))
     })
 }
 
@@ -475,6 +477,35 @@ mod tests {
         ] {
             let parsed = Token::parse(&input);
             assert_eq!(parsed.as_ref().map(Token::expose), expected, "{input:?}");
+        }
+    }
+
+    /// GH_TOKEN wins, as in GitHub CLI; a value that cannot be a token is
+    /// passed over.
+    #[test]
+    fn the_environment_token_is_gh_token_then_github_token() {
+        const CLASSIC: &str = "ghp_abcdefghijklmnopqrstuvwxyz";
+        const FINE: &str = "github_pat_11ABCDEFG0123456789_abcdef";
+        // (GH_TOKEN, GITHUB_TOKEN, the variable used and its token)
+        let cases = [
+            (Some(CLASSIC), Some(FINE), Some(("GH_TOKEN", CLASSIC))),
+            (None, Some(FINE), Some(("GITHUB_TOKEN", FINE))),
+            (
+                Some("not a token"),
+                Some(FINE),
+                Some(("GITHUB_TOKEN", FINE)),
+            ),
+            (None, None, None),
+        ];
+        for (gh_token, github_token, expected) in cases {
+            let var = |name: &str| match name {
+                "GH_TOKEN" => gh_token.map(OsString::from),
+                "GITHUB_TOKEN" => github_token.map(OsString::from),
+                _ => None,
+            };
+            let found = token_from_env(var);
+            let found = found.as_ref().map(|(name, token)| (*name, token.expose()));
+            assert_eq!(found, expected, "{gh_token:?}, {github_token:?}");
         }
     }
 

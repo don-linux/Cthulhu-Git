@@ -555,7 +555,7 @@ fn github_page(ui: &mut Ui, palette: &Palette, github: &mut GitHubAuth, api: &Ap
             {
                 github.import_gh(ui.ctx());
             }
-            if cthulhu_git::github::token_from_env().is_some()
+            if cthulhu_git::github::token_from_env(|name| std::env::var_os(name)).is_some()
                 && text_button(ui, "Use GH_TOKEN", !busy)
                     .on_hover_text("Fills the field from GH_TOKEN or GITHUB_TOKEN.")
                     .clicked()
