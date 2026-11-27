@@ -1,5 +1,6 @@
-//! Extra cases for URL rules, remotes, the API client and the resolver,
-//! all through the fake transport.
+//! Hostile input against the GitHub code as a whole, through the fake
+//! transport: avatar URLs a listing hands back, random URLs, and errors
+//! that must never show the user's token.
 //!
 //! Nothing here opens a socket or touches the system keychain.
 
@@ -15,44 +16,30 @@ use crate::test_support::{
     FakeTransport, NOW, auth_value, commit_json, context, list_url, resolver,
 };
 
-const ALLOWED: &[&str] = &[
-    "api.github.com",
-    "avatars.githubusercontent.com",
-    "github.com",
-    "gravatar.com",
-    "www.gravatar.com",
-    "secure.gravatar.com",
-];
-
-fn token() -> Token {
-    Token::new("ghp_test_token_value_0123456789")
-}
+/// A user's token; no other test input contains it.
+const SECRET: &str = "ghp_SentinelTokenValue0000aaaa";
 
 #[test]
-fn hostile_author_avatar_urls_never_leave_the_allowlist_or_leak_tokens_in_errors() {
-    const SENTINEL: &str = "ghp_SentinelTokenValue0000";
+fn hostile_author_avatar_urls_never_leave_the_allowlist() {
+    let userinfo = format!("https://{SECRET}@evil.example/a.png");
     let avatars = [
         "https://evil.example/a.png",
         "http://avatars.githubusercontent.com/u/1",
-        "https://ghp_SentinelTokenValue0000@evil.example/a.png",
+        userinfo.as_str(),
         "https://avatars.githubusercontent.com.evil.example/u/1",
     ];
     let context = context();
-    let email = "person@example.com";
-    let emails = vec![email.to_owned()];
-
-    for (index, avatar) in avatars.iter().enumerate() {
+    let emails = ["person@example.com".to_owned()];
+    for (index, avatar) in avatars.into_iter().enumerate() {
         let fake = Arc::new(FakeTransport::default());
         let sha = format!("{index:040x}");
-        let warm = list_url(100, Some("aaa111"));
         fake.reply(
-            &warm,
+            &list_url(100, Some("aaa111")),
             200,
             &[("x-ratelimit-remaining", "50")],
-            format!("[{}]", commit_json(&sha, email, Some(avatar))).as_bytes(),
+            format!("[{}]", commit_json(&sha, &emails[0], Some(avatar))).as_bytes(),
         );
-        let mut resolver = resolver(&fake);
-        let urls = resolver.candidates(
+        let urls = resolver(&fake).candidates(
             &AvatarQuery {
                 emails: &emails,
                 repo: Some(&context),
@@ -60,68 +47,61 @@ fn hostile_author_avatar_urls_never_leave_the_allowlist_or_leak_tokens_in_errors
             },
             NOW,
         );
-        assert!(!urls.is_empty(), "case {index}");
-        let transport = fake.clone() as Arc<dyn Transport>;
+        assert!(!urls.is_empty(), "{avatar}");
         for url in &urls {
-            if let Err(FetchError::Failed(message)) = fetch_image(transport.as_ref(), url) {
-                assert!(
-                    !message.contains(SENTINEL),
-                    "fetch_image leaked the sentinel in {message}"
-                );
+            if let Err(FetchError::Failed(message)) = fetch_image(fake.as_ref(), url) {
+                assert!(!message.contains(SECRET), "{avatar}: {message}");
             }
-            if let Err(error) = get(transport.as_ref(), url, None) {
-                let message = error.to_string();
-                assert!(
-                    !message.contains(SENTINEL),
-                    "get leaked the sentinel in {message}"
-                );
+            if let Err(error) = get(fake.as_ref(), url, None) {
+                assert!(!error.to_string().contains(SECRET), "{avatar}: {error}");
             }
         }
-        for (url, _) in fake.requests.lock().expect("requests").iter() {
-            let host = allowed_host(url).unwrap_or_else(|error| {
-                panic!("requested a refused url {url}: {error}");
-            });
-            assert!(ALLOWED.contains(&host.as_str()), "{url} reached {host}");
+        for url in fake.urls() {
+            assert!(allowed_host(&url).is_ok(), "{avatar}: requested {url}");
         }
-        assert!(
-            fake.urls().iter().all(|url| {
-                allowed_host(url).is_ok_and(|host| ALLOWED.contains(&host.as_str()))
-            }),
-            "case {index}: {:?}",
-            fake.urls()
-        );
     }
 }
 
+/// Neither a refused or broken request nor a GitHub error answer carries
+/// the token into its message, even when a URL or a body holds it.
 #[test]
-fn token_parse_bounds_and_debug_hide_the_value() {
-    let value = "a".repeat(20);
-    let parsed = Token::parse(&format!(" \t{value}\n")).expect("trimmed");
-    assert_eq!(parsed.expose(), value);
-    assert!(!parsed.expose().chars().any(|ch| ch.is_whitespace()));
-    assert_eq!(format!("{parsed:?}"), "Token(…)");
-    assert!(!format!("{parsed:?}").contains(&value));
-    assert!(!format!("{:?}", Some(parsed)).contains(&value));
-    assert!(Token::parse(&"a".repeat(19)).is_none());
-    assert!(Token::parse(&"a".repeat(255)).is_some());
-    assert!(Token::parse(&"a".repeat(256)).is_none());
-    assert!(Token::parse("ghp_token with a space inside").is_none());
-}
-
-fn arb_token_input() -> impl Strategy<Value = String> {
-    prop_oneof![
-        3 => prop::collection::vec(any::<char>(), 0..=80).prop_map(|chars| chars.into_iter().collect()),
-        2 => (string_regex("[A-Za-z0-9_-]{20,80}").unwrap(), any::<bool>()).prop_map(
-            |(token, pad)| {
-                if pad {
-                    format!(" \t{token}\r\n")
-                } else {
-                    token
-                }
-            }
-        ),
-        1 => string_regex("[A-Za-z0-9_-]{10,30} [A-Za-z0-9_-]{10,30}").unwrap(),
-    ]
+fn errors_never_show_the_token() {
+    let token = Token::new(SECRET);
+    let fake = FakeTransport::default();
+    let leaky = format!("https://evil.example/?access_token={SECRET}");
+    fake.reply(
+        "https://api.github.com/away",
+        302,
+        &[("Location", &leaky)],
+        b"",
+    );
+    fake.reply(
+        "https://api.github.com/loop",
+        302,
+        &[("Location", "/loop")],
+        b"",
+    );
+    fake.reply("https://api.github.com/bare", 302, &[], b"");
+    let mut shown = Vec::new();
+    for url in [
+        leaky.as_str(),
+        "https://api.github.com/away",
+        "https://api.github.com/loop",
+        "https://api.github.com/bare",
+    ] {
+        let error = get(&fake, url, Some(&token)).expect_err(url);
+        shown.push(format!("{error} {error:?}"));
+    }
+    let repo = context().repo;
+    for status in [200, 401, 403, 404, 422, 500] {
+        fake.reply(&list_url(100, None), status, &[], SECRET.as_bytes());
+        let error =
+            commit_accounts(&fake, Some(&token), &repo, None, 100, NOW).expect_err("no listing");
+        shown.push(format!("{error} {error:?}"));
+    }
+    for message in shown {
+        assert!(!message.contains(SECRET), "{message}");
+    }
 }
 
 fn arb_urlish() -> impl Strategy<Value = String> {
@@ -136,54 +116,19 @@ fn arb_urlish() -> impl Strategy<Value = String> {
 proptest! {
     #![proptest_config(crate::test_support::proptest_config())]
 
-    #[test]
-    fn allowed_host_only_returns_allowlisted_hosts(url in arb_urlish()) {
-        if let Ok(host) = allowed_host(&url) {
-            prop_assert!(ALLOWED.contains(&host.as_str()), "{url} -> {host}");
-        }
-    }
-
+    /// No URL makes `get` panic, request a refused host, or send the
+    /// token anywhere but the API. The allowlist itself is pinned in http.rs.
     #[test]
     fn get_does_not_authorize_a_random_url(url in arb_urlish()) {
         let fake = FakeTransport::default();
-        let secret = token();
-        let expected = format!("Bearer {}", secret.expose());
-        let _ = get(&fake, &url, Some(&secret));
-        let requests = fake.requests.lock().expect("requests");
-        for (requested, headers) in requests.iter() {
-            let host = allowed_host(requested).unwrap_or_else(|error| {
-                panic!("{requested} was sent ({error})");
-            });
-            prop_assert!(ALLOWED.contains(&host.as_str()), "{requested}");
-            match auth_value(headers) {
-                Some(value) => {
-                    prop_assert_eq!(host, "api.github.com");
-                    prop_assert_eq!(value, expected.as_str());
-                }
-                None => prop_assert_ne!(host, "api.github.com"),
-            }
-        }
-    }
-
-    #[test]
-    fn token_parse_output_has_no_whitespace_and_debug_hides_it(input in arb_token_input()) {
-        let trimmed = input.trim();
-        let plausible = (20..=255).contains(&trimmed.len())
-            && trimmed
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
-        match Token::parse(&input) {
-            Some(parsed) => {
-                prop_assert!(plausible, "{trimmed:?}");
-                prop_assert_eq!(parsed.expose(), trimmed);
-                prop_assert!(parsed.expose().chars().all(|ch| !ch.is_whitespace()));
-                let debug = format!("{parsed:?}");
-                let wrapped = format!("Some({parsed:?})");
-                prop_assert_eq!(&debug, "Token(…)");
-                prop_assert!(!debug.contains(parsed.expose()));
-                prop_assert!(!wrapped.contains(trimmed));
-            }
-            None => prop_assert!(!plausible, "{trimmed:?}"),
+        let token = Token::new(SECRET);
+        let _ = get(&fake, &url, Some(&token));
+        let expected = format!("Bearer {SECRET}");
+        for (requested, headers) in fake.requests.lock().expect("requests").iter() {
+            let host = allowed_host(requested);
+            prop_assert!(host.is_ok(), "{requested} was sent");
+            let on_api = host.as_deref() == Ok("api.github.com");
+            prop_assert_eq!(auth_value(headers), on_api.then_some(expected.as_str()));
         }
     }
 }

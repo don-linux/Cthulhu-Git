@@ -475,24 +475,29 @@ mod tests {
         assert!(!format!("{:?}", Some(token)).contains("supersecret"));
     }
 
+    /// An interior newline is refused: the token becomes a header value.
     #[test]
     fn parse_trims_and_refuses_what_cannot_be_a_token() {
-        assert_eq!(
-            Token::parse("  github_pat_11ABCDEFG0123456789_abcdef \n")
-                .map(|token| token.expose().to_owned())
-                .as_deref(),
-            Some("github_pat_11ABCDEFG0123456789_abcdef")
-        );
-        for refused in [
-            "",
-            "short",
-            "has space inside the token value",
-            "ghp_\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
-            "ghp_line\nbreak_inside_the_value",
+        let shortest = "a".repeat(20);
+        let longest = "a".repeat(255);
+        for (input, expected) in [
+            (
+                "  github_pat_11ABCDEFG0123456789_abcdef \n".to_owned(),
+                Some("github_pat_11ABCDEFG0123456789_abcdef"),
+            ),
+            (format!(" \t{shortest}\n"), Some(shortest.as_str())),
+            (longest.clone(), Some(longest.as_str())),
+            ("a".repeat(19), None),
+            ("a".repeat(256), None),
+            (String::new(), None),
+            ("short".to_owned(), None),
+            ("has space inside the token value".to_owned(), None),
+            ("ghp_line\nbreak_inside_the_value".to_owned(), None),
+            (format!("ghp_{}", "\u{e9}".repeat(10)), None),
         ] {
-            assert!(Token::parse(refused).is_none(), "{refused:?}");
+            let parsed = Token::parse(&input);
+            assert_eq!(parsed.as_ref().map(Token::expose), expected, "{input:?}");
         }
-        assert!(Token::parse(&"a".repeat(256)).is_none());
     }
 
     #[test]
