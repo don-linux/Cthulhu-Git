@@ -65,6 +65,7 @@ fn sample_git(path: PathBuf) -> Git {
             patch: 0,
             raw: "2.43.0".to_owned(),
         },
+        command_timeout: std::time::Duration::from_secs(60),
     }
 }
 

@@ -75,6 +75,10 @@ const CLEARED_ENV: &[&str] = &[
     OVERRIDE_VAR,
 ];
 
+/// The command limit of the timeout tests: long enough for the fake to record
+/// its sleeper, far shorter than the 120 s it sleeps.
+const SHORT_LIMIT: Duration = Duration::from_millis(500);
+
 const FAKE_GIT_SCRIPT: &str = r#"#!/bin/sh
 # One shared fake git. Sidecar files next to the invoked symlink select behavior.
 # The quoting test sets this and a PATH that hides the real git; printf is a builtin.
@@ -202,7 +206,7 @@ case "$mode" in
       exit 0
     fi
     history_log_argv "$@"
-    # Outlives the 60s command timeout so the caller must kill the group and return.
+    # Outlives the command timeout so the caller must kill the group and return.
     sleep 120 &
     echo $! > "$0.sleeper"
     wait
@@ -1435,7 +1439,10 @@ fn slow_branch_graph_log_times_out_and_returns() {
     let tmp = TempDir::with_prefix("cthulhu-adv-a-slow-log-").expect("temp dir");
     let fake = link_fake(tmp.path(), "git");
     write_mode(&fake, "slow-log");
-    let git = probe_fake(&fake);
+    let git = Git {
+        command_timeout: SHORT_LIMIT,
+        ..probe_fake(&fake)
+    };
     let workdir = tmp.path().join("workdir");
     fs::create_dir(&workdir).expect("workdir");
     let sleeper = sidecar(&fake, ".sleeper");
@@ -1445,17 +1452,11 @@ fn slow_branch_graph_log_times_out_and_returns() {
         let _ = tx.send(branch_graph(&git, &workdir, &[tip], GRAPH_LOG_LIMIT));
     });
     // `tmp` stays here so the sleeper pid file is not deleted before the assert.
-    // The fake sleeps 120s. The command timeout is 60s. Do not join the worker.
-    let started = Instant::now();
-    match rx.recv_timeout(Duration::from_secs(90)) {
+    // The fake sleeps 120s, far past the limit. Do not join the worker.
+    match rx.recv_timeout(Duration::from_secs(30)) {
         Ok(Err(GitError::TimedOut { command, limit })) => {
             assert_history_log_command(&command);
-            assert_eq!(limit, Duration::from_secs(60));
-            assert!(
-                started.elapsed() >= Duration::from_secs(50),
-                "history log returned in {:?}, before the command timeout",
-                started.elapsed()
-            );
+            assert_eq!(limit, SHORT_LIMIT);
             assert_recorded_pid_is_dead(&sleeper);
         }
         Ok(Ok(graph)) => panic!(
@@ -1467,7 +1468,7 @@ fn slow_branch_graph_log_times_out_and_returns() {
             brief_error(&error)
         ),
         Err(mpsc::RecvTimeoutError::Timeout) => panic!(
-            "branch_graph still running after 90s; a slow history log must hit the command timeout and return"
+            "branch_graph still running after 30s; a slow history log must hit the command timeout and return"
         ),
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             panic!("branch_graph thread exited without a result");
@@ -2604,15 +2605,18 @@ fn checkout_does_not_run_core_fsmonitor() {
 }
 
 #[test]
-fn slow_checkout_times_out_at_sixty_seconds() {
-    // The fake sleeps for 120s. switch_branch must return at its 60s limit and
+fn slow_checkout_times_out_and_kills_what_git_started() {
+    // The fake sleeps for 120s. switch_branch must return at its limit and
     // kill that sleeper. Do not join the worker: a git that ignores the limit
-    // would pin this test on the join instead of the 90s receive.
+    // would pin this test on the join instead of the 30s receive.
     let tmp = TempDir::with_prefix("cthulhu-adv-a-slow-switch-").expect("temp dir");
     let fake = link_fake(tmp.path(), "git");
     write_mode(&fake, "slow-command");
     let sleeper = sidecar(&fake, ".sleeper");
-    let git = probe_fake(&fake);
+    let git = Git {
+        command_timeout: SHORT_LIMIT,
+        ..probe_fake(&fake)
+    };
     let workdir = tmp.path().join("workdir");
     fs::create_dir(&workdir).expect("workdir");
     let (tx, rx) = mpsc::channel();
@@ -2620,18 +2624,18 @@ fn slow_checkout_times_out_at_sixty_seconds() {
         let _ = tx.send(switch_branch(&git, &workdir, "main"));
     });
 
-    match rx.recv_timeout(Duration::from_secs(90)) {
+    match rx.recv_timeout(Duration::from_secs(30)) {
         Ok(Err(GitError::TimedOut { limit, .. })) => {
-            assert_eq!(limit, Duration::from_secs(60));
+            assert_eq!(limit, SHORT_LIMIT);
             assert_recorded_pid_is_dead(&sleeper);
         }
         Ok(Ok(())) => panic!("slow switch_branch returned successfully"),
         Ok(Err(error)) => panic!(
-            "slow switch_branch must time out at 60s, got {}",
+            "slow switch_branch must time out, got {}",
             brief_error(&error)
         ),
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            panic!("switch_branch still running after 90s; the command limit is 60 seconds")
+            panic!("switch_branch still running after 30s, past its command limit")
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             panic!("switch thread exited without a result");

@@ -21,6 +21,10 @@ cargo mutants -f <file> -j2 -o target/mut-base
 `cargo mutants` reports per mutant (caught / missed / timeout), not which test
 killed it, so compare whole runs.
 
+cargo-mutants copies the tree to `$TMPDIR`. Keep that directory outside any
+git repository (never under `target/`): the fixtures assume no repository
+above their temp dirs, and git would otherwise find this one.
+
 ## 2. Classify each test in the module
 
 - **Keep**: unique behavior or a security invariant (see `.claude/rules/testing.md`).

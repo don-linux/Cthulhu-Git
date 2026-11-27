@@ -1,9 +1,9 @@
 # cargo-mutants: https://mutants.rs/
-# cargo test until the two timeout tests stop taking 60 s: the nextest
-# `mutants` profile ends a test after 60 s, so the baseline would fail. Then
-# switch to test_tool = "nextest" and select its profile with
-# NEXTEST_PROFILE=mutants (`profile` here would be a Cargo build profile).
-test_tool = "cargo"
+# One process per test, stopping at the first failure. The extra args go to
+# `cargo nextest run`, where --profile picks the nextest profile in
+# .config/nextest.toml; this file's own `profile` key is a Cargo build profile.
+test_tool = "nextest"
+additional_cargo_test_args = ["--profile", "mutants"]
 exclude_globs = [
     "src/main.rs",
     "src/ui/theme/**",

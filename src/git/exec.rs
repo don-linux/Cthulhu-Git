@@ -47,8 +47,8 @@ pub fn env_names_match(left: &str, right: &str) -> bool {
 /// is skipped so one hung executable cannot hide a later, working git.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// Bound for every other git invocation, so a stalled filesystem cannot pin
-/// the worker forever. Long enough for a large local history.
+/// Default [`Git::command_timeout`], so a stalled filesystem cannot pin the
+/// worker forever. Long enough for a large local history.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Status and log output for the histories this app reads stay far below this.
@@ -60,6 +60,9 @@ const MAX_GIT_OUTPUT: usize = 8 * 1024 * 1024;
 pub struct Git {
     pub path: PathBuf,
     pub version: GitVersion,
+    /// The limit for [`Git::run`] and [`Git::require_ok`]. A command that
+    /// passes it is killed together with the processes it started.
+    pub command_timeout: Duration,
 }
 
 /// Parsed `git --version`. Only the leading dotted numbers are compared;
@@ -184,17 +187,19 @@ impl Git {
         Ok(Self {
             path: path.to_path_buf(),
             version,
+            command_timeout: COMMAND_TIMEOUT,
         })
     }
 
-    /// Runs `git <args>` in `cwd` without a shell, bounded by [`COMMAND_TIMEOUT`].
+    /// Runs `git <args>` in `cwd` without a shell, bounded by
+    /// [`Git::command_timeout`].
     ///
     /// `--no-optional-locks` skips locks a read does not need. A command that
     /// must write, such as pull, still takes its required locks. The user's
     /// environment is inherited (credential helpers, ssh-agent) except every
     /// `GIT_*` variable other than [`KEPT_GIT_VARS`].
     pub fn run(&self, cwd: &Path, args: &[&str]) -> Result<GitOutput, GitError> {
-        self.run_for(cwd, args, COMMAND_TIMEOUT)
+        self.run_for(cwd, args, self.command_timeout)
     }
 
     /// Like [`Git::run`], with a caller-chosen limit. Reads keep the default.
@@ -225,7 +230,7 @@ impl Git {
 
     /// Like [`Git::run`], but a non-zero exit becomes a typed [`GitError`].
     pub fn require_ok(&self, cwd: &Path, args: &[&str]) -> Result<GitOutput, GitError> {
-        self.require_ok_for(cwd, args, COMMAND_TIMEOUT)
+        self.require_ok_for(cwd, args, self.command_timeout)
     }
 
     /// Like [`Git::require_ok`], with a caller-chosen limit.
