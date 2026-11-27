@@ -62,6 +62,10 @@ works; its root is what gets remembered.
 | Bottom bar | Current branch, next to a branch icon, with Fetch and Pull | `main`, `main (no commits yet)` or `Detached HEAD at 21de8d4a3b7c` |
 | Bottom bar, right | Terminal button. Showing the terminal also opens the right sidebar | |
 
+**The terminal.** Clicking it gives it the keyboard. Tab, the arrows and
+Escape then go to the shell, so completion, history and vim work; Ctrl+Tab
+and Ctrl+Shift+Tab move focus back to the rest of the window.
+
 **The history table.** Every column title starts exactly where that column's
 content starts. Each column has its own width, saved as a share of the
 history panel, and its own minimum; drag the divider at a column's right edge

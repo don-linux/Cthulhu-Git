@@ -33,8 +33,8 @@ use alacritty_terminal::term::{
 use alacritty_terminal::tty::{self, Pty};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, Event, EventFilter, FontId, Id, Key, Modifiers, Painter,
-    PointerButton, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2,
+    self, Align2, Color32, CursorIcon, Event, EventFilter, FocusDirection, FontId, Id, Key,
+    Modifiers, Painter, PointerButton, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2,
 };
 
 use super::theme::Palette;
@@ -1119,6 +1119,13 @@ pub fn show(
         Some(Terminal::Live(session)) => {
             let mut origin = visible;
             if interactive {
+                // Before `interact`: egui moves focus when the focused widget
+                // registers, and Tab itself belongs to the shell.
+                if ui.memory(|memory| memory.has_focus(focus_id(view_id)))
+                    && let Some(direction) = leave_direction(ui)
+                {
+                    ui.memory_mut(|memory| memory.move_focus(direction));
+                }
                 let response = ui.interact(visible, focus_id(view_id), Sense::click_and_drag());
                 let response = response.on_hover_cursor(CursorIcon::Text);
                 if response.hovered() && ui.input(|input| input.pointer.primary_pressed()) {
@@ -1168,6 +1175,20 @@ pub fn show(
     if restart {
         *terminal = Some(begin_shell(ui.ctx(), cwd, &metrics));
     }
+}
+
+/// Ctrl+Tab and Ctrl+Shift+Tab move focus out of the terminal, as they do
+/// out of GTK and Qt text views, which keep Tab for themselves.
+fn leave_direction(ui: &mut Ui) -> Option<FocusDirection> {
+    ui.input_mut(|input| {
+        if input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab) {
+            Some(FocusDirection::Previous)
+        } else if input.consume_key(Modifiers::CTRL, Key::Tab) {
+            Some(FocusDirection::Next)
+        } else {
+            None
+        }
+    })
 }
 
 fn begin_shell(ctx: &egui::Context, cwd: &Path, metrics: &Metrics) -> Terminal {
@@ -2714,10 +2735,11 @@ END
     }
 
     /// Escape, Tab and the arrows belong to the shell (vim, completion,
-    /// history), so they must not move focus out of the terminal.
+    /// history), so they must not move focus out of the terminal. Ctrl+Tab
+    /// does, so the keyboard is never trapped.
     #[cfg(unix)]
     #[test]
-    fn focused_terminal_keeps_escape_tab_and_arrows() {
+    fn focused_terminal_keeps_escape_tab_and_arrows_until_ctrl_tab() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let cwd = dir.path().to_owned();
         let view_id = Id::new("focus test");
@@ -2764,6 +2786,30 @@ END
             harness.step();
             harness.step();
             assert!(focused(&harness), "{key:?} moved focus out of the terminal");
+        }
+        for modifiers in [Modifiers::CTRL, Modifiers::CTRL | Modifiers::SHIFT] {
+            harness.key_press_modifiers(modifiers, Key::Tab);
+            harness.step();
+            harness.step();
+            assert!(
+                !focused(&harness),
+                "{modifiers:?}+Tab kept focus in the terminal"
+            );
+            assert!(
+                harness.ctx.memory(|memory| memory.focused()).is_some(),
+                "{modifiers:?}+Tab dropped focus instead of moving it"
+            );
+            harness.hover_at(inside);
+            for pressed in [true, false] {
+                harness.event(Event::PointerButton {
+                    pos: inside,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                });
+                harness.step();
+            }
+            harness.step();
         }
     }
 
