@@ -17,7 +17,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 
 #[cfg(unix)]
-use cthulhu_git::git::{DiscoverInputs, discover_with, extend_path_for_gui};
+use cthulhu_git::git::{DiscoverInputs, discover_with, git_child_path};
 
 #[cfg(unix)]
 const SCRIPT: &str = r#"#!/bin/sh
@@ -138,8 +138,8 @@ fn finder_path_child_sees_homebrew_bin() {
     let finder = "/usr/bin:/bin:/usr/sbin:/sbin";
     // Existence is injected. On Linux `/opt/homebrew/bin` is not on disk, and
     // `Git::command` only appends it on macOS. The child still has to observe
-    // the string `extend_path_for_gui` produces for that Finder PATH.
-    let child_path = extend_path_for_gui(
+    // the string `git_child_path` produces for that Finder PATH.
+    let child_path = git_child_path(
         std::ffi::OsStr::new(finder),
         &[PathBuf::from("/opt/homebrew/bin")],
     );

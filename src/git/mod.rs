@@ -24,7 +24,7 @@ mod proptest_tests;
 pub use branches::{Branch, Upstream, branches};
 pub use discover::{DiscoverInputs, OVERRIDE_VAR, discover_with};
 pub use exec::{
-    Git, GitError, GitOutput, GitVersion, MIN_GIT_VERSION, extend_path_for_gui,
+    Git, GitError, GitOutput, GitVersion, MIN_GIT_VERSION, git_child_path,
     inherited_git_var_is_cleared,
 };
 pub use glance::{CommitGlance, Divergence, RepoGlance, glance};

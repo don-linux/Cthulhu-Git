@@ -292,19 +292,15 @@ impl fmt::Display for GitVersion {
     }
 }
 
-/// Appends `extra_dirs_that_exist` to `path`.
+/// The PATH a git child gets: `path` without empty or relative entries, then
+/// `extra_dirs_that_exist` that are not on it yet.
 ///
-/// Entries already on `path` stay where they are, so a directory the user
-/// put first still wins. Directories are appended in the order given.
-/// Existence is the caller's decision: this does not touch the filesystem.
-///
-/// Empty and relative entries are dropped. Git runs with the repository as
-/// its working directory, so they would resolve inside the repository, and an
-/// empty `path` would otherwise produce a leading empty entry.
-pub fn extend_path_for_gui(path: &OsStr, extra_dirs_that_exist: &[PathBuf]) -> OsString {
-    if extra_dirs_that_exist.is_empty() {
-        return path.to_os_string();
-    }
+/// Git runs with the repository as its working directory, so an empty or
+/// relative entry would find `ssh`, a credential helper or `gpg` inside the
+/// repository. Entries already on `path` stay where they are, so a directory
+/// the user put first still wins. Existence is the caller's decision: this
+/// does not touch the filesystem.
+pub fn git_child_path(path: &OsStr, extra_dirs_that_exist: &[PathBuf]) -> OsString {
     let mut dirs: Vec<PathBuf> = std::env::split_paths(path)
         .filter(|dir| dir.is_absolute())
         .collect();
@@ -323,7 +319,6 @@ const MACOS_USR_LOCAL_BIN: &str = "/usr/local/bin";
 ///
 /// The closure is injected so a test can pretend the directories are there
 /// without creating `/opt/homebrew` on the host.
-#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn macos_gui_path_dirs(exists: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
     [MACOS_HOMEBREW_BIN, MACOS_USR_LOCAL_BIN]
         .into_iter()
@@ -332,13 +327,19 @@ fn macos_gui_path_dirs(exists: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
         .collect()
 }
 
-#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
-fn apply_gui_path(command: &mut Command, parent_path: Option<&OsStr>, extras: &[PathBuf]) {
-    if extras.is_empty() {
+/// Sets [`git_child_path`] on `command`, or leaves an inherited PATH that is
+/// already that. When nothing usable is left PATH is removed: an empty PATH
+/// would search the working directory.
+fn apply_child_path(command: &mut Command, parent_path: Option<&OsStr>, extras: &[PathBuf]) {
+    let path = git_child_path(parent_path.unwrap_or_default(), extras);
+    if parent_path == Some(path.as_os_str()) || (parent_path.is_none() && path.is_empty()) {
         return;
     }
-    let parent = parent_path.unwrap_or(OsStr::new(""));
-    command.env("PATH", extend_path_for_gui(parent, extras));
+    if path.is_empty() {
+        command.env_remove("PATH");
+    } else {
+        command.env("PATH", path);
+    }
 }
 
 /// The single place where git processes are built, so every invocation
@@ -382,12 +383,12 @@ fn command(program: &Path) -> Command {
     // Finder's PATH is `/usr/bin:/bin:/usr/sbin:/sbin`, which hides Homebrew
     // helpers such as `git-credential-manager` and a Homebrew `ssh`. Append
     // those directories on macOS only, after the user's entries.
-    #[cfg(target_os = "macos")]
-    apply_gui_path(
-        &mut command,
-        std::env::var_os("PATH").as_deref(),
-        &macos_gui_path_dirs(|dir| dir.is_dir()),
-    );
+    let extras = if cfg!(target_os = "macos") {
+        macos_gui_path_dirs(|dir| dir.is_dir())
+    } else {
+        Vec::new()
+    };
+    apply_child_path(&mut command, std::env::var_os("PATH").as_deref(), &extras);
 
     #[cfg(unix)]
     {
@@ -1037,93 +1038,86 @@ mod tests {
         );
     }
 
-    fn joined(dirs: &[&str]) -> OsString {
-        std::env::join_paths(dirs.iter().map(PathBuf::from)).expect("PATH")
+    /// An absolute directory on this host: `/usr/bin`, or `C:/usr/bin` on Windows.
+    fn abs(dir: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{dir}")
+        } else {
+            dir.to_owned()
+        }
+    }
+
+    fn joined(dirs: &[String]) -> OsString {
+        std::env::join_paths(dirs).expect("PATH")
     }
 
     #[test]
-    fn extend_path_for_gui_appends_homebrew_after_the_finder_entries() {
-        let finder = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
-        let extras = macos_gui_path_dirs(|dir| {
-            dir == Path::new(MACOS_HOMEBREW_BIN) || dir == Path::new(MACOS_USR_LOCAL_BIN)
-        });
-        let extended = extend_path_for_gui(&joined(&finder), &extras);
-        let mut expected: Vec<_> = finder.iter().map(PathBuf::from).collect();
-        expected.push(PathBuf::from(MACOS_HOMEBREW_BIN));
-        expected.push(PathBuf::from(MACOS_USR_LOCAL_BIN));
-        assert_eq!(
-            std::env::split_paths(&extended).collect::<Vec<_>>(),
-            expected
-        );
-    }
-
-    #[test]
-    fn extend_path_for_gui_keeps_an_existing_entry_in_place() {
-        let parent = ["/custom/bin", MACOS_HOMEBREW_BIN, "/usr/bin"];
-        let extras = vec![
-            PathBuf::from(MACOS_HOMEBREW_BIN),
-            PathBuf::from(MACOS_USR_LOCAL_BIN),
-        ];
-        let extended = extend_path_for_gui(&joined(&parent), &extras);
-        assert_eq!(
-            std::env::split_paths(&extended).collect::<Vec<_>>(),
-            vec![
-                PathBuf::from("/custom/bin"),
-                PathBuf::from(MACOS_HOMEBREW_BIN),
-                PathBuf::from("/usr/bin"),
-                PathBuf::from(MACOS_USR_LOCAL_BIN),
-            ]
-        );
-    }
-
-    #[test]
-    fn extend_path_for_gui_never_adds_an_entry_that_resolves_in_the_repository() {
-        let extras = vec![PathBuf::from(MACOS_HOMEBREW_BIN)];
-        for (parent, expected) in [
-            // No PATH at all: the child must not start with an empty entry (the cwd).
-            ("", vec![MACOS_HOMEBREW_BIN]),
+    fn git_child_path_drops_relative_entries_and_appends_missing_extras() {
+        let [usr, bin, custom, brew] = ["/usr/bin", "/bin", "/custom/bin", "/brew/bin"].map(abs);
+        let homebrew = macos_gui_path_dirs(|_| true);
+        let [brew_dir, local_dir] = [MACOS_HOMEBREW_BIN, MACOS_USR_LOCAL_BIN].map(String::from);
+        for (parent, extras, expected) in [
+            // Finder's PATH gains Homebrew after the user's entries.
             (
-                "/usr/bin::./bin:bin:/bin",
-                vec!["/usr/bin", "/bin", MACOS_HOMEBREW_BIN],
+                vec![usr.clone(), bin.clone()],
+                homebrew.clone(),
+                vec![usr.clone(), bin.clone(), brew_dir, local_dir],
             ),
+            // An entry already on PATH keeps its place.
+            (
+                vec![custom.clone(), brew.clone(), usr.clone()],
+                vec![PathBuf::from(&brew)],
+                vec![custom, brew.clone(), usr.clone()],
+            ),
+            // Empty and relative entries would resolve inside the repository.
+            (
+                vec![
+                    usr.clone(),
+                    String::new(),
+                    "./bin".to_owned(),
+                    "bin".to_owned(),
+                    bin.clone(),
+                ],
+                vec![PathBuf::from(&brew)],
+                vec![usr.clone(), bin.clone(), brew.clone()],
+            ),
+            (vec![String::new()], vec![PathBuf::from(&brew)], vec![brew]),
+            (vec![".".to_owned(), usr.clone()], Vec::new(), vec![usr]),
         ] {
-            let extended = extend_path_for_gui(OsStr::new(parent), &extras);
+            let path = git_child_path(&joined(&parent), &extras);
             assert_eq!(
-                std::env::split_paths(&extended).collect::<Vec<_>>(),
+                std::env::split_paths(&path).collect::<Vec<_>>(),
                 expected.iter().map(PathBuf::from).collect::<Vec<_>>(),
-                "{parent:?} -> {extended:?}"
+                "{parent:?} + {extras:?}"
             );
         }
     }
 
     #[test]
-    fn apply_gui_path_records_homebrew_at_the_end_of_the_child_path() {
-        let mut command = Command::new("git");
-        let finder = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
-        let extras = macos_gui_path_dirs(|dir| dir == Path::new(MACOS_HOMEBREW_BIN));
-        apply_gui_path(&mut command, Some(&joined(&finder)), &extras);
-        let path = command
-            .get_envs()
-            .find(|(key, _)| *key == "PATH")
-            .and_then(|(_, value)| value)
-            .expect("PATH");
-        let dirs: Vec<_> = std::env::split_paths(path).collect();
-        assert_eq!(
-            dirs.first().map(PathBuf::as_path),
-            Some(Path::new("/usr/bin")),
-            "{dirs:?}"
-        );
-        assert_eq!(
-            dirs.last().map(PathBuf::as_path),
-            Some(Path::new(MACOS_HOMEBREW_BIN))
-        );
-    }
-
-    #[test]
-    fn apply_gui_path_leaves_path_inherited_when_no_extra_dir_exists() {
-        let mut command = Command::new("git");
-        apply_gui_path(&mut command, Some(OsStr::new("/usr/bin")), &[]);
-        assert!(command.get_envs().all(|(key, _)| key != "PATH"));
+    fn apply_child_path_sets_only_a_path_that_changes() {
+        let usr = abs("/usr/bin");
+        let brew = [PathBuf::from(abs("/brew/bin"))];
+        let clean = joined(std::slice::from_ref(&usr));
+        let dirty = joined(&[".".to_owned(), usr.clone()]);
+        let with_brew = joined(&[usr.clone(), abs("/brew/bin")]);
+        let only_relative = joined(&[".".to_owned(), String::new()]);
+        // `None`: inherited. `Some(None)`: removed. `Some(Some(path))`: set.
+        for (parent, extras, expected) in [
+            (Some(&clean), &[][..], None),
+            (None, &[][..], None),
+            (Some(&dirty), &[][..], Some(Some(clean.clone()))),
+            (Some(&only_relative), &[][..], Some(None)),
+            (Some(&clean), &brew[..], Some(Some(with_brew))),
+            (None, &brew[..], Some(Some(joined(&[abs("/brew/bin")])))),
+        ] {
+            let mut command = Command::new("git");
+            apply_child_path(&mut command, parent.map(OsString::as_os_str), extras);
+            let path = command
+                .get_envs()
+                .find(|(key, _)| *key == "PATH")
+                .map(|(_, value)| value.map(OsStr::to_os_string));
+            assert_eq!(path, expected, "{parent:?} + {extras:?}");
+        }
     }
 
     #[test]
