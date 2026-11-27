@@ -84,9 +84,9 @@ jobs:
           echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool" | sha256sum -c
           chmod +x appimagetool
           echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
         with:
-          tool: cargo-deb@3.8.0,cargo-generate-rpm@0.21.0
+          tool: cargo-deb@3.8.0,cargo-generate-rpm@0.21.1
 
       # PNG only: KDE draws SVG icons with Qt SVG, which lacks feTurbulence and
       # feDropShadow, so installing icon.svg itself would render it broken.
@@ -200,7 +200,7 @@ jobs:
           test -f squashfs-root/usr/share/doc/cthulhu-git/fonts/FONTS.md
           test -f squashfs-root/usr/share/doc/cthulhu-git/fonts/ubuntu/LICENCE.txt
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.TARGET }}
           path: |
@@ -213,7 +213,7 @@ jobs:
 
   windows:
     name: Windows x86-64 (zip)
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 30
     env:
       TARGET: x86_64-pc-windows-msvc
@@ -314,7 +314,7 @@ jobs:
           cd dist
           7z a "$name.zip" "$name"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.TARGET }}
           path: dist/*.zip
@@ -323,7 +323,7 @@ jobs:
 
   macos:
     name: macOS universal app (dmg)
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 30
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
@@ -342,7 +342,7 @@ jobs:
           cargo build --release --locked --target aarch64-apple-darwin
           cargo build --release --locked --target x86_64-apple-darwin
 
-      # macos-latest runs on Apple Silicon.
+      # macos-26 runs on Apple Silicon.
       - name: resvg
         run: |
           set -Eeuo pipefail
@@ -471,7 +471,7 @@ jobs:
           hdiutil detach "$mount"
           trap - EXIT
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-universal
           path: dist/*.dmg
