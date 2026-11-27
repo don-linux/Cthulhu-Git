@@ -11,7 +11,7 @@ Goal: fewer test lines with the same protection. Evidence decides, not taste.
 ## 1. Baseline
 
 ```bash
-cargo test --locked                     # must be green first (nextest once ETXTBSY is fixed)
+cargo nextest run                       # must be green first
 cargo llvm-cov --html --ignore-filename-regex '(_tests|test_support)\.rs$' \
   --output-dir target/cov-base
 cargo mutants --list -f <file> | wc -l  # size the mutation run
@@ -33,7 +33,7 @@ killed it, so compare whole runs.
 ## 3. Change, then prove
 
 ```bash
-cargo test --locked
+cargo nextest run
 cargo llvm-cov --html ... --output-dir target/cov-new   # covered prod lines must not drop
 cargo mutants -f <file> -j2 -o target/mut-new
 comm -23 <(sort target/mut-base/mutants.out/caught.txt) \

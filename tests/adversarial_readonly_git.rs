@@ -11,6 +11,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::env;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -69,16 +71,7 @@ exit 0
 
 fn shared_script() -> &'static Path {
     static SCRIPT_PATH: OnceLock<PathBuf> = OnceLock::new();
-    SCRIPT_PATH.get_or_init(|| {
-        let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cthulhu-adv-d-fake-git.sh");
-        fs::write(&path, FAKE_GIT_SCRIPT).expect("write shared fake git");
-        let mut permissions = fs::metadata(&path)
-            .expect("fake git metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("chmod fake git");
-        path
-    })
+    SCRIPT_PATH.get_or_init(|| common::shared_script("cthulhu-adv-d-fake-git.sh", FAKE_GIT_SCRIPT))
 }
 
 fn sidecar(link: &Path, suffix: &str) -> PathBuf {

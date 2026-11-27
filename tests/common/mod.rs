@@ -229,9 +229,10 @@ pub fn sh_quote(path: &Path) -> String {
 
 /// One executable per `name` under `CARGO_TARGET_TMPDIR`, mode `0755`.
 ///
-/// The body is POSIX `sh`. A missing shebang is given `#!/bin/sh`. The file
-/// is published with a rename so a concurrent exec keeps the previous inode
-/// (`ETXTBSY`).
+/// The body is POSIX `sh`. A missing shebang is given `#!/bin/sh`. Test
+/// processes run in parallel and exec this file while others publish it, so
+/// it is written under a unique temporary name, closed, and then renamed into
+/// place: the published inode is never open for writing (`ETXTBSY`).
 pub fn shared_script(name: &str, body: &str) -> PathBuf {
     static SCRIPTS: OnceLock<Mutex<std::collections::HashMap<String, PathBuf>>> = OnceLock::new();
     let scripts = SCRIPTS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
@@ -243,21 +244,20 @@ pub fn shared_script(name: &str, body: &str) -> PathBuf {
         panic!("CARGO_TARGET_TMPDIR is set when integration tests compile shared_script");
     });
     let path = Path::new(root).join(name);
-    let staged = path.with_extension("tmp");
     let text = if body.starts_with("#!") {
         body.to_owned()
     } else {
         format!("#!/bin/sh\n{body}")
     };
-    {
-        let mut file = File::create(&staged)
-            .unwrap_or_else(|error| panic!("write {}: {error}", staged.display()));
-        file.write_all(text.as_bytes())
-            .unwrap_or_else(|error| panic!("write {}: {error}", staged.display()));
-        let _ = file.sync_all();
-    }
+    let mut staged = tempfile::NamedTempFile::new_in(root)
+        .unwrap_or_else(|error| panic!("stage {}: {error}", path.display()));
+    staged
+        .write_all(text.as_bytes())
+        .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    let staged = staged.into_temp_path();
     set_executable(&staged);
-    fs::rename(&staged, &path)
+    staged
+        .persist(&path)
         .unwrap_or_else(|error| panic!("install {}: {error}", path.display()));
     guard.insert(name.to_owned(), path.clone());
     path

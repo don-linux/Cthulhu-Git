@@ -2389,20 +2389,22 @@ echo "unexpected fake git ($subcommand): $*" >&2
 exit 1
 "#;
 
+/// Test processes run in parallel and exec this script while others publish
+/// it, so it is written under a unique temporary name, closed, and renamed
+/// into place: the published inode is never open for writing (`ETXTBSY`).
 #[cfg(unix)]
 fn shared_fake_script() -> &'static Path {
     static SCRIPT: OnceLock<PathBuf> = OnceLock::new();
     SCRIPT.get_or_init(|| {
-        let path = quota_temp_root().join("cthulhu-adv-ui-fake-git.sh");
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).expect("fake git script directory");
-        }
-        fs::write(&path, FAKE_GIT_SCRIPT).expect("write shared fake git");
-        let mut permissions = fs::metadata(&path)
-            .expect("fake git metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("chmod fake git");
+        let dir = quota_temp_root();
+        fs::create_dir_all(&dir).expect("fake git script directory");
+        let path = dir.join("cthulhu-adv-ui-fake-git.sh");
+        let mut staged = tempfile::NamedTempFile::new_in(&dir).expect("stage fake git");
+        std::io::Write::write_all(&mut staged, FAKE_GIT_SCRIPT.as_bytes())
+            .expect("write shared fake git");
+        let staged = staged.into_temp_path();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("chmod fake git");
+        staged.persist(&path).expect("install fake git");
         path
     })
 }

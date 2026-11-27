@@ -1,9 +1,8 @@
 # cargo-mutants: https://mutants.rs/
-# cargo test until the git-fake helpers stop rewriting a shared script in
-# place: under nextest's process-per-test model that races (ETXTBSY) and a
-# spurious failure would count a mutant as caught. Then switch to
-# test_tool = "nextest" and select its profile with NEXTEST_PROFILE=mutants
-# (`profile` here would be a Cargo build profile).
+# cargo test until the two timeout tests stop taking 60 s: the nextest
+# `mutants` profile ends a test after 60 s, so the baseline would fail. Then
+# switch to test_tool = "nextest" and select its profile with
+# NEXTEST_PROFILE=mutants (`profile` here would be a Cargo build profile).
 test_tool = "cargo"
 exclude_globs = [
     "src/main.rs",

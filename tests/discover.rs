@@ -1,10 +1,11 @@
 //! Discovery against fake git executables.
 //!
 //! Every fake is a symlink to one shared shell script that prints the version
-//! stored next to the link. Writing a fresh executable per test would race with
-//! other test threads forking (`ETXTBSY`), so the script is written only once,
-//! before any fake is spawned.
+//! stored next to the link. [`common::shared_script`] publishes it with a
+//! rename, so no process ever runs it while it is open for writing (`ETXTBSY`).
 #![cfg(unix)]
+
+mod common;
 
 use std::env;
 use std::fs;
@@ -23,12 +24,7 @@ echo "git version $version"
 
 fn shared_script() -> &'static Path {
     static SCRIPT_PATH: OnceLock<PathBuf> = OnceLock::new();
-    SCRIPT_PATH.get_or_init(|| {
-        let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cthulhu-fake-git.sh");
-        fs::write(&path, SCRIPT).expect("write fake git script");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
-        path
-    })
+    SCRIPT_PATH.get_or_init(|| common::shared_script("cthulhu-fake-git.sh", SCRIPT))
 }
 
 /// Creates `dir/name` answering `git version <version>`; `"broken"` exits 1.
