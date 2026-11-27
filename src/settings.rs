@@ -12,8 +12,8 @@ pub const MAX_RECENT_REPOSITORIES: usize = 10;
 /// Saved font ids are cut here, on a char boundary. A longer name is not stored raw.
 const MAX_FONT_NAME_BYTES: usize = 128;
 
-/// Every field has a default, so files written by older or newer versions
-/// still load: missing fields take the default and unknown ones are ignored.
+/// Files written by older or newer versions still load: a missing field takes
+/// its value from [`Settings::default`] and unknown ones are ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -23,7 +23,7 @@ pub struct Settings {
     pub last_repository: Option<PathBuf>,
     /// Repository roots, newest first, without duplicates.
     /// JSON `null` is the empty list, so one null field does not reject the file.
-    #[serde(default, deserialize_with = "null_as_default")]
+    #[serde(deserialize_with = "null_as_default")]
     pub recent_repositories: Vec<PathBuf>,
     /// Whether the branches sidebar of the repository view is hidden.
     /// The JSON name is historical: this flag used to hide the commit list,
@@ -35,20 +35,17 @@ pub struct Settings {
     pub detail_sidebar_hidden: bool,
     /// Whether the terminal strip in the right sidebar is hidden.
     /// A missing field keeps the terminal hidden, unlike the sidebars.
-    /// `#[serde(default)]` on the struct fills a missing bool with `false`,
-    /// so this field names its own default.
-    #[serde(default = "default_terminal_hidden")]
     pub terminal_hidden: bool,
     /// Interface typeface. `None`, blank, or an unknown id keeps Ubuntu.
     /// An id from the bundled catalog, not a file path or a system family.
     /// A value that is not a string is ignored, so the rest of the file loads.
-    #[serde(default, deserialize_with = "lenient_font")]
+    #[serde(deserialize_with = "lenient_font")]
     pub ui_font: Option<String>,
     /// Font drawn in the terminal. `None`, blank, or an unknown id keeps
     /// Meslo LGS NF. `builtin` keeps the monospace shipped with the app.
     /// Any other value is an id from the bundled catalog, not a file path.
     /// A value that is not a string is ignored, so the rest of the file loads.
-    #[serde(default, deserialize_with = "lenient_font")]
+    #[serde(deserialize_with = "lenient_font")]
     pub terminal_font: Option<String>,
     /// Width of each commit history column. A value that is not an object
     /// keeps every default; a bad field keeps only its own default.
@@ -56,22 +53,11 @@ pub struct Settings {
     pub history_columns: HistoryColumns,
     /// Author avatars are downloaded from GitHub and Gravatar. Off draws
     /// initials only and sends nothing.
-    #[serde(default = "default_author_avatars")]
     pub author_avatars: bool,
     /// A GitHub token was saved in the system keychain. The token itself is
     /// never written here; this flag only says whether to look for it, so a
     /// user without a token never triggers a keychain prompt.
     pub github_token_in_keyring: bool,
-}
-
-/// Older settings files omit the field. The terminal stays hidden until the
-/// user shows it.
-fn default_terminal_hidden() -> bool {
-    true
-}
-
-fn default_author_avatars() -> bool {
-    true
 }
 
 /// Width of each commit history column, in thousandths of the history panel.
@@ -178,11 +164,11 @@ impl Default for Settings {
             recent_repositories: Vec::new(),
             history_sidebar_hidden: false,
             detail_sidebar_hidden: false,
-            terminal_hidden: default_terminal_hidden(),
+            terminal_hidden: true,
             ui_font: None,
             terminal_font: None,
             history_columns: HistoryColumns::default(),
-            author_avatars: default_author_avatars(),
+            author_avatars: true,
             github_token_in_keyring: false,
         }
     }
@@ -498,14 +484,21 @@ mod tests {
             ),
             // Older files: sidebars show, the terminal stays hidden, fonts,
             // columns and avatars keep their defaults, no keychain lookup.
-            // The two `true` fields are spelled out: `Settings::default()`
-            // reads the same functions serde does.
+            // Spelled out: serde fills a missing field from `Settings::default()`.
             (
                 r#"{ "recent_repositories": [] }"#,
                 Some(Settings {
+                    theme: None,
+                    last_repository: None,
+                    recent_repositories: Vec::new(),
+                    history_sidebar_hidden: false,
+                    detail_sidebar_hidden: false,
                     terminal_hidden: true,
+                    ui_font: None,
+                    terminal_font: None,
+                    history_columns: defaults,
                     author_avatars: true,
-                    ..Settings::default()
+                    github_token_in_keyring: false,
                 }),
             ),
             (r#"{ "theme": "abyss" }"#, Some(abyss())),
