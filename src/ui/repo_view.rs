@@ -480,12 +480,13 @@ fn branch_metrics(branch: &Branch) -> String {
     };
     match &branch.upstream {
         Upstream::None => format!("{commits} · no upstream"),
-        Upstream::Gone { name } if name.is_empty() => format!("{commits} · upstream gone"),
-        Upstream::Gone { name } => format!("{commits} · {name} · upstream gone"),
+        Upstream::Gone { name, .. } if name.is_empty() => format!("{commits} · upstream gone"),
+        Upstream::Gone { name, .. } => format!("{commits} · {name} · upstream gone"),
         Upstream::Tracking {
             name,
             ahead,
             behind,
+            ..
         } => {
             let relation = match (*ahead, *behind) {
                 (0, 0) => "in sync".to_owned(),
@@ -923,8 +924,8 @@ fn unavailable(fetch_hover: &'static str, pull_hover: &'static str) -> SyncOffer
     }
 }
 
-/// Fetch when the current branch has an upstream name git can be given.
-/// Pull only while that upstream is still tracking.
+/// Fetch when the current branch's upstream is a remote-tracking ref. Pull
+/// while the upstream is still there, remote or local.
 fn sync_offer(head: &Head, branches: &[ListedBranch]) -> SyncOffer {
     let (Head::Branch(name) | Head::Unborn(name)) = head else {
         return unavailable(
@@ -938,19 +939,35 @@ fn sync_offer(head: &Head, branches: &[ListedBranch]) -> SyncOffer {
             "Pull needs a branch with an upstream.",
         );
     };
+    let fetch = |remote: bool| {
+        if remote {
+            (Some(name.clone()), "Fetch current branch")
+        } else {
+            (
+                None,
+                "The upstream is a local branch; there is nothing to fetch.",
+            )
+        }
+    };
     match &listed.branch.upstream {
-        Upstream::Tracking { .. } => SyncOffer {
-            fetch_branch: Some(name.clone()),
-            pull: true,
-            fetch_hover: "Fetch current branch",
-            pull_hover: "Pull current branch (fast-forward only)",
-        },
-        Upstream::Gone { .. } => SyncOffer {
-            fetch_branch: Some(name.clone()),
-            pull: false,
-            fetch_hover: "Fetch current branch",
-            pull_hover: "The upstream branch is gone.",
-        },
+        Upstream::Tracking { remote, .. } => {
+            let (fetch_branch, fetch_hover) = fetch(*remote);
+            SyncOffer {
+                fetch_branch,
+                pull: true,
+                fetch_hover,
+                pull_hover: "Pull current branch (fast-forward only)",
+            }
+        }
+        Upstream::Gone { remote, .. } => {
+            let (fetch_branch, fetch_hover) = fetch(*remote);
+            SyncOffer {
+                fetch_branch,
+                pull: false,
+                fetch_hover,
+                pull_hover: "The upstream branch is gone.",
+            }
+        }
         Upstream::None => unavailable(
             "This branch has no upstream.",
             "Pull needs a branch with an upstream.",
@@ -1060,6 +1077,7 @@ mod tests {
                 12,
                 Upstream::Tracking {
                     name: "origin/main".to_owned(),
+                    remote: true,
                     ahead: 2,
                     behind: 1,
                 },
@@ -1071,6 +1089,7 @@ mod tests {
                 4,
                 Upstream::Tracking {
                     name: "origin/main".to_owned(),
+                    remote: true,
                     ahead: 0,
                     behind: 0,
                 },
@@ -1082,6 +1101,7 @@ mod tests {
                 3,
                 Upstream::Tracking {
                     name: "origin/main".to_owned(),
+                    remote: true,
                     ahead: 2,
                     behind: 0,
                 },
@@ -1093,6 +1113,7 @@ mod tests {
                 3,
                 Upstream::Gone {
                     name: "origin/main".to_owned(),
+                    remote: true,
                 },
             )),
             "3 commits · origin/main · upstream gone"
@@ -1102,6 +1123,7 @@ mod tests {
                 3,
                 Upstream::Gone {
                     name: String::new(),
+                    remote: false,
                 },
             )),
             "3 commits · upstream gone"
@@ -1116,32 +1138,42 @@ mod tests {
     }
 
     #[test]
-    fn sync_offer_fetches_and_pulls_a_tracking_branch() {
-        let offer = sync_offer(
-            &Head::Branch("main".to_owned()),
-            &[listed(Upstream::Tracking {
-                name: "origin/main".to_owned(),
-                ahead: 0,
-                behind: 1,
-            })],
-        );
-        assert_eq!(offer.fetch_branch.as_deref(), Some("main"));
-        assert!(offer.pull);
-        assert_eq!(offer.fetch_hover, "Fetch current branch");
-        assert_eq!(offer.pull_hover, "Pull current branch (fast-forward only)");
-    }
-
-    #[test]
-    fn sync_offer_fetches_a_gone_upstream_without_pulling() {
-        let offer = sync_offer(
-            &Head::Branch("main".to_owned()),
-            &[listed(Upstream::Gone {
-                name: "origin/main".to_owned(),
-            })],
-        );
-        assert_eq!(offer.fetch_branch.as_deref(), Some("main"));
-        assert!(!offer.pull);
-        assert_eq!(offer.pull_hover, "The upstream branch is gone.");
+    fn sync_offer_fetches_a_remote_upstream_and_pulls_while_it_exists() {
+        const FETCH: &str = "Fetch current branch";
+        const LOCAL: &str = "The upstream is a local branch; there is nothing to fetch.";
+        const PULL: &str = "Pull current branch (fast-forward only)";
+        const GONE: &str = "The upstream branch is gone.";
+        let tracking = |remote| Upstream::Tracking {
+            name: "origin/main".to_owned(),
+            remote,
+            ahead: 0,
+            behind: 1,
+        };
+        let gone = |remote| Upstream::Gone {
+            name: "origin/main".to_owned(),
+            remote,
+        };
+        for (upstream, fetch, pull, fetch_hover, pull_hover) in [
+            (tracking(true), Some("main"), true, FETCH, PULL),
+            (gone(true), Some("main"), false, FETCH, GONE),
+            (tracking(false), None, true, LOCAL, PULL),
+            (gone(false), None, false, LOCAL, GONE),
+        ] {
+            let offer = sync_offer(
+                &Head::Branch("main".to_owned()),
+                &[listed(upstream.clone())],
+            );
+            assert_eq!(
+                (
+                    offer.fetch_branch.as_deref(),
+                    offer.pull,
+                    offer.fetch_hover,
+                    offer.pull_hover
+                ),
+                (fetch, pull, fetch_hover, pull_hover),
+                "{upstream:?}"
+            );
+        }
     }
 
     #[test]

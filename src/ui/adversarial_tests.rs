@@ -1692,6 +1692,7 @@ fn fetch_and_pull_sit_beside_the_branch_name() {
     seed_latest_hover(&mut repo);
     repo.branches[0].branch.upstream = Upstream::Tracking {
         name: "origin/main".to_owned(),
+        remote: true,
         ahead: 1,
         behind: 0,
     };
@@ -1755,6 +1756,7 @@ fn fetch_and_pull_sit_beside_the_branch_name() {
     repo.branches[0].branch.name = long.clone();
     repo.branches[0].branch.upstream = Upstream::Tracking {
         name: "origin/main".to_owned(),
+        remote: true,
         ahead: 0,
         behind: 0,
     };
@@ -2364,7 +2366,7 @@ case "$subcommand" in
     exit 0
     ;;
   for-each-ref)
-    printf '%s\037%s\037%s\037%s\037%s\n' main "$OID" "" "" 1700000000
+    printf '%s\037%s\037%s\037%s\037%s\037%s\n' main "$OID" "" "" "" 1700000000
     exit 0
     ;;
   rev-list)

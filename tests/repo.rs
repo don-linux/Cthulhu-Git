@@ -351,6 +351,7 @@ fn branches_report_commit_counts_and_ahead_behind() {
         feature.upstream,
         Upstream::Tracking {
             name: "main".to_owned(),
+            remote: false,
             ahead: 1,
             behind: 0,
         }

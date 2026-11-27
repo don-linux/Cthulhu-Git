@@ -34,9 +34,14 @@ pub enum Upstream {
     /// `branch.<name>.merge` is set, but the upstream ref is gone.
     Gone {
         name: String,
+        remote: bool,
     },
     Tracking {
         name: String,
+        /// The upstream is a remote-tracking ref (`refs/remotes/…`), which a
+        /// fetch can update. A branch that tracks a local branch
+        /// (`branch.<name>.remote = .`) has nothing to fetch.
+        remote: bool,
         ahead: u64,
         behind: u64,
     },
@@ -57,7 +62,7 @@ struct ParsedRef {
 pub fn branches(git: &Git, root: &Path, head: &Head) -> Result<Vec<Branch>, GitError> {
     let separator = FIELD_SEPARATOR as char;
     let format = format!(
-        "--format=%(refname:short){separator}%(objectname){separator}%(upstream:short){separator}%(upstream:track){separator}%(committerdate:unix)"
+        "--format=%(refname:short){separator}%(objectname){separator}%(upstream:short){separator}%(upstream){separator}%(upstream:track){separator}%(committerdate:unix)"
     );
     let args = ["for-each-ref", format.as_str(), "refs/heads"];
     let output = git.require_ok(root, &args)?;
@@ -112,7 +117,8 @@ fn parse_count(stdout: &[u8]) -> Option<u64> {
     std::str::from_utf8(&bytes).ok()?.parse().ok()
 }
 
-/// `name SEP oid SEP upstream SEP track SEP committer-time`, one branch per line.
+/// `name SEP oid SEP upstream SEP upstream-ref SEP track SEP committer-time`,
+/// one branch per line.
 /// The committer time is Unix seconds, empty when the ref has no commit.
 fn parse_refs(stdout: &[u8]) -> Option<Vec<ParsedRef>> {
     let mut refs = Vec::new();
@@ -129,10 +135,11 @@ fn parse_refs(stdout: &[u8]) -> Option<Vec<ParsedRef>> {
 }
 
 fn parse_ref_line(line: &[u8]) -> Option<ParsedRef> {
-    let mut parts = line.splitn(5, |byte| *byte == FIELD_SEPARATOR);
+    let mut parts = line.splitn(6, |byte| *byte == FIELD_SEPARATOR);
     let name = parts.next()?;
     let oid = parts.next()?;
     let upstream = parts.next()?;
+    let remote = parts.next()?.starts_with(b"refs/remotes/");
     let track = parts.next()?;
     let committer_time = parts.next()?;
     if name.is_empty() {
@@ -152,7 +159,7 @@ fn parse_ref_line(line: &[u8]) -> Option<ParsedRef> {
         name,
         oid,
         committer_time: parse_committer_time(committer_time)?,
-        upstream: classify_upstream(&upstream, &track)?,
+        upstream: classify_upstream(&upstream, remote, &track)?,
     })
 }
 
@@ -172,10 +179,11 @@ fn parse_committer_time(bytes: &[u8]) -> Option<Option<i64>> {
 
 /// `%(upstream:track)` is empty when there is no upstream and when the branch
 /// is even with its upstream. `[gone]` means the upstream ref disappeared.
-fn classify_upstream(name: &str, track: &str) -> Option<Upstream> {
+fn classify_upstream(name: &str, remote: bool, track: &str) -> Option<Upstream> {
     if track == "[gone]" {
         return Some(Upstream::Gone {
             name: name.to_owned(),
+            remote,
         });
     }
     if name.is_empty() && track.is_empty() {
@@ -188,6 +196,7 @@ fn classify_upstream(name: &str, track: &str) -> Option<Upstream> {
     };
     Some(Upstream::Tracking {
         name: name.to_owned(),
+        remote,
         ahead,
         behind,
     })
@@ -249,9 +258,16 @@ mod tests {
         line_with_oid(name, OID, upstream, track, "1700000000")
     }
 
+    /// The upstream ref is derived from the short name: with a `/` it is a
+    /// remote-tracking ref, without one a local branch.
     fn line_with_oid(name: &str, oid: &str, upstream: &str, track: &str, when: &str) -> Vec<u8> {
+        let full = match upstream {
+            "" => String::new(),
+            short if short.contains('/') => format!("refs/remotes/{short}"),
+            short => format!("refs/heads/{short}"),
+        };
         let mut out = name.as_bytes().to_vec();
-        for field in [oid, upstream, track, when] {
+        for field in [oid, upstream, &full, track, when] {
             out.push(FIELD_SEPARATOR);
             out.extend_from_slice(field.as_bytes());
         }
@@ -279,6 +295,7 @@ mod tests {
             refs[0].upstream,
             Upstream::Tracking {
                 name: "main".to_owned(),
+                remote: false,
                 ahead: 1,
                 behind: 2
             }
@@ -287,6 +304,7 @@ mod tests {
             refs[1].upstream,
             Upstream::Tracking {
                 name: "origin/topic".to_owned(),
+                remote: true,
                 ahead: 4,
                 behind: 0
             }
@@ -295,6 +313,7 @@ mod tests {
             refs[2].upstream,
             Upstream::Tracking {
                 name: "origin/old".to_owned(),
+                remote: true,
                 ahead: 0,
                 behind: 3
             }
@@ -303,6 +322,7 @@ mod tests {
             refs[3].upstream,
             Upstream::Tracking {
                 name: "origin/even".to_owned(),
+                remote: true,
                 ahead: 0,
                 behind: 0
             }
@@ -311,7 +331,8 @@ mod tests {
         assert_eq!(
             refs[5].upstream,
             Upstream::Gone {
-                name: "origin/missing".to_owned()
+                name: "origin/missing".to_owned(),
+                remote: true,
             }
         );
     }
@@ -333,6 +354,7 @@ mod tests {
             refs[0].upstream,
             Upstream::Tracking {
                 name: "main".to_owned(),
+                remote: false,
                 ahead: 1,
                 behind: 0
             }

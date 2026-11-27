@@ -267,7 +267,7 @@ fn many_branches_do_not_spawn_one_rev_list_each() {
         refs.extend(name.as_bytes());
         refs.push(0x1f);
         refs.extend(oid.as_bytes());
-        refs.extend_from_slice(b"\x1f\x1f\x1f1700000000\n");
+        refs.extend_from_slice(b"\x1f\x1f\x1f\x1f1700000000\n");
     }
     fs::write(sidecar(&link, ".refs"), refs).expect("refs sidecar");
     let invocations = sidecar(&link, ".invocations");
