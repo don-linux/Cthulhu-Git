@@ -66,7 +66,7 @@ fn assert_parse(error: &SettingsError) {
     assert!(matches!(error, SettingsError::Parse(..)), "{error:?}");
     let message = error.to_string();
     assert!(
-        message.contains("using the defaults until a setting changes."),
+        message.contains("using the defaults and leaving the file as it is."),
         "{message}"
     );
 }

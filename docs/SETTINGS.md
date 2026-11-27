@@ -6,7 +6,8 @@ Map of the settings logic. Update this file when you change it.
 
 ```text
 startup   Settings::default_path() -> Settings::load_from(path)
-          missing file -> defaults; unreadable/invalid -> defaults + error banner
+          missing file -> defaults; unreadable/invalid -> defaults + error banner,
+          and nothing is saved that session, so the file is left as it is
 decide    command-line folder > settings.last_repository > home screen
 change    mutate CthulhuApp.settings -> CthulhuApp::save_settings() -> Settings::save_to(path)
 token     github_token_in_keyring -> GitHubAuth::load reads the keychain on a worker thread

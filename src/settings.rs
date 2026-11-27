@@ -399,7 +399,7 @@ impl fmt::Display for SettingsError {
             }
             Self::Parse(path, error) => write!(
                 f,
-                "Settings file {} is invalid ({error}); using the defaults until a setting changes.",
+                "Settings file {} is invalid ({error}); using the defaults and leaving the file as it is.",
                 path.display()
             ),
             Self::Write(path, error) => {
