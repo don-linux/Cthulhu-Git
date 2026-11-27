@@ -930,7 +930,7 @@ fn adversarial_home_keeps_last_repository() {
     let sandbox = Sandbox::new();
     let repo = GitRepo::init("rlyeh-valid");
     repo.empty_commit("Awaken");
-    let canonical = fs::canonicalize(&repo.root).expect("canonical repo");
+    let canonical = dunce::canonicalize(&repo.root).expect("canonical repo");
 
     let mut harness = sandbox.app(Some(repo.root.clone()));
     settle_open(&mut harness);
