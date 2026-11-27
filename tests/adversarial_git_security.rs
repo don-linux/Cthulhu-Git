@@ -1911,11 +1911,12 @@ fn pull_ff_only_fast_forwards_when_pull_rebase_is_false_and_behind_upstream() {
 }
 
 #[test]
-fn fetch_updates_the_tracking_ref_of_a_remote_with_a_slash() {
+fn fetch_updates_the_tracking_ref_git_names_as_upstream() {
     let origin = Fixture::init();
     origin.write("tracked.txt", "base\n");
     origin.git(&["add", "tracked.txt"]);
     origin.git(&["commit", "-m", "base"]);
+    origin.git(&["branch", "other"]);
     let local_tmp = TempDir::with_prefix("cthulhu-adv-fetch-").expect("local temp");
     let local_root = local_tmp.path().join("clone");
     let origin_path = fs::canonicalize(&origin.root).expect("origin path");
@@ -1932,6 +1933,11 @@ fn fetch_updates_the_tracking_ref_of_a_remote_with_a_slash() {
     // `%(upstream:short)` is now `team/origin/main`: splitting it at the first
     // `/` would fetch from a remote called `team`.
     run(&local_root, &["remote", "rename", "origin", "team/origin"]);
+    // git's upstream is the first `merge` value; `--get` would read the last.
+    run(
+        &local_root,
+        &["config", "--add", "branch.main.merge", "refs/heads/other"],
+    );
     origin.write("tracked.txt", "origin ahead\n");
     origin.git(&["add", "tracked.txt"]);
     origin.git(&["commit", "-m", "origin ahead"]);

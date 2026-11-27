@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use super::exec::{Git, GitError, rejected};
+use super::exec::{Git, GitError, classify_failure, rejected};
 
 /// Fetch and pull talk to a network. A local read stays on the shorter limit.
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(3 * 60);
@@ -78,8 +78,12 @@ fn refspec_forbidden(ch: char) -> bool {
 
 /// Fetches the upstream of local `branch` into its remote-tracking ref.
 pub fn fetch(git: &Git, root: &Path, branch: &str) -> Result<(), GitError> {
-    let remote = config_value(git, root, &format!("branch.{branch}.remote"))?;
-    let merge = config_value(git, root, &format!("branch.{branch}.merge"))?;
+    // `%(upstream)` comes from the last `remote` and the first `merge`, the
+    // pair git itself uses, so the refspec matches the tracking ref.
+    let remote = config_values(git, root, &format!("branch.{branch}.remote"))?.pop();
+    let merge = config_values(git, root, &format!("branch.{branch}.merge"))?
+        .into_iter()
+        .next();
     let tracking = git.require_ok(
         root,
         &[
@@ -103,14 +107,25 @@ pub fn fetch(git: &Git, root: &Path, branch: &str) -> Result<(), GitError> {
     Ok(())
 }
 
-/// `git config --get <key>`, or `None` when the key is not set.
-fn config_value(git: &Git, root: &Path, key: &str) -> Result<Option<String>, GitError> {
-    let output = git.run(root, &["config", "--get", key])?;
-    if !output.status.success() {
-        return Ok(None);
+/// Every value of `key`, in the order git reads them. Empty when the key is
+/// not set; any other failure, such as a broken config file, is an error.
+fn config_values(git: &Git, root: &Path, key: &str) -> Result<Vec<String>, GitError> {
+    let args = ["config", "--get-all", "-z", key];
+    let output = git.run(root, &args)?;
+    if output.status.code() == Some(1) {
+        return Ok(Vec::new());
     }
-    let value = String::from_utf8_lossy(&output.stdout);
-    Ok(Some(value.trim_end_matches(['\n', '\r']).to_owned()))
+    if !output.status.success() {
+        return Err(classify_failure(root, &args, output.status, &output.stderr));
+    }
+    let mut values: Vec<String> = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .map(|value| String::from_utf8_lossy(value).into_owned())
+        .collect();
+    // `-z` ends every value with NUL, so the last piece is empty.
+    values.pop();
+    Ok(values)
 }
 
 /// Fast-forwards the current branch to its upstream. Anything else is an error
