@@ -156,6 +156,25 @@ fn output_past_the_cap_is_refused() {
     }
 }
 
+/// GitHub CLI exits while a grandchild that left its process group holds
+/// its stdout. The token import gives up when its time is up instead of
+/// waiting for that grandchild. The fake git stands in for `gh`: its mode
+/// answers `auth token` like any other command.
+#[cfg(unix)]
+#[test]
+fn a_gh_grandchild_holding_stdout_does_not_pin_the_token_import() {
+    let tmp = temp();
+    let gh = fake_git(&tmp.path().join("gh"), "2.43.0", "setsid-writer");
+    let dir = tmp.path().as_os_str().to_owned();
+    let result = within("setsid gh", Duration::from_secs(20), move || {
+        let path = |name: &str| (name == "PATH").then(|| dir.clone());
+        cthulhu_git::github::gh_cli_token(path).map(|token| token.expose().to_owned())
+    });
+    let timed_out = "GitHub CLI did not answer in time.";
+    assert_eq!(result.as_ref().map_err(String::as_str), Err(timed_out));
+    kill_sleeper(&sidecar(&gh, ".pid"));
+}
+
 /// Git exits while a grandchild still holds its stdout. The call does not
 /// wait for the grandchild. Stopping git's group ends a writer in it, and the
 /// call returns git's result. A writer that left the group with `setsid` is
@@ -183,19 +202,23 @@ fn background_writer_does_not_pin_a_finished_git() {
                 matches!(&result, Err(GitError::Spawn(_))),
                 "{case:?}: {result:?}"
             );
-            // Nothing of git's reaches it, so the test stops it.
-            let pid: i32 = fs::read_to_string(&pid_file)
-                .expect("pid file")
-                .trim()
-                .parse()
-                .expect("pid");
-            let sleeper = rustix::process::Pid::from_raw(pid).filter(|_| pid > 1);
-            let _ = rustix::process::kill_process(
-                sleeper.expect("a child pid"),
-                rustix::process::Signal::KILL,
-            );
+            kill_sleeper(&pid_file);
         }
     }
+}
+
+/// Stops a sleeper that left the process group: nothing of the command
+/// that started it reaches it.
+#[cfg(unix)]
+fn kill_sleeper(pid_file: &Path) {
+    let pid: i32 = fs::read_to_string(pid_file)
+        .expect("pid file")
+        .trim()
+        .parse()
+        .expect("pid");
+    let sleeper = rustix::process::Pid::from_raw(pid).filter(|_| pid > 1);
+    let _ =
+        rustix::process::kill_process(sleeper.expect("a child pid"), rustix::process::Signal::KILL);
 }
 
 #[cfg(unix)]

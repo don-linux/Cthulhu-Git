@@ -321,13 +321,14 @@ pub fn token_from_env(var: impl Fn(&str) -> Option<OsString>) -> Option<(&'stati
 }
 
 /// Asks GitHub CLI for its github.com token (`gh auth token`). Only absolute
-/// `PATH` entries and the usual install folders are searched.
-pub fn gh_cli_token() -> Result<Token, String> {
-    let path_var = std::env::var_os("PATH");
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+/// `PATH` entries and the usual install folders are searched, in the
+/// environment `var` reads.
+pub fn gh_cli_token(var: impl Fn(&str) -> Option<OsString>) -> Result<Token, String> {
+    let home = var("HOME")
+        .or_else(|| var("USERPROFILE"))
         .map(PathBuf::from);
-    let gh = find_gh(path_var.as_deref(), home.as_deref())
+    let fallbacks = gh_fallbacks(home.as_deref(), var("ProgramFiles"));
+    let gh = find_gh(var("PATH").as_deref(), fallbacks)
         .ok_or_else(|| "GitHub CLI (gh) was not found.".to_owned())?;
     run_gh(
         Command::new(&gh)
@@ -342,9 +343,9 @@ fn gh_name() -> &'static str {
     if cfg!(windows) { "gh.exe" } else { "gh" }
 }
 
-fn gh_fallbacks(home: Option<&Path>) -> Vec<PathBuf> {
+fn gh_fallbacks(home: Option<&Path>, program_files: Option<OsString>) -> Vec<PathBuf> {
     let mut paths = if cfg!(windows) {
-        std::env::var_os("ProgramFiles")
+        program_files
             .map(|dir| vec![PathBuf::from(dir).join("GitHub CLI").join("gh.exe")])
             .unwrap_or_default()
     } else {
@@ -363,13 +364,13 @@ fn gh_fallbacks(home: Option<&Path>) -> Vec<PathBuf> {
 /// repository could plant its own `gh`; they are skipped. A file without the
 /// execute bit is skipped too, so an earlier non-executable does not hide
 /// `/usr/bin/gh`.
-pub(crate) fn find_gh(path_var: Option<&std::ffi::OsStr>, home: Option<&Path>) -> Option<PathBuf> {
+fn find_gh(path_var: Option<&std::ffi::OsStr>, fallbacks: Vec<PathBuf>) -> Option<PathBuf> {
     path_var
         .into_iter()
         .flat_map(std::env::split_paths)
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(gh_name()))
-        .chain(gh_fallbacks(home))
+        .chain(fallbacks)
         .find(|path| is_executable_file(path))
 }
 
@@ -407,8 +408,9 @@ fn run_gh(command: &mut Command, timeout: Duration) -> Result<Token, String> {
         .stdout
         .take()
         .ok_or_else(|| "GitHub CLI output was not captured.".to_owned())?;
-    // Joining the reader would wait on a grandchild that still holds the
-    // pipe. A buffer sent after the caller gave up is wiped with the channel.
+    // A grandchild of gh may hold the pipe after gh exits, so the reader is
+    // waited for only as long as the budget lasts, never joined. A buffer
+    // sent after that is wiped with the channel.
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut bytes = Zeroizing::new(Vec::new());
@@ -429,10 +431,16 @@ fn run_gh(command: &mut Command, timeout: Duration) -> Result<Token, String> {
             Err(error) => return Err(format!("GitHub CLI failed: {error}")),
         }
     };
-    let stdout = receiver.recv().unwrap_or_default();
     if !success {
         return Err("GitHub CLI is not signed in to github.com (run `gh auth login`).".to_owned());
     }
+    let stdout = match receiver.recv_timeout(timeout.saturating_sub(started.elapsed())) {
+        Ok(bytes) => bytes,
+        Err(RecvTimeoutError::Timeout) => {
+            return Err("GitHub CLI did not answer in time.".to_owned());
+        }
+        Err(RecvTimeoutError::Disconnected) => Zeroizing::default(),
+    };
     // Parsed in place, without a copy: text that is not UTF-8 is no token.
     std::str::from_utf8(&stdout)
         .ok()
@@ -530,7 +538,7 @@ mod tests {
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let path = std::env::join_paths([PathBuf::from("relative/bin"), dir.path().to_path_buf()])
             .expect("join");
-        assert_eq!(find_gh(Some(&path), None), Some(gh.clone()));
+        assert_eq!(find_gh(Some(&path), Vec::new()), Some(gh.clone()));
 
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         let later = dir.path().join("later");
@@ -544,7 +552,7 @@ mod tests {
             later,
         ])
         .expect("join");
-        assert_eq!(find_gh(Some(&path), None), Some(next));
+        assert_eq!(find_gh(Some(&path), Vec::new()), Some(next));
 
         let home = tempfile::TempDir::new().expect("home");
         let local = home.path().join(".local").join("bin").join("gh");
@@ -552,7 +560,7 @@ mod tests {
         std::fs::write(&local, "#!/bin/sh\n").expect("write");
         std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         assert!(
-            gh_fallbacks(Some(home.path()))
+            gh_fallbacks(Some(home.path()), None)
                 .iter()
                 .any(|path| path == &local),
             "the user-local gh install must be on the fallback list"

@@ -148,7 +148,9 @@ impl GitHubAuth {
 
     pub fn import_gh(&mut self, ctx: &Context) {
         self.notice = Some(Notice::Info("Asking GitHub CLI…".to_owned()));
-        self.run(ctx, || Outcome::Imported(github::gh_cli_token()));
+        self.run(ctx, || {
+            Outcome::Imported(github::gh_cli_token(|name| std::env::var_os(name)))
+        });
     }
 
     /// Fills the field from `GH_TOKEN` or `GITHUB_TOKEN`. Saving stays the
