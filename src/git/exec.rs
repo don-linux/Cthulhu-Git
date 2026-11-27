@@ -26,8 +26,15 @@ const KEPT_GIT_VARS: &[&str] = &[
 
 /// `true` when `name` is an inherited `GIT_*` variable that redirects git,
 /// rewrites history, or points at another exec path.
+///
+/// Case-insensitive: Windows environment names are, and Git for Windows reads
+/// `Git_Dir` as `GIT_DIR`.
 pub fn inherited_git_var_is_cleared(name: &str) -> bool {
-    name.starts_with("GIT_") && !KEPT_GIT_VARS.contains(&name)
+    name.get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_"))
+        && !KEPT_GIT_VARS
+            .iter()
+            .any(|kept| kept.eq_ignore_ascii_case(name))
 }
 
 /// `git --version` should be nearly instant. A candidate that does not answer
@@ -1001,6 +1008,8 @@ mod tests {
             "GIT_CONFIG_KEY_0",
             "GIT_CONFIG_PARAMETERS",
             "GIT_TRACE",
+            "Git_Dir",
+            "git_work_tree",
         ] {
             assert!(inherited_git_var_is_cleared(cleared), "{cleared}");
         }
@@ -1009,6 +1018,8 @@ mod tests {
             "GIT_SSH_COMMAND",
             "GIT_SSH_VARIANT",
             "GIT_ASKPASS",
+            "git_ssh_command",
+            "GITHUB_TOKEN",
             "SSH_AUTH_SOCK",
             "PATH",
             "HOME",
