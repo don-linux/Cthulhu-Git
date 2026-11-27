@@ -226,18 +226,14 @@ impl GitHubAuth {
                         self.verify(ctx);
                     }
                     // The flag is left alone: a token saved earlier may
-                    // still be in the keychain for the next launch.
-                    // A lock or a timeout is not a finished refusal. The
-                    // keychain call can still be sitting on a prompt, so this
-                    // must not say the token was not saved.
+                    // still be in the keychain for the next launch. This one
+                    // is not, even after a timeout: the keychain worker puts
+                    // the previous value back if the write lands late.
                     Err(error) => {
                         self.stored = Stored::Session;
-                        let trailer = if matches!(error, TokenStoreError::Locked(_)) {
-                            "Still waiting on the keychain. The token is used until Cthulhu Git closes."
-                        } else {
-                            "The token is used until Cthulhu Git closes, and is not saved."
-                        };
-                        self.notice = Some(Notice::Error(format!("{error} {trailer}")));
+                        self.notice = Some(Notice::Error(format!(
+                            "{error} The token is used until Cthulhu Git closes, and is not saved."
+                        )));
                     }
                 }
             }
@@ -325,69 +321,50 @@ mod tests {
         assert!(matches!(auth.notice, Some(Notice::Error(_))));
     }
 
+    /// A save that timed out is not kept either: the keychain worker puts the
+    /// previous value back if the write lands late.
     #[test]
-    fn a_locked_save_does_not_claim_the_token_was_not_saved() {
+    fn a_failed_save_says_the_token_is_not_saved_and_keeps_the_flag() {
         let ctx = Context::default();
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(Outcome::Saved(
-                Token::new("ghp_abcdefghijklmnopqrstuvwxyz"),
-                Err(TokenStoreError::Locked("timed out".to_owned())),
-            ))
-            .expect("send");
-        let mut auth = GitHubAuth {
-            task: Some(receiver),
-            stored: Stored::Keychain,
-            ..GitHubAuth::default()
-        };
-        let changes = auth.poll(&ctx);
-        let Some(Notice::Error(notice)) = auth.notice() else {
-            panic!("expected an error notice, got {:?}", auth.notice());
-        };
-        assert!(
-            !notice.contains("not saved"),
-            "a late keychain write can still land, got {notice}"
-        );
-        assert!(
-            notice.contains("Still waiting"),
-            "the locked save should say the keychain is still in progress, got {notice}"
-        );
-        assert!(matches!(auth.stored(), Stored::Session));
-        assert!(
-            changes
-                .iter()
-                .any(|change| matches!(change, Change::Token(Some(_))))
-        );
-        assert!(
-            !changes
-                .iter()
-                .any(|change| matches!(change, Change::InKeychain(false))),
-            "a timed-out save must not clear github_token_in_keyring, got {changes:?}"
-        );
-    }
-
-    #[test]
-    fn a_refused_save_still_says_the_token_was_not_saved() {
-        let ctx = Context::default();
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(Outcome::Saved(
-                Token::new("ghp_abcdefghijklmnopqrstuvwxyz"),
-                Err(TokenStoreError::Failed("refused".to_owned())),
-            ))
-            .expect("send");
-        let mut auth = GitHubAuth {
-            task: Some(receiver),
-            ..GitHubAuth::default()
-        };
-        let _ = auth.poll(&ctx);
-        let Some(Notice::Error(notice)) = auth.notice() else {
-            panic!("expected an error notice, got {:?}", auth.notice());
-        };
-        assert!(
-            notice.contains("not saved"),
-            "a finished refusal has no late write, got {notice}"
-        );
-        assert!(!notice.contains("Still waiting"), "{notice}");
+        for error in [
+            TokenStoreError::Locked("the keychain did not answer in time".to_owned()),
+            TokenStoreError::Locked("the collection is locked".to_owned()),
+            TokenStoreError::Failed("refused".to_owned()),
+            TokenStoreError::Unavailable("no keychain".to_owned()),
+        ] {
+            let (sender, receiver) = mpsc::channel();
+            sender
+                .send(Outcome::Saved(
+                    Token::new("ghp_abcdefghijklmnopqrstuvwxyz"),
+                    Err(error.clone()),
+                ))
+                .expect("send");
+            let mut auth = GitHubAuth {
+                task: Some(receiver),
+                stored: Stored::Keychain,
+                ..GitHubAuth::default()
+            };
+            let changes = auth.poll(&ctx);
+            let Some(Notice::Error(notice)) = auth.notice() else {
+                panic!(
+                    "{error:?}: expected an error notice, got {:?}",
+                    auth.notice()
+                );
+            };
+            assert!(notice.contains("not saved"), "{error:?}: {notice}");
+            assert!(matches!(auth.stored(), Stored::Session), "{error:?}");
+            assert!(
+                changes
+                    .iter()
+                    .any(|change| matches!(change, Change::Token(Some(_)))),
+                "{error:?}: {changes:?}"
+            );
+            assert!(
+                !changes
+                    .iter()
+                    .any(|change| matches!(change, Change::InKeychain(false))),
+                "{error:?}: a failed save must not clear github_token_in_keyring, got {changes:?}"
+            );
+        }
     }
 }
