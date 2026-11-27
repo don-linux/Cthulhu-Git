@@ -6,7 +6,6 @@
 //! the first time that commit's card opens.
 
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use cthulhu_git::git::{
     self, CommitHover, CommitStats, Git, GitError, GraphBranch, GraphRow, Person,
@@ -17,7 +16,7 @@ use eframe::egui::{self, CursorIcon, Label, RichText, Sense, Ui, Vec2};
 use super::async_cache::{AsyncCache, Cached, GitRead};
 use super::avatars::{self, AvatarService};
 use super::theme::Palette;
-use super::{text, widgets};
+use super::{clock, text, widgets};
 
 const CARD_WIDTH: f32 = 440.0;
 const AUTHOR_AVATAR: f32 = 40.0;
@@ -466,11 +465,9 @@ fn line_with_links(
     });
 }
 
+/// [`clock::now_unix`] as git stores commit times, for [`relative_time`].
 pub(super) fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs() as i64)
-        .unwrap_or(0)
+    i64::try_from(clock::now_unix()).unwrap_or(i64::MAX)
 }
 
 /// "just now", "5 minutes ago", "3 days ago", "2 years ago". A time in the

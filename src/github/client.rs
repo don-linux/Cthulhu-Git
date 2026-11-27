@@ -199,28 +199,25 @@ pub fn authenticated_user(
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FetchError {
-    /// 404, 410, a refused URL, or a body over the cap. Try the next URL.
+    /// 404, 410, a refused URL, a body over the cap, or any other failed
+    /// answer. Try the next URL.
     #[error("no picture at that URL")]
     Missing,
     /// Timeout, connect, or TLS. Try the next URL, and do not remember a miss
     /// when every URL failed this way.
     #[error("could not reach the picture's host")]
     Unavailable,
-    #[error("the picture could not be downloaded: {0}")]
-    Failed(String),
 }
 
 /// Downloads an image. Never sends the token.
 pub fn fetch_image(transport: &dyn Transport, url: &str) -> Result<Vec<u8>, FetchError> {
     let response = http::get(transport, url, None).map_err(|error| match error {
-        HttpError::NotAllowed | HttpError::TooLarge => FetchError::Missing,
         HttpError::TimedOut | HttpError::Connect | HttpError::Tls(_) => FetchError::Unavailable,
-        other => FetchError::Failed(other.to_string()),
+        _ => FetchError::Missing,
     })?;
     match response.status {
         200 if !response.body.is_empty() => Ok(response.body),
-        200 | 404 | 410 => Err(FetchError::Missing),
-        status => Err(FetchError::Failed(format!("HTTP {status}"))),
+        _ => Err(FetchError::Missing),
     }
 }
 

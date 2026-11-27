@@ -8,11 +8,10 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use cthulhu_git::git::Person;
 use cthulhu_git::github::{
@@ -22,10 +21,11 @@ use cthulhu_git::github::{
 use cthulhu_git::settings::write_atomic;
 use eframe::egui::epaint::RectShape;
 use eframe::egui::{
-    Align2, Color32, ColorImage, Context, CornerRadius, FontId, Painter, Pos2, Rect, TextureHandle,
+    Align2, Color32, ColorImage, Context, FontId, Painter, Pos2, Rect, TextureHandle,
     TextureOptions, Vec2,
 };
 
+use super::clock::now_unix;
 use super::theme::Palette;
 
 const WORKERS: usize = 4;
@@ -81,8 +81,9 @@ pub struct AvatarService {
     /// Copied out of the resolver after each lookup, for the settings page.
     status: Arc<Mutex<ApiStatus>>,
     /// Bumped by [`Self::set_token`], so a lookup that ran with the old token
-    /// does not leave a stale "no avatar".
-    generation: Arc<AtomicU64>,
+    /// does not leave a stale "no avatar". Only this thread reads it; a job
+    /// carries its copy to the worker and back.
+    generation: u64,
     entries: HashMap<String, Entry>,
     ready: VecDeque<String>,
     jobs: Option<Sender<Job>>,
@@ -111,7 +112,7 @@ impl AvatarService {
             cache,
             resolver: Arc::new(Mutex::new(AvatarResolver::new(transport))),
             status: Arc::new(Mutex::new(ApiStatus::default())),
-            generation: Arc::new(AtomicU64::new(0)),
+            generation: 0,
             entries: HashMap::new(),
             ready: VecDeque::new(),
             jobs: None,
@@ -129,7 +130,7 @@ impl AvatarService {
     /// Returns at once; the resolver takes the token on a thread of its own,
     /// because a worker may be holding it for a request.
     pub fn set_token(&mut self, token: Option<Token>) {
-        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.generation += 1;
         self.entries
             .retain(|_, entry| !matches!(entry, Entry::Missing | Entry::Retry(_)));
         let resolver = Arc::clone(&self.resolver);
@@ -155,7 +156,6 @@ impl AvatarService {
 
     /// Uploads the pictures that finished downloading. Call once per frame.
     pub fn poll(&mut self, ctx: &Context) {
-        let generation = self.generation.load(Ordering::SeqCst);
         while let Ok(done) = self.done_rx.try_recv() {
             let entry = match done.loaded {
                 Loaded::Image(image) => {
@@ -167,7 +167,7 @@ impl AvatarService {
                     ))
                 }
                 // Asked with a token that has since changed: ask again.
-                Loaded::Missing | Loaded::RetryAt(_) if done.generation != generation => {
+                Loaded::Missing | Loaded::RetryAt(_) if done.generation != self.generation => {
                     self.entries.remove(&done.key);
                     continue;
                 }
@@ -213,7 +213,7 @@ impl AvatarService {
             emails: person.emails(),
             repo: repo.cloned(),
             authored: authored.map(str::to_owned),
-            generation: self.generation.load(Ordering::SeqCst),
+            generation: self.generation,
         };
         if self
             .sender(ctx)
@@ -275,13 +275,6 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0)
-}
-
 fn load(
     job: &Job,
     resolver: &Mutex<AvatarResolver>,
@@ -322,7 +315,7 @@ fn load(
                     return Loaded::Image(image);
                 }
             }
-            Err(FetchError::Missing) | Err(FetchError::Failed(_)) => {}
+            Err(FetchError::Missing) => {}
             Err(FetchError::Unavailable) => retryable = true,
         }
     }
@@ -543,9 +536,8 @@ pub fn paint_avatar(
     }
     let rect = Rect::from_center_size(center, Vec2::splat(diameter));
     if let Some(texture) = texture {
-        let corner = CornerRadius::same(radius.round().clamp(0.0, 255.0) as u8);
         painter.add(
-            RectShape::filled(rect, corner, Color32::WHITE).with_texture(
+            RectShape::filled(rect, radius, Color32::WHITE).with_texture(
                 texture.id(),
                 Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
             ),

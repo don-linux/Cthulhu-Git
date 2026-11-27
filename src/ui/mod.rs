@@ -12,6 +12,7 @@ mod adversarial_tests;
 mod async_cache;
 mod avatars;
 mod changes;
+mod clock;
 mod folder_picker;
 mod fonts;
 mod github_auth;
