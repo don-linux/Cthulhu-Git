@@ -3,3 +3,6 @@
 pub mod git;
 pub mod github;
 pub mod settings;
+
+#[cfg(test)]
+mod test_support;

@@ -7,7 +7,6 @@ use std::collections::HashSet;
 
 use proptest::prelude::*;
 use proptest::string::string_regex;
-use proptest::test_runner::FileFailurePersistence;
 
 use super::graph::parse_graph_log;
 use super::log::fold_with_recorded;
@@ -21,14 +20,6 @@ fn fold_unmapped(author: &mut Person, co_authors: Vec<Person>) -> Vec<Person> {
 }
 
 const COAUTHOR_KEY: &str = "co-authored-by:";
-
-fn proptest_config() -> ProptestConfig {
-    ProptestConfig {
-        cases: 64,
-        failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
-        ..ProptestConfig::default()
-    }
-}
 
 fn norm_email(email: &str) -> String {
     email.trim().to_lowercase()
@@ -670,7 +661,7 @@ fn parse_remote_config_dotted_names_and_cr_in_values() {
 }
 
 proptest! {
-    #![proptest_config(proptest_config())]
+    #![proptest_config(crate::test_support::proptest_config())]
 
     #[test]
     fn parse_graph_log_never_panics(bytes in arb_bytes()) {

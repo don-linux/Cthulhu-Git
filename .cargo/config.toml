@@ -1,0 +1,3 @@
+# Property tests run 64 cases. A shell `PROPTEST_CASES=N` wins over this value.
+[env]
+PROPTEST_CASES = "64"

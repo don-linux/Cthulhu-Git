@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
 use proptest::prelude::*;
-use proptest::test_runner::FileFailurePersistence;
 
 use super::exec::{GitError, GitVersion, MIN_GIT_VERSION, classify_failure};
 use super::log::{SHORT_OID_LEN, parse_log, short_oid};
@@ -30,14 +29,6 @@ fn status_raw(raw: i32) -> ExitStatus {
     {
         use std::os::windows::process::ExitStatusExt;
         ExitStatus::from_raw(raw as u32)
-    }
-}
-
-fn proptest_config() -> ProptestConfig {
-    ProptestConfig {
-        cases: 64,
-        failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
-        ..ProptestConfig::default()
     }
 }
 
@@ -242,7 +233,7 @@ fn assert_version_order(left: &GitVersion, right: &GitVersion) {
 }
 
 proptest! {
-    #![proptest_config(proptest_config())]
+    #![proptest_config(crate::test_support::proptest_config())]
 
     #[test]
     fn git_version_parse_never_panics_and_matches_numeric_prefix(input in arb_version_input()) {

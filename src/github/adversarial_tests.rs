@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 use proptest::string::string_regex;
-use proptest::test_runner::FileFailurePersistence;
 
 use super::client::{FetchError, check, fetch_image, parse_commit_accounts};
 use super::http::fake::FakeTransport;
@@ -25,14 +24,6 @@ const ALLOWED: &[&str] = &[
 
 const NOW: u64 = 1_800_000_000;
 const LIST: &str = "https://api.github.com/repos/don-linux/Cthulhu-Git/commits";
-
-fn proptest_config() -> ProptestConfig {
-    ProptestConfig {
-        cases: 64,
-        failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
-        ..ProptestConfig::default()
-    }
-}
 
 fn token() -> Token {
     Token::new("ghp_test_token_value_0123456789")
@@ -1036,7 +1027,7 @@ fn arb_urlish() -> impl Strategy<Value = String> {
 }
 
 proptest! {
-    #![proptest_config(proptest_config())]
+    #![proptest_config(crate::test_support::proptest_config())]
 
     #[test]
     fn allowed_host_only_returns_allowlisted_hosts(url in arb_urlish()) {
