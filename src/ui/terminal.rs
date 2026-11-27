@@ -282,7 +282,7 @@ fn vars_to_unset(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<St
             cthulhu_git::git::inherited_git_var_is_cleared(name)
                 || ["GH_TOKEN", "GITHUB_TOKEN"]
                     .iter()
-                    .any(|token| token.eq_ignore_ascii_case(name))
+                    .any(|token| cthulhu_git::git::env_names_match(token, name))
         })
         .collect();
     names.sort();
@@ -2796,6 +2796,9 @@ END
             (raw(b"GIT_\xff"), raw(b"x")),
             (raw(b"GITHUB_TOKEN"), raw(b"\xff")),
             (raw(b"GIT_SSH_COMMAND"), raw(b"ssh")),
+            // Another variable on Unix, which git and gh never read.
+            (raw(b"github_token"), raw(b"mine")),
+            (raw(b"git_prompt_style"), raw(b"short")),
         ];
         assert_eq!(vars_to_unset(vars), ["GITHUB_TOKEN", "GIT_DIR"]);
     }

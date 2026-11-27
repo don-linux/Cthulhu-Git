@@ -26,15 +26,21 @@ const KEPT_GIT_VARS: &[&str] = &[
 
 /// `true` when `name` is an inherited `GIT_*` variable that redirects git,
 /// rewrites history, or points at another exec path.
-///
-/// Case-insensitive: Windows environment names are, and Git for Windows reads
-/// `Git_Dir` as `GIT_DIR`.
 pub fn inherited_git_var_is_cleared(name: &str) -> bool {
     name.get(..4)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_"))
-        && !KEPT_GIT_VARS
-            .iter()
-            .any(|kept| kept.eq_ignore_ascii_case(name))
+        .is_some_and(|prefix| env_names_match(prefix, "GIT_"))
+        && !KEPT_GIT_VARS.iter().any(|kept| env_names_match(kept, name))
+}
+
+/// Environment names compare as the platform does: without regard to case on
+/// Windows, where Git for Windows reads `Git_Dir` as `GIT_DIR`, and exactly
+/// elsewhere, where `git_dir` is another variable that git never reads.
+pub fn env_names_match(left: &str, right: &str) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
 }
 
 /// `git --version` should be nearly instant. A candidate that does not answer
@@ -1008,10 +1014,15 @@ mod tests {
             "GIT_CONFIG_KEY_0",
             "GIT_CONFIG_PARAMETERS",
             "GIT_TRACE",
-            "Git_Dir",
-            "git_work_tree",
         ] {
             assert!(inherited_git_var_is_cleared(cleared), "{cleared}");
+        }
+        for other_case in ["Git_Dir", "git_work_tree"] {
+            assert_eq!(
+                inherited_git_var_is_cleared(other_case),
+                cfg!(windows),
+                "{other_case}"
+            );
         }
         for kept in [
             "GIT_SSH",
