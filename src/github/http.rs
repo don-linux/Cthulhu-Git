@@ -107,20 +107,19 @@ fn classify_ureq(error: ureq::Error) -> HttpError {
         ureq::Error::ConnectionFailed | ureq::Error::HostNotFound => HttpError::Connect,
         ureq::Error::Tls(message) => HttpError::Tls(message.to_owned()),
         ureq::Error::TlsRequired => HttpError::Tls("TLS is required".to_owned()),
-        ureq::Error::Io(error) => classify_io(&error),
+        ureq::Error::Io(error) => classify_io_kind(&error),
         other => HttpError::Transport(other.to_string()),
     }
 }
 
-fn classify_io(error: &std::io::Error) -> HttpError {
-    // The body reader reports ureq's own errors wrapped in an io::Error.
-    if let Some(inner) = error
-        .get_ref()
-        .and_then(|inner| inner.downcast_ref::<ureq::Error>())
-        && matches!(inner, ureq::Error::BodyExceedsLimit(_))
-    {
-        return HttpError::TooLarge;
-    }
+/// The body reader reports ureq's own errors (body limit, timeouts,
+/// decompression) wrapped in an io::Error; ureq's `From` unwraps them so they
+/// are classified like errors from the request itself.
+fn classify_io(error: std::io::Error) -> HttpError {
+    classify_ureq(ureq::Error::from(error))
+}
+
+fn classify_io_kind(error: &std::io::Error) -> HttpError {
     match error.kind() {
         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => HttpError::TimedOut,
         std::io::ErrorKind::ConnectionRefused
@@ -197,7 +196,7 @@ fn read_capped(reader: &mut impl std::io::Read, limit: usize) -> Result<Vec<u8>,
             Ok(0) => return Ok(body),
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(classify_io(&error)),
+            Err(error) => return Err(classify_io(error)),
         };
         if body.len() + read > limit {
             return Err(HttpError::TooLarge);
@@ -340,15 +339,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_body_over_the_limit_is_too_large_not_a_transport_error() {
-        // ureq's body reader reports the limit as an io::Error wrapping its
-        // own error.
-        let error = ureq::Error::BodyExceedsLimit(MAX_BODY).into_io();
-        assert_eq!(classify_io(&error), HttpError::TooLarge);
-        assert_eq!(
-            classify_ureq(ureq::Error::BodyExceedsLimit(MAX_BODY)),
-            HttpError::TooLarge
-        );
+    fn body_read_errors_are_classified_like_request_errors() {
+        use std::io::{Error, ErrorKind};
+        // The body reader hands ureq's own errors back wrapped in an io::Error.
+        for (error, expected) in [
+            (
+                ureq::Error::BodyExceedsLimit(MAX_BODY).into_io(),
+                HttpError::TooLarge,
+            ),
+            (
+                ureq::Error::Timeout(ureq::Timeout::Global).into_io(),
+                HttpError::TimedOut,
+            ),
+            (Error::from(ErrorKind::TimedOut), HttpError::TimedOut),
+            (Error::from(ErrorKind::ConnectionReset), HttpError::Connect),
+        ] {
+            let shown = format!("{error:?}");
+            assert_eq!(classify_io(error), expected, "{shown}");
+        }
     }
 
     #[test]
