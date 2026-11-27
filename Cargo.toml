@@ -41,8 +41,8 @@ tempfile = "3.27.0"
 # build.rs renders assets/icon.svg; none of these end up in the binary.
 [build-dependencies]
 embed-resource = "3.0.12"
-ico = "0.5.0"
-resvg = { version = "0.48.1", default-features = false }
+ico = "0.6.0"
+resvg = { version = "0.50.0", default-features = false }
 
 # Linux packages, built by .github/workflows/build.yml. The icons under
 # target/icons/ are rendered from assets/icon.svg by that workflow first.

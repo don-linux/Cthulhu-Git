@@ -25,7 +25,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RESVG_VERSION: "0.48.1"
+  RESVG_VERSION: "0.50.0"
   # File names only. Kept out of the script text so a label cannot break the shell.
   LABEL: ${{ inputs.label }}
 
@@ -77,7 +77,7 @@ jobs:
           cd "$RUNNER_TEMP/tools"
           curl -fsSL -o resvg.tar.gz \
             "https://github.com/linebender/resvg/releases/download/v$RESVG_VERSION/resvg-linux-x86_64.tar.gz"
-          echo "fa8c26495a187e592c501db15bf9e8a9fdc051d4b2b336b39703d5b59f912b9d  resvg.tar.gz" | sha256sum -c
+          echo "5d1c9ffd43c82fb802d92cef8100055c612cd3e248d5a787c20079293a456e21  resvg.tar.gz" | sha256sum -c
           tar xzf resvg.tar.gz
           curl -fsSL -o appimagetool \
             "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
@@ -350,7 +350,7 @@ jobs:
           cd "$RUNNER_TEMP/tools"
           curl -fsSL -o resvg.zip \
             "https://github.com/linebender/resvg/releases/download/v$RESVG_VERSION/resvg-macos-aarch64.zip"
-          echo "06440eb5aa14a28cbfc7e40ae39e1ffa71adc051b89fbaa913b4f1d9b905d09f  resvg.zip" | shasum -a 256 -c
+          echo "8155b569f2b93723ba3645b53536eead3b591c8faf62bdaafd3033ba37838837  resvg.zip" | shasum -a 256 -c
           unzip -q resvg.zip
           echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
 
