@@ -1097,31 +1097,37 @@ fn reload_graph(git: &Git, root: &Path, tips: &[GraphTip]) -> Result<HistoryGrap
 }
 
 #[cfg(test)]
-mod selection_tests {
-    use super::{ListedBranch, selected_tips};
-    use cthulhu_git::git::{Branch, Upstream};
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{Arc, mpsc};
 
-    fn branch(name: &str, current: bool) -> Branch {
-        Branch {
-            name: name.to_owned(),
-            oid: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
-            committer_time: Some(10),
-            commit_count: 1,
-            upstream: Upstream::None,
-            current,
-        }
-    }
+    use cthulhu_git::git::HistoryGraph;
+    use cthulhu_git::settings::HistoryColumns;
+    use eframe::egui;
+    use serde_json::json;
+    use tempfile::TempDir;
 
-    fn listed(name: &str, current: bool, checked: bool) -> ListedBranch {
-        ListedBranch {
-            branch: branch(name, current),
-            checked,
-        }
+    use super::avatars::AvatarService;
+    use super::test_support::{absent_git, commit, listed, opened};
+    use super::{Action, CthulhuApp, GraphLoad, Opening, Screen, Startup, selected_tips};
+
+    /// The app as it starts on `settings_path`, with a git that is installed nowhere.
+    fn app(ctx: &egui::Context, settings_path: Option<PathBuf>) -> CthulhuApp {
+        CthulhuApp::new(
+            ctx,
+            Startup {
+                command_line: None,
+                settings_path,
+                avatars: |_| AvatarService::disabled(),
+                find_git: Arc::new(|| Ok(absent_git())),
+            },
+        )
     }
 
     #[test]
     fn checking_main_makes_it_the_principal_lane() {
-        let mut branches = vec![listed("feature", true, true), listed("main", false, false)];
+        let mut branches = vec![listed("feature", true), listed("main", false)];
         let alone = selected_tips(&branches, None);
         assert_eq!(alone.len(), 1);
         assert!(alone[0].principal);
@@ -1140,139 +1146,274 @@ mod selection_tests {
                 .any(|tip| tip.name == "feature" && !tip.principal && tip.current)
         );
     }
-}
 
-#[cfg(test)]
-mod settings_load_tests {
-    use std::fs;
-    use std::path::{Path, PathBuf};
-
-    use cthulhu_git::settings::Settings;
-    use tempfile::TempDir;
-
-    use super::avatars::AvatarService;
-    use super::github_auth::GitHubAuth;
-    use super::{CthulhuApp, Screen, loaded_settings};
-
-    fn app_for_save(
-        settings: Settings,
-        settings_path: Option<PathBuf>,
-        loaded_ok: bool,
-        error: Option<String>,
-    ) -> CthulhuApp {
-        CthulhuApp {
-            settings,
-            settings_path,
-            loaded_ok,
-            screen: Screen::Home,
-            opening: None,
-            picker: None,
-            error,
-            opened_count: 0,
-            settings_open: false,
-            fonts: super::fonts::FontService::default(),
-            font_preview: None,
-            graph_load: None,
-            graph_generation: 0,
-            sync_job: None,
-            avatars: AvatarService::disabled(),
-            github: GitHubAuth::default(),
-            find_git: std::sync::Arc::new(|| Ok(super::test_support::absent_git())),
-            git_version: None,
-            git_probe: None,
-            glances: std::collections::HashMap::new(),
-            glance_paths: Vec::new(),
-            glance_scan: None,
-            was_home: false,
-        }
+    /// How the settings file stands when the app starts.
+    #[derive(Debug, Clone, Copy)]
+    enum Start {
+        Missing,
+        Bytes(&'static [u8]),
+        Directory,
+        NoHomeFolder,
     }
 
-    /// Makes `path` fail `Settings::load_from` and restores it on drop.
-    ///
-    /// Mode bits are restored only on Unix. Other platforms leave the field
-    /// unread: the load is pointed at a directory instead of a chmod'd file.
-    struct Unreadable<'a> {
-        #[cfg_attr(not(unix), expect(dead_code, reason = "mode restore is Unix-only"))]
-        path: &'a Path,
+    /// Each action that changes a saved setting, in order, and fields the
+    /// file holds after it.
+    fn persisting_actions() -> [(Action, serde_json::Value); 7] {
+        let columns = HistoryColumns {
+            branch: 5,
+            graph: 300,
+            ..HistoryColumns::default()
+        };
+        [
+            (
+                Action::ToggleBranchesSidebar,
+                json!({ "history_sidebar_hidden": true }),
+            ),
+            (
+                Action::ToggleDetailSidebar,
+                json!({ "detail_sidebar_hidden": true }),
+            ),
+            // Showing the terminal opens the sidebar that holds it.
+            (
+                Action::ToggleTerminal,
+                json!({ "terminal_hidden": false, "detail_sidebar_hidden": false }),
+            ),
+            (
+                Action::SetUiFont(Some("inter".to_owned())),
+                json!({ "ui_font": "inter" }),
+            ),
+            (
+                Action::SetTerminalFont(Some("obel-mono".to_owned())),
+                json!({ "terminal_font": "obel-mono" }),
+            ),
+            // A width out of range goes back to its default.
+            (
+                Action::SetHistoryColumns(columns),
+                json!({ "history_columns": {
+                    "branch": 180, "graph": 300, "hash": 110, "message": 370, "author": 200
+                } }),
+            ),
+            (
+                Action::SetAuthorAvatars(false),
+                json!({ "author_avatars": false }),
+            ),
+        ]
     }
 
-    impl<'a> Unreadable<'a> {
-        fn block(path: &'a Path) -> Self {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut permissions = fs::metadata(path).expect("metadata").permissions();
-                permissions.set_mode(0o0);
-                fs::set_permissions(path, permissions).expect("chmod");
-            }
-            Self { path }
-        }
-    }
-
-    impl Drop for Unreadable<'_> {
-        fn drop(&mut self) {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut permissions = fs::metadata(self.path).expect("metadata").permissions();
-                permissions.set_mode(0o644);
-                fs::set_permissions(self.path, permissions).expect("restore mode");
-            }
-        }
-    }
-
+    /// A file that could not be read is the user's: no later action replaces
+    /// it with defaults. A missing file counts as read.
     #[test]
-    fn failed_load_never_overwrites_settings_file() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = dir.path().join("settings.json");
-        let original = b"{\n  \"github_token_in_keyring\": true,\n  \"theme\": \"abyss\"\n}\n";
-        fs::write(&path, original).expect("write");
-
-        let load_path = blocked_load_path(&path, dir.path());
-        let _guard = Unreadable::block(&path);
-        let loaded = Settings::load_from(&load_path);
-        let (settings, loaded_ok, message) = loaded_settings(Some(loaded));
-        assert!(!loaded_ok);
-        assert!(message.is_some());
-
-        let mut app = app_for_save(settings, Some(path.clone()), loaded_ok, message.clone());
-        app.settings.theme = Some("ink".to_owned());
-        app.save_settings();
-        drop(_guard);
-
-        assert_eq!(fs::read(&path).expect("read"), original);
-        assert_eq!(app.error, message);
+    fn settings_are_written_only_after_a_good_load() {
+        // (start, loaded)
+        const STARTS: [(Start, bool); 5] = [
+            (Start::Missing, true),
+            (Start::Bytes(b"{}"), true),
+            (Start::Bytes(b"{"), false),
+            (Start::Directory, false),
+            (Start::NoHomeFolder, false),
+        ];
+        let ctx = egui::Context::default();
+        for (start, loaded) in STARTS {
+            let dir = TempDir::new().expect("temp dir");
+            let path = dir.path().join("settings.json");
+            match start {
+                Start::Bytes(bytes) => fs::write(&path, bytes).expect("seed settings"),
+                Start::Directory => fs::create_dir(&path).expect("directory"),
+                Start::Missing | Start::NoHomeFolder => {}
+            }
+            let home = !matches!(start, Start::NoHomeFolder);
+            let mut app = app(&ctx, home.then(|| path.clone()));
+            assert_eq!(app.loaded_ok, loaded, "{start:?}");
+            assert_eq!(app.error.is_none(), loaded, "{start:?}: {:?}", app.error);
+            let error = app.error.clone();
+            for (action, fields) in persisting_actions() {
+                let name = format!("{action:?}");
+                let before = fs::read(&path).ok();
+                app.apply_action(&ctx, action);
+                let after = fs::read(&path).ok();
+                if !loaded {
+                    assert_eq!(after, before, "{start:?}: {name} wrote the file");
+                    continue;
+                }
+                let saved: serde_json::Value = serde_json::from_slice(&after.unwrap_or_default())
+                    .unwrap_or_else(|error| panic!("{start:?}: {name}: {error}"));
+                for (field, value) in fields.as_object().expect("fields") {
+                    assert_eq!(&saved[field], value, "{start:?}: {name} saved {field}");
+                }
+            }
+            assert_eq!(app.error, error, "{start:?}");
+        }
     }
 
+    /// An open waits for its worker. A worker that dies is an error on Home.
     #[test]
-    fn load_failure_sets_loaded_ok_false() {
-        let dir = TempDir::new().expect("temp dir");
-        let missing = dir.path().join("missing.json");
-        let (_, loaded_ok, message) = loaded_settings(Some(Settings::load_from(&missing)));
-        assert!(loaded_ok);
-        assert!(message.is_none());
-
-        let blocked = dir.path().join("not-a-file");
-        fs::create_dir(&blocked).expect("dir");
-        let (settings, loaded_ok, message) = loaded_settings(Some(Settings::load_from(&blocked)));
-        assert_eq!(settings, Settings::default());
-        assert!(!loaded_ok);
-        assert!(message.is_some());
-
-        let (_, loaded_ok, message) = loaded_settings(None);
-        assert!(!loaded_ok);
-        assert!(message.is_some());
+    fn an_open_waits_for_its_worker() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx, None);
+        let (sender, receiver) = mpsc::channel();
+        let path = PathBuf::from("/repos/slow");
+        app.opening = Some(Opening { path, receiver });
+        app.poll_opening(&ctx);
+        assert!(app.opening.is_some(), "the open ended before its worker");
+        drop(sender);
+        app.poll_opening(&ctx);
+        assert!(app.opening.is_none(), "a dead worker left the open running");
+        let error = app.error.as_deref();
+        assert_eq!(error, Some("Opening stopped unexpectedly. Try again."));
+        assert!(matches!(app.screen, Screen::Home));
     }
 
-    /// On Unix the settings file itself is unreadable. Elsewhere a directory
-    /// is not JSON, and the save still targets the original file.
-    #[cfg(unix)]
-    fn blocked_load_path(file: &Path, _dir: &Path) -> PathBuf {
-        file.to_path_buf()
+    /// What happens on screen while the history worker reads the graph.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Meanwhile {
+        Nothing,
+        OpenAnother,
+        GoHome,
+        AnotherView,
+        UncheckFeature,
+        UncheckAll,
     }
 
-    #[cfg(not(unix))]
-    fn blocked_load_path(_file: &Path, dir: &Path) -> PathBuf {
-        dir.to_path_buf()
+    /// How the worker ends.
+    #[derive(Debug, Clone, Copy)]
+    enum Worker {
+        Sends,
+        Fails,
+        Dies,
+        Busy,
+    }
+
+    /// The drawn graph after the next frame.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Graph {
+        Kept,
+        Applied,
+        Cleared,
+    }
+
+    /// The history load after the next frame.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Load {
+        Idle,
+        Same,
+        Restarted,
+    }
+
+    const EARLIER: &str = "an earlier error";
+    const FAILED: &str = "fatal: the log failed";
+    const STOPPED: &str = "The history graph stopped unexpectedly. Try again.";
+
+    /// Meanwhile, worker, loading, graph, error, requested, load.
+    #[rustfmt::skip]
+    type GraphCase = (Meanwhile, Worker, bool, Graph, Option<&'static str>, bool, Load);
+
+    /// The repository shows the graph of `main`; the user has just checked
+    /// `feature`, and the worker is reading `main` and `feature`.
+    #[test]
+    fn a_graph_result_lands_only_on_the_selection_that_asked() {
+        #[rustfmt::skip]
+        const CASES: [GraphCase; 9] = [
+            (Meanwhile::Nothing, Worker::Sends, true, Graph::Applied, None, true, Load::Idle),
+            // A failure is not asked again until the checkboxes change.
+            (Meanwhile::Nothing, Worker::Fails, true, Graph::Kept, Some(FAILED), true, Load::Idle),
+            (Meanwhile::Nothing, Worker::Dies, true, Graph::Kept, Some(STOPPED), true, Load::Idle),
+            // The same selection is not asked twice while it is in flight.
+            (Meanwhile::Nothing, Worker::Busy, true, Graph::Kept, Some(EARLIER), false, Load::Same),
+            (Meanwhile::OpenAnother, Worker::Sends, false, Graph::Kept, None, false, Load::Restarted),
+            (Meanwhile::GoHome, Worker::Sends, false, Graph::Kept, None, false, Load::Idle),
+            (Meanwhile::AnotherView, Worker::Sends, false, Graph::Kept, Some(EARLIER), false, Load::Restarted),
+            (Meanwhile::UncheckFeature, Worker::Sends, true, Graph::Kept, Some(EARLIER), false, Load::Idle),
+            (Meanwhile::UncheckAll, Worker::Sends, true, Graph::Cleared, Some(EARLIER), false, Load::Idle),
+        ];
+        let ctx = egui::Context::default();
+        for (meanwhile, worker, loading, graph, error, requested, load) in CASES {
+            let case = format!("{meanwhile:?}, then the worker {worker:?}");
+            let dir = TempDir::new().expect("temp dir");
+            let settings = dir.path().join("settings.json");
+            let mut app = app(&ctx, Some(settings.clone()));
+            let last = Some(PathBuf::from("/repos/history"));
+            app.settings.last_repository.clone_from(&last);
+            app.error = Some(EARLIER.to_owned());
+            let mut repo = opened("history", commit("one"));
+            let mut feature = listed("feature", false);
+            feature.checked = true;
+            feature.branch.oid = Some("b".repeat(40));
+            repo.branches.push(feature);
+            let selection = selected_tips(&repo.branches, None);
+            let (sender, receiver) = mpsc::channel();
+            app.graph_generation += 1;
+            let generation = app.graph_generation;
+            app.graph_load = Some(GraphLoad {
+                generation,
+                view_id: repo.view_id,
+                selection: selection.clone(),
+                receiver,
+            });
+            match meanwhile {
+                Meanwhile::AnotherView => repo.view_id = egui::Id::new("another view"),
+                Meanwhile::UncheckFeature => repo.branches[1].checked = false,
+                Meanwhile::UncheckAll => {
+                    for branch in &mut repo.branches {
+                        branch.checked = false;
+                    }
+                }
+                _ => {}
+            }
+            app.screen = Screen::Repo(Box::new(repo));
+            match meanwhile {
+                Meanwhile::OpenAnother => {
+                    app.apply_action(&ctx, Action::Open(PathBuf::from("/repos/another")));
+                }
+                Meanwhile::GoHome => {
+                    // The frame that handles Home ends with `sync_graph`.
+                    app.apply_action(&ctx, Action::Home);
+                    app.sync_graph(&ctx);
+                }
+                _ => {}
+            }
+            assert_eq!(app.history_loading(), loading, "{case}");
+
+            let result = match worker {
+                Worker::Sends => Some(Ok(HistoryGraph {
+                    truncated: true,
+                    ..HistoryGraph::default()
+                })),
+                Worker::Fails => Some(Err(FAILED.to_owned())),
+                Worker::Dies | Worker::Busy => None,
+            };
+            if let Some(result) = result {
+                // A dropped load has no receiver left.
+                let _ = sender.send(result);
+            }
+            let _running = matches!(worker, Worker::Busy).then_some(sender);
+            app.poll_graph();
+            app.sync_graph(&ctx);
+
+            assert_eq!(app.error.as_deref(), error, "{case}");
+            let now = match &app.graph_load {
+                None => Load::Idle,
+                Some(running) if running.generation == generation => Load::Same,
+                Some(_) => Load::Restarted,
+            };
+            assert_eq!(now, load, "{case}");
+            match &app.screen {
+                Screen::Repo(repo) => {
+                    let shown = if repo.graph.truncated {
+                        Graph::Applied
+                    } else if repo.graph.rows.is_empty() {
+                        Graph::Cleared
+                    } else {
+                        Graph::Kept
+                    };
+                    assert_eq!(shown, graph, "{case}");
+                    assert_eq!(repo.graph_requested == selection, requested, "{case}");
+                }
+                Screen::Home => assert_eq!(meanwhile, Meanwhile::GoHome, "{case}"),
+            }
+            // Leaving the repository keeps it for the next launch, and nothing
+            // here is a reason to write the settings.
+            assert_eq!(app.settings.last_repository, last, "{case}");
+            assert!(!settings.exists(), "{case}: settings were written");
+        }
     }
 }

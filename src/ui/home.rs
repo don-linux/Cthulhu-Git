@@ -29,7 +29,7 @@ const LOGO_SIDE: f32 = 128.0;
 const NARROW_COLUMN: f32 = 420.0;
 /// Exact card size. A minimum would still let the first card grow into the
 /// space the scroll area has left.
-const CARD_SIZE: Vec2 = Vec2::new(300.0, 168.0);
+pub(super) const CARD_SIZE: Vec2 = Vec2::new(300.0, 168.0);
 const CARD_GAP: f32 = 12.0;
 /// Interface icons are drawn at 18px. See `icons::ICON_SIZE`.
 const BRANCH_ICON: f32 = 18.0;
