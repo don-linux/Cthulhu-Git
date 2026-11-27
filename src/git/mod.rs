@@ -29,8 +29,8 @@ pub use graph::{
 };
 pub use log::{
     Commit, CommitDetail, CommitFile, CommitHover, CommitStats, DiffKind, DiffLine, FileDiff,
-    History, Person, SHORT_OID_LEN, commit_hover, email_key, file_diff, history, latest_commit,
-    parse_co_authors, short_oid,
+    Person, SHORT_OID_LEN, commit_hover, email_key, file_diff, latest_commit, parse_co_authors,
+    short_oid,
 };
 pub use reap::reap_process_tree;
 pub use remotes::{Remote, remotes};

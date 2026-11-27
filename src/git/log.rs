@@ -32,26 +32,6 @@ pub struct Commit {
     pub summary: String,
 }
 
-/// The newest commits reachable from HEAD, newest first.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct History {
-    pub commits: Vec<Commit>,
-    /// More commits exist beyond the requested limit.
-    pub truncated: bool,
-}
-
-impl Commit {
-    pub fn short_oid(&self) -> &str {
-        short_oid(&self.oid)
-    }
-}
-
-impl History {
-    pub fn latest(&self) -> Option<&Commit> {
-        self.commits.first()
-    }
-}
-
 /// Someone named on a commit: its author, or a `Co-authored-by` trailer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Person {
@@ -768,138 +748,12 @@ pub fn short_oid(oid: &str) -> &str {
     oid.get(..SHORT_OID_LEN).unwrap_or(oid)
 }
 
-/// Reads up to `limit` commits reachable from HEAD in the repository at `root`.
-///
-/// `head` comes from [`super::inspect`]; an unborn branch has no commits, so
-/// git is not asked at all (it would fail instead of printing nothing).
-///
-/// `--no-textconv` and `--no-ext-diff` are set so a repository diff driver
-/// cannot run while the history list is displayed.
-pub fn history(git: &Git, root: &Path, head: &Head, limit: usize) -> Result<History, GitError> {
-    if matches!(head, Head::Unborn(_)) || limit == 0 {
-        return Ok(History::default());
-    }
-
-    // Git 2.55 parses --max-count as a 32-bit signed integer. A larger value
-    // is rejected ("not an integer") instead of listing the commits.
-    let max_count = format!(
-        "--max-count={}",
-        limit.saturating_add(1).min(i32::MAX as usize)
-    );
-    let args = [
-        "log",
-        &max_count,
-        "-z",
-        "--format=%H%x1f%s",
-        "--no-color",
-        "--no-textconv",
-        "--no-ext-diff",
-        "HEAD",
-        "--",
-    ];
-    let output = git.require_ok(root, &args)?;
-    let mut commits = parse_log(&output.stdout).ok_or_else(|| {
-        super::exec::rejected(
-            &format!("git {}", args.join(" ")),
-            "unrecognized log output",
-        )
-    })?;
-
-    let truncated = commits.len() > limit;
-    commits.truncate(limit);
-    Ok(History { commits, truncated })
-}
-
-/// Parses `git log -z --format=%H%x1f%s`: NUL-terminated records of
-/// `<oid> 0x1f <subject>`.
-///
-/// `-z` ends a record on NUL, so a NUL inside the subject ends that subject.
-/// Bytes after it are another commit only when they contain a field
-/// separator. A tail with none is discarded; otherwise that one subject
-/// would reject every commit already parsed. A record that fails validation
-/// still rejects the whole log.
-pub(crate) fn parse_log(stdout: &[u8]) -> Option<Vec<Commit>> {
-    let mut commits = Vec::new();
-    for record in stdout
-        .split(|byte| *byte == 0)
-        .filter(|record| !record.is_empty())
-    {
-        match parse_log_record(record) {
-            Some(commit) => commits.push(commit),
-            None if commits.is_empty() || record.contains(&FIELD_SEPARATOR) => return None,
-            None => {}
-        }
-    }
-    Some(commits)
-}
-
-fn parse_log_record(record: &[u8]) -> Option<Commit> {
-    let separator = record.iter().position(|byte| *byte == FIELD_SEPARATOR)?;
-    let (oid, summary) = (&record[..separator], &record[separator + 1..]);
-    if oid.is_empty() || !oid.iter().all(u8::is_ascii_hexdigit) {
-        return None;
-    }
-    Some(Commit {
-        oid: String::from_utf8_lossy(oid).into_owned(),
-        summary: String::from_utf8_lossy(summary).into_owned(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
 
     use super::*;
     use crate::test_support::OID_A;
-
-    /// `git log -z --format=%H%x1f%s` output, and the `(oid, summary)` pairs
-    /// read from it. `None` rejects the whole log.
-    type Log = Option<&'static [(&'static str, &'static str)]>;
-
-    const LOGS: &[(&[u8], Log)] = &[
-        (
-            b"abcd\x1fAwaken the Old Ones\0ff\x1fInitial commit\0",
-            Some(&[("abcd", "Awaken the Old Ones"), ("ff", "Initial commit")]),
-        ),
-        (b"", Some(&[])),
-        (b"\0\0\0", Some(&[])),
-        (
-            b"abcd\x1fsum\0ff\x1fnext",
-            Some(&[("abcd", "sum"), ("ff", "next")]),
-        ),
-        (b"abcd\x1f\0", Some(&[("abcd", "")])),
-        (b"abcd\x1fa\x1fb\0", Some(&[("abcd", "a\u{1f}b")])),
-        (b"abcd\x1fcaf\xe9\0", Some(&[("abcd", "caf\u{fffd}")])),
-        // `-z` cuts a subject at its NUL. The tail has no separator, so it is
-        // the rest of that subject and not a commit.
-        (
-            b"abcd\x1fsubject with NUL\0 and more\0",
-            Some(&[("abcd", "subject with NUL")]),
-        ),
-        (b"no separator\0", None),
-        (b"\x1fsubject without oid\0", None),
-        (b"not-hex\x1fsubject\0", None),
-        (b"ab\0cd\x1fsum", None),
-    ];
-
-    #[test]
-    fn parse_log_table() {
-        for (stdout, expected) in LOGS {
-            let commits = parse_log(stdout).map(|commits| {
-                commits
-                    .into_iter()
-                    .map(|commit| (commit.oid, commit.summary))
-                    .collect::<Vec<_>>()
-            });
-            let expected = expected.map(|pairs| {
-                pairs
-                    .iter()
-                    .map(|(oid, summary)| ((*oid).to_owned(), (*summary).to_owned()))
-                    .collect::<Vec<_>>()
-            });
-            assert_eq!(commits, expected, "{stdout:?}");
-        }
-    }
 
     #[test]
     fn short_oid_is_twelve_characters() {
@@ -911,11 +765,7 @@ mod tests {
             ("0123456789abc", "0123456789ab"),
             (long.as_str(), "4b825dc642cb"),
         ] {
-            let commit = Commit {
-                oid: oid.to_owned(),
-                summary: String::new(),
-            };
-            assert_eq!(commit.short_oid(), short, "{oid:?}");
+            assert_eq!(short_oid(oid), short, "{oid:?}");
         }
     }
 
