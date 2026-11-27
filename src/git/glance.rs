@@ -40,7 +40,15 @@ pub struct Divergence {
 /// Reads [`RepoGlance`] for the repository that contains `path`.
 pub fn glance(git: &Git, path: &Path) -> Result<RepoGlance, GitError> {
     let info = super::repo::inspect(git, path)?;
-    let latest = commit_glance(git, &info.root, &info.head)?;
+    // `%s` and not the detail's `%B`: the subject is all a card shows. Date
+    // first, so a unit separator inside the subject stays in the subject.
+    let latest = log::head_commit(
+        git,
+        &info.root,
+        &info.head,
+        "--format=%ad%x1f%s",
+        parse_commit_glance,
+    )?;
     let upstream = match info.head {
         Head::Branch(_) => upstream_divergence(git, &info.root)?,
         Head::Unborn(_) | Head::Detached { .. } => None,
@@ -50,25 +58,6 @@ pub fn glance(git: &Git, path: &Path) -> Result<RepoGlance, GitError> {
         latest,
         upstream,
     })
-}
-
-fn commit_glance(git: &Git, root: &Path, head: &Head) -> Result<Option<CommitGlance>, GitError> {
-    if matches!(head, Head::Unborn(_)) {
-        return Ok(None);
-    }
-
-    // Date first, so a unit separator inside the subject stays in the subject.
-    let args = [
-        "log",
-        "-1",
-        "--date=format-local:%Y-%m-%d %H:%M",
-        "--format=%ad%x1f%s",
-        "--no-textconv",
-        "--no-ext-diff",
-        "HEAD",
-        "--",
-    ];
-    git.read(root, &args, "log", parse_commit_glance).map(Some)
 }
 
 fn upstream_divergence(git: &Git, root: &Path) -> Result<Option<Divergence>, GitError> {
@@ -87,53 +76,29 @@ fn upstream_divergence(git: &Git, root: &Path) -> Result<Option<Divergence>, Git
 }
 
 fn parse_commit_glance(stdout: &[u8]) -> Option<CommitGlance> {
-    if stdout.is_empty() {
-        return None;
-    }
     let [when, subject] = log::split_fields(trim_eol(stdout, Cr::AfterLf))?;
-    if !is_local_stamp(when) {
-        return None;
-    }
-    Some(CommitGlance {
+    is_local_stamp(when).then(|| CommitGlance {
         when: String::from_utf8_lossy(when).into_owned(),
         subject: String::from_utf8_lossy(subject).into_owned(),
     })
 }
 
-/// `YYYY-MM-DD HH:MM`, the shape `--date=format-local:%Y-%m-%d %H:%M` prints.
+/// The shape [`log::LOCAL_DATE`] prints, `YYYY-MM-DD HH:MM`: a digit for
+/// every `0` of the template, the template's byte elsewhere.
 fn is_local_stamp(stamp: &[u8]) -> bool {
-    if stamp.len() != 16 {
-        return false;
-    }
-    let digit = |index: usize| stamp[index].is_ascii_digit();
-    digit(0)
-        && digit(1)
-        && digit(2)
-        && digit(3)
-        && stamp[4] == b'-'
-        && digit(5)
-        && digit(6)
-        && stamp[7] == b'-'
-        && digit(8)
-        && digit(9)
-        && stamp[10] == b' '
-        && digit(11)
-        && digit(12)
-        && stamp[13] == b':'
-        && digit(14)
-        && digit(15)
+    const TEMPLATE: &[u8] = b"0000-00-00 00:00";
+    stamp.len() == TEMPLATE.len()
+        && stamp.iter().zip(TEMPLATE).all(|(byte, shape)| match shape {
+            b'0' => byte.is_ascii_digit(),
+            _ => byte == shape,
+        })
 }
 
+/// `ahead \t behind`. Anything else in either count, a line ending
+/// included, fails to parse.
 fn parse_divergence(stdout: &[u8]) -> Option<Divergence> {
-    let record = trim_eol(stdout, Cr::AfterLf);
-    if record.is_empty() || record.contains(&b'\n') || record.contains(&b'\r') {
-        return None;
-    }
-    let text = std::str::from_utf8(record).ok()?;
+    let text = std::str::from_utf8(trim_eol(stdout, Cr::AfterLf)).ok()?;
     let (ahead, behind) = text.split_once('\t')?;
-    if ahead.is_empty() || behind.is_empty() || behind.contains('\t') {
-        return None;
-    }
     Some(Divergence {
         ahead: ahead.parse().ok()?,
         behind: behind.parse().ok()?,

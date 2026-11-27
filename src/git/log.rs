@@ -234,33 +234,45 @@ fn parse_commit(record: &[u8]) -> Option<CommitRecord<'_>> {
     })
 }
 
+/// Author time in the local zone as `YYYY-MM-DD HH:MM`, the stamp every view shows.
+pub(crate) const LOCAL_DATE: &str = "--date=format-local:%Y-%m-%d %H:%M";
+
 /// Reads `HEAD`'s newest commit. An unborn branch has none, so git is not asked.
 ///
 /// The record is not NUL-terminated. A NUL inside the message stays in
 /// `message` instead of cutting the record short.
-///
-/// `--no-textconv` and `--no-ext-diff` are set so a repository diff driver
-/// cannot run while the commit is only being displayed.
 pub fn latest_commit(
     git: &Git,
     root: &Path,
     head: &Head,
 ) -> Result<Option<CommitDetail>, GitError> {
+    head_commit(git, root, head, COMMIT_FORMAT, parse_commit_detail)
+}
+
+/// `git log -1` of `HEAD` in `format`, read by `parse`. An unborn branch has
+/// no commit, so git is not asked. `--no-textconv` and `--no-ext-diff` keep
+/// a repository diff driver from running while a commit is only displayed.
+pub(crate) fn head_commit<T>(
+    git: &Git,
+    root: &Path,
+    head: &Head,
+    format: &str,
+    parse: impl FnOnce(&[u8]) -> Option<T>,
+) -> Result<Option<T>, GitError> {
     if matches!(head, Head::Unborn(_)) {
         return Ok(None);
     }
-
     let args = [
         "log",
         "-1",
-        "--date=format-local:%Y-%m-%d %H:%M",
-        COMMIT_FORMAT,
+        LOCAL_DATE,
+        format,
         "--no-textconv",
         "--no-ext-diff",
         "HEAD",
         "--",
     ];
-    git.read(root, &args, "log", parse_commit_detail).map(Some)
+    git.read(root, &args, "log", parse).map(Some)
 }
 
 /// Parses `git log -1` with [`COMMIT_FORMAT`]. Only git's record newline
@@ -364,7 +376,7 @@ pub fn commit_hover(git: &Git, root: &Path, oid: &str) -> Result<CommitHover, Gi
         "--first-parent",
         "--numstat",
         "-z",
-        "--date=format-local:%Y-%m-%d %H:%M",
+        LOCAL_DATE,
         format.as_str(),
         oid,
         "--",
