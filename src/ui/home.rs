@@ -52,12 +52,6 @@ pub struct HomeState<'a> {
     pub error: Option<&'a str>,
 }
 
-enum Facts<'a> {
-    Pending,
-    Unreadable,
-    Ready(&'a RepoGlance),
-}
-
 pub fn show(ui: &mut Ui, state: &HomeState<'_>) -> Option<Action> {
     // Panels are siblings: a side panel and the central panel have to be added
     // on this parent, with the central panel last, or egui cannot lay them out.
@@ -207,8 +201,8 @@ fn recent_cards(ui: &mut Ui, state: &HomeState<'_>, action: &mut Option<Action>)
         |ui| {
             ui.spacing_mut().item_spacing = Vec2::splat(CARD_GAP);
             for path in state.recent {
-                let facts = facts(state.glances, path);
-                if recent_card(ui, path, facts, !state.busy).clicked() {
+                let glance = state.glances.get(path);
+                if recent_card(ui, path, glance, !state.busy).clicked() {
                     *action = Some(Action::Open(path.clone()));
                 }
             }
@@ -216,15 +210,8 @@ fn recent_cards(ui: &mut Ui, state: &HomeState<'_>, action: &mut Option<Action>)
     );
 }
 
-fn facts<'a>(glances: &'a HashMap<PathBuf, Glance>, path: &Path) -> Facts<'a> {
-    match glances.get(path) {
-        Some(Glance::Ready(glance)) => Facts::Ready(glance),
-        Some(Glance::Unreadable) => Facts::Unreadable,
-        None => Facts::Pending,
-    }
-}
-
-fn recent_card(ui: &mut Ui, path: &Path, facts: Facts<'_>, enabled: bool) -> egui::Response {
+/// `glance` is `None` until the scan reports this path.
+fn recent_card(ui: &mut Ui, path: &Path, glance: Option<&Glance>, enabled: bool) -> egui::Response {
     let path_text = path.display().to_string();
     let palette = theme::current(ui.ctx()).palette;
     // Reserve the card on the wrapping layout itself. A nested scope is placed
@@ -255,7 +242,7 @@ fn recent_card(ui: &mut Ui, path: &Path, facts: Facts<'_>, enabled: bool) -> egu
     if !enabled {
         body.disable();
     }
-    card_body(&mut body, path, facts, hovered);
+    card_body(&mut body, path, glance, hovered);
     response
 }
 
@@ -288,26 +275,25 @@ fn paint_card(ui: &Ui, rect: Rect, hovered: bool, enabled: bool, palette: &theme
     );
 }
 
-fn card_body(ui: &mut Ui, path: &Path, facts: Facts<'_>, hovered: bool) {
+/// Lines that hold the place of a missing fact keep the lines after them
+/// where they always are.
+fn card_body(ui: &mut Ui, path: &Path, glance: Option<&Glance>, hovered: bool) {
     let palette = theme::current(ui.ctx()).palette;
     ui.spacing_mut().item_spacing.y = 2.0;
     card_line(ui, RichText::new(display_name(path)).strong());
     card_line(ui, RichText::new(path.display().to_string()).small().weak());
     ui.add_space(6.0);
-    match facts {
-        Facts::Pending => {
+    match glance {
+        None => {
             branch_line(ui, PENDING, palette.text_muted);
             card_line(ui, muted_small(PENDING));
             card_line(ui, RichText::new(PENDING).weak());
             card_line(ui, muted_small(PENDING));
         }
-        Facts::Unreadable => {
+        Some(Glance::Unreadable) => {
             card_line(ui, RichText::new(UNREADABLE).color(palette.error));
-            card_line(ui, muted_small(" "));
-            card_line(ui, RichText::new(" "));
-            card_line(ui, muted_small(" "));
         }
-        Facts::Ready(glance) => {
+        Some(Glance::Ready(glance)) => {
             let branch = if hovered {
                 palette.text
             } else {
@@ -320,19 +306,13 @@ fn card_body(ui: &mut Ui, path: &Path, facts: Facts<'_>, hovered: bool) {
                 }
                 None => card_line(ui, muted_small(" ")),
             }
-            match &glance.latest {
-                Some(line) => {
-                    if line.subject.is_empty() {
-                        card_line(ui, RichText::new(" "));
-                    } else {
-                        card_line(ui, RichText::new(&line.subject));
-                    }
-                    card_line(ui, muted_small(&line.when));
-                }
-                None => {
+            if let Some(line) = &glance.latest {
+                if line.subject.is_empty() {
                     card_line(ui, RichText::new(" "));
-                    card_line(ui, muted_small(" "));
+                } else {
+                    card_line(ui, RichText::new(&line.subject));
                 }
+                card_line(ui, muted_small(&line.when));
             }
         }
     }

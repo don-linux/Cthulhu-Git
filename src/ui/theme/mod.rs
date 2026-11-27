@@ -57,8 +57,6 @@ pub struct Palette {
 pub struct Theme {
     /// Stable key stored in `settings.json`; never rename a published id.
     pub id: &'static str,
-    /// Human-readable name for a future theme picker.
-    pub name: &'static str,
     /// Selects egui's dark or light base style under the palette.
     pub dark: bool,
     pub palette: Palette,

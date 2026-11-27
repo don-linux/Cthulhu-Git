@@ -4,7 +4,6 @@ use super::{Palette, Theme};
 
 pub const THEME: Theme = Theme {
     id: "dark",
-    name: "Dark",
     dark: true,
     palette: Palette {
         background: Color32::from_rgb(0x0e, 0x11, 0x16),

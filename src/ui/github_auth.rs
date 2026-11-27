@@ -18,8 +18,9 @@ pub fn token_field_id() -> Id {
 }
 
 /// Where the token in use lives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Stored {
+    #[default]
     None,
     Keychain,
     /// No keychain could take it: it is forgotten when the app closes.
@@ -49,6 +50,7 @@ pub enum Change {
     InKeychain(bool),
 }
 
+#[derive(Default)]
 pub struct GitHubAuth {
     token: Option<Token>,
     stored: Stored,
@@ -58,20 +60,6 @@ pub struct GitHubAuth {
     user: Option<String>,
     rate: Option<RateLimit>,
     task: Option<Task<Outcome>>,
-}
-
-impl Default for GitHubAuth {
-    fn default() -> Self {
-        Self {
-            token: None,
-            stored: Stored::None,
-            draft: String::new(),
-            notice: None,
-            user: None,
-            rate: None,
-            task: None,
-        }
-    }
 }
 
 impl GitHubAuth {

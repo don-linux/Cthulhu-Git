@@ -15,7 +15,7 @@ fn main() -> eframe::Result {
     // eframe, which would open a window.
     if version_flag(first_argument.as_deref()) {
         println!("{}", env!("CARGO_PKG_VERSION"));
-        std::process::exit(0);
+        return Ok(());
     }
 
     // A folder given on the command line (or by the Linux desktop entry's

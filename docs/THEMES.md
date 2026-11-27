@@ -23,7 +23,7 @@ exceptions.
 | File | Symbol | What it controls |
 | ---- | ------ | ---------------- |
 | `src/ui/theme/mod.rs` | `Palette` | The color roles every theme must fill in |
-| `src/ui/theme/mod.rs` | `Theme` | `id` (saved in settings, never rename), `name`, `dark` (egui base style), `palette` |
+| `src/ui/theme/mod.rs` | `Theme` | `id` (saved in settings, never rename), `dark` (egui base style), `palette` |
 | `src/ui/theme/mod.rs` | `THEMES` | Registry of every theme |
 | `src/ui/theme/mod.rs` | `DEFAULT_THEME` | Used when settings have no theme or an unknown id |
 | `src/ui/theme/mod.rs` | `by_id`, `resolve` | Id lookup, with fallback to the default |
@@ -62,7 +62,7 @@ exceptions.
 
 ## Add a theme
 
-1. Copy `src/ui/theme/dark.rs` to `src/ui/theme/<name>.rs` and change `id`, `name`, `dark` and the colors.
+1. Copy `src/ui/theme/dark.rs` to `src/ui/theme/<name>.rs` and change `id`, `dark` and the colors.
 2. Declare it in `src/ui/theme/mod.rs` (`mod <name>;`) and add `<name>::THEME` to `THEMES`.
 3. `cargo test` checks that ids are unique and the default is registered.
 
