@@ -1022,18 +1022,12 @@ mod tests {
             SEARCHES.fetch_add(1, Ordering::SeqCst);
             Ok(absent_git())
         }
-        let rejected = || GitError::Rejected {
+        let rejected = GitError::OutputLimit {
             command: "git log".to_owned(),
-            reason: "refused".to_owned(),
         };
-        let gone = || GitError::Spawn(io::ErrorKind::NotFound.into());
+        let gone = GitError::Spawn(io::ErrorKind::NotFound.into());
         // (the error a command returned before this find, searches so far)
-        let cases: [(Option<GitError>, usize); 4] = [
-            (None, 1),
-            (None, 1),
-            (Some(rejected()), 1),
-            (Some(gone()), 2),
-        ];
+        let cases = [(None, 1), (None, 1), (Some(rejected), 1), (Some(gone), 2)];
         let finder = GitFinder::new(search);
         for (step, (error, searches)) in cases.into_iter().enumerate() {
             if let Some(error) = error {
@@ -1276,12 +1270,13 @@ mod tests {
                 _ => {}
             }
             let (task, sender) = Task::pending();
-            let graph_load = Some(GraphLoad {
+            let selection_load = GraphLoad {
                 selection: selection.clone(),
                 task,
-            });
+            };
+            let (repo, graph_load) = (Box::new(repo), Some(selection_load));
             app.screen = Screen::Repo {
-                repo: Box::new(repo),
+                repo,
                 graph_load,
                 sync: None,
             };
@@ -1299,47 +1294,30 @@ mod tests {
             assert_eq!(app.history_loading(), loading, "{case}");
 
             // A dropped load has no receiver left, so a send may fail.
-            let sender = match worker {
-                Worker::Sends => {
-                    let graph = HistoryGraph {
-                        truncated: true,
-                        ..HistoryGraph::default()
-                    };
-                    let _ = sender.send(Ok(graph));
-                    Some(sender)
-                }
-                Worker::Fails => {
-                    let _ = sender.send(Err(GitError::Rejected {
-                        command: "git log".to_owned(),
-                        reason: "the log failed".to_owned(),
-                    }));
-                    Some(sender)
-                }
-                Worker::Dies => {
-                    drop(sender);
-                    None
-                }
-                Worker::Busy => Some(sender),
+            let _ = match worker {
+                Worker::Sends => sender.send(Ok(HistoryGraph {
+                    truncated: true,
+                    ..HistoryGraph::default()
+                })),
+                Worker::Fails => sender.send(Err(GitError::Rejected {
+                    command: "git log".to_owned(),
+                    reason: "the log failed".to_owned(),
+                })),
+                Worker::Dies | Worker::Busy => Ok(()),
             };
+            // Moved in either way, so a dead worker's sender is gone now.
+            let sender = (!matches!(worker, Worker::Dies)).then_some(sender);
             app.poll_graph();
             app.sync_graph(&ctx);
 
             assert_eq!(app.error.as_deref(), error, "{case}");
-            // The task the test holds the sender of still listens.
+            // Only the load the test started still listens to its sender.
             let same =
                 sender.is_some_and(|sender| sender.send(Ok(HistoryGraph::default())).is_ok());
-            let now = match &app.screen {
-                Screen::Repo {
-                    graph_load: Some(_),
-                    ..
-                } => {
-                    if same {
-                        Load::Same
-                    } else {
-                        Load::Restarted
-                    }
-                }
-                _ => Load::Idle,
+            let now = match (app.history_loading(), same) {
+                (false, _) => Load::Idle,
+                (true, true) => Load::Same,
+                (true, false) => Load::Restarted,
             };
             assert_eq!(now, load, "{case}");
             match &app.screen {
