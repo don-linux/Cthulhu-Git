@@ -11,11 +11,11 @@ Goal: fewer test lines with the same protection. Evidence decides, not taste.
 ## 1. Baseline
 
 ```bash
-cargo nextest run                       # must be green first
-cargo llvm-cov nextest --html --ignore-filename-regex '(_tests|test_support)\.rs$' \
+cargo test --locked                     # must be green first (nextest once ETXTBSY is fixed)
+cargo llvm-cov --html --ignore-filename-regex '(_tests|test_support)\.rs$' \
   --output-dir target/cov-base
 cargo mutants --list -f <file> | wc -l  # size the mutation run
-NEXTEST_PROFILE=mutants cargo mutants -f <file> -j2 -o target/mut-base
+cargo mutants -f <file> -j2 -o target/mut-base
 ```
 
 `cargo mutants` reports per mutant (caught / missed / timeout), not which test
@@ -33,9 +33,9 @@ killed it, so compare whole runs.
 ## 3. Change, then prove
 
 ```bash
-cargo nextest run
-cargo llvm-cov nextest --html ... --output-dir target/cov-new   # covered prod lines must not drop
-NEXTEST_PROFILE=mutants cargo mutants -f <file> -j2 -o target/mut-new
+cargo test --locked
+cargo llvm-cov --html ... --output-dir target/cov-new   # covered prod lines must not drop
+cargo mutants -f <file> -j2 -o target/mut-new
 comm -23 <(sort target/mut-base/mutants.out/caught.txt) \
          <(sort target/mut-new/mutants.out/caught.txt)        # must be empty
 ```

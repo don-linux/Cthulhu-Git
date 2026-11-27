@@ -341,8 +341,8 @@ mod tests {
 
     #[test]
     fn a_body_over_the_limit_is_too_large_not_a_transport_error() {
-        // ureq 3.5 reports the decoded-body limit through the reader as an
-        // io::Error wrapping its own error.
+        // ureq's body reader reports the limit as an io::Error wrapping its
+        // own error.
         let error = ureq::Error::BodyExceedsLimit(MAX_BODY).into_io();
         assert_eq!(classify_io(&error), HttpError::TooLarge);
         assert_eq!(

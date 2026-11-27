@@ -9,6 +9,12 @@
             "if": "Edit(*.rs)",
             "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo fmt --all",
             "timeout": 60
+          },
+          {
+            "type": "command",
+            "if": "Write(*.rs)",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo fmt --all",
+            "timeout": 60
           }
         ]
       }

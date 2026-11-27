@@ -10,7 +10,10 @@ if [ "$(jq -r '.stop_hook_active // false' <<<"$input")" = true ]; then
 fi
 
 cd "${CLAUDE_PROJECT_DIR:-$(dirname "$0")/../..}" || exit 0
-changed=$({ git diff --name-only HEAD -- '*.rs' 'Cargo.toml'; git ls-files -o --exclude-standard -- '*.rs'; } 2>/dev/null)
+# Compare with where the branch left main, so changes already committed in
+# this turn are still checked. On main itself that is HEAD.
+base=$(git merge-base HEAD main 2>/dev/null || echo HEAD)
+changed=$({ git diff --name-only "$base" -- '*.rs' 'Cargo.toml' 'Cargo.lock'; git ls-files -o --exclude-standard -- '*.rs'; } 2>/dev/null)
 [ -z "$changed" ] && exit 0
 
 if ! out=$(cargo clippy --locked --all-targets --quiet -- -D warnings 2>&1); then

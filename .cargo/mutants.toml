@@ -1,7 +1,10 @@
 # cargo-mutants: https://mutants.rs/
-# Select the nextest profile with NEXTEST_PROFILE=mutants (`profile` here would
-# be a Cargo build profile).
-test_tool = "nextest"
+# cargo test until the git-fake helpers stop rewriting a shared script in
+# place: under nextest's process-per-test model that races (ETXTBSY) and a
+# spurious failure would count a mutant as caught. Then switch to
+# test_tool = "nextest" and select its profile with NEXTEST_PROFILE=mutants
+# (`profile` here would be a Cargo build profile).
+test_tool = "cargo"
 exclude_globs = [
     "src/main.rs",
     "src/ui/theme/**",

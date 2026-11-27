@@ -13,14 +13,18 @@ system `git` (no libgit2). Two crates in one package:
 cargo fmt --all
 cargo clippy --locked --all-targets -- -D warnings   # CI gate on every OS
 cargo test --locked                                  # what CI runs
-cargo nextest run                                    # faster local loop
-cargo llvm-cov nextest --html                        # coverage report
+cargo llvm-cov --html                                # coverage report
+cargo nextest run                                    # not yet: see below
 cargo deny check licenses bans sources
 cargo shear                                          # unused dependencies
 ```
 
 Hooks in `.claude/settings.json` run `cargo fmt` after every Rust edit and
 clippy before a turn ends.
+
+nextest runs each test in its own process, and the fake-git helpers in the
+tests still rewrite one shared script in place, which races (ETXTBSY). Use
+`cargo test` until that is fixed (refactor phase 3).
 
 ## Code rules
 
