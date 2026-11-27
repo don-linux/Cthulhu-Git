@@ -30,12 +30,12 @@ pub use exec::{
 pub use glance::{CommitGlance, Divergence, RepoGlance, glance};
 pub use graph::{
     GraphBranch, GraphCandidate, GraphCommit, GraphRow, GraphTip, GraphTrace, HistoryGraph,
-    LANE_COLORS, branch_graph, graph_tips, head_commit_oid, layout_graph, painted_lane_color,
+    LANE_COLORS, branch_graph, graph_tips, head_commit_oid, layout_graph,
 };
 pub use log::{
     Commit, CommitDetail, CommitFile, CommitHover, CommitStats, DiffKind, DiffLine, FileDiff,
-    History, Person, SHORT_OID_LEN, commit_hover, email_key, file_diff, fold_co_authors, history,
-    latest_commit, parse_co_authors, short_oid,
+    History, Person, SHORT_OID_LEN, commit_hover, email_key, file_diff, history, latest_commit,
+    parse_co_authors, short_oid,
 };
 pub use reap::reap_process_tree;
 pub use remotes::{Remote, remotes};

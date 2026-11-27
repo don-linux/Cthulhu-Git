@@ -10,8 +10,15 @@ use proptest::string::string_regex;
 use proptest::test_runner::FileFailurePersistence;
 
 use super::graph::parse_graph_log;
+use super::log::fold_with_recorded;
 use super::remotes::parse_remote_config;
 use super::*;
+
+/// Folding when `.mailmap` left the author as recorded.
+fn fold_unmapped(author: &mut Person, co_authors: Vec<Person>) -> Vec<Person> {
+    let recorded = author.clone();
+    fold_with_recorded(author, &recorded, co_authors)
+}
 
 const COAUTHOR_KEY: &str = "co-authored-by:";
 
@@ -555,7 +562,7 @@ fn parse_co_authors_splits_on_bare_cr_like_the_vscode_regex() {
 #[test]
 fn fold_co_authors_email_case_name_alias_and_empty_name() {
     let mut author = Person::new("Ada Lovelace", "Ada@Example.com");
-    let kept = fold_co_authors(
+    let kept = fold_unmapped(
         &mut author,
         vec![
             Person::new("Someone", "ada@example.com"),
@@ -578,7 +585,7 @@ fn fold_co_authors_email_case_name_alias_and_empty_name() {
     assert_eq!(kept, vec![Person::new("Grace Hopper", "grace@example.com")]);
 
     let mut blank = Person::new("", "author@example.com");
-    let kept = fold_co_authors(
+    let kept = fold_unmapped(
         &mut blank,
         vec![
             Person::new("", "other@example.com"),
@@ -599,13 +606,13 @@ fn fold_co_authors_email_case_name_alias_and_empty_name() {
     );
 
     let mut spaced = Person::new("Ada ", "ada@example.com");
-    let kept = fold_co_authors(&mut spaced, vec![Person::new("ada", "alt@example.com")]);
+    let kept = fold_unmapped(&mut spaced, vec![Person::new("ada", "alt@example.com")]);
     assert!(kept.is_empty());
     assert_eq!(spaced.aliases, vec!["alt@example.com".to_owned()]);
     assert_eq!(spaced.name, "Ada ");
 
     let mut whitespace_name = Person::new("   ", "ada@example.com");
-    let kept = fold_co_authors(
+    let kept = fold_unmapped(
         &mut whitespace_name,
         vec![Person::new("Ada", "alt@example.com")],
     );
@@ -752,7 +759,7 @@ proptest! {
         co_authors in prop::collection::vec(arb_person(), 0..=6),
     ) {
         let mut folded = author.clone();
-        let kept = fold_co_authors(&mut folded, co_authors.clone());
+        let kept = fold_unmapped(&mut folded, co_authors.clone());
         assert_eq!(folded.name, author.name);
         assert_eq!(folded.email, author.email);
         let author_key = norm_email(&author.email);

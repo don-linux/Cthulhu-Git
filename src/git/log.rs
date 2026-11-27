@@ -140,14 +140,10 @@ fn parse_name_and_email(value: &str) -> Option<Person> {
 /// Co-authors that are not the author. A trailer with one of the author's
 /// addresses is dropped; one with the author's name but another address adds
 /// that address to `author.aliases`.
-pub fn fold_co_authors(author: &mut Person, co_authors: Vec<Person>) -> Vec<Person> {
-    let recorded = author.clone();
-    fold_with_recorded(author, &recorded, co_authors)
-}
-
-/// [`fold_co_authors`] when `.mailmap` may have rewritten the author:
-/// `recorded` is the identity written in the commit (`%an <%ae>`). Its address
-/// becomes an alias, and a trailer naming it is the author too.
+///
+/// `.mailmap` may have rewritten the author: `recorded` is the identity written
+/// in the commit (`%an <%ae>`). Its address becomes an alias, and a trailer
+/// naming it is the author too.
 pub(crate) fn fold_with_recorded(
     author: &mut Person,
     recorded: &Person,

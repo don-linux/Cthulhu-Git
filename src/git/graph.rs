@@ -265,12 +265,6 @@ fn lane_color(sidebar_index: usize, principal: bool) -> usize {
     }
 }
 
-/// The palette slot a stored color paints. Kept next to [`lane_color`] so the
-/// theme's modulo cannot drift from the assignment.
-pub fn painted_lane_color(color: usize) -> usize {
-    color % LANE_COLORS
-}
-
 /// Commits reachable from `tips`, newest first, laid out into lanes.
 ///
 /// An empty tip list or a limit of zero does not run git. Passing the same
@@ -1669,9 +1663,8 @@ mod tests {
         }
         branches.push(choice("main", OID_A, true, Some(9), true));
         let tips = graph_tips(&branches, None);
-        let painted = |name: &str| {
-            painted_lane_color(tips.iter().find(|tip| tip.name == name).unwrap().color)
-        };
+        let painted =
+            |name: &str| tips.iter().find(|tip| tip.name == name).unwrap().color % LANE_COLORS;
         assert_eq!(painted("main"), 0);
         assert_eq!(painted("b0"), painted("b7"));
         assert_ne!(painted("b0"), painted("b1"));
@@ -1686,22 +1679,20 @@ mod tests {
             choice("main", OID_C, false, Some(1), true),
         ];
         let tips = graph_tips(&branches, None);
-        let painted = |name: &str| {
-            painted_lane_color(tips.iter().find(|tip| tip.name == name).unwrap().color)
-        };
+        let painted =
+            |name: &str| tips.iter().find(|tip| tip.name == name).unwrap().color % LANE_COLORS;
         assert_eq!(painted("main"), 0);
         assert_ne!(painted("feature"), painted("bugfix"));
         assert_ne!(painted("feature"), 0);
         assert_ne!(painted("bugfix"), 0);
 
         let with_head = graph_tips(&branches, Some("7777777777777777777777777777777777777777"));
-        let head = painted_lane_color(
-            with_head
-                .iter()
-                .find(|tip| tip.name == "HEAD")
-                .unwrap()
-                .color,
-        );
+        let head = with_head
+            .iter()
+            .find(|tip| tip.name == "HEAD")
+            .unwrap()
+            .color
+            % LANE_COLORS;
         assert_ne!(head, 0);
         assert_ne!(head, painted("feature"));
         assert_ne!(head, painted("bugfix"));
