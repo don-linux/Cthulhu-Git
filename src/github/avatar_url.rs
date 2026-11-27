@@ -75,46 +75,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn noreply_addresses_with_an_id_go_straight_to_the_avatar_host() {
-        assert_eq!(
-            direct_avatar_url("194445529+don-linux@users.noreply.github.com").as_deref(),
-            Some("https://avatars.githubusercontent.com/u/194445529?s=96")
-        );
-        assert_eq!(
-            direct_avatar_url("49699333+dependabot[bot]@users.noreply.github.com").as_deref(),
-            Some("https://avatars.githubusercontent.com/u/49699333?s=96")
-        );
-        assert_eq!(noreply_user_id("+login@users.noreply.github.com"), None);
-        assert_eq!(noreply_user_id("12a+login@users.noreply.github.com"), None);
-        assert_eq!(noreply_user_id("123+@users.noreply.github.com"), None);
-        assert_eq!(
-            noreply_user_id("123+login@users.noreply.github.com.evil"),
-            None
-        );
+    fn direct_avatar_urls_skip_the_api() {
+        for (email, direct) in [
+            // A noreply address with an id goes straight to the avatar host.
+            (
+                "194445529+don-linux@users.noreply.github.com",
+                Some("https://avatars.githubusercontent.com/u/194445529?s=96"),
+            ),
+            (
+                "49699333+dependabot[bot]@users.noreply.github.com",
+                Some("https://avatars.githubusercontent.com/u/49699333?s=96"),
+            ),
+            // An older one, with only the login, uses the profile redirect.
+            (
+                "don-linux@users.noreply.github.com",
+                Some("https://github.com/don-linux.png?size=96"),
+            ),
+            ("a/b@users.noreply.github.com", None),
+            ("@users.noreply.github.com", None),
+            (
+                "cursoragent@cursor.com",
+                Some("https://avatars.githubusercontent.com/u/199161495?s=96"),
+            ),
+            ("someone@cursor.com", None),
+            ("ada@miskatonic.test", None),
+        ] {
+            assert_eq!(direct_avatar_url(email).as_deref(), direct, "{email}");
+        }
+        for email in [
+            "+login@users.noreply.github.com",
+            "12a+login@users.noreply.github.com",
+            "123+@users.noreply.github.com",
+            "123+login@users.noreply.github.com.evil",
+        ] {
+            assert_eq!(noreply_user_id(email), None, "{email}");
+        }
     }
 
     #[test]
-    fn older_noreply_addresses_use_the_profile_redirect() {
-        assert_eq!(
-            direct_avatar_url("don-linux@users.noreply.github.com").as_deref(),
-            Some("https://github.com/don-linux.png?size=96")
-        );
-        assert_eq!(direct_avatar_url("a/b@users.noreply.github.com"), None);
-        assert_eq!(direct_avatar_url("@users.noreply.github.com"), None);
-    }
-
-    #[test]
-    fn cursor_agent_is_a_known_account() {
-        assert_eq!(
-            direct_avatar_url("cursoragent@cursor.com").as_deref(),
-            Some("https://avatars.githubusercontent.com/u/199161495?s=96")
-        );
-        assert_eq!(direct_avatar_url("someone@cursor.com"), None);
-        assert_eq!(direct_avatar_url("ada@miskatonic.test"), None);
-    }
-
-    #[test]
-    fn gravatar_hashes_the_normalized_address() {
+    fn gravatar_hashes_the_address_and_api_avatars_get_a_size() {
         // Gravatar's documented example hash for "MyEmailAddress@example.com".
         assert_eq!(
             sha256_hex("myemailaddress@example.com"),
@@ -124,17 +123,17 @@ mod tests {
             gravatar_url("myemailaddress@example.com"),
             "https://gravatar.com/avatar/84059b07d4be67b806386c0aad8070a23f18836bbaae342275dc0a83414c32ee?s=96&d=404"
         );
-    }
-
-    #[test]
-    fn api_avatars_get_the_size_parameter() {
-        assert_eq!(
-            sized("https://avatars.githubusercontent.com/u/1?v=4"),
-            "https://avatars.githubusercontent.com/u/1?v=4&s=96"
-        );
-        assert_eq!(
-            sized("https://avatars.githubusercontent.com/u/1"),
-            "https://avatars.githubusercontent.com/u/1?s=96"
-        );
+        for (url, sized_url) in [
+            (
+                "https://avatars.githubusercontent.com/u/1?v=4",
+                "https://avatars.githubusercontent.com/u/1?v=4&s=96",
+            ),
+            (
+                "https://avatars.githubusercontent.com/u/1",
+                "https://avatars.githubusercontent.com/u/1?s=96",
+            ),
+        ] {
+            assert_eq!(sized(url), sized_url, "{url}");
+        }
     }
 }
