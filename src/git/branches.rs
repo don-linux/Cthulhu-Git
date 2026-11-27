@@ -361,7 +361,7 @@ mod tests {
             (tracked("feature", "main", "[behind 1, ahead 2]"), None),
             (line("feature", "not-hex", "main", "", "1"), None),
             (line("feature", OID_A, "", "", "yesterday"), None),
-            // A record from before the committer time was added is incomplete.
+            // A record without the committer-time field is incomplete.
             (format!("feature\x1f{OID_A}\x1f\x1f\n").into_bytes(), None),
             (b"feature\x1fmain\x1f\n".to_vec(), None),
         ];

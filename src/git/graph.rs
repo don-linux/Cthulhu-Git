@@ -955,7 +955,7 @@ mod tests {
             (b"no separator\0".to_vec(), None),
             (record("not-hex", "", CTHULHU, "x", ""), None),
             (record(OID_A, "not-a-hash", CTHULHU, "x", ""), None),
-            // The old three-field format has no author or trailer block.
+            // A three-field record has no author or trailer block.
             (format!("{OID_A}\x1f\x1fsummary\0").into_bytes(), None),
         ];
         for (stdout, expected) in cases {
