@@ -23,8 +23,8 @@ use super::avatars::{self, AvatarService};
 use super::hover::{self, CardContext, HoverCache};
 use super::icons::{self, Icon};
 use super::theme::Palette;
-use super::widgets;
 use super::{ListedBranch, OpenedRepo};
+use super::{text, widgets};
 
 /// Commit text and branch labels, relative to egui's body size.
 const TEXT_SCALE: f32 = 1.3;
@@ -279,7 +279,10 @@ pub fn show(
             .data_mut(|data| data.remove::<String>(lit_branch_id(*view_id)));
         // A reload that has not landed yet keeps the commit the user chose.
         retain_selected(ui, *view_id, rows, loading);
-        wrapped_line(ui, empty, palette.text_muted);
+        ui.add(Label::new(text::wrapped(
+            ui,
+            RichText::new(empty).color(palette.text_muted),
+        )));
         return HistoryOutput {
             columns: None,
             reveal_detail: false,
@@ -453,32 +456,6 @@ fn scaled(ui: &Ui, style: TextStyle) -> FontId {
     let mut font = style.resolve(ui.style());
     font.size *= TEXT_SCALE;
     font
-}
-
-/// The full sentence, broken so every row stays inside `ui`'s width.
-///
-/// Word wrap alone lets one token paint past the history column into the
-/// detail sidebar. Breaking anywhere keeps the galley in the column without
-/// eliding it.
-fn wrapped_line(ui: &mut Ui, text: &str, color: Color32) {
-    let width = ui.available_width().max(0.0);
-    let mut job = LayoutJob::single_section(
-        text.to_owned(),
-        TextFormat {
-            font_id: TextStyle::Body.resolve(ui.style()),
-            color,
-            valign: ui.text_valign(),
-            ..TextFormat::default()
-        },
-    );
-    job.wrap = TextWrapping {
-        max_width: width,
-        max_rows: usize::MAX,
-        break_anywhere: true,
-        overflow_character: None,
-    };
-    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-    ui.add(Label::new(galley));
 }
 
 fn empty_history(branches: &[ListedBranch], detached: bool) -> &'static str {
@@ -766,14 +743,9 @@ fn elided(ui: &Ui, text: &str, font: FontId, color: Color32, max_width: f32) -> 
             ..TextFormat::default()
         },
     );
-    job.wrap = TextWrapping {
-        max_width: max_width.max(0.0),
-        max_rows: 1,
-        // Hashes and branch names are one token, so the ellipsis may land
-        // inside a word.
-        break_anywhere: true,
-        overflow_character: Some('…'),
-    };
+    // Hashes and branch names are one token, so the ellipsis may land
+    // inside a word.
+    job.wrap = TextWrapping::truncate_at_width(max_width.max(0.0));
     ui.painter().layout_job(job)
 }
 

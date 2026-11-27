@@ -12,12 +12,12 @@ use cthulhu_git::git::{
     self, CommitHover, CommitStats, Git, GitError, GraphBranch, GraphRow, Person,
 };
 use cthulhu_git::github::{GitHubRepo, RepoContext};
-use eframe::egui::{self, CursorIcon, FontSelection, Label, RichText, Sense, Ui, Vec2, WidgetText};
+use eframe::egui::{self, CursorIcon, Label, RichText, Sense, Ui, Vec2};
 
 use super::async_cache::{AsyncCache, Cached, GitRead};
 use super::avatars::{self, AvatarService};
 use super::theme::Palette;
-use super::widgets;
+use super::{text, widgets};
 
 const CARD_WIDTH: f32 = 440.0;
 const AUTHOR_AVATAR: f32 = 40.0;
@@ -223,34 +223,19 @@ pub(super) fn email_link(ui: &mut Ui, email: &str, palette: &Palette) {
     }
     let text = format!("<{email}>");
     match mailto_url(email) {
-        Some(url) => fitting_link(ui, RichText::new(text).color(palette.accent), &url),
+        Some(url) => {
+            ui.hyperlink_to(
+                text::wrapped(ui, RichText::new(text).color(palette.accent)),
+                url,
+            );
+        }
         None => fitting_label(ui, RichText::new(text).color(palette.text_muted)),
     }
 }
 
 /// One line, broken anywhere inside `ui`'s width.
 fn fitting_label(ui: &mut Ui, text: RichText) {
-    let galley = fitting_galley(ui, text);
-    ui.add(Label::new(galley));
-}
-
-fn fitting_link(ui: &mut Ui, text: RichText, url: &str) {
-    let galley = fitting_galley(ui, text);
-    ui.hyperlink_to(galley, url);
-}
-
-fn fitting_galley(ui: &mut Ui, text: RichText) -> std::sync::Arc<egui::Galley> {
-    let width = ui.available_width().max(0.0);
-    let mut job = std::sync::Arc::unwrap_or_clone(WidgetText::from(text).into_layout_job(
-        ui.style(),
-        FontSelection::Default,
-        ui.text_valign(),
-    ));
-    job.wrap.max_width = width;
-    job.wrap.break_anywhere = true;
-    job.wrap.max_rows = usize::MAX;
-    job.wrap.overflow_character = None;
-    ui.fonts_mut(|fonts| fonts.layout_job(job))
+    ui.add(Label::new(text::wrapped(ui, text)));
 }
 
 /// Branch names that point at one commit, in the graph's colors.

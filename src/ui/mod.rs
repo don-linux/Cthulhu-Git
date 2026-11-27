@@ -27,6 +27,7 @@ mod task;
 mod terminal;
 #[cfg(test)]
 mod test_support;
+mod text;
 pub mod theme;
 mod widgets;
 
