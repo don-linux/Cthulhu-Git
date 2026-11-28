@@ -476,7 +476,16 @@ jobs:
           mkdir -p "$staging/icons"
           cp assets/icons/LICENSE "$staging/icons/"
           dmg="dist/cthulhu-git-${LABEL}-macos-universal.dmg"
-          hdiutil create -volname "Cthulhu Git" -srcfolder "$staging" -ov -format UDZO "$dmg"
+          # With -srcfolder, hdiutil(1) sizes the volume as the source data
+          # plus some padding, and that padding is sometimes too small for the
+          # APFS volume it creates: copying the universal binary fails with
+          # "No space left on device". -size overrides that calculation. The
+          # spare room is free space, which UDZO compresses away.
+          data_kb="$(find "$staging" -type f -exec stat -f %z {} + |
+            awk '{ total += $1 } END { print int(total / 1024) + 1 }')"
+          size_kb=$((data_kb + data_kb / 10 + 20 * 1024))
+          hdiutil create -volname "Cthulhu Git" -srcfolder "$staging" -size "${size_kb}k" \
+            -ov -format UDZO "$dmg"
           hdiutil verify "$dmg"
           mount="$RUNNER_TEMP/dmg-mount"
           rm -rf "$mount"
