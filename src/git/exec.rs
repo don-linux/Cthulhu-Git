@@ -401,6 +401,10 @@ fn command(program: &Path) -> Command {
 /// The child still inherits the real environment of this process: only the
 /// changes against `parent_env` are recorded on the command, which is why
 /// [`command`] passes `std::env::vars_os()`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one constructor of git commands; everything below hardens it"
+)]
 fn command_with_env(
     program: &Path,
     parent_env: impl IntoIterator<Item = (OsString, OsString)>,
@@ -1108,6 +1112,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "checks `harden` alone, on a bare command"
+    )]
     fn git_runs_behind_the_hardening_prefix() {
         const PREFIX: [&str; 7] = [
             "--no-optional-locks",

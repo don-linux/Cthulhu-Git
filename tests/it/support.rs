@@ -8,6 +8,10 @@
     dead_code,
     reason = "src/ui/adversarial_tests.rs includes this file for `isolate` only"
 )]
+#![expect(
+    clippy::disallowed_methods,
+    reason = "fixtures run git through `isolate`, and the process tools directly"
+)]
 
 use std::ffi::OsStr;
 use std::fs;

@@ -159,6 +159,10 @@ fn embed_source_revision() {
     println!("cargo::rustc-env=CTHULHU_GIT_COMMIT_DATE={date}");
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a build script cannot use the crate it builds; this reads `git log -1` of the checkout"
+)]
 fn source_revision() -> Option<(String, String)> {
     // Without its own `.git`, git would describe whichever repository
     // contains this directory, such as a packaging tree.

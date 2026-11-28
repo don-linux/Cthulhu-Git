@@ -8,5 +8,12 @@ allow-expect-in-tests = true
 # changing a public signature.
 avoid-breaking-exported-api = false
 
+# Every git child is built by `git::exec`: it scrubs inherited `GIT_*`
+# variables, keeps only absolute PATH entries and puts the hardening options
+# first. Other programs and test fixtures say why at the call.
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "build git commands with `git::exec`, which scrubs `GIT_*` and hardens the call" },
+]
+
 # Product names written in prose, not code.
 doc-valid-idents = ["ConPTY", "MacPorts", "GIF89a", ".."]

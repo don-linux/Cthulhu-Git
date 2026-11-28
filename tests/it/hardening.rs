@@ -5,6 +5,11 @@
 //! plain git proves each one is armed, so a quiet log means the app ignored
 //! it, not that the fixture was inert.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "positive controls run plain git, and a suggested command runs in `/bin/sh`"
+)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

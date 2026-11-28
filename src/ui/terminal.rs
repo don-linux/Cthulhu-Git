@@ -720,6 +720,10 @@ fn session_of(pid: u32) -> Option<i32> {
 }
 
 #[cfg(target_os = "macos")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "`/bin/ps` by absolute path, not git"
+)]
 fn session_of_ps(pid: u32) -> Option<i32> {
     let output = std::process::Command::new("/bin/ps")
         .args(["-o", "sess=", "-p", &pid.to_string()])
@@ -752,6 +756,10 @@ fn processes_in_session(session: i32) -> Vec<u32> {
 }
 
 #[cfg(target_os = "macos")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "`/bin/ps` by absolute path, not git"
+)]
 fn processes_in_session(session: i32) -> Vec<u32> {
     let Ok(output) = std::process::Command::new("/bin/ps")
         .args(["-ax", "-o", "pid=,sess="])
@@ -781,6 +789,10 @@ fn processes_in_session(_session: i32) -> Vec<u32> {
 }
 
 #[cfg(windows)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "`taskkill` from `SystemRoot`, not git"
+)]
 fn kill_process_tree(pid: u32) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -1843,6 +1855,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a `setsid` session to stop, not git"
+    )]
     fn stop_session_kills_a_background_job_that_ignores_hup() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let sleeper = dir.path().join("sleeper");
@@ -1875,6 +1891,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "re-runs this test binary in another working directory"
+    )]
     fn relative_shell_does_not_execute_a_planted_binary() {
         use std::os::unix::fs::PermissionsExt;
 

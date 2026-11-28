@@ -321,6 +321,10 @@ pub fn token_from_env(var: impl Fn(&str) -> Option<OsString>) -> Option<(&'stati
 /// Asks GitHub CLI for its github.com token (`gh auth token`). Only absolute
 /// `PATH` entries and the usual install folders are searched, in the
 /// environment `var` reads.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "GitHub CLI, found by absolute path, not git"
+)]
 pub fn gh_cli_token(var: impl Fn(&str) -> Option<OsString>) -> Result<Token, String> {
     let home = var("HOME")
         .or_else(|| var("USERPROFILE"))
@@ -566,6 +570,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "`/bin/sh` stands in for gh")]
     fn run_gh_kills_a_hung_child_and_reads_only_a_signed_in_token() {
         let started = Instant::now();
         let result = run_gh(

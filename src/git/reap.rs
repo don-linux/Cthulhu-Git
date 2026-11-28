@@ -135,6 +135,10 @@ fn ppid_from_status(pid: u32) -> Option<u32> {
 /// cannot take a new dependency to decode it. `/bin/ps` is absolute so `PATH`
 /// cannot select a different binary.
 #[cfg(target_os = "macos")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "`/bin/ps` by absolute path, not git"
+)]
 fn snapshot_ppids() -> HashMap<u32, u32> {
     let mut ppids = HashMap::new();
     let Ok(output) = std::process::Command::new("/bin/ps")
@@ -171,6 +175,10 @@ fn snapshot_ppids() -> HashMap<u32, u32> {
 #[cfg(test)]
 mod tests {
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a short-lived process to reap, not git"
+    )]
     fn killing_the_group_after_the_leader_has_exited_returns() {
         let mut child = std::process::Command::new("true")
             .stdin(std::process::Stdio::null())
