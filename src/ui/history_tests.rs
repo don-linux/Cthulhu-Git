@@ -1302,102 +1302,39 @@ fn click_branch(harness: &mut Harness<'_, Screen>, name: &str) {
     harness.step();
 }
 
-fn glow_vertices(harness: &Harness<'_, Screen>) -> Vec<egui::epaint::Vertex> {
-    let mut found = Vec::new();
-    for clipped in &harness.output().shapes {
-        collect_glow(&clipped.shape, &mut found);
-    }
-    found
-}
-
-fn collect_glow(shape: &egui::Shape, found: &mut Vec<egui::epaint::Vertex>) {
-    match shape {
-        egui::Shape::Mesh(mesh) if mesh.texture_id == egui::TextureId::default() => {
-            found.extend(mesh.vertices.iter().copied());
-        }
-        egui::Shape::Vec(shapes) => {
-            for shape in shapes {
-                collect_glow(shape, found);
-            }
-        }
-        _ => {}
-    }
-}
-
-struct LaneMarks {
-    segments: Vec<[Pos2; 2]>,
-    dots: Vec<Pos2>,
-}
-
-fn lane_marks(harness: &Harness<'_, Screen>, color: egui::Color32) -> LaneMarks {
-    let mut marks = LaneMarks {
-        segments: Vec::new(),
-        dots: Vec::new(),
-    };
-    for clipped in &harness.output().shapes {
-        collect_lane_marks(&clipped.shape, color, &mut marks);
-    }
-    marks
-}
-
-fn collect_lane_marks(shape: &egui::Shape, color: egui::Color32, marks: &mut LaneMarks) {
-    match shape {
-        egui::Shape::LineSegment { points, stroke } if stroke.color == color => {
-            marks.segments.push(*points);
-        }
-        egui::Shape::Circle(circle) if circle.fill == color => {
-            marks.dots.push(circle.center);
-        }
-        egui::Shape::Vec(shapes) => {
-            for shape in shapes {
-                collect_lane_marks(shape, color, marks);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn distance_to_segment(point: Pos2, start: Pos2, end: Pos2) -> f32 {
-    let delta = end - start;
-    let len2 = delta.length_sq();
-    if len2 <= f32::EPSILON {
-        return point.distance(start);
-    }
-    let t = ((point - start).dot(delta) / len2).clamp(0.0, 1.0);
-    point.distance(start + delta * t)
-}
-
-/// The commit dot is 8 points and the aura extends 5 past a stroke, plus a point of slack.
-const HALO_REACH: f32 = 14.0;
-
-fn near_lane(point: Pos2, marks: &LaneMarks) -> bool {
-    marks
-        .segments
+/// Vertex colors of the meshes clipped to the Graph column: the lit lane's
+/// light. Its geometry is pinned by `lane_glow`'s golden test; these tests
+/// only ask which lane is lit. The open detail sidebar paints meshes of its
+/// own, outside the column.
+fn glow_colors(harness: &Harness<'_, Screen>) -> Vec<egui::Color32> {
+    let headers = header_row(harness);
+    let left = title_left(&headers, "Graph") - super::history::CELL_PAD - TOL;
+    let right = title_left(&headers, "Commit Hash") - super::history::CELL_PAD + TOL;
+    let in_graph = |clip: egui::Rect| clip.left() >= left && clip.right() <= right;
+    harness
+        .output()
+        .shapes
         .iter()
-        .any(|segment| distance_to_segment(point, segment[0], segment[1]) <= HALO_REACH)
-        || marks
-            .dots
-            .iter()
-            .any(|dot| point.distance(*dot) <= HALO_REACH)
+        .filter_map(|clipped| match &clipped.shape {
+            egui::Shape::Mesh(mesh) if in_graph(clipped.clip_rect) => Some(&mesh.vertices),
+            _ => None,
+        })
+        .flatten()
+        .map(|vertex| vertex.color)
+        .collect()
 }
 
-/// Glow vertices of `lane` that sit on that lane. The open detail sidebar
-/// paints other meshes, so an empty mesh list is not the signal.
+/// Visible vertices of the light in `lane`'s color.
 fn lane_glow_near(harness: &Harness<'_, Screen>, lane: egui::Color32) -> usize {
-    let marks = lane_marks(harness, lane);
-    glow_vertices(harness)
+    glow_colors(harness)
         .into_iter()
-        .filter(|vertex| {
-            vertex.color.a() > 0
-                && is_lane_glow(vertex.color, lane)
-                && near_lane(vertex.pos, &marks)
-        })
+        .filter(|color| color.a() > 0 && is_lane_glow(*color, lane))
         .count()
 }
 
 fn assert_no_glow(harness: &Harness<'_, Screen>) {
     assert!(
-        glow_vertices(harness).is_empty(),
+        glow_colors(harness).is_empty(),
         "a halo is drawn with no branch lit"
     );
 }
@@ -1420,30 +1357,15 @@ fn is_lane_glow(color: egui::Color32, lane: egui::Color32) -> bool {
 }
 
 fn assert_glow_is(harness: &Harness<'_, Screen>, lane: egui::Color32) {
-    let vertices = glow_vertices(harness);
-    let colored: Vec<_> = vertices
-        .iter()
-        .filter(|vertex| vertex.color.a() > 0)
-        .copied()
-        .collect();
-    assert!(!colored.is_empty(), "the lit branch has no halo");
-    for vertex in &colored {
-        assert!(
-            is_lane_glow(vertex.color, lane),
-            "halo vertex {:?} is not the lit lane color",
-            vertex.color
-        );
-    }
-    let marks = lane_marks(harness, lane);
+    let colors = glow_colors(harness);
     assert!(
-        !marks.segments.is_empty(),
-        "the lit lane has no stroke to follow"
+        lane_glow_near(harness, lane) > 0,
+        "the lit branch has no halo"
     );
-    for vertex in &vertices {
+    for color in colors {
         assert!(
-            near_lane(vertex.pos, &marks),
-            "halo point {:?} is away from the lit lane",
-            vertex.pos
+            is_lane_glow(color, lane),
+            "halo vertex {color:?} is not the lit lane color"
         );
     }
 }

@@ -866,6 +866,18 @@ struct LaneGlow {
     origin: f32,
 }
 
+/// The commit dot's center, the radius of the background ring it sits in,
+/// and its own radius. At the narrowest lanes the dots shrink so neighbors
+/// do not touch.
+fn commit_dot(graph: Rect, row: &GraphRow, lane_width: f32) -> (Pos2, f32, f32) {
+    let center = Pos2::new(
+        lane_center(graph, row.commit_lane, lane_width),
+        graph.center().y,
+    );
+    let outer = DOT_OUTER.min(lane_width / 2.0 - 1.0);
+    (center, outer, DOT_INNER.min(outer - 1.5).max(1.0))
+}
+
 fn paint_lanes(
     painter: &egui::Painter,
     graph: Rect,
@@ -875,40 +887,20 @@ fn paint_lanes(
     fill: Color32,
     glow: Option<LaneGlow>,
 ) {
-    let dot = Pos2::new(
-        lane_center(graph, row.commit_lane, lane_width),
-        graph.center().y,
-    );
-    let outer = DOT_OUTER.min(lane_width / 2.0 - 1.0);
-    if let Some(glow) = glow {
-        let color = palette.graph_color(glow.color);
-        let mut mesh = Mesh::default();
-        for trace in &row.traces {
-            if trace.color != glow.color {
-                continue;
-            }
-            let (start, end) = trace_ends(graph, trace.from_lane, trace.to_lane, dot, lane_width);
-            add_glow_segment(&mut mesh, start, end, color, glow);
-        }
-        if row.commit_color == glow.color {
-            // The commit circle is opaque, so the aura is the band outside it.
-            // `gap` is measured from the dot's edge, and it stops short of the
-            // next lane's stroke.
-            let gap = lane_width / 2.0 - outer - 0.5;
-            if gap >= 1.0 {
-                add_glow_disc(
-                    &mut mesh,
-                    dot,
-                    outer,
-                    outer + GLOW_RADIUS.min(gap),
-                    color,
-                    glow_alpha(glow.time, glow.origin + dot.y),
-                );
-            }
-        }
-        if !mesh.is_empty() {
-            painter.add(mesh);
-        }
+    let (dot, outer, inner) = commit_dot(graph, row, lane_width);
+    let (halo, crest) = glow
+        .map(|glow| {
+            lane_glow(
+                graph,
+                row,
+                lane_width,
+                glow,
+                palette.graph_color(glow.color),
+            )
+        })
+        .unwrap_or_default();
+    if !halo.is_empty() {
+        painter.add(halo);
     }
     for trace in &row.traces {
         let (start, end) = trace_ends(graph, trace.from_lane, trace.to_lane, dot, lane_width);
@@ -920,15 +912,54 @@ fn paint_lanes(
             Stroke::new(LANE_STROKE, palette.graph_color(trace.color)),
         );
     }
-    // At the narrowest lanes the dots shrink so neighbors do not touch.
-    let inner = DOT_INNER.min(outer - 1.5).max(1.0);
     painter.circle_filled(dot, outer, fill);
     painter.circle_filled(dot, inner, palette.graph_color(row.commit_color));
     // After the stroke and the dot, so the spark sits on the line the eye
     // follows. The halo underneath stays the steady glow.
-    if let Some(glow) = glow {
-        paint_crest(painter, graph, row, palette, lane_width, glow);
+    if !crest.is_empty() {
+        painter.add(crest);
     }
+}
+
+/// The light on the lit lane in one row, in `color`: the halo, painted under
+/// the strokes and the dot, and the spark, painted over them.
+fn lane_glow(
+    graph: Rect,
+    row: &GraphRow,
+    lane_width: f32,
+    glow: LaneGlow,
+    color: Color32,
+) -> (Mesh, Mesh) {
+    let (dot, outer, inner) = commit_dot(graph, row, lane_width);
+    let (mut halo, mut crest) = (Mesh::default(), Mesh::default());
+    for trace in row.traces.iter().filter(|trace| trace.color == glow.color) {
+        let (start, end) = trace_ends(graph, trace.from_lane, trace.to_lane, dot, lane_width);
+        add_glow_segment(&mut halo, start, end, color, glow);
+        add_crest_segment(&mut crest, start, end, color, glow);
+    }
+    if row.commit_color == glow.color {
+        // The commit circle is opaque, so the aura is the band outside it.
+        // `gap` is measured from the dot's edge, and it stops short of the
+        // next lane's stroke.
+        let gap = lane_width / 2.0 - outer - 0.5;
+        if gap >= 1.0 {
+            add_glow_disc(
+                &mut halo,
+                dot,
+                outer,
+                outer + GLOW_RADIUS.min(gap),
+                color,
+                glow_alpha(glow.time, glow.origin + dot.y),
+            );
+        }
+        // The dot's light stays inside the colored circle, so it does not
+        // reach the next lane.
+        let lobe = crest_lobe(glow.time, glow.origin + dot.y);
+        if lobe > 0.02 {
+            add_crest_disc(&mut crest, dot, inner, color, lobe);
+        }
+    }
+    (halo, crest)
 }
 
 fn trace_ends(
@@ -1073,42 +1104,6 @@ fn add_glow_disc(mesh: &mut Mesh, center: Pos2, inner: f32, outer: f32, color: C
             mesh.add_triangle(a, c, b);
             mesh.add_triangle(b, c, d);
         }
-    }
-}
-
-/// The spark on top of the stroke and the commit dot. The dot's light stays
-/// inside the colored circle, so it does not reach the next lane.
-fn paint_crest(
-    painter: &egui::Painter,
-    graph: Rect,
-    row: &GraphRow,
-    palette: &Palette,
-    lane_width: f32,
-    glow: LaneGlow,
-) {
-    let dot = Pos2::new(
-        lane_center(graph, row.commit_lane, lane_width),
-        graph.center().y,
-    );
-    let outer = DOT_OUTER.min(lane_width / 2.0 - 1.0);
-    let dot_radius = DOT_INNER.min(outer - 1.5).max(1.0);
-    let color = palette.graph_color(glow.color);
-    let mut mesh = Mesh::default();
-    for trace in &row.traces {
-        if trace.color != glow.color {
-            continue;
-        }
-        let (start, end) = trace_ends(graph, trace.from_lane, trace.to_lane, dot, lane_width);
-        add_crest_segment(&mut mesh, start, end, color, glow);
-    }
-    if row.commit_color == glow.color {
-        let lobe = crest_lobe(glow.time, glow.origin + dot.y);
-        if lobe > 0.02 {
-            add_crest_disc(&mut mesh, dot, dot_radius, color, lobe);
-        }
-    }
-    if !mesh.is_empty() {
-        painter.add(mesh);
     }
 }
 
@@ -1430,6 +1425,7 @@ fn chip_fill(palette: &Palette, color: usize, current: bool, lit: bool) -> Color
 
 #[cfg(test)]
 mod tests {
+    use cthulhu_git::git::GraphTrace;
     use proptest::prelude::*;
 
     use super::*;
@@ -1672,6 +1668,128 @@ mod tests {
         assert!(
             behind > ahead && ahead > 0.0,
             "the tail should outlast the front, ahead {ahead}, behind {behind}"
+        );
+    }
+
+    type Trace = (Option<usize>, Option<usize>, usize);
+    type GlowRow = (&'static str, f32, f64, [usize; 2], &'static [Trace]);
+    const STRAIGHT: &[Trace] = &[(Some(0), Some(0), 0), (Some(1), None, 2)];
+    const LANE_CHANGE: &[Trace] = &[(Some(1), Some(0), 0)];
+    /// Into the dot and out to both parents, past another color's lane, and
+    /// a trace with no length.
+    const MERGE: &[Trace] = &[
+        (Some(0), None, 0),
+        (None, Some(0), 0),
+        (None, Some(1), 0),
+        (Some(2), Some(2), 3),
+        (None, None, 0),
+    ];
+    const DOT: &[Trace] = &[(Some(1), None, 0), (None, Some(1), 0)];
+    /// Rows lit on lane color 0, whose dot sits 140 points down the branch:
+    /// (case, lane width, seconds, dot lane and color, traces as from lane,
+    /// to lane and color). At 0.7 s the crest is on the dot, at 0.425 s its
+    /// front reaches only the upper half, at 2.3 s it is half a wavelength
+    /// away. On 20-point lanes the aura is narrower than the halo; on the
+    /// narrowest there is no room for it.
+    const GLOW_ROWS: [GlowRow; 7] = [
+        ("straight", LANE_MAX, 0.7, [1, 2], STRAIGHT),
+        ("lane change", LANE_MAX, 0.7, [2, 2], LANE_CHANGE),
+        ("merge", 20.0, 0.7, [0, 0], MERGE),
+        ("dot", LANE_MAX, 0.7, [1, 0], DOT),
+        ("narrow", LANE_MIN, 0.7, [1, 0], DOT),
+        ("crest edge", LANE_MAX, 0.425, [1, 0], DOT),
+        ("crest away", LANE_MAX, 2.3, [1, 0], DOT),
+    ];
+    /// Per row above: the halo's and the crest's vertex and index counts,
+    /// then a digest of each mesh's exact bits. One row per line, as the
+    /// test prints them.
+    #[rustfmt::skip]
+    const GOLDEN: [([[usize; 2]; 2], [u64; 2]); 7] = [
+        ([[30, 120], [25, 96]], [0xd7e20f28027a9a35, 0x43f38e51d12d739a]), // straight
+        ([[36, 150], [30, 120]], [0x75fbc29c0416f8ec, 0xb0711276fd7cd83d]), // lane change
+        ([[108, 402], [86, 312]], [0x7db8a48a103b3ea8, 0x2fa896d0a854ad9f]), // merge
+        ([[84, 312], [66, 240]], [0x1aaa1a4a360d428d, 0xa97ffe770013a1c9]), // dot
+        ([[36, 120], [66, 240]], [0x11281c45b3196845, 0xf7cad7d9de74f997]), // narrow
+        ([[84, 312], [15, 48]], [0xb61e34c53fef13b9, 0x239961336da8b433]), // crest edge
+        ([[84, 312], [0, 0]], [0x8a735e8ee3cdcab1, 0xcbf29ce484222325]), // crest away
+    ];
+
+    /// FNV-1a over each vertex's position, UV and color bits, then the indices.
+    fn mesh_digest(mesh: &Mesh) -> u64 {
+        let words = |vertex: &egui::epaint::Vertex| {
+            let [x, y, u, v] = [vertex.pos.x, vertex.pos.y, vertex.uv.x, vertex.uv.y];
+            let color = u32::from_le_bytes(vertex.color.to_array());
+            [x, y, u, v].map(f32::to_bits).into_iter().chain([color])
+        };
+        (mesh.vertices.iter().flat_map(words))
+            .chain(mesh.indices.iter().copied())
+            .flat_map(u32::to_le_bytes)
+            .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+            })
+    }
+
+    /// Every vertex, color and index of the lit lane's light at fixed times.
+    /// The digests hold the exact bits of glibc's `expf` and `sinf`; another
+    /// libm may round a last bit differently, so other systems check counts.
+    #[test]
+    fn lane_glow_meshes_match_the_golden() {
+        let exact = cfg!(all(target_os = "linux", target_env = "gnu"));
+        let graph = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(150.0, 40.0));
+        let (mut now, mut changed) = (String::new(), String::new());
+        for ((case, lane_width, time, [lane, color], traces), golden) in
+            GLOW_ROWS.into_iter().zip(GOLDEN)
+        {
+            let row = GraphRow {
+                oid: String::new(),
+                summary: String::new(),
+                author: Person::default(),
+                co_authors: Vec::new(),
+                branches: Vec::new(),
+                commit_lane: lane,
+                commit_color: color,
+                traces: (traces.iter())
+                    .map(|&(from_lane, to_lane, color)| GraphTrace {
+                        from_lane,
+                        to_lane,
+                        color,
+                    })
+                    .collect(),
+            };
+            let glow = LaneGlow {
+                time,
+                color: 0,
+                origin: 70.0,
+            };
+            let meshes = lane_glow(
+                graph,
+                &row,
+                lane_width,
+                glow,
+                Color32::from_rgb(64, 160, 224),
+            );
+            let meshes = [("halo", meshes.0), ("crest", meshes.1)];
+            let counts = meshes
+                .each_ref()
+                .map(|(_, mesh)| [mesh.vertices.len(), mesh.indices.len()]);
+            let digests = meshes.each_ref().map(|(_, mesh)| mesh_digest(mesh));
+            let [halo, crest] = digests;
+            now += &format!("({counts:?}, [{halo:#018x}, {crest:#018x}]), // {case}\n");
+            if counts == golden.0 && (!exact || digests == golden.1) {
+                continue;
+            }
+            changed += &format!("\n{case}: counts {:?}, now {counts:?}\n", golden.0);
+            for (name, mesh) in &meshes {
+                for (index, vertex) in mesh.vertices.iter().enumerate() {
+                    let (x, y, color) = (vertex.pos.x, vertex.pos.y, vertex.color.to_array());
+                    changed += &format!("{name} {index}: ({x:?}, {y:?}) {color:?}\n");
+                }
+                changed += &format!("{name} indices: {:?}\n", mesh.indices);
+            }
+        }
+        assert!(
+            changed.is_empty(),
+            "the glow changed:{changed}\nGOLDEN is now:\n{now}"
         );
     }
 }
