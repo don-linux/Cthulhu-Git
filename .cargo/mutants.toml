@@ -10,10 +10,13 @@ additional_cargo_test_args = ["--profile", "mutants"]
 # still run; only the mutation run skips it.
 exclude_globs = [
     "src/git/reap.rs",
+    # `main` starts eframe, and the window icon is read only by the window it
+    # opens; no test opens one. exclude_re cannot name just those two: it does
+    # not apply to struct-field deletions, such as the `NativeOptions` in `main`.
     "src/main.rs",
-    "src/ui/theme/**",
+    # Point sizes and SVG painting, checked on screenshots: the test rules keep
+    # pixel geometry out of tests, so most of its mutants would be missed.
     "src/ui/icons.rs",
-    "src/ui/fonts.rs",
     "src/**/*_tests.rs",
     "src/**/test_support.rs",
 ]
@@ -21,4 +24,7 @@ exclude_re = [
     "impl (Debug|Display)",
     # The terminal's session kill, for the same reason as reap.rs above.
     "\\b(should_signal|stop_session|signal_pid|pty_pid|session_of|session_of_ps|session_from_stat|processes_in_session|kill_process_tree)\\b",
+    # A lane, chip or tag color is only seen on screen: a test that checks a
+    # painted color reads it from these same functions, so a constant passes.
+    "^src/ui/theme/mod\\.rs:.* replace Palette::(graph_color|graph_chip|graph_connector|tag_chip) -> Color32 with Default::default\\(\\)$",
 ]
