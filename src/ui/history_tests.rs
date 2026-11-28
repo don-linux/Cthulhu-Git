@@ -1297,11 +1297,18 @@ fn history_chip_center(harness: &Harness<'_, Screen>, name: &str) -> Pos2 {
     chips[0].center()
 }
 
+/// Frames a lane takes to light up or go out at the harness's 60 per second,
+/// and one to spare for the rounding of the steps.
+fn fade_frames() -> usize {
+    (super::history::GLOW_FADE * 60.0).ceil() as usize + 1
+}
+
+/// The click lands after the lanes are painted, so the light starts on the
+/// next frame; this returns once the fade is through.
 fn click_branch(harness: &mut Harness<'_, Screen>, name: &str) {
     let at = history_chip_center(harness, name);
     click_at(harness, at);
-    // The click lands after the lanes are painted, so the halo shows on the next frame.
-    harness.step();
+    harness.run_steps(1 + fade_frames());
 }
 
 /// Vertex colors of the meshes clipped to the Graph column: the lit lane's
@@ -1332,6 +1339,11 @@ fn lane_glow_near(harness: &Harness<'_, Screen>, lane: egui::Color32) -> usize {
         .into_iter()
         .filter(|color| color.a() > 0 && is_lane_glow(*color, lane))
         .count()
+}
+
+fn brightest_glow(harness: &Harness<'_, Screen>) -> u8 {
+    let colors = glow_colors(harness);
+    colors.iter().map(|color| color.a()).max().unwrap_or(0)
 }
 
 fn assert_no_glow(harness: &Harness<'_, Screen>) {
@@ -1385,10 +1397,25 @@ fn clicking_a_branch_tag_lights_only_that_lanes_halo() {
 
     assert_no_glow(&harness);
 
-    click_branch(&mut harness, "main");
+    // A third of the way into the fade the light is there, but weaker than
+    // the floor it reaches when fully lit.
+    let tag = history_chip_center(&harness, "main");
+    click_at(&mut harness, tag);
+    harness.run_steps(fade_frames() / 3);
+    let fading_in = brightest_glow(&harness);
+    harness.run_steps(fade_frames());
     assert_glow_is(&harness, main);
+    let lit = brightest_glow(&harness);
+    assert!(
+        0 < fading_in && fading_in < lit,
+        "fading in at {fading_in}, lit at {lit}"
+    );
 
-    click_branch(&mut harness, "main");
+    // Going out, the light stays until the fade is through.
+    click_at(&mut harness, tag);
+    harness.run_steps(fade_frames() / 3);
+    assert_glow_is(&harness, main);
+    harness.run_steps(fade_frames());
     assert_no_glow(&harness);
 
     click_branch(&mut harness, "feature");

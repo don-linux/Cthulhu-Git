@@ -84,6 +84,8 @@ const GLOW_CREST_WHITE: f32 = 0.45;
 /// Alpha at the spark's center. The edges fade to clear.
 const GLOW_CREST_ALPHA: u8 = 210;
 const GLOW_FRAME: Duration = Duration::from_millis(16);
+/// Seconds a lane and its tag take to light up or go out.
+pub(super) const GLOW_FADE: f32 = 0.3;
 const AVATAR: f32 = 26.0;
 /// How far each stacked avatar sits from the previous one.
 const AVATAR_STEP: f32 = AVATAR * 0.62;
@@ -342,6 +344,16 @@ pub fn show(
         head: rows[0].oid.clone(),
     });
     let time = ui.input(|input| input.time);
+    // One fade per lane color, asked every frame from the first: a lane lit
+    // from dark fades in, and the lane it replaces fades out at the same time.
+    let glows: Vec<(usize, f32)> = (0..cthulhu_git::git::LANE_COLORS)
+        .filter_map(|color| {
+            let on = lit.as_ref().is_some_and(|lit| lit.color == color);
+            let id = view_id.with(("history-glow-fade", color));
+            let fade = ui.ctx().animate_bool_with_time(id, on, GLOW_FADE);
+            (fade > 0.0).then_some((color, fade))
+        })
+        .collect();
 
     let (click, glowed) = ui
         .scope(|ui| {
@@ -357,6 +369,7 @@ pub fn show(
                 text_font,
                 mono_font,
                 lit,
+                glows,
                 time,
                 selected: selected_commit.as_deref(),
                 click: None,
@@ -554,6 +567,8 @@ struct RowContext<'a> {
     text_font: FontId,
     mono_font: FontId,
     lit: Option<LitBranch>,
+    /// Lane colors with light on them, and how far each has lit up.
+    glows: Vec<(usize, f32)>,
     time: f64,
     /// Commit whose row stays filled. `None` is the latest commit in the sidebar.
     selected: Option<&'a str>,
@@ -641,24 +656,21 @@ fn history_row(
             }
         }
         let lanes = painter.with_clip_rect(graph.intersect(ui.clip_rect()));
-        cx.glowed |= paint_lanes(
-            &lanes,
-            graph,
-            row,
-            palette,
-            layout.lane_width,
-            fill,
-            cx.lit.as_ref().map(|lit| LaneGlow {
+        let glows: Vec<LaneGlow> = (cx.glows.iter())
+            .map(|&(color, fade)| LaneGlow {
                 time: cx.time,
-                color: lit.color,
+                color,
                 // `origin + screen_y` is the content Y, so the crest stays on
                 // the same commits when the table scrolls.
                 origin: row_index as f32 * row_height - rect.top(),
-            }),
-        );
+                fade,
+            })
+            .collect();
+        cx.glowed |= paint_lanes(&lanes, graph, row, palette, layout.lane_width, fill, &glows);
     }
     if let Some(chip) = &chip {
         let lit = cx.lit.as_ref().is_some_and(|lit| lit.name == chip.name);
+        let lit = (ui.ctx()).animate_bool_with_time(row_id.with("tag-lit"), lit, GLOW_FADE);
         if paint_branch_chip(ui, chip, palette, lit) {
             cx.click = Some(RowClick::Branch(chip.name.clone()));
         }
@@ -869,6 +881,8 @@ struct LaneGlow {
     time: f64,
     color: usize,
     origin: f32,
+    /// How far the lane has lit up, from 0 (out) to 1. Every alpha scales by it.
+    fade: f32,
 }
 
 /// The commit dot's center, the radius of the background ring it sits in,
@@ -891,20 +905,16 @@ fn paint_lanes(
     palette: &Palette,
     lane_width: f32,
     fill: Color32,
-    glow: Option<LaneGlow>,
+    glows: &[LaneGlow],
 ) -> bool {
     let (dot, outer, inner) = commit_dot(graph, row, lane_width);
-    let (halo, crest) = glow
-        .map(|glow| {
-            lane_glow(
-                graph,
-                row,
-                lane_width,
-                glow,
-                palette.graph_color(glow.color),
-            )
-        })
-        .unwrap_or_default();
+    let (mut halo, mut crest) = (Mesh::default(), Mesh::default());
+    for &glow in glows {
+        let color = palette.graph_color(glow.color);
+        let (lane_halo, lane_crest) = lane_glow(graph, row, lane_width, glow, color);
+        halo.append(lane_halo);
+        crest.append(lane_crest);
+    }
     let glowed = !halo.is_empty() || !crest.is_empty();
     if !halo.is_empty() {
         painter.add(halo);
@@ -958,13 +968,14 @@ fn lane_glow(
                 outer + GLOW_RADIUS.min(gap),
                 color,
                 glow_alpha(glow.time, glow.origin + dot.y),
+                glow.fade,
             );
         }
         // The dot's light stays inside the colored circle, so it does not
         // reach the next lane.
         let lobe = crest_lobe(glow.time, glow.origin + dot.y);
         if lobe > 0.02 {
-            add_crest_disc(&mut crest, dot, inner, color, lobe);
+            add_crest_disc(&mut crest, dot, inner, color, lobe, glow.fade);
         }
     }
     (halo, crest)
@@ -1124,22 +1135,29 @@ fn add_glow_segment(mesh: &mut Mesh, start: Pos2, end: Pos2, color: Color32, glo
         &STOPS,
         |point| glow_alpha(glow.time, glow.origin + point.y),
         |_| true,
-        |alpha, share| glow_color(color, glow_share(alpha, share)),
+        |alpha, share| glow_color(color, glow_share(alpha, share * glow.fade)),
     );
 }
 
 /// Ring outside the commit dot. `inner` is the opaque circle; `outer` is where
-/// the aura fades out. `peak` is the alpha at the circle's edge.
-fn add_glow_disc(mesh: &mut Mesh, center: Pos2, inner: f32, outer: f32, color: Color32, peak: u8) {
+/// the aura fades out. `peak` is the alpha at the circle's edge when fully lit.
+fn add_glow_disc(
+    mesh: &mut Mesh,
+    center: Pos2,
+    inner: f32,
+    outer: f32,
+    color: Color32,
+    peak: u8,
+    fade: f32,
+) {
     if outer < inner + 0.5 {
         return;
     }
-    let tint = |alpha| glow_color(color, alpha);
-    let shoulder = tint(glow_share(peak, GLOW_EDGE_SHARE));
+    let tint = |share| glow_color(color, glow_share(peak, share * fade));
     let aura = [
-        (inner, tint(peak)),
-        ((inner + outer) * 0.5, shoulder),
-        (outer, tint(0)),
+        (inner, tint(1.0)),
+        ((inner + outer) * 0.5, tint(GLOW_EDGE_SHARE)),
+        (outer, tint(0.0)),
     ];
     // On a base of 1, each scale is exactly the radius it names.
     rings(mesh, center, 1.0, 16, &aura);
@@ -1180,16 +1198,23 @@ fn add_crest_segment(mesh: &mut Mesh, start: Pos2, end: Pos2, color: Color32, gl
         &STOPS,
         |point| crest_lobe(glow.time, glow.origin + point.y),
         |lobe| lobe > 0.02,
-        |lobe, share| crest_color(color, lobe, share),
+        |lobe, share| crest_color(color, lobe, share * glow.fade),
     );
 }
 
 /// Soft spot on the commit dot, fading at `radius`.
-fn add_crest_disc(mesh: &mut Mesh, center: Pos2, radius: f32, color: Color32, lobe: f32) {
+fn add_crest_disc(
+    mesh: &mut Mesh,
+    center: Pos2,
+    radius: f32,
+    color: Color32,
+    lobe: f32,
+    fade: f32,
+) {
     if radius < 0.5 {
         return;
     }
-    let tint = |share| crest_color(color, lobe, share);
+    let tint = |share: f32| crest_color(color, lobe, share * fade);
     let spot = [(0.0, tint(1.0)), (0.55, tint(0.45)), (1.0, tint(0.0))];
     rings(mesh, center, radius, 12, &spot);
 }
@@ -1351,7 +1376,8 @@ fn branch_chip(
 }
 
 /// `true` when the tag was clicked.
-fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette, lit: bool) -> bool {
+/// `lit` is how far the tag's lane has lit up, from 0 to 1.
+fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette, lit: f32) -> bool {
     let color = palette.graph_color(chip.color);
     let icon_rect = Rect::from_center_size(
         Pos2::new(
@@ -1399,18 +1425,11 @@ fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette, lit: boo
     response.clicked()
 }
 
-fn chip_fill(palette: &Palette, color: usize, current: bool, lit: bool) -> Color32 {
+fn chip_fill(palette: &Palette, color: usize, current: bool, lit: f32) -> Color32 {
     let fill = palette.graph_chip(color, current);
-    if !lit {
-        return fill;
-    }
     let lane = palette.graph_color(color);
-    Color32::from_rgba_unmultiplied(
-        lane.r(),
-        lane.g(),
-        lane.b(),
-        fill.a().saturating_add(CHIP_LIT_BOOST),
-    )
+    let boost = (f32::from(CHIP_LIT_BOOST) * lit).round() as u8;
+    Color32::from_rgba_unmultiplied(lane.r(), lane.g(), lane.b(), fill.a().saturating_add(boost))
 }
 
 #[cfg(test)]
@@ -1662,7 +1681,7 @@ mod tests {
     }
 
     type Trace = (Option<usize>, Option<usize>, usize);
-    type GlowRow = (&'static str, f32, f64, [usize; 2], &'static [Trace]);
+    type GlowRow = (&'static str, f32, f64, f32, [usize; 2], &'static [Trace]);
     const STRAIGHT: &[Trace] = &[(Some(0), Some(0), 0), (Some(1), None, 2)];
     const LANE_CHANGE: &[Trace] = &[(Some(1), Some(0), 0)];
     /// Into the dot and out to both parents, past another color's lane, and
@@ -1676,25 +1695,27 @@ mod tests {
     ];
     const DOT: &[Trace] = &[(Some(1), None, 0), (None, Some(1), 0)];
     /// Rows lit on lane color 0, whose dot sits 140 points down the branch:
-    /// (case, lane width, seconds, dot lane and color, traces as from lane,
-    /// to lane and color). At 0.7 s the crest is on the dot, at 0.425 s its
-    /// front reaches only the upper half, at 2.3 s it is half a wavelength
-    /// away. On 20-point lanes the aura is narrower than the halo; on the
-    /// narrowest there is no room for it.
-    const GLOW_ROWS: [GlowRow; 7] = [
-        ("straight", LANE_MAX, 0.7, [1, 2], STRAIGHT),
-        ("lane change", LANE_MAX, 0.7, [2, 2], LANE_CHANGE),
-        ("merge", 20.0, 0.7, [0, 0], MERGE),
-        ("dot", LANE_MAX, 0.7, [1, 0], DOT),
-        ("narrow", LANE_MIN, 0.7, [1, 0], DOT),
-        ("crest edge", LANE_MAX, 0.425, [1, 0], DOT),
-        ("crest away", LANE_MAX, 2.3, [1, 0], DOT),
+    /// (case, lane width, seconds, fade, dot lane and color, traces as from
+    /// lane, to lane and color). At 0.7 s the crest is on the dot, at 0.425 s
+    /// its front reaches only the upper half, at 2.3 s it is half a
+    /// wavelength away. On 20-point lanes the aura is narrower than the halo;
+    /// on the narrowest there is no room for it. Half lit is the dot halfway
+    /// through its fade.
+    const GLOW_ROWS: [GlowRow; 8] = [
+        ("straight", LANE_MAX, 0.7, 1.0, [1, 2], STRAIGHT),
+        ("lane change", LANE_MAX, 0.7, 1.0, [2, 2], LANE_CHANGE),
+        ("merge", 20.0, 0.7, 1.0, [0, 0], MERGE),
+        ("dot", LANE_MAX, 0.7, 1.0, [1, 0], DOT),
+        ("narrow", LANE_MIN, 0.7, 1.0, [1, 0], DOT),
+        ("crest edge", LANE_MAX, 0.425, 1.0, [1, 0], DOT),
+        ("crest away", LANE_MAX, 2.3, 1.0, [1, 0], DOT),
+        ("half lit", LANE_MAX, 0.7, 0.5, [1, 0], DOT),
     ];
     /// Per row above: the halo's and the crest's vertex and index counts,
     /// then a digest of each mesh's exact bits. One row per line, as the
     /// test prints them.
     #[rustfmt::skip]
-    const GOLDEN: [([[usize; 2]; 2], [u64; 2]); 7] = [
+    const GOLDEN: [([[usize; 2]; 2], [u64; 2]); 8] = [
         ([[30, 120], [25, 96]], [0xd7e20f28027a9a35, 0x43f38e51d12d739a]), // straight
         ([[36, 150], [30, 120]], [0x75fbc29c0416f8ec, 0xb0711276fd7cd83d]), // lane change
         ([[108, 402], [86, 312]], [0x7db8a48a103b3ea8, 0x2fa896d0a854ad9f]), // merge
@@ -1702,6 +1723,7 @@ mod tests {
         ([[36, 120], [66, 240]], [0x11281c45b3196845, 0xf7cad7d9de74f997]), // narrow
         ([[84, 312], [15, 48]], [0xb61e34c53fef13b9, 0x239961336da8b433]), // crest edge
         ([[84, 312], [0, 0]], [0x8a735e8ee3cdcab1, 0xcbf29ce484222325]), // crest away
+        ([[84, 312], [66, 240]], [0x22a1d5b5c9f8f2ed, 0xc7b7a38f1a4a5066]), // half lit
     ];
 
     /// FNV-1a over each vertex's position, UV and color bits, then the indices.
@@ -1719,12 +1741,14 @@ mod tests {
             })
     }
 
-    /// The graph cell of a row lit on lane color 0 at `time`, whose dot sits
-    /// 140 points down the branch, and the row with that dot and `traces`.
+    /// The graph cell of a row lit on lane color 0 at `time` and `fade`, whose
+    /// dot sits 140 points down the branch, and the row with that dot and
+    /// `traces`.
     fn lit_row(
         [lane, color]: [usize; 2],
         traces: &[Trace],
         time: f64,
+        fade: f32,
     ) -> (Rect, GraphRow, LaneGlow) {
         let traces = traces
             .iter()
@@ -1747,6 +1771,7 @@ mod tests {
             time,
             color: 0,
             origin: 70.0,
+            fade,
         };
         let graph = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(150.0, 40.0));
         (graph, row, glow)
@@ -1759,8 +1784,10 @@ mod tests {
     fn lane_glow_meshes_match_the_golden() {
         let exact = cfg!(all(target_os = "linux", target_env = "gnu"));
         let (mut now, mut changed) = (String::new(), String::new());
-        for ((case, lane_width, time, dot, traces), golden) in GLOW_ROWS.into_iter().zip(GOLDEN) {
-            let (graph, row, glow) = lit_row(dot, traces, time);
+        for ((case, lane_width, time, fade, dot, traces), golden) in
+            GLOW_ROWS.into_iter().zip(GOLDEN)
+        {
+            let (graph, row, glow) = lit_row(dot, traces, time, fade);
             let color = Color32::from_rgb(64, 160, 224);
             let meshes = lane_glow(graph, &row, lane_width, glow, color);
             let meshes = [("halo", meshes.0), ("crest", meshes.1)];
@@ -1793,11 +1820,11 @@ mod tests {
     #[test]
     fn paint_lanes_puts_the_halo_under_the_strokes_and_the_crest_on_top() {
         let palette = &crate::ui::theme::DEFAULT_THEME.palette;
-        let (graph, row, glow) = lit_row([0, 0], MERGE, 0.7);
+        let (graph, row, glow) = lit_row([0, 0], MERGE, 0.7, 1.0);
         let (halo, crest) = lane_glow(graph, &row, 20.0, glow, palette.graph_color(0));
         let mut output = egui::Context::default().run_ui(egui::RawInput::default(), |ui| {
             let fill = Color32::BLACK;
-            paint_lanes(ui.painter(), graph, &row, palette, 20.0, fill, Some(glow));
+            paint_lanes(ui.painter(), graph, &row, palette, 20.0, fill, &[glow]);
         });
         output.textures_delta.clear();
         let painted: Vec<&str> = (output.shapes.iter())
