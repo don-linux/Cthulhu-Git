@@ -111,12 +111,8 @@ impl AvatarResolver {
         &self.status
     }
 
-    /// URLs to try in order. May block on the GitHub API; `now` is Unix seconds.
-    pub fn candidates(&mut self, query: &AvatarQuery<'_>, now: u64) -> Vec<String> {
-        self.resolve(query, now).urls
-    }
-
-    /// [`Self::candidates`], with whether the answer may improve later.
+    /// URLs to try in order, and whether the answer may improve later. May
+    /// block on the GitHub API; `now` is Unix seconds.
     pub fn resolve(&mut self, query: &AvatarQuery<'_>, now: u64) -> Candidates {
         let mut urls = Vec::new();
         let mut push = |url: String| {
@@ -239,6 +235,10 @@ impl AvatarResolver {
 
     /// `Some(Some(url))` when an address has an avatar, `Some(None)` when
     /// GitHub already said none of them has one, `None` when unknown.
+    #[expect(
+        clippy::option_option,
+        reason = "mirrors `known`, whose `None` value records that GitHub has no avatar"
+    )]
     fn lookup(&mut self, repo: &GitHubRepo, emails: &[String]) -> Option<Option<String>> {
         let state = self.state(repo);
         let mut all_unlinked = !emails.is_empty();
@@ -319,105 +319,91 @@ impl AvatarResolver {
 
 #[cfg(test)]
 mod tests {
-    use super::super::http::fake::FakeTransport;
     use super::*;
+    use crate::test_support::{
+        FakeTransport, NOW, ask, auth_value, commit_json, context, list_url, resolver,
+    };
 
-    const NOW: u64 = 1_800_000_000;
-    const LIST: &str = "https://api.github.com/repos/don-linux/Cthulhu-Git/commits";
-
-    fn context() -> RepoContext {
-        RepoContext {
-            repo: GitHubRepo {
-                owner: "don-linux".to_owned(),
-                name: "Cthulhu-Git".to_owned(),
-            },
-            head: "aaa111".to_owned(),
-        }
+    fn listing(commits: &[String]) -> Vec<u8> {
+        format!("[{}]", commits.join(",")).into_bytes()
     }
 
-    fn commit_json(sha: &str, email: &str, avatar: Option<&str>) -> String {
-        let author = avatar
-            .map(|url| format!(r#"{{"avatar_url": "{url}"}}"#))
-            .unwrap_or_else(|| "null".to_owned());
-        format!(
-            r#"{{"sha": "{sha}", "commit": {{"author": {{"email": "{email}"}}, "committer": null}},
-                "author": {author}, "committer": null}}"#
-        )
-    }
-
-    fn resolver(fake: &Arc<FakeTransport>) -> AvatarResolver {
-        AvatarResolver::new(Arc::clone(fake) as Arc<dyn Transport>)
-    }
-
-    fn emails(list: &[&str]) -> Vec<String> {
-        list.iter().map(|email| (*email).to_owned()).collect()
-    }
-
+    /// A noreply address with an id or a login, and a known agent, go
+    /// straight to the avatar host with Gravatar second; the API is not
+    /// asked for them, and is for anyone else.
     #[test]
     fn noreply_and_known_agents_skip_the_api() {
         let fake = Arc::new(FakeTransport::default());
         let mut resolver = resolver(&fake);
-        let context = context();
-        let people = emails(&["cursoragent@cursor.com"]);
-        let urls = resolver.candidates(
-            &AvatarQuery {
-                emails: &people,
-                repo: Some(&context),
-                authored: Some("aaa111"),
-            },
-            NOW,
-        );
-        assert_eq!(
-            urls[0],
-            "https://avatars.githubusercontent.com/u/199161495?s=96"
-        );
-        assert!(urls[1].starts_with("https://gravatar.com/avatar/"));
-        assert!(fake.urls().is_empty());
+        for (email, direct) in [
+            (
+                "194445529+don-linux@users.noreply.github.com",
+                "https://avatars.githubusercontent.com/u/194445529?s=96",
+            ),
+            (
+                "49699333+dependabot[bot]@users.noreply.github.com",
+                "https://avatars.githubusercontent.com/u/49699333?s=96",
+            ),
+            (
+                "don-linux@users.noreply.github.com",
+                "https://github.com/don-linux.png?size=96",
+            ),
+            (
+                "cursoragent@cursor.com",
+                "https://avatars.githubusercontent.com/u/199161495?s=96",
+            ),
+        ] {
+            let urls = ask(&mut resolver, email, Some("aaa111"), NOW).urls;
+            assert_eq!(urls[0], direct, "{email}");
+            assert!(
+                urls[1].starts_with("https://gravatar.com/avatar/"),
+                "{email}"
+            );
+        }
+        assert_eq!(fake.urls(), [] as [String; 0]);
+
+        let warm = list_url(100, Some("aaa111"));
+        fake.reply(&warm, 200, &[], b"[]");
+        ask(&mut resolver, "person@example.com", None, NOW);
+        assert_eq!(fake.urls(), [warm]);
     }
 
     #[test]
     fn one_listing_answers_every_author_on_it() {
         let fake = Arc::new(FakeTransport::default());
-        let body = format!(
-            "[{}, {}]",
-            commit_json(
-                "aaa111",
-                "fernando@example.com",
-                Some("https://avatars.githubusercontent.com/u/194445529?v=4")
-            ),
-            commit_json("bbb222", "ghost@example.com", None)
-        );
         fake.reply(
-            &format!("{LIST}?per_page=100&sha=aaa111"),
+            &list_url(100, Some("aaa111")),
             200,
             &[("x-ratelimit-remaining", "59"), ("x-ratelimit-limit", "60")],
-            body.as_bytes(),
+            &listing(&[
+                commit_json(
+                    "aaa111",
+                    "fernando@example.com",
+                    Some("https://avatars.githubusercontent.com/u/194445529?v=4"),
+                ),
+                commit_json("bbb222", "ghost@example.com", None),
+                // An address keeps the first avatar listed for it.
+                commit_json(
+                    "ccc333",
+                    "fernando@example.com",
+                    Some("https://avatars.githubusercontent.com/u/1?v=4"),
+                ),
+            ]),
         );
         let mut resolver = resolver(&fake);
         let context = context();
-        let fernando = emails(&["fernando@example.com"]);
-        let urls = resolver.candidates(
-            &AvatarQuery {
-                emails: &fernando,
-                repo: Some(&context),
-                authored: Some("aaa111"),
-            },
-            NOW,
-        );
+        let fernando = ["fernando@example.com".to_owned()];
+        let query = AvatarQuery {
+            emails: &fernando,
+            repo: Some(&context),
+            authored: Some("aaa111"),
+        };
         assert_eq!(
-            urls[0],
+            resolver.resolve(&query, NOW).urls[0],
             "https://avatars.githubusercontent.com/u/194445529?v=4&s=96"
         );
         // GitHub already said this address has no account: no second request.
-        let ghost = emails(&["ghost@example.com"]);
-        let urls = resolver.candidates(
-            &AvatarQuery {
-                emails: &ghost,
-                repo: Some(&context),
-                authored: Some("bbb222"),
-            },
-            NOW,
-        );
+        let urls = ask(&mut resolver, "ghost@example.com", Some("bbb222"), NOW).urls;
         assert_eq!(urls.len(), 1);
         assert!(urls[0].starts_with("https://gravatar.com/"));
         assert_eq!(fake.urls().len(), 1);
@@ -427,210 +413,160 @@ mod tests {
         );
     }
 
+    /// A listed commit answers its author even when `.mailmap` changed the
+    /// address the history shows.
+    #[test]
+    fn a_listed_commit_answers_its_mailmapped_author_without_another_call() {
+        let fake = Arc::new(FakeTransport::default());
+        fake.reply(
+            &list_url(100, Some("aaa111")),
+            200,
+            &[],
+            &listing(&[commit_json(
+                "ccc333",
+                "raw-address@example.com",
+                Some("https://avatars.githubusercontent.com/u/7?v=4"),
+            )]),
+        );
+        let mut resolver = resolver(&fake);
+        let urls = ask(&mut resolver, "mailmapped@example.com", Some("ccc333"), NOW).urls;
+        assert_eq!(
+            urls[0],
+            "https://avatars.githubusercontent.com/u/7?v=4&s=96"
+        );
+        assert_eq!(fake.urls().len(), 1);
+    }
+
     #[test]
     fn an_unpushed_head_falls_back_to_the_default_branch_then_one_commit() {
         let fake = Arc::new(FakeTransport::default());
-        fake.reply(&format!("{LIST}?per_page=100&sha=aaa111"), 422, &[], b"{}");
-        fake.reply(&format!("{LIST}?per_page=100"), 200, &[], b"[]");
+        fake.reply(&list_url(100, Some("aaa111")), 422, &[], b"{}");
+        fake.reply(&list_url(100, None), 200, &[], b"[]");
         fake.reply(
-            &format!("{LIST}?per_page=1&sha=ccc333"),
+            &list_url(1, Some("ccc333")),
             200,
             &[],
-            format!(
-                "[{}]",
-                commit_json(
-                    "ccc333",
-                    "raw-address@example.com",
-                    Some("https://avatars.githubusercontent.com/u/7?v=4")
-                )
-            )
-            .as_bytes(),
+            &listing(&[commit_json(
+                "ccc333",
+                "raw-address@example.com",
+                Some("https://avatars.githubusercontent.com/u/7?v=4"),
+            )]),
         );
         let mut resolver = resolver(&fake);
-        let context = context();
-        let mapped = emails(&["mailmapped@example.com"]);
-        let query = AvatarQuery {
-            emails: &mapped,
-            repo: Some(&context),
-            authored: Some("ccc333"),
-        };
-        let urls = resolver.candidates(&query, NOW);
+        let urls = ask(&mut resolver, "mailmapped@example.com", Some("ccc333"), NOW).urls;
         assert_eq!(
             urls[0],
             "https://avatars.githubusercontent.com/u/7?v=4&s=96"
         );
         // Asked once per address.
-        resolver.candidates(&query, NOW);
+        ask(&mut resolver, "mailmapped@example.com", Some("ccc333"), NOW);
         assert_eq!(fake.urls().len(), 3);
     }
 
+    /// A co-author has no commit of their own to look up: only the listing
+    /// is asked, never one request per person.
     #[test]
-    fn rate_limits_pause_the_api_until_the_reset() {
+    fn a_co_author_without_an_authored_commit_is_not_looked_up() {
         let fake = Arc::new(FakeTransport::default());
+        let warm = list_url(100, Some("aaa111"));
         fake.reply(
-            &format!("{LIST}?per_page=100&sha=aaa111"),
-            403,
-            &[
-                ("x-ratelimit-remaining", "0"),
-                ("x-ratelimit-reset", "1800003600"),
-            ],
-            b"{}",
+            &warm,
+            200,
+            &[("x-ratelimit-remaining", "40")],
+            &listing(&[commit_json("aaa111", "author@example.com", None)]),
         );
         let mut resolver = resolver(&fake);
-        let context = context();
-        let someone = emails(&["someone@example.com"]);
-        let query = AvatarQuery {
-            emails: &someone,
-            repo: Some(&context),
-            authored: Some("ddd444"),
-        };
-        let urls = resolver.candidates(&query, NOW);
-        assert_eq!(urls.len(), 1, "only Gravatar while paused: {urls:?}");
-        assert_eq!(resolver.status().paused_until, Some(1_800_003_600));
-        resolver.candidates(&query, NOW + 10);
-        assert_eq!(fake.urls().len(), 1);
-    }
+        for email in ["co1@example.com", "co2@example.com", "co3@example.com"] {
+            let urls = ask(&mut resolver, email, None, NOW).urls;
+            assert!(
+                urls.iter().all(|url| url.contains("gravatar.com")),
+                "{urls:?}"
+            );
+        }
+        assert_eq!(fake.urls(), std::slice::from_ref(&warm));
 
-    #[test]
-    fn a_rejected_token_is_dropped_and_the_request_retried_without_it() {
-        let fake = Arc::new(FakeTransport::default());
-        fake.reply(&format!("{LIST}?per_page=100&sha=aaa111"), 401, &[], b"{}");
-        let mut resolver = resolver(&fake);
-        resolver.set_token(Some(Token::new("ghp_revoked_token_0000000000")));
-        let context = context();
-        let someone = emails(&["someone@example.com"]);
-        resolver.candidates(
-            &AvatarQuery {
-                emails: &someone,
-                repo: Some(&context),
-                authored: None,
-            },
-            NOW,
-        );
-        assert!(resolver.status().token_rejected);
-        let requests = fake.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        let has_auth = |index: usize| {
-            requests[index]
-                .1
-                .iter()
-                .any(|(name, _)| name == "Authorization")
-        };
-        assert!(has_auth(0));
-        assert!(!has_auth(1));
-    }
-
-    #[test]
-    fn a_listing_that_fails_for_now_is_tried_again_for_the_next_person() {
-        let fake = Arc::new(FakeTransport::default());
-        let list = format!("{LIST}?per_page=100&sha=aaa111");
-        fake.reply(&list, 500, &[], b"{}");
-        let mut resolver = resolver(&fake);
-        let context = context();
-        let first = emails(&["first@example.com"]);
-        let answer = resolver.resolve(
-            &AvatarQuery {
-                emails: &first,
-                repo: Some(&context),
-                authored: Some("fff666"),
-            },
-            NOW,
-        );
-        assert!(answer.provisional, "a 500 is not a final answer");
-        assert_eq!(
-            fake.urls(),
-            std::slice::from_ref(&list),
-            "no per-commit call after a failed listing"
-        );
-
+        let one = list_url(1, Some("ccc333"));
         fake.reply(
-            &list,
+            &one,
             200,
             &[],
-            format!(
-                "[{}]",
-                commit_json(
-                    "aaa111",
-                    "second@example.com",
-                    Some("https://avatars.githubusercontent.com/u/9?v=4")
-                )
-            )
-            .as_bytes(),
+            &listing(&[commit_json(
+                "ccc333",
+                "raw@example.com",
+                Some("https://avatars.githubusercontent.com/u/7?v=4"),
+            )]),
         );
-        let second = emails(&["second@example.com"]);
-        let answer = resolver.resolve(
-            &AvatarQuery {
-                emails: &second,
-                repo: Some(&context),
-                authored: Some("aaa111"),
-            },
-            NOW,
-        );
-        assert!(!answer.provisional);
-        assert_eq!(
-            answer.urls[0],
-            "https://avatars.githubusercontent.com/u/9?v=4&s=96"
-        );
-        assert_eq!(fake.urls(), [list.clone(), list]);
-    }
-
-    #[test]
-    fn a_listed_commit_answers_its_mailmapped_author_without_another_call() {
-        let fake = Arc::new(FakeTransport::default());
-        fake.reply(
-            &format!("{LIST}?per_page=100&sha=aaa111"),
-            200,
-            &[],
-            format!(
-                "[{}]",
-                commit_json(
-                    "ccc333",
-                    "raw-address@example.com",
-                    Some("https://avatars.githubusercontent.com/u/7?v=4")
-                )
-            )
-            .as_bytes(),
-        );
-        let mut resolver = resolver(&fake);
-        let context = context();
-        let mapped = emails(&["mailmapped@example.com"]);
-        let urls = resolver.candidates(
-            &AvatarQuery {
-                emails: &mapped,
-                repo: Some(&context),
-                authored: Some("ccc333"),
-            },
-            NOW,
-        );
+        let urls = ask(&mut resolver, "co1@example.com", Some("ccc333"), NOW).urls;
         assert_eq!(
             urls[0],
             "https://avatars.githubusercontent.com/u/7?v=4&s=96"
         );
-        assert_eq!(fake.urls().len(), 1);
+        assert_eq!(fake.urls(), [warm, one]);
+    }
+
+    /// While paused only Gravatar is offered and nothing is requested; at
+    /// the reset the listing is tried again first, then the one commit.
+    #[test]
+    fn a_rate_limit_pauses_the_api_until_the_reset() {
+        let fake = Arc::new(FakeTransport::default());
+        let warm = list_url(100, Some("aaa111"));
+        let reset = 1_800_003_600u64;
+        fake.reply(
+            &warm,
+            403,
+            &[
+                ("x-ratelimit-remaining", "0"),
+                ("x-ratelimit-reset", &reset.to_string()),
+            ],
+            b"{}",
+        );
+        let one = list_url(1, Some("bbb222"));
+        fake.reply(
+            &one,
+            200,
+            &[("x-ratelimit-remaining", "20")],
+            &listing(&[commit_json(
+                "bbb222",
+                "person@example.com",
+                Some("https://avatars.githubusercontent.com/u/8?v=4"),
+            )]),
+        );
+        let mut resolver = resolver(&fake);
+        let urls = ask(&mut resolver, "person@example.com", Some("bbb222"), NOW).urls;
+        assert_eq!(urls.len(), 1, "{urls:?}");
+        assert!(urls[0].contains("gravatar.com"));
+        assert_eq!(resolver.status().paused_until, Some(reset));
+        ask(
+            &mut resolver,
+            "person@example.com",
+            Some("bbb222"),
+            reset - 1,
+        );
+        assert_eq!(fake.urls(), std::slice::from_ref(&warm));
+
+        fake.reply(&warm, 200, &[("x-ratelimit-remaining", "21")], b"[]");
+        let urls = ask(&mut resolver, "person@example.com", Some("bbb222"), reset).urls;
+        assert_eq!(
+            urls[0],
+            "https://avatars.githubusercontent.com/u/8?v=4&s=96"
+        );
+        assert_eq!(fake.urls(), [warm.clone(), warm, one]);
     }
 
     #[test]
     fn a_paused_api_is_provisional_and_says_when_to_retry() {
         let fake = Arc::new(FakeTransport::default());
         fake.reply(
-            &format!("{LIST}?per_page=100&sha=aaa111"),
+            &list_url(100, Some("aaa111")),
             429,
             &[("retry-after", "120")],
             b"{}",
         );
         let mut resolver = resolver(&fake);
-        let context = context();
-        let someone = emails(&["someone@example.com"]);
-        let answer = resolver.resolve(
-            &AvatarQuery {
-                emails: &someone,
-                repo: Some(&context),
-                authored: Some("ddd444"),
-            },
-            NOW,
-        );
+        let answer = ask(&mut resolver, "someone@example.com", Some("ddd444"), NOW);
         assert!(answer.provisional);
         assert_eq!(answer.retry_at, Some(NOW + 120));
+        let someone = ["someone@example.com".to_owned()];
         let settled = resolver.resolve(
             &AvatarQuery {
                 emails: &someone,
@@ -645,42 +581,127 @@ mod tests {
         );
     }
 
+    /// A new token, or none, forgets the learned accounts, the status and
+    /// a pause, and the next listing carries the new token.
     #[test]
-    fn an_empty_commit_id_is_never_looked_up() {
+    fn set_token_starts_over() {
         let fake = Arc::new(FakeTransport::default());
-        fake.reply(&format!("{LIST}?per_page=100&sha=aaa111"), 200, &[], b"[]");
-        let mut resolver = resolver(&fake);
-        let context = context();
-        let someone = emails(&["someone@example.com"]);
-        let answer = resolver.resolve(
-            &AvatarQuery {
-                emails: &someone,
-                repo: Some(&context),
-                authored: Some(""),
-            },
-            NOW,
+        let warm = list_url(100, Some("aaa111"));
+        let avatar = |id: u32| format!("https://avatars.githubusercontent.com/u/{id}?v=4");
+        let learned = |id: u32| {
+            listing(&[commit_json(
+                "aaa111",
+                "person@example.com",
+                Some(&avatar(id)),
+            )])
+        };
+        fake.reply(
+            &warm,
+            200,
+            &[("x-ratelimit-remaining", "40"), ("x-ratelimit-limit", "60")],
+            &learned(1),
         );
-        assert!(!answer.provisional);
-        assert_eq!(fake.urls().len(), 1);
+        let mut resolver = resolver(&fake);
+        let urls = ask(&mut resolver, "person@example.com", Some("aaa111"), NOW).urls;
+        assert_eq!(urls[0], format!("{}&s=96", avatar(1)));
+        assert_eq!(
+            resolver.status().rate.and_then(|rate| rate.remaining),
+            Some(40)
+        );
+
+        let fresh = Token::parse("ghp_brand_new_token_value_012345").expect("token");
+        resolver.set_token(Some(fresh.clone()));
+        assert_eq!(resolver.status(), &ApiStatus::default());
+        fake.reply(
+            &warm,
+            403,
+            &[
+                ("x-ratelimit-remaining", "0"),
+                ("x-ratelimit-reset", "1800003600"),
+            ],
+            b"{}",
+        );
+        ask(&mut resolver, "person@example.com", Some("aaa111"), NOW);
+        assert_eq!(resolver.status().paused_until, Some(1_800_003_600));
+
+        resolver.set_token(None);
+        assert_eq!(resolver.status(), &ApiStatus::default());
+        fake.reply(&warm, 200, &[("x-ratelimit-remaining", "7")], &learned(2));
+        let urls = ask(&mut resolver, "person@example.com", Some("aaa111"), NOW).urls;
+        assert_eq!(urls[0], format!("{}&s=96", avatar(2)));
+
+        let requests = fake.requests.lock().expect("requests");
+        let auth: Vec<_> = requests
+            .iter()
+            .map(|(_, headers)| auth_value(headers))
+            .collect();
+        let bearer = format!("Bearer {}", fresh.expose());
+        assert_eq!(auth, [None, Some(bearer.as_str()), None]);
     }
 
     #[test]
-    fn a_private_repository_without_a_token_is_not_asked_again() {
+    fn a_rejected_token_is_dropped_and_the_request_retried_without_it() {
         let fake = Arc::new(FakeTransport::default());
-        fake.reply(&format!("{LIST}?per_page=100&sha=aaa111"), 404, &[], b"{}");
+        fake.reply(&list_url(100, Some("aaa111")), 401, &[], b"{}");
         let mut resolver = resolver(&fake);
-        let context = context();
-        for email in ["a@example.com", "b@example.com"] {
-            let list = emails(&[email]);
-            resolver.candidates(
-                &AvatarQuery {
-                    emails: &list,
-                    repo: Some(&context),
-                    authored: Some("eee555"),
-                },
-                NOW,
-            );
+        let revoked = Token::parse("ghp_revoked_token_0000000000").expect("token");
+        resolver.set_token(Some(revoked));
+        ask(&mut resolver, "someone@example.com", None, NOW);
+        assert!(resolver.status().token_rejected);
+        let requests = fake.requests.lock().expect("requests");
+        let auth: Vec<_> = requests
+            .iter()
+            .map(|(_, headers)| auth_value(headers).is_some())
+            .collect();
+        assert_eq!(auth, [true, false]);
+    }
+
+    #[test]
+    fn a_listing_that_fails_for_now_is_tried_again_for_the_next_person() {
+        let fake = Arc::new(FakeTransport::default());
+        let list = list_url(100, Some("aaa111"));
+        fake.reply(&list, 500, &[], b"{}");
+        let mut resolver = resolver(&fake);
+        let answer = ask(&mut resolver, "first@example.com", Some("fff666"), NOW);
+        assert!(answer.provisional, "a 500 is not a final answer");
+        assert_eq!(
+            fake.urls(),
+            std::slice::from_ref(&list),
+            "no per-commit call after a failed listing"
+        );
+
+        fake.reply(
+            &list,
+            200,
+            &[],
+            &listing(&[commit_json(
+                "aaa111",
+                "second@example.com",
+                Some("https://avatars.githubusercontent.com/u/9?v=4"),
+            )]),
+        );
+        let answer = ask(&mut resolver, "second@example.com", Some("aaa111"), NOW);
+        assert!(!answer.provisional);
+        assert_eq!(
+            answer.urls[0],
+            "https://avatars.githubusercontent.com/u/9?v=4&s=96"
+        );
+        assert_eq!(fake.urls(), [list.clone(), list]);
+    }
+
+    /// One listing, and nothing more, for an empty commit id and for a
+    /// private repository without a token.
+    #[test]
+    fn an_empty_commit_id_and_a_private_repository_are_asked_once() {
+        for (status, authored) in [(200, ""), (404, "eee555")] {
+            let fake = Arc::new(FakeTransport::default());
+            fake.reply(&list_url(100, Some("aaa111")), status, &[], b"[]");
+            let mut resolver = resolver(&fake);
+            for email in ["a@example.com", "b@example.com"] {
+                let answer = ask(&mut resolver, email, Some(authored), NOW);
+                assert!(!answer.provisional, "{status} {email}");
+            }
+            assert_eq!(fake.urls().len(), 1, "{status}");
         }
-        assert_eq!(fake.urls().len(), 1);
     }
 }

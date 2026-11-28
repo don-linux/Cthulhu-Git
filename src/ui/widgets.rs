@@ -4,10 +4,11 @@
 use std::time::Duration;
 
 use eframe::egui::{
-    self, Align2, Button, Context, CursorIcon, Frame, Id, Margin, Order, Response, RichText,
-    Stroke, Ui, Vec2,
+    self, Align2, AsIdSalt, Button, Color32, Context, CursorIcon, Frame, Id, InnerResponse, Margin,
+    Order, Response, RichText, Role, Sense, Stroke, Ui, UiBuilder, Vec2, WidgetInfo,
 };
 
+use super::Action;
 use super::icons::{self, Icon};
 use super::theme;
 
@@ -72,6 +73,76 @@ pub fn secondary_button(ui: &mut Ui, text: &str, icon: Option<Icon>, enabled: bo
         .on_hover_cursor(CursorIcon::PointingHand)
 }
 
+/// A row that is one click target, like egui's `selectable_label`: filled
+/// while selected or hovered, with `margin` around what `add` draws. `add`
+/// returns the label that names the row, and accessibility reads the row as
+/// a button with that name and its selected state.
+pub fn selectable_row(
+    ui: &mut Ui,
+    id_salt: impl AsIdSalt,
+    selected: bool,
+    margin: Margin,
+    add: impl FnOnce(&mut Ui) -> Response,
+) -> Response {
+    let palette = theme::current(ui.ctx()).palette;
+    let InnerResponse {
+        inner: name,
+        response,
+    } = ui.scope_builder(
+        UiBuilder::new().id_salt(id_salt).sense(Sense::click()),
+        |ui| {
+            let fill = if selected {
+                palette.surface_active
+            } else if ui.response().hovered() {
+                palette.surface_hover
+            } else {
+                Color32::TRANSPARENT
+            };
+            Frame::new()
+                .fill(fill)
+                .corner_radius(CORNER_RADIUS)
+                .inner_margin(margin)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    add(ui)
+                })
+                .inner
+        },
+    );
+    response.widget_info(|| WidgetInfo {
+        selected: Some(selected),
+        ..WidgetInfo::new(Role::Button)
+    });
+    response
+        .labelled_by(name.id)
+        .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// The top and bottom bars of the repository and settings screens.
+pub fn bar_frame(palette: &theme::Palette) -> Frame {
+    Frame::new()
+        .fill(palette.surface)
+        .stroke(Stroke::new(1.0, palette.border))
+        .inner_margin(Margin::symmetric(12, 6))
+}
+
+/// Home and the folder dialog, as both bars offer them. The folder is
+/// dimmed and off while an open or another dialog is running.
+pub fn home_and_folder(ui: &mut Ui, busy: bool, actions: &mut Vec<Action>) {
+    let palette = theme::current(ui.ctx()).palette;
+    if icons::icon_button(ui, Icon::House, palette.text, "Open another repository").clicked() {
+        actions.push(Action::Home);
+    }
+    let folder_tint = if busy {
+        palette.text_muted
+    } else {
+        palette.text
+    };
+    if icons::icon_button_enabled(ui, Icon::Folder, folder_tint, "Open a folder", !busy).clicked() {
+        actions.push(Action::Browse);
+    }
+}
+
 pub fn error_banner(ui: &mut Ui, message: &str) {
     let palette = theme::current(ui.ctx()).palette;
     Frame::new()
@@ -97,7 +168,7 @@ struct ClipboardToast {
 }
 
 fn clipboard_toast_id() -> Id {
-    Id::new("cthulhu-clipboard-toast")
+    Id::unique("cthulhu-clipboard-toast")
 }
 
 /// Puts the full hash on the clipboard and posts a short notice for
@@ -138,7 +209,7 @@ pub(super) fn show_clipboard_toast(ctx: &Context) {
                 .corner_radius(CORNER_RADIUS)
                 .inner_margin(Margin::symmetric(12, 8))
                 .show(ui, |ui| {
-                    ui.label(RichText::new(&toast.notice).color(palette.text));
+                    ui.label(&toast.notice);
                 });
         });
 }

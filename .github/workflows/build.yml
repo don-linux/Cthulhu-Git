@@ -7,6 +7,8 @@ name: Build
 # The icon comes from assets/icon.svg. build.rs renders it with resvg for the
 # window icon and the Windows .exe; the jobs below render the Linux and macOS
 # sizes with the resvg CLI of the same version, so every PNG is identical.
+# Inside the window the app draws the SVG itself, with the resvg egui_extras
+# depends on.
 on:
   workflow_call:
     inputs:
@@ -25,7 +27,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RESVG_VERSION: "0.48.1"
+  RESVG_VERSION: "0.50.0"
   # File names only. Kept out of the script text so a label cannot break the shell.
   LABEL: ${{ inputs.label }}
 
@@ -74,19 +76,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rpm desktop-file-utils
           mkdir -p "$RUNNER_TEMP/tools"
+          # The prebuilt Linux resvg needs a newer glibc than this runner, the
+          # oldest supported Ubuntu, so build the CLI from the crate build.rs uses.
+          cargo install --locked --root "$RUNNER_TEMP/tools" "resvg@$RESVG_VERSION"
           cd "$RUNNER_TEMP/tools"
-          curl -fsSL -o resvg.tar.gz \
-            "https://github.com/linebender/resvg/releases/download/v$RESVG_VERSION/resvg-linux-x86_64.tar.gz"
-          echo "fa8c26495a187e592c501db15bf9e8a9fdc051d4b2b336b39703d5b59f912b9d  resvg.tar.gz" | sha256sum -c
-          tar xzf resvg.tar.gz
           curl -fsSL -o appimagetool \
             "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
           echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool" | sha256sum -c
           chmod +x appimagetool
           echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+          echo "$RUNNER_TEMP/tools/bin" >> "$GITHUB_PATH"
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
         with:
-          tool: cargo-deb@3.8.0,cargo-generate-rpm@0.21.0
+          tool: cargo-deb@3.8.0,cargo-generate-rpm@0.21.1
 
       # PNG only: KDE draws SVG icons with Qt SVG, which lacks feTurbulence and
       # feDropShadow, so installing icon.svg itself would render it broken.
@@ -121,6 +123,8 @@ jobs:
           cp packaging/linux/cthulhu-git.desktop "dist/$name/share/applications/"
           cp -R target/icons/hicolor "dist/$name/share/icons/"
           stage_font_licenses "dist/$name/share/doc/cthulhu-git/fonts"
+          mkdir -p "dist/$name/share/doc/cthulhu-git/icons"
+          cp assets/icons/LICENSE "dist/$name/share/doc/cthulhu-git/icons/"
           tar czf "dist/$name.tar.gz" -C dist "$name"
           rm -rf "dist/$name"
 
@@ -160,6 +164,8 @@ jobs:
           cp packaging/linux/cthulhu-git.desktop "$appdir/usr/share/applications/"
           cp -R target/icons/hicolor "$appdir/usr/share/icons/"
           stage_font_licenses "$appdir/usr/share/doc/cthulhu-git/fonts"
+          mkdir -p "$appdir/usr/share/doc/cthulhu-git/icons"
+          cp assets/icons/LICENSE "$appdir/usr/share/doc/cthulhu-git/icons/"
           cp target/icons/hicolor/256x256/apps/cthulhu-git.png "$appdir/cthulhu-git.png"
           ln -sfn cthulhu-git.png "$appdir/.DirIcon"
           ln -sfn usr/bin/cthulhu-git "$appdir/AppRun"
@@ -184,12 +190,16 @@ jobs:
           dpkg-deb --contents "$deb" | grep -F 'usr/share/doc/cthulhu-git/fonts/ubuntu/LICENCE.txt'
           test -f /usr/share/doc/cthulhu-git/fonts/FONTS.md
           test -f /usr/share/doc/cthulhu-git/fonts/ubuntu/LICENCE.txt
+          test -f /usr/share/doc/cthulhu-git/fonts/egui/UFL.txt
+          test -f /usr/share/doc/cthulhu-git/icons/LICENSE
 
           rpm -qpi "$rpm"
           rpm -qpR "$rpm"
           rpm -qpl "$rpm" | grep -qx /usr/share/applications/cthulhu-git.desktop
           rpm -qpl "$rpm" | grep -qx /usr/share/doc/cthulhu-git/fonts/FONTS.md
           rpm -qpl "$rpm" | grep -qx /usr/share/doc/cthulhu-git/fonts/ubuntu/LICENCE.txt
+          rpm -qpl "$rpm" | grep -qx /usr/share/doc/cthulhu-git/fonts/egui/UFL.txt
+          rpm -qpl "$rpm" | grep -qx /usr/share/doc/cthulhu-git/icons/LICENSE
 
           cd "$RUNNER_TEMP"
           rm -rf -- "$RUNNER_TEMP/squashfs-root"
@@ -199,8 +209,10 @@ jobs:
           test -f squashfs-root/.DirIcon
           test -f squashfs-root/usr/share/doc/cthulhu-git/fonts/FONTS.md
           test -f squashfs-root/usr/share/doc/cthulhu-git/fonts/ubuntu/LICENCE.txt
+          test -f squashfs-root/usr/share/doc/cthulhu-git/fonts/egui/UFL.txt
+          test -f squashfs-root/usr/share/doc/cthulhu-git/icons/LICENSE
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.TARGET }}
           path: |
@@ -213,7 +225,7 @@ jobs:
 
   windows:
     name: Windows x86-64 (zip)
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 30
     env:
       TARGET: x86_64-pc-windows-msvc
@@ -311,10 +323,12 @@ jobs:
           mkdir -p "dist/$name"
           cp "target/$TARGET/release/cthulhu-git.exe" README.md LICENSE "dist/$name/"
           stage_font_licenses "dist/$name/fonts"
+          mkdir -p "dist/$name/icons"
+          cp assets/icons/LICENSE "dist/$name/icons/"
           cd dist
           7z a "$name.zip" "$name"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.TARGET }}
           path: dist/*.zip
@@ -323,7 +337,7 @@ jobs:
 
   macos:
     name: macOS universal app (dmg)
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 30
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
@@ -342,7 +356,7 @@ jobs:
           cargo build --release --locked --target aarch64-apple-darwin
           cargo build --release --locked --target x86_64-apple-darwin
 
-      # macos-latest runs on Apple Silicon.
+      # macos-26 runs on Apple Silicon.
       - name: resvg
         run: |
           set -Eeuo pipefail
@@ -350,7 +364,7 @@ jobs:
           cd "$RUNNER_TEMP/tools"
           curl -fsSL -o resvg.zip \
             "https://github.com/linebender/resvg/releases/download/v$RESVG_VERSION/resvg-macos-aarch64.zip"
-          echo "06440eb5aa14a28cbfc7e40ae39e1ffa71adc051b89fbaa913b4f1d9b905d09f  resvg.zip" | shasum -a 256 -c
+          echo "8155b569f2b93723ba3645b53536eead3b591c8faf62bdaafd3033ba37838837  resvg.zip" | shasum -a 256 -c
           unzip -q resvg.zip
           echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
 
@@ -459,8 +473,19 @@ jobs:
           ln -sfn /Applications "$staging/Applications"
           cp README.md LICENSE "$staging/"
           stage_font_licenses "$staging/fonts"
+          mkdir -p "$staging/icons"
+          cp assets/icons/LICENSE "$staging/icons/"
           dmg="dist/cthulhu-git-${LABEL}-macos-universal.dmg"
-          hdiutil create -volname "Cthulhu Git" -srcfolder "$staging" -ov -format UDZO "$dmg"
+          # With -srcfolder, hdiutil(1) sizes the volume as the source data
+          # plus some padding, and that padding is sometimes too small for the
+          # APFS volume it creates: copying the universal binary fails with
+          # "No space left on device". -size overrides that calculation. The
+          # spare room is free space, which UDZO compresses away.
+          data_kb="$(find "$staging" -type f -exec stat -f %z {} + |
+            awk '{ total += $1 } END { print int(total / 1024) + 1 }')"
+          size_kb=$((data_kb + data_kb / 10 + 20 * 1024))
+          hdiutil create -volname "Cthulhu Git" -srcfolder "$staging" -size "${size_kb}k" \
+            -ov -format UDZO "$dmg"
           hdiutil verify "$dmg"
           mount="$RUNNER_TEMP/dmg-mount"
           rm -rf "$mount"
@@ -471,7 +496,7 @@ jobs:
           hdiutil detach "$mount"
           trap - EXIT
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-universal
           path: dist/*.dmg

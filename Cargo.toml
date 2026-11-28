@@ -1,8 +1,8 @@
 [package]
 name = "cthulhu-git"
-version = "0.0.8"
+version = "0.0.9"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.100"
 description = "Desktop Git client: opens a repository and shows its branch, latest commit and commit history."
 license = "MIT"
 repository = "https://github.com/don-linux/Cthulhu-Git"
@@ -12,37 +12,48 @@ publish = false
 alacritty_terminal = "0.26.0"
 directories = "6.0.0"
 dunce = "1.0.5"
-# persistence is not a default feature in eframe 0.36. It remembers the
+# persistence is not a default feature in eframe 0.37. It remembers the
 # window position, restored size, and whether it was maximized.
-eframe = { version = "0.36.2", features = ["persistence"] }
+eframe = { version = "0.37.0", features = ["persistence"] }
+# Only for this feature, which eframe does not forward: egui bundles its
+# monochrome emoji fonts again, so emoji look the same on every system
+# instead of coming from the system's color emoji font.
+egui = { version = "0.37.0", default-features = false, features = ["monochrome_emoji_fonts"] }
+# The SVG loader alone: the interface icons and the logo are rendered at the
+# size and scale they are drawn at.
+egui_extras = { version = "0.37.0", default-features = false, features = ["svg"] }
 # Author avatars. Already in the tree through eframe; only these decoders.
 # No GIF: its decoder allocates up to 50 MB before image's limits apply.
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 # The optional GitHub token, in Keychain, Credential Manager or Secret Service.
 keyring = "4.2.0"
-pollster = "1.0.1"
-rfd = "0.17.2"
+pollster = "1.0.3"
+rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2"
-serde_json = "1.0.151"
-sha2 = "0.11.1"
+serde_json = "1.0.154"
+sha2 = "0.11.2"
+# Atomic writes of settings and the avatar cache: unique, exclusive temp files.
+tempfile = "3.27.0"
 # HTTPS for avatars and the GitHub API: rustls with ring, no OpenSSL.
-ureq = "3.4.2"
+ureq = "3.5.2"
 zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
-egui_kittest = { version = "0.36", features = ["eframe"] }
-proptest = "1.11.0"
-tempfile = "3.27.0"
+egui_kittest = { version = "0.37.0", features = ["eframe"] }
+# keyring's own core: its in-memory mock store stands in for the keychain.
+keyring-core = "1.1.0"
+proptest = "1.12.0"
 
-# build.rs renders assets/icon.svg; none of these end up in the binary.
+# build.rs renders assets/icon.svg for the window icon and the Windows .exe.
+# None of these end up in the binary; the resvg in it comes with egui_extras.
 [build-dependencies]
-embed-resource = "3.0.11"
-ico = "0.5.0"
-resvg = { version = "0.48.1", default-features = false }
+embed-resource = "3.0.12"
+ico = "0.6.0"
+resvg = { version = "0.50.0", default-features = false }
 
 # Linux packages, built by .github/workflows/build.yml. The icons under
 # target/icons/ are rendered from assets/icon.svg by that workflow first.
@@ -75,7 +86,7 @@ assets = [
     ["target/icons/hicolor/128x128/apps/cthulhu-git.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
     ["target/icons/hicolor/256x256/apps/cthulhu-git.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["target/icons/hicolor/512x512/apps/cthulhu-git.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
-    # The binaries embed the fonts, so the notices have to ship with the package.
+    # The binary embeds the fonts and the icons, so their notices ship with the package.
     ["docs/FONTS.md", "usr/share/doc/cthulhu-git/fonts/", "644"],
     ["assets/fonts/aspekta/OFL.txt", "usr/share/doc/cthulhu-git/fonts/aspekta/", "644"],
     ["assets/fonts/departure-mono/OFL.txt", "usr/share/doc/cthulhu-git/fonts/departure-mono/", "644"],
@@ -87,6 +98,11 @@ assets = [
     ["assets/fonts/ubuntu/LICENCE.txt", "usr/share/doc/cthulhu-git/fonts/ubuntu/", "644"],
     ["assets/fonts/ubuntu-mono/LICENCE.txt", "usr/share/doc/cthulhu-git/fonts/ubuntu-mono/", "644"],
     ["assets/fonts/ubuntu-sans/LICENCE.txt", "usr/share/doc/cthulhu-git/fonts/ubuntu-sans/", "644"],
+    ["assets/fonts/egui/Hack-Regular.txt", "usr/share/doc/cthulhu-git/fonts/egui/", "644"],
+    ["assets/fonts/egui/OFL.txt", "usr/share/doc/cthulhu-git/fonts/egui/", "644"],
+    ["assets/fonts/egui/UFL.txt", "usr/share/doc/cthulhu-git/fonts/egui/", "644"],
+    ["assets/fonts/egui/emoji-icon-font-mit-license.txt", "usr/share/doc/cthulhu-git/fonts/egui/", "644"],
+    ["assets/icons/LICENSE", "usr/share/doc/cthulhu-git/icons/", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -116,6 +132,11 @@ assets = [
     { source = "assets/fonts/ubuntu/LICENCE.txt", dest = "/usr/share/doc/cthulhu-git/fonts/ubuntu/LICENCE.txt", mode = "644", doc = true },
     { source = "assets/fonts/ubuntu-mono/LICENCE.txt", dest = "/usr/share/doc/cthulhu-git/fonts/ubuntu-mono/LICENCE.txt", mode = "644", doc = true },
     { source = "assets/fonts/ubuntu-sans/LICENCE.txt", dest = "/usr/share/doc/cthulhu-git/fonts/ubuntu-sans/LICENCE.txt", mode = "644", doc = true },
+    { source = "assets/fonts/egui/Hack-Regular.txt", dest = "/usr/share/doc/cthulhu-git/fonts/egui/Hack-Regular.txt", mode = "644", doc = true },
+    { source = "assets/fonts/egui/OFL.txt", dest = "/usr/share/doc/cthulhu-git/fonts/egui/OFL.txt", mode = "644", doc = true },
+    { source = "assets/fonts/egui/UFL.txt", dest = "/usr/share/doc/cthulhu-git/fonts/egui/UFL.txt", mode = "644", doc = true },
+    { source = "assets/fonts/egui/emoji-icon-font-mit-license.txt", dest = "/usr/share/doc/cthulhu-git/fonts/egui/emoji-icon-font-mit-license.txt", mode = "644", doc = true },
+    { source = "assets/icons/LICENSE", dest = "/usr/share/doc/cthulhu-git/icons/LICENSE", mode = "644", doc = true },
 ]
 
 [package.metadata.generate-rpm.requires]
@@ -141,3 +162,27 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Drawing converts between f32 points and integer cells, rows and lanes. The
+# values are small and clamped first; checked conversions there would only add noise.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+# The library has one caller, this package's binary. Each module's error enum
+# documents its failures, and every pure function's result is already used.
+missing_errors_doc = "allow"
+must_use_candidate = "allow"
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+
+# Unoptimized, rasterizing the in-app logo's SVG filters takes seconds, which
+# every UI test that shows the home screen pays. Release builds are unaffected.
+[profile.dev.package.resvg]
+opt-level = 3
+
+[profile.dev.package.tiny-skia]
+opt-level = 3

@@ -16,15 +16,15 @@ use cthulhu_git::settings::HistoryColumns;
 use eframe::egui::text::{LayoutJob, TextFormat, TextWrapping};
 use eframe::egui::{
     self, Align, Color32, CursorIcon, FontId, Galley, Id, Label, Layout, Mesh, Pos2, Rect,
-    RichText, ScrollArea, Sense, Stroke, TextStyle, Ui, UiBuilder, Vec2, WidgetInfo, WidgetType,
+    RichText, Role, ScrollArea, Sense, Stroke, TextStyle, Ui, UiBuilder, Vec2, WidgetInfo,
 };
 
 use super::avatars::{self, AvatarService};
 use super::hover::{self, CardContext, HoverCache};
 use super::icons::{self, Icon};
 use super::theme::Palette;
-use super::widgets;
 use super::{ListedBranch, OpenedRepo};
+use super::{text, widgets};
 
 /// Commit text and branch labels, relative to egui's body size.
 const TEXT_SCALE: f32 = 1.3;
@@ -34,8 +34,8 @@ pub(super) const CELL_PAD: f32 = 8.0;
 const HEADER_HEIGHT: f32 = 30.0;
 const ROW_PAD: f32 = 18.0;
 const ROW_MIN: f32 = 40.0;
-pub(super) const LANE_MIN: f32 = 14.0;
-pub(super) const LANE_MAX: f32 = 28.0;
+const LANE_MIN: f32 = 14.0;
+const LANE_MAX: f32 = 28.0;
 const LANE_STROKE: f32 = 3.0;
 const DOT_OUTER: f32 = 8.0;
 const DOT_INNER: f32 = 6.0;
@@ -84,6 +84,8 @@ const GLOW_CREST_WHITE: f32 = 0.45;
 /// Alpha at the spark's center. The edges fade to clear.
 const GLOW_CREST_ALPHA: u8 = 210;
 const GLOW_FRAME: Duration = Duration::from_millis(16);
+/// Seconds a lane and its tag take to light up or go out.
+pub(super) const GLOW_FADE: f32 = 0.3;
 const AVATAR: f32 = 26.0;
 /// How far each stacked avatar sits from the previous one.
 const AVATAR_STEP: f32 = AVATAR * 0.62;
@@ -105,7 +107,7 @@ pub(super) enum Column {
 }
 
 impl Column {
-    pub(super) const ALL: [Self; 5] = [
+    const ALL: [Self; 5] = [
         Self::Branch,
         Self::Graph,
         Self::Hash,
@@ -113,7 +115,7 @@ impl Column {
         Self::Author,
     ];
 
-    pub(super) fn title(self) -> &'static str {
+    fn title(self) -> &'static str {
         match self {
             Self::Branch => "Branch",
             Self::Graph => "Graph",
@@ -151,13 +153,13 @@ impl Column {
 
 /// Where each column sits, from the left edge of the table's content.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct ColumnLayout {
-    pub left: [f32; 5],
-    pub width: [f32; 5],
+struct ColumnLayout {
+    left: [f32; 5],
+    width: [f32; 5],
     /// The columns' sum, or the panel when that is wider, so a row's
     /// highlight still reaches the right edge.
-    pub content_width: f32,
-    pub lane_width: f32,
+    content_width: f32,
+    lane_width: f32,
 }
 
 impl ColumnLayout {
@@ -183,7 +185,7 @@ pub(super) fn column_mins(hash_text_width: f32, lanes: usize) -> [f32; 5] {
 
 /// A column is its share of `panel`, or its minimum when that is larger.
 /// Nothing is moved between columns.
-pub(super) fn layout_columns(
+fn layout_columns(
     panel: f32,
     columns: &HistoryColumns,
     mins: [f32; 5],
@@ -221,10 +223,6 @@ pub(super) fn per_mille_for(width: f32, panel: f32) -> u16 {
         .clamp(f32::from(*range.start()), f32::from(*range.end())) as u16
 }
 
-fn default_per_mille(column: Column) -> u16 {
-    column.per_mille(&HistoryColumns::default())
-}
-
 /// What [`show`] asks the repository screen to keep after this frame.
 pub struct HistoryOutput {
     /// New column widths when a divider was released or double-clicked.
@@ -239,6 +237,10 @@ pub struct HistoryOutput {
 /// When `loading` is set and there are no rows yet, the muted line says the
 /// history is still opening. A finished load with no commits keeps
 /// "No commits yet."
+#[expect(
+    clippy::too_many_lines,
+    reason = "one frame of the table in order: the divider drag is read before the layout is used, and the rows, fades and header share that layout"
+)]
 pub fn show(
     ui: &mut Ui,
     repo: &mut OpenedRepo,
@@ -253,12 +255,14 @@ pub fn show(
     } else {
         empty_history(&repo.branches, repo.detached_oid.is_some())
     };
-    repo.hover.poll(ui.ctx(), &repo.info.root);
+    repo.hover.poll(ui.ctx(), &repo.git, &repo.info.root);
     let OpenedRepo {
         graph,
         hover,
         github,
         view_id,
+        selected_commit,
+        lit_branch: lit_name,
         ..
     } = repo;
     let rows = &graph.rows;
@@ -267,35 +271,22 @@ pub fn show(
     } else {
         rows.len().to_string()
     };
-    ui.add(
-        Label::new(
-            RichText::new(format!("Commit history ({count})"))
-                .strong()
-                .color(palette.text),
-        )
-        .truncate(),
-    );
+    ui.add(Label::new(RichText::new(format!("Commit history ({count})")).strong()).truncate());
     ui.add_space(6.0);
+    // A reload that has not landed yet keeps the commit the user chose.
+    retain_selected(ui.ctx(), selected_commit, rows, loading);
+    let lit = lit_branch(lit_name, rows);
     if rows.is_empty() {
         // The column between the sidebars can be narrower than these sentences.
         // Wrap inside it; truncating would drop the line the loading state shows.
-        ui.ctx()
-            .data_mut(|data| data.remove::<String>(lit_branch_id(*view_id)));
-        // A reload that has not landed yet keeps the commit the user chose.
-        retain_selected(ui, *view_id, rows, loading);
-        wrapped_line(ui, empty, palette.text_muted);
+        ui.add(Label::new(text::wrapped(ui, RichText::new(empty).weak())));
         return HistoryOutput {
             columns: None,
             reveal_detail: false,
         };
     }
-    retain_selected(ui, *view_id, rows, loading);
-    let selected = selected_commit(ui.ctx(), *view_id);
     if graph.truncated {
-        ui.label(
-            RichText::new(format!("Showing the latest {} commits.", rows.len()))
-                .color(palette.text_muted),
-        );
+        ui.label(RichText::new(format!("Showing the latest {} commits.", rows.len())).weak());
         ui.add_space(4.0);
     }
 
@@ -305,8 +296,8 @@ pub fn show(
         .ctx()
         .data(|data| data.get_temp(live_id))
         .unwrap_or(saved);
-    let text_font = scaled(ui, TextStyle::Body);
-    let mono_font = scaled(ui, TextStyle::Monospace);
+    let text_font = scaled(ui, &TextStyle::Body);
+    let mono_font = scaled(ui, &TextStyle::Monospace);
     let hash_width = ui
         .painter()
         .layout_no_wrap(
@@ -331,13 +322,13 @@ pub fn show(
                 continue;
             };
             if response.double_clicked() {
-                column.set(&mut live, default_per_mille(column));
+                live = reset_column(live, column);
                 done = Some(live);
             } else if (response.dragged() || response.drag_stopped())
                 && let Some(pointer) = response.interact_pointer_pos()
             {
-                let wanted = (pointer.x - (origin + layout.left[index])).max(mins[index]);
-                column.set(&mut live, share_for(wanted, mins[index], panel));
+                let width = pointer.x - (origin + layout.left[index]);
+                live = drag_column(live, column, width, mins[index], panel);
                 if response.drag_stopped() {
                     done = Some(live);
                 } else {
@@ -347,22 +338,28 @@ pub fn show(
         }
         layout = layout_columns(panel, &live, mins, graph.columns);
     }
-    let line = ui
+    let line_height = ui
         .text_style_height(&TextStyle::Monospace)
         .max(ui.text_style_height(&TextStyle::Body))
         * TEXT_SCALE;
-    let row_height = (line + ROW_PAD).max(ROW_MIN);
+    let row_height = (line_height + ROW_PAD).max(ROW_MIN);
     let context = github.as_ref().map(|repo| RepoContext {
         repo: repo.clone(),
         head: rows[0].oid.clone(),
     });
-    let lit = lit_branch(ui, *view_id, rows);
     let time = ui.input(|input| input.time);
-    if lit.is_some() {
-        ui.ctx().request_repaint_after(GLOW_FRAME);
-    }
+    // One fade per lane color, asked every frame from the first: a lane lit
+    // from dark fades in, and the lane it replaces fades out at the same time.
+    let glows: Vec<(usize, f32)> = (0..cthulhu_git::git::LANE_COLORS)
+        .filter_map(|color| {
+            let on = lit.as_ref().is_some_and(|lit| lit.color == color);
+            let id = view_id.with(("history-glow-fade", color));
+            let fade = ui.ctx().animate_bool_with_time(id, on, GLOW_FADE);
+            (fade > 0.0).then_some((color, fade))
+        })
+        .collect();
 
-    let reveal_detail = ui
+    let (click, glowed) = ui
         .scope(|ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             let (header_rect, _) =
@@ -375,11 +372,12 @@ pub fn show(
                 repo: context.as_ref(),
                 text_font,
                 mono_font,
-                view_id: *view_id,
                 lit,
+                glows,
                 time,
-                selected,
-                reveal_detail: false,
+                selected: selected_commit.as_deref(),
+                click: None,
+                glowed: false,
             };
             // Where the rows were placed this frame. The scroll area's returned
             // offset already includes this frame's wheel and scrollbar input,
@@ -399,9 +397,19 @@ pub fn show(
             ui.ctx()
                 .data_mut(|data| data.insert_temp(origin_id, origin_x));
             header(ui, header_rect, origin_x, &layout, *view_id, palette);
-            cells.reveal_detail
+            (cells.click, cells.glowed)
         })
         .inner;
+    // The crest moves only while it is on screen and someone can watch it:
+    // a lit lane scrolled away, or a window in the background, costs no frames.
+    if glowed && ui.input(|input| input.focused) {
+        ui.ctx().request_repaint_after(GLOW_FRAME);
+    }
+    let reveal_detail = click.is_some_and(|click| {
+        // The sidebar and the lanes are already drawn. One more frame shows the click.
+        ui.ctx().request_repaint();
+        apply_click(click, selected_commit, lit_name)
+    });
 
     let columns = if let Some(columns) = done {
         ui.ctx()
@@ -424,49 +432,40 @@ fn divider_id(view_id: Id, index: usize) -> Id {
     view_id.with(("history-divider", index))
 }
 
-/// The share to store for a column dragged to `wanted` points. A column
-/// pushed against its minimum stores that minimum's share, so the saved
-/// width matches the one on screen. When the panel is narrower than the
-/// minimum, that share would be the whole panel or more; the smallest share
-/// is stored instead, so a wider window later does not hand the column most
-/// of the panel. The minimum holds it either way.
-fn share_for(wanted: f32, min: f32, panel: f32) -> u16 {
-    if wanted <= min + 0.5 && panel > 0.0 && min / panel * 1000.0 > 1000.0 {
-        return *HistoryColumns::RANGE.start();
-    }
-    per_mille_for(wanted, panel)
+/// `columns` with `column` dragged to `width` points. A column pushed
+/// against its minimum stores that minimum's share, so the saved width
+/// matches the one on screen; a minimum exactly as wide as the panel stores
+/// the whole panel. When the panel is narrower than the minimum, that share
+/// would be more than the whole panel; the smallest share is stored instead,
+/// so a wider window later does not hand the column most of the panel. The
+/// minimum holds it either way.
+fn drag_column(
+    mut columns: HistoryColumns,
+    column: Column,
+    width: f32,
+    min: f32,
+    panel: f32,
+) -> HistoryColumns {
+    let wanted = width.max(min);
+    let share = if wanted <= min + 0.5 && min > panel {
+        *HistoryColumns::RANGE.start()
+    } else {
+        per_mille_for(wanted, panel)
+    };
+    column.set(&mut columns, share);
+    columns
 }
 
-fn scaled(ui: &Ui, style: TextStyle) -> FontId {
+/// `columns` with `column` back at its default share.
+fn reset_column(mut columns: HistoryColumns, column: Column) -> HistoryColumns {
+    column.set(&mut columns, column.per_mille(&HistoryColumns::default()));
+    columns
+}
+
+fn scaled(ui: &Ui, style: &TextStyle) -> FontId {
     let mut font = style.resolve(ui.style());
     font.size *= TEXT_SCALE;
     font
-}
-
-/// The full sentence, broken so every row stays inside `ui`'s width.
-///
-/// Word wrap alone lets one token paint past the history column into the
-/// detail sidebar. Breaking anywhere keeps the galley in the column without
-/// eliding it.
-fn wrapped_line(ui: &mut Ui, text: &str, color: Color32) {
-    let width = ui.available_width().max(0.0);
-    let mut job = LayoutJob::single_section(
-        text.to_owned(),
-        TextFormat {
-            font_id: TextStyle::Body.resolve(ui.style()),
-            color,
-            valign: ui.text_valign(),
-            ..TextFormat::default()
-        },
-    );
-    job.wrap = TextWrapping {
-        max_width: width,
-        max_rows: usize::MAX,
-        break_anywhere: true,
-        overflow_character: None,
-    };
-    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-    ui.add(Label::new(galley));
 }
 
 fn empty_history(branches: &[ListedBranch], detached: bool) -> &'static str {
@@ -519,13 +518,9 @@ fn header(
                 |ui| {
                     ui.set_clip_rect(title.intersect(rect));
                     ui.add(
-                        Label::new(
-                            RichText::new(column.title())
-                                .strong()
-                                .color(palette.text_muted),
-                        )
-                        .selectable(false)
-                        .truncate(),
+                        Label::new(RichText::new(column.title()).weak())
+                            .selectable(false)
+                            .truncate(),
                     );
                 },
             );
@@ -549,11 +544,7 @@ fn header(
             .interact(grab, divider_id(view_id, index), Sense::click_and_drag())
             .on_hover_cursor(CursorIcon::ResizeColumn);
         response.widget_info(|| {
-            WidgetInfo::labeled(
-                WidgetType::Other,
-                true,
-                format!("Resize {}", column.title()),
-            )
+            WidgetInfo::labeled(Role::Unknown, true, format!("Resize {}", column.title()))
         });
         let active = response.hovered() || response.dragged();
         painter.vline(
@@ -579,13 +570,27 @@ struct RowContext<'a> {
     repo: Option<&'a RepoContext>,
     text_font: FontId,
     mono_font: FontId,
-    view_id: Id,
     lit: Option<LitBranch>,
+    /// Lane colors with light on them, and how far each has lit up.
+    glows: Vec<(usize, f32)>,
     time: f64,
     /// Commit whose row stays filled. `None` is the latest commit in the sidebar.
-    selected: Option<String>,
-    /// Set when this frame chooses a commit that was not already chosen.
-    reveal_detail: bool,
+    selected: Option<&'a str>,
+    /// This frame's click, applied once every row is drawn, so the whole
+    /// table paints the state the frame started with.
+    click: Option<RowClick>,
+    /// A painted row carried the lit lane's light this frame.
+    glowed: bool,
+}
+
+enum RowClick {
+    /// A hash or message cell: that commit goes to the sidebar.
+    Commit(String),
+    /// The author cell: the sidebar goes back to the latest commit.
+    Author,
+    /// A branch tag: its lane lights or goes out, and the sidebar goes back
+    /// to the latest commit.
+    Branch(String),
 }
 
 /// Branch whose lane is lit. The name is what the tag toggles; the color is
@@ -606,6 +611,10 @@ fn content(cell: Rect) -> Rect {
     )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one row in paint order: fill, connector, lanes and chip, then each cell and the sensors on top"
+)]
 fn history_row(
     ui: &mut Ui,
     row: &GraphRow,
@@ -618,11 +627,11 @@ fn history_row(
     if !ui.is_rect_visible(rect) {
         return;
     }
-    let row_id = ui.id().with(("history-row", row.oid.as_str()));
+    let row_id = ui.scope_id().with(("history-row", row.oid.as_str()));
     let palette = cx.palette;
     // The pointer, not a hover widget: the hash and message click sensors sit
     // on top of the row and must not take this highlight away.
-    let selected = cx.selected.as_deref() == Some(row.oid.as_str());
+    let selected = cx.selected == Some(row.oid.as_str());
     let hovered = ui.rect_contains_pointer(rect);
     let fill = if selected {
         palette.selection
@@ -655,25 +664,22 @@ fn history_row(
             }
         }
         let lanes = painter.with_clip_rect(graph.intersect(ui.clip_rect()));
-        paint_lanes(
-            &lanes,
-            graph,
-            row,
-            palette,
-            layout.lane_width,
-            fill,
-            cx.lit.as_ref().map(|lit| LaneGlow {
+        let glows: Vec<LaneGlow> = (cx.glows.iter())
+            .map(|&(color, fade)| LaneGlow {
                 time: cx.time,
-                color: lit.color,
-                // `origin + screen_y` is the content Y, so the crest stays on
-                // the same commits when the table scrolls.
-                origin: row_index as f32 * row_height - rect.top(),
-            }),
-        );
+                color,
+                origin: glow_origin(row_index, row_height, rect.top()),
+                fade,
+            })
+            .collect();
+        cx.glowed |= paint_lanes(&lanes, graph, row, palette, layout.lane_width, fill, &glows);
     }
     if let Some(chip) = &chip {
         let lit = cx.lit.as_ref().is_some_and(|lit| lit.name == chip.name);
-        paint_branch_chip(ui, chip, palette, lit, cx.view_id);
+        let lit = (ui.ctx()).animate_bool_with_time(row_id.with("tag-lit"), lit, GLOW_FADE);
+        if paint_branch_chip(ui, chip, palette, lit) {
+            cx.click = Some(RowClick::Branch(chip.name.clone()));
+        }
     }
 
     text_cell(
@@ -710,7 +716,7 @@ fn history_row(
         Sense::CLICK,
     );
     if author.clicked() {
-        clear_selected_commit(ui, cx.view_id);
+        cx.click = Some(RowClick::Author);
     }
     hover::show_card(
         &author,
@@ -728,22 +734,22 @@ fn history_row(
     // the whole column, padding included, and nothing outside it. A later
     // click on the same commit changes nothing else. Only the hash column
     // copies, and only on a double click.
-    if click_commit(
+    let hash = click_commit(
         ui,
         layout.cell(rect, Column::Hash),
         row_id.with("pick-hash"),
         &row.oid,
-        cx.view_id,
         true,
-    ) || click_commit(
+    );
+    let message = click_commit(
         ui,
         layout.cell(rect, Column::Message),
         row_id.with("pick-message"),
         &row.oid,
-        cx.view_id,
         false,
-    ) {
-        cx.reveal_detail = true;
+    );
+    if hash || message {
+        cx.click = Some(RowClick::Commit(row.oid.clone()));
     }
 }
 
@@ -758,14 +764,9 @@ fn elided(ui: &Ui, text: &str, font: FontId, color: Color32, max_width: f32) -> 
             ..TextFormat::default()
         },
     );
-    job.wrap = TextWrapping {
-        max_width: max_width.max(0.0),
-        max_rows: 1,
-        // Hashes and branch names are one token, so the ellipsis may land
-        // inside a word.
-        break_anywhere: true,
-        overflow_character: Some('…'),
-    };
+    // Hashes and branch names are one token, so the ellipsis may land
+    // inside a word.
+    job.wrap = TextWrapping::truncate_at_width(max_width.max(0.0));
     ui.painter().layout_job(job)
 }
 
@@ -783,7 +784,7 @@ fn text_cell(ui: &mut Ui, rect: Rect, text: &str, font: FontId, color: Color32, 
         .with_clip_rect(rect.intersect(ui.clip_rect()))
         .galley(pos, galley, color);
     ui.interact(text_rect, id, Sense::hover())
-        .widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text));
+        .widget_info(|| WidgetInfo::labeled(Role::Label, true, text));
 }
 
 fn display_name(person: &Person) -> &str {
@@ -873,7 +874,7 @@ fn author_cell(
         );
     }
     ui.interact(rect, id, Sense::hover())
-        .widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, names.as_str()));
+        .widget_info(|| WidgetInfo::labeled(Role::Label, true, names.as_str()));
 }
 
 fn lane_center(graph: Rect, lane: usize, lane_width: f32) -> f32 {
@@ -886,8 +887,30 @@ struct LaneGlow {
     time: f64,
     color: usize,
     origin: f32,
+    /// How far the lane has lit up, from 0 (out) to 1. Every alpha scales by it.
+    fade: f32,
 }
 
+/// [`LaneGlow::origin`] of the row `row_index` drawn at `row_top`: plus a
+/// screen Y, it gives the content Y, so the crest stays on the same commits
+/// when the table scrolls.
+fn glow_origin(row_index: usize, row_height: f32, row_top: f32) -> f32 {
+    row_index as f32 * row_height - row_top
+}
+
+/// The commit dot's center, the radius of the background ring it sits in,
+/// and its own radius. At the narrowest lanes the dots shrink so neighbors
+/// do not touch.
+fn commit_dot(graph: Rect, row: &GraphRow, lane_width: f32) -> (Pos2, f32, f32) {
+    let center = Pos2::new(
+        lane_center(graph, row.commit_lane, lane_width),
+        graph.center().y,
+    );
+    let outer = DOT_OUTER.min(lane_width / 2.0 - 1.0);
+    (center, outer, DOT_INNER.min(outer - 1.5).max(1.0))
+}
+
+/// Returns whether the row carried any of the lit lane's light.
 fn paint_lanes(
     painter: &egui::Painter,
     graph: Rect,
@@ -895,42 +918,19 @@ fn paint_lanes(
     palette: &Palette,
     lane_width: f32,
     fill: Color32,
-    glow: Option<LaneGlow>,
-) {
-    let dot = Pos2::new(
-        lane_center(graph, row.commit_lane, lane_width),
-        graph.center().y,
-    );
-    let outer = DOT_OUTER.min(lane_width / 2.0 - 1.0);
-    if let Some(glow) = glow {
+    glows: &[LaneGlow],
+) -> bool {
+    let (dot, outer, inner) = commit_dot(graph, row, lane_width);
+    let (mut halo, mut crest) = (Mesh::default(), Mesh::default());
+    for &glow in glows {
         let color = palette.graph_color(glow.color);
-        let mut mesh = Mesh::default();
-        for trace in &row.traces {
-            if trace.color != glow.color {
-                continue;
-            }
-            let (start, end) = trace_ends(graph, trace.from_lane, trace.to_lane, dot, lane_width);
-            add_glow_segment(&mut mesh, start, end, color, glow);
-        }
-        if row.commit_color == glow.color {
-            // The commit circle is opaque, so the aura is the band outside it.
-            // `gap` is measured from the dot's edge, and it stops short of the
-            // next lane's stroke.
-            let gap = lane_width / 2.0 - outer - 0.5;
-            if gap >= 1.0 {
-                add_glow_disc(
-                    &mut mesh,
-                    dot,
-                    outer,
-                    outer + GLOW_RADIUS.min(gap),
-                    color,
-                    glow_alpha(glow.time, glow.origin + dot.y),
-                );
-            }
-        }
-        if !mesh.is_empty() {
-            painter.add(mesh);
-        }
+        let (lane_halo, lane_crest) = lane_glow(graph, row, lane_width, glow, color);
+        halo.append(lane_halo);
+        crest.append(lane_crest);
+    }
+    let glowed = !halo.is_empty() || !crest.is_empty();
+    if !halo.is_empty() {
+        painter.add(halo);
     }
     for trace in &row.traces {
         let (start, end) = trace_ends(graph, trace.from_lane, trace.to_lane, dot, lane_width);
@@ -942,15 +942,57 @@ fn paint_lanes(
             Stroke::new(LANE_STROKE, palette.graph_color(trace.color)),
         );
     }
-    // At the narrowest lanes the dots shrink so neighbors do not touch.
-    let inner = DOT_INNER.min(outer - 1.5).max(1.0);
     painter.circle_filled(dot, outer, fill);
     painter.circle_filled(dot, inner, palette.graph_color(row.commit_color));
     // After the stroke and the dot, so the spark sits on the line the eye
     // follows. The halo underneath stays the steady glow.
-    if let Some(glow) = glow {
-        paint_crest(painter, graph, row, palette, lane_width, glow);
+    if !crest.is_empty() {
+        painter.add(crest);
     }
+    glowed
+}
+
+/// The light on the lit lane in one row, in `color`: the halo, painted under
+/// the strokes and the dot, and the spark, painted over them.
+fn lane_glow(
+    graph: Rect,
+    row: &GraphRow,
+    lane_width: f32,
+    glow: LaneGlow,
+    color: Color32,
+) -> (Mesh, Mesh) {
+    let (dot, outer, inner) = commit_dot(graph, row, lane_width);
+    let (mut halo, mut crest) = (Mesh::default(), Mesh::default());
+    for trace in row.traces.iter().filter(|trace| trace.color == glow.color) {
+        let (start, end) = trace_ends(graph, trace.from_lane, trace.to_lane, dot, lane_width);
+        let on_edge = [trace.from_lane.is_some(), trace.to_lane.is_some()];
+        add_glow_segment(&mut halo, [start, end], on_edge, color, glow);
+        add_crest_segment(&mut crest, [start, end], on_edge, color, glow);
+    }
+    if row.commit_color == glow.color {
+        // The commit circle is opaque, so the aura is the band outside it.
+        // `gap` is measured from the dot's edge, and it stops short of the
+        // next lane's stroke.
+        let gap = lane_width / 2.0 - outer - 0.5;
+        if gap >= 1.0 {
+            add_glow_disc(
+                &mut halo,
+                dot,
+                outer,
+                outer + GLOW_RADIUS.min(gap),
+                color,
+                glow_alpha(glow.time, glow.origin + dot.y),
+                glow.fade,
+            );
+        }
+        // The dot's light stays inside the colored circle, so it does not
+        // reach the next lane.
+        let lobe = crest_lobe(glow.time, glow.origin + dot.y);
+        if lobe > 0.02 {
+            add_crest_disc(&mut crest, dot, inner, color, lobe, glow.fade);
+        }
+    }
+    (halo, crest)
 }
 
 fn trace_ends(
@@ -1012,10 +1054,101 @@ fn glow_share(alpha: u8, share: f32) -> u8 {
     (f32::from(alpha) * share).round() as u8
 }
 
-/// A ribbon along `start`→`end`. Full alpha out to the stroke edge, since the
+/// A band along `start`→`end`, sampled every [`GLOW_SAMPLE`] or closer. Each
+/// sample reads its `light` once; `shade` colors each stop across the band
+/// from that light and the stop's share. A segment with no length, or with
+/// no sample that `shows`, adds nothing.
+fn ribbon<T: Copy>(
+    mesh: &mut Mesh,
+    [start, end]: [Pos2; 2],
+    on_edge: [bool; 2],
+    stops: &[(f32, f32)],
+    light: impl Fn(Pos2) -> T,
+    shows: impl Fn(T) -> bool,
+    shade: impl Fn(T, f32) -> Color32,
+) {
+    let delta = end - start;
+    let length = delta.length();
+    if length < 0.5 {
+        return;
+    }
+    let intervals = (length / GLOW_SAMPLE).ceil().max(1.0) as usize;
+    let tangent = delta / length;
+    let normal = Vec2::new(-tangent.y, tangent.x);
+    let samples: Vec<(Pos2, T)> = (0..=intervals)
+        .map(|step| {
+            let point = start + delta * (step as f32 / intervals as f32);
+            (point, light(point))
+        })
+        .collect();
+    let crosses = samples.iter().any(|&(_, light)| shows(light));
+    if !crosses {
+        return;
+    }
+    let first = mesh.vertices.len() as u32;
+    for (step, (point, light)) in samples.into_iter().enumerate() {
+        // An end on the row's top or bottom edge is cut along that edge, where
+        // the next row's ribbon starts square to its own lane. A cut square to
+        // a lane change would leave a notch without light at the joint. Such
+        // a segment always runs down the row, so `normal.x` is never zero.
+        let along_edge = (step == 0 && on_edge[0]) || (step == intervals && on_edge[1]);
+        for &(offset, share) in stops {
+            let across = if along_edge {
+                Vec2::new(offset / normal.x, 0.0)
+            } else {
+                normal * offset
+            };
+            mesh.colored_vertex(point + across, shade(light, share));
+        }
+    }
+    stitch(mesh, first, intervals as u32, stops.len() as u32, false);
+}
+
+/// Rings of `steps` vertices around `center`, each `base * scale` from it in
+/// one color, and the bands between neighboring rings.
+fn rings(mesh: &mut Mesh, center: Pos2, base: f32, steps: usize, rings: &[(f32, Color32)]) {
+    let first = mesh.vertices.len() as u32;
+    for &(scale, color) in rings {
+        for step in 0..steps {
+            let angle = step as f32 / steps as f32 * std::f32::consts::TAU;
+            let (sin, cos) = angle.sin_cos();
+            mesh.colored_vertex(center + Vec2::new(cos, sin) * base * scale, color);
+        }
+    }
+    let bands = rings.len().saturating_sub(1) as u32;
+    stitch(mesh, first, bands, steps as u32, true);
+}
+
+/// Two triangles for each pair of neighbors in `bands` + 1 rows of `width`
+/// vertices from `first`, joining each row to the next. A `closed` row also
+/// joins its last vertex to its first.
+fn stitch(mesh: &mut Mesh, first: u32, bands: u32, width: u32, closed: bool) {
+    let pairs = if closed {
+        width
+    } else {
+        width.saturating_sub(1)
+    };
+    for band in 0..bands {
+        let row = first + band * width;
+        let next = row + width;
+        for index in 0..pairs {
+            let right = (index + 1) % width;
+            mesh.add_triangle(row + index, next + index, row + right);
+            mesh.add_triangle(row + right, next + index, next + right);
+        }
+    }
+}
+
+/// The halo along `start`→`end`. Full alpha out to the stroke edge, since the
 /// stroke is painted on top of the center, then a falloff that clears before
-/// the next lane. Samples follow content Y, including on a diagonal.
-fn add_glow_segment(mesh: &mut Mesh, start: Pos2, end: Pos2, color: Color32, glow: LaneGlow) {
+/// the next lane.
+fn add_glow_segment(
+    mesh: &mut Mesh,
+    ends: [Pos2; 2],
+    on_edge: [bool; 2],
+    color: Color32,
+    glow: LaneGlow,
+) {
     // Offset from the stroke center, and the share of this sample's alpha.
     const STOPS: [(f32, f32); 6] = [
         (-GLOW_RADIUS, 0.0),
@@ -1025,113 +1158,39 @@ fn add_glow_segment(mesh: &mut Mesh, start: Pos2, end: Pos2, color: Color32, glo
         (GLOW_SHOULDER, GLOW_EDGE_SHARE),
         (GLOW_RADIUS, 0.0),
     ];
-    let delta = end - start;
-    let length = delta.length();
-    if length < 0.5 {
-        return;
-    }
-    let steps = (length / GLOW_SAMPLE).ceil().max(1.0) as usize;
-    let tangent = delta / length;
-    let normal = Vec2::new(-tangent.y, tangent.x);
-    let base = mesh.vertices.len() as u32;
-    let across = STOPS.len() as u32;
-    for step in 0..=steps {
-        let point = start + delta * (step as f32 / steps as f32);
-        let alpha = glow_alpha(glow.time, glow.origin + point.y);
-        for (offset, share) in STOPS {
-            mesh.colored_vertex(
-                point + normal * offset,
-                glow_color(color, glow_share(alpha, share)),
-            );
-        }
-    }
-    for step in 0..steps as u32 {
-        let row = base + step * across;
-        let next = row + across;
-        for index in 0..across - 1 {
-            let left = row + index;
-            let right = left + 1;
-            let next_left = next + index;
-            let next_right = next_left + 1;
-            mesh.add_triangle(left, next_left, right);
-            mesh.add_triangle(right, next_left, next_right);
-        }
-    }
+    ribbon(
+        mesh,
+        ends,
+        on_edge,
+        &STOPS,
+        |point| glow_alpha(glow.time, glow.origin + point.y),
+        |_| true,
+        |alpha, share| glow_color(color, glow_share(alpha, share * glow.fade)),
+    );
 }
 
 /// Ring outside the commit dot. `inner` is the opaque circle; `outer` is where
-/// the aura fades out. `peak` is the alpha at the circle's edge.
-fn add_glow_disc(mesh: &mut Mesh, center: Pos2, inner: f32, outer: f32, color: Color32, peak: u8) {
+/// the aura fades out. `peak` is the alpha at the circle's edge when fully lit.
+fn add_glow_disc(
+    mesh: &mut Mesh,
+    center: Pos2,
+    inner: f32,
+    outer: f32,
+    color: Color32,
+    peak: u8,
+    fade: f32,
+) {
     if outer < inner + 0.5 {
         return;
     }
-    const STEPS: usize = 16;
-    let mid_radius = (inner + outer) * 0.5;
-    let rings = [
-        (inner, peak),
-        (mid_radius, glow_share(peak, GLOW_EDGE_SHARE)),
-        (outer, 0),
+    let tint = |share| glow_color(color, glow_share(peak, share * fade));
+    let aura = [
+        (inner, tint(1.0)),
+        (f32::midpoint(inner, outer), tint(GLOW_EDGE_SHARE)),
+        (outer, tint(0.0)),
     ];
-    let base = mesh.vertices.len() as u32;
-    for (radius, alpha) in rings {
-        for step in 0..STEPS {
-            let angle = step as f32 / STEPS as f32 * std::f32::consts::TAU;
-            let (sin, cos) = angle.sin_cos();
-            mesh.colored_vertex(
-                center + Vec2::new(cos, sin) * radius,
-                glow_color(color, alpha),
-            );
-        }
-    }
-    for ring in 0..2 {
-        let inner_ring = base + ring * STEPS as u32;
-        let outer_ring = inner_ring + STEPS as u32;
-        for step in 0..STEPS {
-            let next = (step + 1) % STEPS;
-            let a = inner_ring + step as u32;
-            let b = inner_ring + next as u32;
-            let c = outer_ring + step as u32;
-            let d = outer_ring + next as u32;
-            mesh.add_triangle(a, c, b);
-            mesh.add_triangle(b, c, d);
-        }
-    }
-}
-
-/// The spark on top of the stroke and the commit dot. The dot's light stays
-/// inside the colored circle, so it does not reach the next lane.
-fn paint_crest(
-    painter: &egui::Painter,
-    graph: Rect,
-    row: &GraphRow,
-    palette: &Palette,
-    lane_width: f32,
-    glow: LaneGlow,
-) {
-    let dot = Pos2::new(
-        lane_center(graph, row.commit_lane, lane_width),
-        graph.center().y,
-    );
-    let outer = DOT_OUTER.min(lane_width / 2.0 - 1.0);
-    let dot_radius = DOT_INNER.min(outer - 1.5).max(1.0);
-    let color = palette.graph_color(glow.color);
-    let mut mesh = Mesh::default();
-    for trace in &row.traces {
-        if trace.color != glow.color {
-            continue;
-        }
-        let (start, end) = trace_ends(graph, trace.from_lane, trace.to_lane, dot, lane_width);
-        add_crest_segment(&mut mesh, start, end, color, glow);
-    }
-    if row.commit_color == glow.color {
-        let lobe = crest_lobe(glow.time, glow.origin + dot.y);
-        if lobe > 0.02 {
-            add_crest_disc(&mut mesh, dot, dot_radius, color, lobe);
-        }
-    }
-    if !mesh.is_empty() {
-        painter.add(mesh);
-    }
+    // On a base of 1, each scale is exactly the radius it names.
+    rings(mesh, center, 1.0, 16, &aura);
 }
 
 fn crest_color(lane: Color32, lobe: f32, share: f32) -> Color32 {
@@ -1151,8 +1210,15 @@ fn crest_color(lane: Color32, lobe: f32, share: f32) -> Color32 {
     )
 }
 
-/// A short light along `start`→`end`, sampled so it follows a diagonal.
-fn add_crest_segment(mesh: &mut Mesh, start: Pos2, end: Pos2, color: Color32, glow: LaneGlow) {
+/// A short light along `start`→`end`. A segment the spark does not reach
+/// adds nothing.
+fn add_crest_segment(
+    mesh: &mut Mesh,
+    ends: [Pos2; 2],
+    on_edge: [bool; 2],
+    color: Color32,
+    glow: LaneGlow,
+) {
     // Offset from the stroke center, and the share of this sample's alpha.
     const STOPS: [(f32, f32); 5] = [
         (-GLOW_CREST_RADIUS, 0.0),
@@ -1161,144 +1227,77 @@ fn add_crest_segment(mesh: &mut Mesh, start: Pos2, end: Pos2, color: Color32, gl
         (LANE_STROKE / 2.0, 0.7),
         (GLOW_CREST_RADIUS, 0.0),
     ];
-    let delta = end - start;
-    let length = delta.length();
-    if length < 0.5 {
-        return;
-    }
-    let steps = (length / GLOW_SAMPLE).ceil().max(1.0) as usize;
-    let tangent = delta / length;
-    let normal = Vec2::new(-tangent.y, tangent.x);
-    let lobe_at = |point: Pos2| crest_lobe(glow.time, glow.origin + point.y);
-    let crosses = (0..=steps).any(|step| {
-        let point = start + delta * (step as f32 / steps as f32);
-        lobe_at(point) > 0.02
-    });
-    if !crosses {
-        return;
-    }
-    let base = mesh.vertices.len() as u32;
-    let across = STOPS.len() as u32;
-    for step in 0..=steps {
-        let point = start + delta * (step as f32 / steps as f32);
-        let lobe = lobe_at(point);
-        for (offset, share) in STOPS {
-            mesh.colored_vertex(point + normal * offset, crest_color(color, lobe, share));
-        }
-    }
-    for step in 0..steps as u32 {
-        let row = base + step * across;
-        let next = row + across;
-        for index in 0..across - 1 {
-            let left = row + index;
-            let right = left + 1;
-            let next_left = next + index;
-            let next_right = next_left + 1;
-            mesh.add_triangle(left, next_left, right);
-            mesh.add_triangle(right, next_left, next_right);
-        }
-    }
+    ribbon(
+        mesh,
+        ends,
+        on_edge,
+        &STOPS,
+        |point| crest_lobe(glow.time, glow.origin + point.y),
+        |lobe| lobe > 0.02,
+        |lobe, share| crest_color(color, lobe, share * glow.fade),
+    );
 }
 
 /// Soft spot on the commit dot, fading at `radius`.
-fn add_crest_disc(mesh: &mut Mesh, center: Pos2, radius: f32, color: Color32, lobe: f32) {
+fn add_crest_disc(
+    mesh: &mut Mesh,
+    center: Pos2,
+    radius: f32,
+    color: Color32,
+    lobe: f32,
+    fade: f32,
+) {
     if radius < 0.5 {
         return;
     }
-    const STEPS: usize = 12;
-    let rings = [(0.0, 1.0), (0.55, 0.45), (1.0, 0.0)];
-    let base = mesh.vertices.len() as u32;
-    for (scale, share) in rings {
-        let tint = crest_color(color, lobe, share);
-        for step in 0..STEPS {
-            let angle = step as f32 / STEPS as f32 * std::f32::consts::TAU;
-            let (sin, cos) = angle.sin_cos();
-            mesh.colored_vertex(center + Vec2::new(cos, sin) * radius * scale, tint);
+    let tint = |share: f32| crest_color(color, lobe, share * fade);
+    let spot = [(0.0, tint(1.0)), (0.55, tint(0.45)), (1.0, tint(0.0))];
+    rings(mesh, center, radius, 12, &spot);
+}
+
+/// Returns whether a different commit was chosen. A second click on the
+/// chosen commit changes nothing.
+fn apply_click(click: RowClick, selected: &mut Option<String>, lit: &mut Option<String>) -> bool {
+    match click {
+        RowClick::Commit(oid) => {
+            let chosen = selected.as_ref() != Some(&oid);
+            *selected = Some(oid);
+            chosen
+        }
+        RowClick::Author => {
+            *selected = None;
+            false
+        }
+        RowClick::Branch(name) => {
+            toggle_lit(lit, &name);
+            *selected = None;
+            false
         }
     }
-    for ring in 0..2 {
-        let inner_ring = base + ring * STEPS as u32;
-        let outer_ring = inner_ring + STEPS as u32;
-        for step in 0..STEPS {
-            let next = (step + 1) % STEPS;
-            let a = inner_ring + step as u32;
-            let b = inner_ring + next as u32;
-            let c = outer_ring + step as u32;
-            let d = outer_ring + next as u32;
-            mesh.add_triangle(a, c, b);
-            mesh.add_triangle(b, c, d);
-        }
-    }
-}
-
-fn lit_branch_id(view_id: Id) -> Id {
-    view_id.with("history-lit-branch")
-}
-
-fn selected_commit_id(view_id: Id) -> Id {
-    view_id.with("history-selected-commit")
-}
-
-/// The commit the sidebar is showing instead of the latest one.
-pub(super) fn selected_commit(ctx: &egui::Context, view_id: Id) -> Option<String> {
-    ctx.data(|data| data.get_temp(selected_commit_id(view_id)))
-}
-
-/// Remembers `oid` when it is not already the chosen commit.
-///
-/// Returns whether the choice changed. A second click on the same commit
-/// does not.
-fn select_commit(ui: &Ui, view_id: Id, oid: &str) -> bool {
-    let id = selected_commit_id(view_id);
-    let current: Option<String> = ui.ctx().data(|data| data.get_temp(id));
-    if current.as_deref() == Some(oid) {
-        return false;
-    }
-    ui.ctx()
-        .data_mut(|data| data.insert_temp(id, oid.to_owned()));
-    ui.ctx().request_repaint();
-    true
-}
-
-fn clear_selected_commit(ui: &Ui, view_id: Id) {
-    let id = selected_commit_id(view_id);
-    let present = ui.ctx().data(|data| data.get_temp::<String>(id).is_some());
-    if !present {
-        return;
-    }
-    ui.ctx().data_mut(|data| data.remove::<String>(id));
-    ui.ctx().request_repaint();
 }
 
 /// Forgets a chosen commit that is no longer in `rows`. An empty table that
 /// is still loading keeps it, so a reload does not snap back to the latest.
-fn retain_selected(ui: &Ui, view_id: Id, rows: &[GraphRow], loading: bool) {
-    let id = selected_commit_id(view_id);
-    let Some(oid) = ui.ctx().data(|data| data.get_temp::<String>(id)) else {
-        return;
-    };
-    if rows.iter().any(|row| row.oid == oid) || (loading && rows.is_empty()) {
-        return;
+/// The sidebar is already drawn, so forgetting takes one more frame.
+fn retain_selected(
+    ctx: &egui::Context,
+    selected: &mut Option<String>,
+    rows: &[GraphRow],
+    loading: bool,
+) {
+    let kept =
+        |oid: &mut String| rows.iter().any(|row| row.oid == *oid) || (loading && rows.is_empty());
+    if selected.take_if(|oid| !kept(oid)).is_some() {
+        ctx.request_repaint();
     }
-    ui.ctx().data_mut(|data| data.remove::<String>(id));
-    ui.ctx().request_repaint();
 }
 
-/// Click target for one hash or message cell.
+/// Click target for one hash or message cell. Returns whether it was clicked.
 ///
-/// Returns whether this click chose a different commit. A repeat click on the
-/// chosen commit returns false, so the sidebar and the accent stay put.
 /// `copy_on_double_click` copies the full hash on the second click of a double
 /// click. That second click is also a normal click, and it finds the commit
 /// already chosen.
-fn click_commit(
-    ui: &mut Ui,
-    cell: Rect,
-    id: Id,
-    oid: &str,
-    view_id: Id,
-    copy_on_double_click: bool,
-) -> bool {
+fn click_commit(ui: &mut Ui, cell: Rect, id: Id, oid: &str, copy_on_double_click: bool) -> bool {
     if cell.width() <= 0.0 {
         return false;
     }
@@ -1313,41 +1312,37 @@ fn click_commit(
     if copy_on_double_click && response.double_clicked() {
         widgets::copy_commit_hash(ui.ctx(), oid);
     }
-    response.clicked() && select_commit(ui, view_id, oid)
+    response.clicked()
 }
 
-fn toggle_lit_branch(ui: &Ui, view_id: Id, name: &str) {
-    let id = lit_branch_id(view_id);
-    let current: Option<String> = ui.ctx().data(|data| data.get_temp(id));
-    if current.as_deref() == Some(name) {
-        ui.ctx().data_mut(|data| data.remove::<String>(id));
+/// Lights `name`, or puts it out when it is the lit branch.
+fn toggle_lit(lit: &mut Option<String>, name: &str) {
+    *lit = if lit.as_deref() == Some(name) {
+        None
     } else {
-        ui.ctx()
-            .data_mut(|data| data.insert_temp(id, name.to_owned()));
-    }
-    // The lanes for this frame are already drawn. One more frame shows the change.
-    ui.ctx().request_repaint();
+        Some(name.to_owned())
+    };
 }
 
-/// The stored name, when that branch is still on a row. A missing branch is forgotten.
-fn lit_branch(ui: &Ui, view_id: Id, rows: &[GraphRow]) -> Option<LitBranch> {
-    let id = lit_branch_id(view_id);
-    let name: String = ui.ctx().data(|data| data.get_temp(id))?;
-    let color = rows.iter().find_map(|row| {
-        row.branches
-            .iter()
-            .find(|branch| branch.name == name)
-            .map(|branch| branch.color)
+/// The lit branch and its lane color. A branch no row carries is forgotten.
+fn lit_branch(name: &mut Option<String>, rows: &[GraphRow]) -> Option<LitBranch> {
+    let found = name.as_ref().and_then(|name| {
+        rows.iter()
+            .flat_map(|row| &row.branches)
+            .find(|branch| branch.name == *name)
     });
-    let Some(color) = color else {
-        ui.ctx().data_mut(|data| data.remove::<String>(id));
+    let Some(branch) = found else {
+        *name = None;
         return None;
     };
-    Some(LitBranch { name, color })
+    Some(LitBranch {
+        name: branch.name.clone(),
+        color: branch.color,
+    })
 }
 
 /// Checked-out branch first, then the sidebar order the row already has.
-pub(super) fn ordered_branches(branches: &[GraphBranch]) -> Vec<&GraphBranch> {
+fn ordered_branches(branches: &[GraphBranch]) -> Vec<&GraphBranch> {
     let mut order: Vec<_> = branches.iter().enumerate().collect();
     order.sort_by_key(|(index, branch)| (!branch.current, *index));
     order.into_iter().map(|(_, branch)| branch).collect()
@@ -1416,7 +1411,9 @@ fn branch_chip(
     })
 }
 
-fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette, lit: bool, view_id: Id) {
+/// `true` when the tag was clicked.
+/// `lit` is how far the tag's lane has lit up, from 0 to 1.
+fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette, lit: f32) -> bool {
     let color = palette.graph_color(chip.color);
     let icon_rect = Rect::from_center_size(
         Pos2::new(
@@ -1434,7 +1431,7 @@ fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette, lit: boo
             4.0,
             chip_fill(palette, chip.color, chip.current, lit),
         );
-        icons::paint_icon(&painter, ui.ctx(), icon_rect, Icon::GitBranch, color);
+        icons::paint_icon(&painter, icon_rect, Icon::GitBranch, color);
         let text_x = icon_rect.right() + CHIP_PAD;
         painter.galley(
             Pos2::new(text_x, chip.rect.center().y - chip.text.size().y / 2.0),
@@ -1456,165 +1453,186 @@ fn paint_branch_chip(ui: &mut Ui, chip: &BranchChip, palette: &Palette, lit: boo
     let response = ui
         .interact(
             chip.rect,
-            ui.id().with(("branch-label", chip.oid.as_str())),
+            ui.scope_id().with(("branch-label", chip.oid.as_str())),
             Sense::click(),
         )
         .on_hover_cursor(CursorIcon::PointingHand);
-    if response.clicked() {
-        toggle_lit_branch(ui, view_id, &chip.name);
-        clear_selected_commit(ui, view_id);
-    }
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, chip.names.as_str()));
+    response.widget_info(|| WidgetInfo::labeled(Role::Label, true, chip.names.as_str()));
+    response.clicked()
 }
 
-fn chip_fill(palette: &Palette, color: usize, current: bool, lit: bool) -> Color32 {
+fn chip_fill(palette: &Palette, color: usize, current: bool, lit: f32) -> Color32 {
     let fill = palette.graph_chip(color, current);
-    if !lit {
-        return fill;
-    }
     let lane = palette.graph_color(color);
-    Color32::from_rgba_unmultiplied(
-        lane.r(),
-        lane.g(),
-        lane.b(),
-        fill.a().saturating_add(CHIP_LIT_BOOST),
-    )
+    let boost = (f32::from(CHIP_LIT_BOOST) * lit).round() as u8;
+    Color32::from_rgba_unmultiplied(lane.r(), lane.g(), lane.b(), fill.a().saturating_add(boost))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
+    use cthulhu_git::git::GraphTrace;
+    use proptest::prelude::*;
+
     use super::*;
 
+    /// Width of the hash sample the rows below are computed with.
     const HASH_TEXT: f32 = 100.0;
 
-    fn mins(lanes: usize) -> [f32; 5] {
-        column_mins(HASH_TEXT, lanes)
+    fn columns([branch, graph, hash, message, author]: [u16; 5]) -> HistoryColumns {
+        HistoryColumns {
+            branch,
+            graph,
+            hash,
+            message,
+            author,
+        }
     }
 
-    fn widths(layout: &ColumnLayout) -> [f32; 5] {
-        layout.width
+    proptest! {
+        #![proptest_config(crate::ui::test_support::proptest_config())]
+
+        /// Each column is its share of the panel, or its minimum when that is
+        /// larger, laid end to end. The lanes fit in the graph column, and
+        /// changing one share never moves another column.
+        #[test]
+        #[expect(
+            clippy::float_cmp,
+            reason = "the layout returns one of these values, computed the same way, so they are equal to the bit"
+        )]
+        fn each_column_is_its_share_or_its_minimum(
+            panel in -10.0_f32..4000.0,
+            shares in proptest::array::uniform5(HistoryColumns::RANGE),
+            lanes in 0_usize..64,
+            hash in 0.0_f32..400.0,
+            changed in 0_usize..5,
+            value in HistoryColumns::RANGE,
+        ) {
+            let mins = column_mins(hash, lanes);
+            let layout = layout_columns(panel, &columns(shares), mins, lanes);
+            let mut x = 0.0;
+            for column in Column::ALL {
+                let index = column.index();
+                let share = panel.max(0.0) * f32::from(shares[index]) / 1000.0;
+                let (width, min) = (layout.width[index], mins[index]);
+                let case = format!("{column:?} is {width}, share {share}, minimum {min}");
+                prop_assert_eq!(layout.left[index], x, "{} starts off its neighbor", case);
+                prop_assert!(width >= min && width >= share, "{case}");
+                prop_assert!(width == share || width == min, "{case}");
+                x += width;
+            }
+            prop_assert_eq!(layout.content_width, x.max(panel.max(0.0)));
+            let room = layout.width[Column::Graph.index()] - 2.0 * CELL_PAD;
+            let lane = layout.lane_width;
+            prop_assert!((LANE_MIN..=LANE_MAX).contains(&lane), "lane width {lane}");
+            let lanes_width = lanes.max(1) as f32 * lane;
+            prop_assert!(lanes_width <= room + 0.01, "{lanes} lanes of {lane} in {room}");
+
+            let mut moved = columns(shares);
+            Column::ALL[changed].set(&mut moved, value);
+            let after = layout_columns(panel, &moved, mins, lanes);
+            for column in Column::ALL.into_iter().filter(|column| column.index() != changed) {
+                let index = column.index();
+                prop_assert_eq!(after.width[index], layout.width[index], "{:?} moved", column);
+            }
+        }
     }
 
+    /// (panel, shares, lanes, the columns' sum, lane width). The defaults fill
+    /// a wide panel exactly. Shares of 20 leave most of a wide panel free. A
+    /// narrow panel keeps every minimum and scrolls. Forty lanes shrink to the
+    /// narrowest lane, one grows to the widest. No panel at all still lays out
+    /// every minimum.
     #[test]
-    fn the_defaults_fill_a_wide_panel_exactly() {
-        let layout = layout_columns(2000.0, &HistoryColumns::default(), mins(1), 1);
-        let sum: f32 = layout.width.iter().sum();
-        assert!((sum - 2000.0).abs() < 0.01, "sum {sum}");
-        assert!((layout.content_width - 2000.0).abs() < 0.01);
-        for index in 1..5 {
+    fn layouts_at_the_edges() {
+        let defaults = HistoryColumns::default();
+        for (panel, shares, lanes, sum, lane_width) in [
+            (2000.0, defaults, 1, 2000.0, LANE_MAX),
+            (4000.0, columns([20; 5]), 1, 816.0, LANE_MAX),
+            (196.0, defaults, 2, 780.0, LANE_MIN),
+            (600.0, defaults, 40, 1312.0, LANE_MIN),
+            (0.0, defaults, 0, 766.0, LANE_MIN),
+            (-5.0, defaults, 0, 766.0, LANE_MIN),
+        ] {
+            let case = format!("panel {panel}, {lanes} lanes, {shares:?}");
+            let layout = layout_columns(panel, &shares, column_mins(HASH_TEXT, lanes), lanes);
+            let total: f32 = layout.width.iter().sum();
             assert!(
-                (layout.left[index] - (layout.left[index - 1] + layout.width[index - 1])).abs()
-                    < 0.01
+                (total - sum).abs() < 0.01,
+                "{case}: columns add up to {total}"
+            );
+            assert!(
+                (layout.content_width - total.max(panel)).abs() < 0.01,
+                "{case}: content is {}",
+                layout.content_width
+            );
+            assert_eq!(layout.lane_width, lane_width, "{case}");
+        }
+    }
+
+    /// (dragged width, minimum, panel, stored share). Only the dragged
+    /// column's share changes.
+    #[test]
+    fn a_dragged_width_is_stored_as_a_share_of_the_panel() {
+        let start = columns([100, 200, 300, 400, 500]);
+        for (width, min, panel, stored) in [
+            (500.0, 0.0, 1000.0, 500),
+            (1.0, 0.0, 1000.0, 20),
+            (5000.0, 0.0, 1000.0, 1000),
+            (500.0, 0.0, 0.0, 20),
+            (f32::NAN, 0.0, 1000.0, 20),
+            (600.0, MESSAGE_MIN, 1000.0, 600),
+            // On a panel that fits the minimum, the saved share is the one on
+            // screen, also when the pointer went past the minimum.
+            (MESSAGE_MIN, MESSAGE_MIN, 1660.0, 169),
+            (100.0, MESSAGE_MIN, 1660.0, 169),
+            // A 260-point panel cannot hold the 280-point message minimum.
+            // Saving 280/260 as 1000 would make the column fill a wider
+            // window later.
+            (MESSAGE_MIN, MESSAGE_MIN, 260.0, 20),
+            // A panel exactly as wide as the minimum still fits it.
+            (MESSAGE_MIN, MESSAGE_MIN, MESSAGE_MIN, 1000),
+        ] {
+            assert_eq!(
+                drag_column(start, Column::Message, width, min, panel),
+                HistoryColumns {
+                    message: stored,
+                    ..start
+                },
+                "{width} of a {panel} panel, minimum {min}"
             );
         }
     }
 
+    /// (branches: has a commit and is checked, detached HEAD, sentence).
     #[test]
-    fn changing_one_column_never_changes_another() {
-        let base = HistoryColumns::default();
-        for panel in [300.0, 900.0, 1600.0, 3000.0] {
-            let before = layout_columns(panel, &base, mins(3), 3);
-            for column in Column::ALL {
-                for value in [20, 50, 400, 1000] {
-                    let mut changed = base;
-                    column.set(&mut changed, value);
-                    let after = layout_columns(panel, &changed, mins(3), 3);
-                    for other in Column::ALL.into_iter().filter(|other| *other != column) {
-                        assert_eq!(
-                            widths(&before)[other.index()],
-                            widths(&after)[other.index()],
-                            "{column:?}={value} moved {other:?} at {panel}"
-                        );
-                    }
-                }
-            }
+    fn an_empty_history_says_why() {
+        for (branches, detached, sentence) in [
+            (&[][..], false, "No commits yet."),
+            (&[(false, false)], false, "No commits yet."),
+            (
+                &[(true, false), (false, true)],
+                false,
+                "No branches selected.",
+            ),
+            (&[(true, false)], true, "No commits yet."),
+            (&[(true, true)], false, "No commits yet."),
+        ] {
+            let listed: Vec<ListedBranch> = branches
+                .iter()
+                .map(|&(born, checked)| {
+                    let mut listed = crate::ui::test_support::listed("b", checked);
+                    listed.branch.oid = born.then(|| "a".repeat(40));
+                    listed
+                })
+                .collect();
+            assert_eq!(
+                empty_history(&listed, detached),
+                sentence,
+                "{branches:?}, detached {detached}"
+            );
         }
-    }
-
-    #[test]
-    fn a_narrow_panel_scrolls_instead_of_squeezing() {
-        let layout = layout_columns(196.0, &HistoryColumns::default(), mins(2), 2);
-        for (index, (width, floor)) in layout.width.iter().zip(mins(2)).enumerate() {
-            assert!(width + 0.01 >= floor, "column {index}");
-        }
-        let sum: f32 = layout.width.iter().sum();
-        assert!(layout.content_width > 196.0);
-        assert!((layout.content_width - sum).abs() < 0.01);
-    }
-
-    #[test]
-    fn narrow_columns_leave_free_space_on_the_right() {
-        let small = HistoryColumns {
-            branch: 20,
-            graph: 20,
-            hash: 20,
-            message: 20,
-            author: 20,
-        };
-        let layout = layout_columns(4000.0, &small, mins(1), 1);
-        let sum: f32 = layout.width.iter().sum();
-        assert!(sum < 4000.0);
-        assert!((layout.content_width - 4000.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn the_graph_minimum_comes_from_its_own_lanes() {
-        let many = layout_columns(600.0, &HistoryColumns::default(), mins(40), 40);
-        let graph = many.width[Column::Graph.index()];
-        assert!(graph + 0.01 >= 40.0 * LANE_MIN + 2.0 * CELL_PAD);
-        assert!((many.lane_width - LANE_MIN).abs() < 0.01);
-        let one = layout_columns(2000.0, &HistoryColumns::default(), mins(1), 1);
-        assert!((one.lane_width - LANE_MAX).abs() < 0.01);
-        assert!(one.width[Column::Graph.index()] > LANE_MAX + 2.0 * CELL_PAD);
-    }
-
-    #[test]
-    fn layout_survives_zero_and_odd_inputs() {
-        for panel in [0.0, -5.0, f32::MIN_POSITIVE] {
-            let layout = layout_columns(panel, &HistoryColumns::default(), mins(0), 0);
-            for value in layout.width.iter().chain(&layout.left) {
-                assert!(value.is_finite() && *value >= 0.0);
-            }
-            assert!(layout.lane_width >= LANE_MIN);
-        }
-    }
-
-    #[test]
-    fn dragged_widths_become_shares_of_the_panel() {
-        assert_eq!(per_mille_for(500.0, 1000.0), 500);
-        assert_eq!(per_mille_for(1.0, 1000.0), 20);
-        assert_eq!(per_mille_for(5000.0, 1000.0), 1000);
-        assert_eq!(per_mille_for(500.0, 0.0), 20);
-        assert_eq!(per_mille_for(f32::NAN, 1000.0), 20);
-    }
-
-    #[test]
-    fn a_column_dragged_to_its_minimum_stores_the_smallest_share() {
-        // A 260-point panel cannot hold the 280-point message minimum. Saving
-        // 280/260 as 1000 would make the column fill a wider window later.
-        assert_eq!(share_for(280.0, MESSAGE_MIN, 260.0), 20);
-        let later = layout_columns(
-            2000.0,
-            &HistoryColumns {
-                message: share_for(280.0, MESSAGE_MIN, 260.0),
-                ..HistoryColumns::default()
-            },
-            mins(1),
-            1,
-        );
-        assert!((later.width[Column::Message.index()] - MESSAGE_MIN).abs() < 0.01);
-        assert_eq!(share_for(600.0, MESSAGE_MIN, 1000.0), 600);
-        // On a panel that fits the minimum, the saved share is the one on screen.
-        assert_eq!(share_for(MESSAGE_MIN, MESSAGE_MIN, 1660.0), 169);
-    }
-
-    #[test]
-    fn titles_read_in_the_requested_order() {
-        let titles: Vec<_> = Column::ALL.iter().map(|column| column.title()).collect();
-        assert_eq!(
-            titles,
-            ["Branch", "Graph", "Commit Hash", "Commit Message", "Author"]
-        );
     }
 
     #[test]
@@ -1702,5 +1720,174 @@ mod tests {
             behind > ahead && ahead > 0.0,
             "the tail should outlast the front, ahead {ahead}, behind {behind}"
         );
+    }
+
+    type Trace = (Option<usize>, Option<usize>, usize);
+    type GlowRow = (&'static str, f32, f64, f32, [usize; 2], &'static [Trace]);
+    const STRAIGHT: &[Trace] = &[(Some(0), Some(0), 0), (Some(1), None, 2)];
+    const LANE_CHANGE: &[Trace] = &[(Some(1), Some(0), 0)];
+    /// Into the dot and out to both parents, past another color's lane, and
+    /// a trace with no length.
+    const MERGE: &[Trace] = &[
+        (Some(0), None, 0),
+        (None, Some(0), 0),
+        (None, Some(1), 0),
+        (Some(2), Some(2), 3),
+        (None, None, 0),
+    ];
+    const DOT: &[Trace] = &[(Some(1), None, 0), (None, Some(1), 0)];
+    /// Rows lit on lane color 0, whose dot sits 140 points down the branch:
+    /// (case, lane width, seconds, fade, dot lane and color, traces as from
+    /// lane, to lane and color). At 0.7 s the crest is on the dot, at 0.425 s
+    /// its front reaches only the upper half, at 2.3 s it is half a
+    /// wavelength away. On 20-point lanes the aura is narrower than the halo;
+    /// on the narrowest there is no room for it. Half lit is the dot halfway
+    /// through its fade.
+    const GLOW_ROWS: [GlowRow; 8] = [
+        ("straight", LANE_MAX, 0.7, 1.0, [1, 2], STRAIGHT),
+        ("lane change", LANE_MAX, 0.7, 1.0, [2, 2], LANE_CHANGE),
+        ("merge", 20.0, 0.7, 1.0, [0, 0], MERGE),
+        ("dot", LANE_MAX, 0.7, 1.0, [1, 0], DOT),
+        ("narrow", LANE_MIN, 0.7, 1.0, [1, 0], DOT),
+        ("crest edge", LANE_MAX, 0.425, 1.0, [1, 0], DOT),
+        ("crest away", LANE_MAX, 2.3, 1.0, [1, 0], DOT),
+        ("half lit", LANE_MAX, 0.7, 0.5, [1, 0], DOT),
+    ];
+    /// Per row above: the halo's and the crest's vertex and index counts,
+    /// then a digest of each mesh's exact bits. One row per line, as the
+    /// test prints them.
+    #[rustfmt::skip]
+    #[expect(
+        clippy::unreadable_literal,
+        reason = "the digests are pasted as the test prints them, with `{:#018x}`"
+    )]
+    const GOLDEN: [([[usize; 2]; 2], [u64; 2]); 8] = [
+        ([[30, 120], [25, 96]], [0xd7e20f28027a9a35, 0x43f38e51d12d739a]), // straight
+        ([[36, 150], [30, 120]], [0x96903933ab41dd26, 0x3de8a17a1344d847]), // lane change
+        ([[108, 402], [86, 312]], [0xe4bc37ab4ec5b458, 0x3b0028a3706a8351]), // merge
+        ([[84, 312], [66, 240]], [0x1aaa1a4a360d428d, 0xa97ffe770013a1c9]), // dot
+        ([[36, 120], [66, 240]], [0x11281c45b3196845, 0xf7cad7d9de74f997]), // narrow
+        ([[84, 312], [15, 48]], [0xb61e34c53fef13b9, 0x239961336da8b433]), // crest edge
+        ([[84, 312], [0, 0]], [0x8a735e8ee3cdcab1, 0xcbf29ce484222325]), // crest away
+        ([[84, 312], [66, 240]], [0x22a1d5b5c9f8f2ed, 0xc7b7a38f1a4a5066]), // half lit
+    ];
+
+    /// FNV-1a over each vertex's position, UV and color bits, then the indices.
+    fn mesh_digest(mesh: &Mesh) -> u64 {
+        let words = |vertex: &egui::epaint::Vertex| {
+            let [x, y, u, v] = [vertex.pos.x, vertex.pos.y, vertex.uv.x, vertex.uv.y];
+            let color = u32::from_le_bytes(vertex.color.to_array());
+            [x, y, u, v].map(f32::to_bits).into_iter().chain([color])
+        };
+        (mesh.vertices.iter().flat_map(words))
+            .chain(mesh.indices.iter().copied())
+            .flat_map(u32::to_le_bytes)
+            .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+            })
+    }
+
+    /// The graph cell of a row lit on lane color 0 at `time` and `fade`, and
+    /// the row with that dot and `traces`. It is the fourth row of 40 points,
+    /// drawn at y 50, so its dot sits 140 points down the branch.
+    fn lit_row(
+        [lane, color]: [usize; 2],
+        traces: &[Trace],
+        time: f64,
+        fade: f32,
+    ) -> (Rect, GraphRow, LaneGlow) {
+        let traces = traces
+            .iter()
+            .map(|&(from_lane, to_lane, color)| GraphTrace {
+                from_lane,
+                to_lane,
+                color,
+            });
+        let row = GraphRow {
+            oid: String::new(),
+            summary: String::new(),
+            author: Person::default(),
+            co_authors: Vec::new(),
+            branches: Vec::new(),
+            commit_lane: lane,
+            commit_color: color,
+            traces: traces.collect(),
+        };
+        let graph = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(150.0, 40.0));
+        let glow = LaneGlow {
+            time,
+            color: 0,
+            origin: glow_origin(3, graph.height(), graph.top()),
+            fade,
+        };
+        (graph, row, glow)
+    }
+
+    /// Every vertex, color and index of the lit lane's light at fixed times.
+    /// The digests hold the exact bits of glibc's `expf` and `sinf`; another
+    /// libm may round a last bit differently, so other systems check counts.
+    #[test]
+    fn lane_glow_meshes_match_the_golden() {
+        let exact = cfg!(all(target_os = "linux", target_env = "gnu"));
+        let (mut now, mut changed) = (String::new(), String::new());
+        for ((case, lane_width, time, fade, dot, traces), golden) in
+            GLOW_ROWS.into_iter().zip(GOLDEN)
+        {
+            let (graph, row, glow) = lit_row(dot, traces, time, fade);
+            let color = Color32::from_rgb(64, 160, 224);
+            let meshes = lane_glow(graph, &row, lane_width, glow, color);
+            let meshes = [("halo", meshes.0), ("crest", meshes.1)];
+            let counts = meshes
+                .each_ref()
+                .map(|(_, mesh)| [mesh.vertices.len(), mesh.indices.len()]);
+            let digests = meshes.each_ref().map(|(_, mesh)| mesh_digest(mesh));
+            let [halo, crest] = digests;
+            let _ = writeln!(
+                now,
+                "({counts:?}, [{halo:#018x}, {crest:#018x}]), // {case}"
+            );
+            if counts == golden.0 && (!exact || digests == golden.1) {
+                continue;
+            }
+            let _ = writeln!(changed, "\n{case}: counts {:?}, now {counts:?}", golden.0);
+            for (name, mesh) in &meshes {
+                for (index, vertex) in mesh.vertices.iter().enumerate() {
+                    let (x, y, color) = (vertex.pos.x, vertex.pos.y, vertex.color.to_array());
+                    let _ = writeln!(changed, "{name} {index}: ({x:?}, {y:?}) {color:?}");
+                }
+                let _ = writeln!(changed, "{name} indices: {:?}", mesh.indices);
+            }
+        }
+        assert!(
+            changed.is_empty(),
+            "the glow changed:{changed}\nGOLDEN is now:\n{now}"
+        );
+    }
+
+    /// The halo goes under the strokes and the dots, the crest over them. A
+    /// trace with no length paints no stroke.
+    #[test]
+    fn paint_lanes_puts_the_halo_under_the_strokes_and_the_crest_on_top() {
+        let palette = &crate::ui::theme::DEFAULT_THEME.palette;
+        let (graph, row, glow) = lit_row([0, 0], MERGE, 0.7, 1.0);
+        let (halo, crest) = lane_glow(graph, &row, 20.0, glow, palette.graph_color(0));
+        let mut output = egui::Context::default().run_ui(egui::RawInput::default(), |ui| {
+            let fill = Color32::BLACK;
+            paint_lanes(ui.painter(), graph, &row, palette, 20.0, fill, &[glow]);
+        });
+        output.textures_delta.clear();
+        let painted: Vec<&str> = (output.shapes.iter())
+            .map(|clipped| match &clipped.shape {
+                egui::Shape::Mesh(mesh) if **mesh == halo => "halo",
+                egui::Shape::Mesh(mesh) if **mesh == crest => "crest",
+                egui::Shape::LineSegment { .. } => "stroke",
+                egui::Shape::Circle(_) => "dot",
+                _ => "other",
+            })
+            .collect();
+        let order = [
+            "halo", "stroke", "stroke", "stroke", "stroke", "dot", "dot", "crest",
+        ];
+        assert_eq!(painted, order);
     }
 }

@@ -1,0 +1,13 @@
+# Property tests run 64 cases. A shell `PROPTEST_CASES=N` wins over this value.
+[env]
+PROPTEST_CASES = "64"
+
+# The resolver skips versions published less than a week ago, so `cargo
+# update` does not take a compromised release before it can be found and
+# yanked. Builds keep what Cargo.lock holds: the default
+# `resolver.incompatible-publish-age = "deny"` only refuses new picks, and a
+# full `cargo update` fails while a requirement in Cargo.toml needs a newer
+# release. An urgent fix:
+# `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate> --precise <version>`.
+[registry]
+global-min-publish-age = "7 days"

@@ -3,31 +3,33 @@
 //! cells that must stay inside their columns, and the opening line while
 //! history is still loading.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use cthulhu_git::git::{
-    Branch, Commit, CommitDetail, CommitFile, CommitHover, CommitStats, DiffKind, DiffLine,
-    FileDiff, GraphBranch, GraphCommit, GraphRow, GraphTip, Head, HistoryGraph, Person, RepoInfo,
+    Branch, CommitDetail, CommitFile, CommitHover, CommitStats, DiffKind, DiffLine, FileDiff,
+    GraphBranch, GraphCommit, GraphRow, GraphTip, Head, HistoryGraph, Person, RepoInfo,
     SHORT_OID_LEN, Upstream, layout_graph,
 };
 use cthulhu_git::github::GitHubRepo;
 use cthulhu_git::settings::HistoryColumns;
-use eframe::egui::accesskit::Role;
+use eframe::egui::accesskit::{Role, Toggled};
 use eframe::egui::output::OutputCommand;
-use eframe::egui::{self, Modifiers, MouseWheelUnit, PointerButton, Pos2, TouchPhase};
-use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use eframe::egui::{
+    self, Modifiers, MouseWheelSource, MouseWheelUnit, PointerButton, Pos2, TouchPhase,
+};
+use egui_kittest::kittest::{NodeT, Queryable};
+use egui_kittest::{Harness, HarnessBuilder};
 
 use super::avatars::AvatarService;
 use super::hover::HoverCache;
-use super::repo_view::{self, ViewState};
+use super::repo_view::{self, Panels, ViewState};
 use super::theme;
 use super::{Action, ListedBranch, OpenedRepo};
 
 const PIXELS_PER_POINT: f32 = 1.0;
 const HEIGHT: f32 = 640.0;
-/// The app's minimum inner size, and the window the narrow-history kittest uses.
+/// The app's minimum inner size.
 const MIN_WINDOW: egui::Vec2 = egui::Vec2::new(520.0, 400.0);
+/// The window of the tests that pick and copy commits.
+const PICK_WINDOW: egui::Vec2 = egui::Vec2::new(1400.0, HEIGHT);
 /// Titles and cells are aligned when their left edges differ by at most a point.
 const TOL: f32 = 1.0;
 const TITLES: [&str; 5] = ["Branch", "Graph", "Commit Hash", "Commit Message", "Author"];
@@ -35,18 +37,18 @@ const TITLES: [&str; 5] = ["Branch", "Graph", "Commit Hash", "Commit Message", "
 struct Screen {
     repo: OpenedRepo,
     columns: HistoryColumns,
-    branches_open: bool,
-    detail_open: bool,
+    panels: Panels,
     /// This repository's history graph is still being read.
     history_loading: bool,
     actions: Vec<Action>,
 }
 
-struct RowText<'a> {
-    summary: &'a str,
-    short_oid: &'a str,
-    author: &'a str,
-    branch: &'a str,
+/// What each text column shows on the first row.
+struct RowText {
+    summary: String,
+    short_oid: String,
+    author: String,
+    branch: String,
 }
 
 struct Edge {
@@ -64,15 +66,26 @@ fn screen(
     Screen {
         repo,
         columns,
-        branches_open,
-        detail_open,
+        panels: Panels {
+            branches: branches_open,
+            detail: detail_open,
+            terminal: false,
+        },
         history_loading: false,
         actions: Vec::new(),
     }
 }
 
 fn harness(size: egui::Vec2, screen: Screen) -> Harness<'static, Screen> {
-    Harness::builder()
+    harness_from(Harness::builder(), size, screen)
+}
+
+fn harness_from(
+    builder: HarnessBuilder<Screen>,
+    size: egui::Vec2,
+    screen: Screen,
+) -> Harness<'static, Screen> {
+    builder
         .with_size(size)
         .with_pixels_per_point(PIXELS_PER_POINT)
         .with_step_dt(1.0 / 60.0)
@@ -85,9 +98,7 @@ fn harness(size: egui::Vec2, screen: Screen) -> Harness<'static, Screen> {
                     &mut screen.repo,
                     &ViewState {
                         error: None,
-                        branches_open: screen.branches_open,
-                        detail_open: screen.detail_open,
-                        terminal_open: false,
+                        panels: screen.panels,
                         syncing: None,
                         columns: screen.columns,
                         history_loading: screen.history_loading,
@@ -98,9 +109,7 @@ fn harness(size: egui::Vec2, screen: Screen) -> Harness<'static, Screen> {
                 for action in &produced {
                     match action {
                         Action::SetHistoryColumns(columns) => screen.columns = *columns,
-                        Action::ToggleDetailSidebar => {
-                            screen.detail_open = !screen.detail_open;
-                        }
+                        Action::SetPanels(panels) => screen.panels = *panels,
                         _ => {}
                     }
                 }
@@ -128,13 +137,29 @@ fn tip(oid: &str) -> GraphTip {
     }
 }
 
-fn opened(name: &str, commits: &[Commit], truncated: bool) -> OpenedRepo {
+/// `commits` newest first, as (oid, summary): one lane by Ada, each commit the
+/// parent of the one above it, and `main` on the newest.
+fn opened(name: &str, commits: &[(String, String)], truncated: bool) -> OpenedRepo {
     let author = person("Ada Lovelace", "ada@example.invalid");
-    let mut graph = linear_graph(commits, &author);
-    graph.truncated = truncated;
-    let oid = commits.first().map(|commit| commit.oid.clone());
+    let inputs: Vec<GraphCommit> = commits
+        .iter()
+        .enumerate()
+        .map(|(index, (oid, summary))| GraphCommit {
+            oid: oid.clone(),
+            summary: summary.clone(),
+            parents: commits
+                .get(index + 1)
+                .map_or_default(|(parent, _)| vec![parent.clone()]),
+            author: author.clone(),
+            co_authors: Vec::new(),
+        })
+        .collect();
+    let oid = commits.first().map(|(oid, _)| oid.clone());
     let tips = oid.iter().map(|oid| tip(oid)).collect::<Vec<_>>();
+    let mut graph = layout_graph(&inputs, &tips);
+    graph.truncated = truncated;
     OpenedRepo {
+        git: super::test_support::absent_git(),
         info: RepoInfo {
             root: std::path::PathBuf::from("/repos").join(name),
             name: name.to_owned(),
@@ -155,14 +180,16 @@ fn opened(name: &str, commits: &[Commit], truncated: bool) -> OpenedRepo {
             },
             checked: true,
         }],
-        latest: commits.first().map(|commit| CommitDetail {
-            oid: commit.oid.clone(),
+        latest: commits.first().map(|(oid, summary)| CommitDetail {
+            oid: oid.clone(),
             author: author.clone(),
             co_authors: Vec::new(),
             authored_at: "2026-01-01 00:00".to_owned(),
-            message: commit.summary.clone(),
+            message: summary.clone(),
         }),
-        view_id: egui::Id::new(("agent-history", name)),
+        selected_commit: None,
+        lit_branch: None,
+        view_id: egui::Id::unique(("agent-history", name)),
         terminal: None,
         github: None,
         hover: HoverCache::default(),
@@ -172,18 +199,9 @@ fn opened(name: &str, commits: &[Commit], truncated: bool) -> OpenedRepo {
 }
 
 fn opened_graph(name: &str, graph: HistoryGraph) -> OpenedRepo {
-    let mut repo = opened(
-        name,
-        &[Commit {
-            oid: graph
-                .rows
-                .first()
-                .map(|row| row.oid.clone())
-                .unwrap_or_else(|| "0".repeat(40)),
-            summary: "placeholder".to_owned(),
-        }],
-        false,
-    );
+    let first = graph.rows.first().map(|row| row.oid.clone());
+    let oid = first.unwrap_or_else(|| "0".repeat(40));
+    let mut repo = opened(name, &[(oid, "placeholder".to_owned())], false);
     if let Some(row) = graph.rows.first() {
         repo.latest = Some(CommitDetail {
             oid: row.oid.clone(),
@@ -197,30 +215,6 @@ fn opened_graph(name: &str, graph: HistoryGraph) -> OpenedRepo {
     repo
 }
 
-/// One lane, each commit the parent of the one above it, `main` on the newest.
-fn linear_graph(commits: &[Commit], author: &Person) -> HistoryGraph {
-    let inputs: Vec<GraphCommit> = commits
-        .iter()
-        .enumerate()
-        .map(|(index, commit)| GraphCommit {
-            oid: commit.oid.clone(),
-            summary: commit.summary.clone(),
-            parents: commits
-                .get(index + 1)
-                .map(|parent| vec![parent.oid.clone()])
-                .unwrap_or_default(),
-            author: author.clone(),
-            co_authors: Vec::new(),
-        })
-        .collect();
-    let tips = commits
-        .first()
-        .map(|commit| tip(&commit.oid))
-        .into_iter()
-        .collect::<Vec<_>>();
-    layout_graph(&inputs, &tips)
-}
-
 /// Branch list and latest commit are already known; the graph has no rows.
 ///
 /// Opening a repository installs the current branch, which already has
@@ -228,12 +222,10 @@ fn linear_graph(commits: &[Commit], author: &Person) -> HistoryGraph {
 /// `history_loading` the empty table is still opening. Without it, the same
 /// empty table is "No commits yet."
 fn opened_while_history_loads(name: &str) -> OpenedRepo {
+    let summary = "field notes from the estuary".to_owned();
     let mut repo = opened(
         name,
-        &[Commit {
-            oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-            summary: "field notes from the estuary".to_owned(),
-        }],
+        &[(super::test_support::TIP.to_owned(), summary)],
         false,
     );
     repo.graph = HistoryGraph::default();
@@ -241,34 +233,26 @@ fn opened_while_history_loads(name: &str) -> OpenedRepo {
 }
 
 fn one_commit(summary: &str) -> OpenedRepo {
-    opened(
-        summary,
-        &[Commit {
-            oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-            summary: summary.to_owned(),
-        }],
-        false,
-    )
+    let commit = (super::test_support::TIP.to_owned(), summary.to_owned());
+    opened(summary, &[commit], false)
 }
 
-fn row_text(repo: &OpenedRepo) -> (String, String, String, String) {
+fn row_text(repo: &OpenedRepo) -> RowText {
     let row = &repo.graph.rows[0];
-    let branch = row
-        .branches
-        .iter()
-        .map(|branch| branch.name.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let author = std::iter::once(row.author.name.as_str())
-        .chain(row.co_authors.iter().map(|person| person.name.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    (
-        row.summary.clone(),
-        short_oid(&row.oid).to_owned(),
-        author,
-        branch,
-    )
+    RowText {
+        summary: row.summary.clone(),
+        short_oid: short_oid(&row.oid).to_owned(),
+        author: std::iter::once(row.author.name.as_str())
+            .chain(row.co_authors.iter().map(|person| person.name.as_str()))
+            .collect::<Vec<_>>()
+            .join(", "),
+        branch: row
+            .branches
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
 }
 
 fn message_min() -> f32 {
@@ -277,8 +261,7 @@ fn message_min() -> f32 {
 
 fn label_rects(harness: &Harness<'_, Screen>, exact: &str) -> Vec<egui::Rect> {
     harness
-        .query_all_by_role(Role::Label)
-        .filter(|node| node.value().as_deref() == Some(exact))
+        .query_all_by_role_and_label(Role::Label, exact)
         .map(|node| node.rect())
         .collect()
 }
@@ -348,12 +331,12 @@ fn header_names(headers: &[(&'static str, egui::Rect)]) -> String {
         .join(" ")
 }
 
-fn column_text<'a>(title: &str, row: &RowText<'a>) -> Option<&'a str> {
+fn column_text<'a>(title: &str, row: &'a RowText) -> Option<&'a str> {
     match title {
-        "Branch" => Some(row.branch),
-        "Commit Hash" => Some(row.short_oid),
-        "Commit Message" => Some(row.summary),
-        "Author" => Some(row.author),
+        "Branch" => Some(row.branch.as_str()),
+        "Commit Hash" => Some(row.short_oid.as_str()),
+        "Commit Message" => Some(row.summary.as_str()),
+        "Author" => Some(row.author.as_str()),
         _ => None,
     }
 }
@@ -398,7 +381,7 @@ fn content_rect(
 fn aligned_edges(
     harness: &Harness<'_, Screen>,
     case: &str,
-    row: &RowText<'_>,
+    row: &RowText,
     prefix: bool,
     author_off_screen: bool,
 ) -> Vec<Edge> {
@@ -409,9 +392,9 @@ fn aligned_edges(
         labels(harness)
     );
     let names: Vec<_> = headers.iter().map(|(name, _)| *name).collect();
-    let mut previous = -1isize;
+    let mut previous = None;
     for name in &names {
-        let index = TITLES.iter().position(|title| title == name).unwrap() as isize;
+        let index = TITLES.iter().position(|title| title == name);
         assert!(
             index > previous,
             "{case}: titles out of order: {}",
@@ -480,8 +463,8 @@ fn aligned_edges(
         headers.iter().find(|(name, _)| *name == "Graph"),
         headers.iter().find(|(name, _)| *name == "Commit Hash"),
     ) {
-        let chip = content_rect(harness, row.branch, branch.1, row_y);
-        let hash_cell = content_rect(harness, row.short_oid, hash.1, row_y);
+        let chip = content_rect(harness, &row.branch, branch.1, row_y);
+        let hash_cell = content_rect(harness, &row.short_oid, hash.1, row_y);
         let graph_column_left = graph.1.left() - super::history::CELL_PAD;
         assert!(
             chip.right() <= graph_column_left + TOL,
@@ -500,10 +483,9 @@ fn aligned_edges(
 
 fn pointer_over_history(harness: &Harness<'_, Screen>, height: f32) -> Pos2 {
     let headers = header_row(harness);
-    let title = headers
+    let (_, title) = headers
         .iter()
         .find(|(name, _)| *name == "Commit Hash" || *name == "Branch" || *name == "Graph")
-        .map(|(_, rect)| *rect)
         .unwrap_or_else(|| panic!("no visible column\n{}", labels(harness)));
     // A few points into the title keeps the pointer over the history body
     // and off the sidebars, below the single commit row.
@@ -522,12 +504,14 @@ fn wheel_x(harness: &mut Harness<'_, Screen>, at: Pos2, delta_x: f32) {
         unit: MouseWheelUnit::Point,
         delta: egui::Vec2::ZERO,
         phase: TouchPhase::Start,
+        source: MouseWheelSource::Unknown,
         modifiers: Modifiers::default(),
     });
     harness.input_mut().events.push(egui::Event::MouseWheel {
         unit: MouseWheelUnit::Point,
         delta: egui::vec2(delta_x, 0.0),
         phase: TouchPhase::Move,
+        source: MouseWheelSource::Unknown,
         modifiers: Modifiers::default(),
     });
     harness.step();
@@ -566,6 +550,8 @@ fn drag(harness: &mut Harness<'_, Screen>, from: Pos2, to: Pos2) {
     harness.step();
 }
 
+/// Move, press and release on one frame. The kittest output keeps only the
+/// last frame, so a copy made by this click is still in it.
 fn click_at(harness: &mut Harness<'_, Screen>, at: Pos2) {
     move_pointer(harness, at);
     set_button(harness, at, true);
@@ -578,26 +564,6 @@ fn double_click_at(harness: &mut Harness<'_, Screen>, at: Pos2) {
     click_at(harness, at);
 }
 
-fn action_name(action: &Action) -> String {
-    match action {
-        Action::Browse => "Browse".to_owned(),
-        Action::Open(path) => format!("Open({})", path.display()),
-        Action::Home => "Home".to_owned(),
-        Action::OpenSettings => "OpenSettings".to_owned(),
-        Action::CloseSettings => "CloseSettings".to_owned(),
-        Action::ToggleBranchesSidebar => "ToggleBranchesSidebar".to_owned(),
-        Action::ToggleDetailSidebar => "ToggleDetailSidebar".to_owned(),
-        Action::ToggleTerminal => "ToggleTerminal".to_owned(),
-        Action::SetUiFont(font) => format!("SetUiFont({font:?})"),
-        Action::SetTerminalFont(font) => format!("SetTerminalFont({font:?})"),
-        Action::Fetch(upstream) => format!("Fetch({upstream})"),
-        Action::Pull => "Pull".to_owned(),
-        Action::Checkout(name) => format!("Checkout({name})"),
-        Action::SetHistoryColumns(columns) => format!("SetHistoryColumns({columns:?})"),
-        Action::SetAuthorAvatars(on) => format!("SetAuthorAvatars({on})"),
-    }
-}
-
 fn take_column_change(harness: &mut Harness<'_, Screen>) -> HistoryColumns {
     let actions = std::mem::take(&mut harness.state_mut().actions);
     let changes: Vec<_> = actions
@@ -607,50 +573,63 @@ fn take_column_change(harness: &mut Harness<'_, Screen>) -> HistoryColumns {
             _ => None,
         })
         .collect();
-    let described = actions
-        .iter()
-        .map(action_name)
-        .collect::<Vec<_>>()
-        .join(", ");
     assert_eq!(
         changes.len(),
         1,
-        "expected one SetHistoryColumns, actions: {described}"
+        "expected one SetHistoryColumns, actions: {actions:?}"
     );
     let others: Vec<_> = actions
         .iter()
         .filter(|action| !matches!(action, Action::SetHistoryColumns(_)))
-        .map(action_name)
         .collect();
     assert!(
         others.is_empty(),
-        "unexpected actions beside SetHistoryColumns: {}",
-        others.join(", ")
+        "unexpected actions beside SetHistoryColumns: {others:?}"
     );
     changes[0]
 }
 
-fn title_left(headers: &[(&'static str, egui::Rect)], name: &str) -> f32 {
+fn title_rect(headers: &[(&'static str, egui::Rect)], name: &str) -> egui::Rect {
     headers
         .iter()
         .find(|(title, _)| *title == name)
         .unwrap_or_else(|| panic!("missing title {name}: {}", header_names(headers)))
         .1
-        .left()
 }
 
-/// Panel width implied by the default message share. Title gaps are the
-/// column widths; the author divider's grab shifts inward on the panel edge.
-fn panel_width(headers: &[(&'static str, egui::Rect)]) -> f32 {
-    let defaults = HistoryColumns::default();
+fn title_left(headers: &[(&'static str, egui::Rect)], name: &str) -> f32 {
+    title_rect(headers, name).left()
+}
+
+fn header_title(harness: &Harness<'_, Screen>, name: &str) -> egui::Rect {
+    title_rect(&header_row(harness), name)
+}
+
+fn divider(harness: &Harness<'_, Screen>, column: &str) -> Pos2 {
+    harness
+        .get_by_label(&format!("Resize {column}"))
+        .rect()
+        .center()
+}
+
+/// Panel width implied by the message share, after checking that each
+/// column left of it is its share of that panel. Title gaps are the column
+/// widths; the author divider's grab shifts inward on the panel edge.
+fn panel_width(headers: &[(&'static str, egui::Rect)], columns: HistoryColumns) -> f32 {
     let message = title_left(headers, "Author") - title_left(headers, "Commit Message");
-    let panel = message * 1000.0 / f32::from(defaults.message);
-    let branch = title_left(headers, "Graph") - title_left(headers, "Branch");
-    let expected_branch = panel * f32::from(defaults.branch) / 1000.0;
-    assert!(
-        (branch - expected_branch).abs() <= TOL,
-        "branch width {branch:.2} does not match its default share of panel {panel:.2}"
-    );
+    let panel = message * 1000.0 / f32::from(columns.message);
+    for (left, right, share) in [
+        ("Branch", "Graph", columns.branch),
+        ("Graph", "Commit Hash", columns.graph),
+        ("Commit Hash", "Commit Message", columns.hash),
+    ] {
+        let width = title_left(headers, right) - title_left(headers, left);
+        let expected = panel * f32::from(share) / 1000.0;
+        assert!(
+            (width - expected).abs() <= TOL,
+            "{left} is {width:.2} wide, its share of panel {panel:.2} is {expected:.2}"
+        );
+    }
     panel
 }
 
@@ -705,292 +684,187 @@ fn assert_scrolled_together(before: &[Edge], after: &[Edge], expect_movement: bo
     );
 }
 
+/// (window width, both sidebars open, shares fill the panel, Author culled).
+/// A wide window gives each column its share; at 900 the minimums push the
+/// columns past the panel, and with both sidebars Author sits past the right
+/// edge; 520 is the app's minimum window.
 #[test]
 fn titles_line_up_with_their_cells_at_several_widths() {
-    let summary = "field notes from the estuary";
-    for width in [2600.0, 1400.0, 900.0] {
-        for branches_open in [false, true] {
-            for detail_open in [false, true] {
-                let repo = one_commit(summary);
-                let (summary, short_oid, author, branch) = row_text(&repo);
-                let row = RowText {
-                    summary: &summary,
-                    short_oid: &short_oid,
-                    author: &author,
-                    branch: &branch,
-                };
-                let harness = harness(
-                    egui::vec2(width, HEIGHT),
-                    screen(repo, HistoryColumns::default(), branches_open, detail_open),
-                );
-                let case = format!("width {width}, branches {branches_open}, detail {detail_open}");
-                let _ = aligned_edges(
-                    &harness,
-                    &case,
-                    &row,
-                    true,
-                    width == 900.0 && branches_open && detail_open,
-                );
-            }
+    for (width, sidebars, proportional, author_culled) in [
+        (2600.0, false, true, false),
+        (900.0, false, false, false),
+        (900.0, true, false, true),
+        (MIN_WINDOW.x, true, false, false),
+    ] {
+        let repo = one_commit("field notes from the estuary");
+        let row = row_text(&repo);
+        let harness = harness(
+            egui::vec2(width, HEIGHT),
+            screen(repo, HistoryColumns::default(), sidebars, sidebars),
+        );
+        let case = format!("width {width}, sidebars {sidebars}");
+        let _ = aligned_edges(&harness, &case, &row, true, author_culled);
+        if proportional {
+            panel_width(&header_row(&harness), HistoryColumns::default());
         }
     }
 }
 
+/// The wheel changes the scroll offset after the rows are placed, and the
+/// header uses that same placement. Titles and cells agree on the wheel
+/// frame; on the next one both have moved left.
 #[test]
-fn titles_stay_aligned_after_the_history_scrolls_right() {
-    let summary = "field notes from the estuary";
-    let repo = one_commit(summary);
-    let (summary, short_oid, author, branch) = row_text(&repo);
-    let row = RowText {
-        summary: &summary,
-        short_oid: &short_oid,
-        author: &author,
-        branch: &branch,
-    };
+fn titles_follow_their_cells_through_a_sideways_scroll() {
+    let repo = one_commit("field notes from the estuary");
+    let row = row_text(&repo);
     // Both sidebars on a 900px window force the minimums past the panel,
     // so the table can actually scroll sideways.
     let mut harness = harness(
         egui::vec2(900.0, HEIGHT),
         screen(repo, HistoryColumns::default(), true, true),
     );
-    let before = aligned_edges(&harness, "before scroll", &row, true, true);
+    let before = aligned_edges(&harness, "before the wheel", &row, true, true);
     let at = pointer_over_history(&harness, HEIGHT);
     wheel_x(&mut harness, at, -80.0);
-    // The wheel is consumed while the rows of this frame are already placed.
-    // One more frame paints the rows at the offset the header just adopted.
+    let during = aligned_edges(&harness, "wheel frame", &row, false, false);
+    assert_scrolled_together(&before, &during, false);
     move_pointer(&mut harness, Pos2::new(2.0, 2.0));
     harness.step();
-    let after = aligned_edges(&harness, "after scroll", &row, false, false);
+    let after = aligned_edges(&harness, "after the wheel", &row, false, false);
     assert_scrolled_together(&before, &after, true);
 }
 
+/// The message divider, dragged wider, reset by a double click, then dragged
+/// past its minimum. The other columns keep their shares throughout.
 #[test]
-fn titles_match_cells_on_the_frame_the_wheel_is_applied() {
-    let summary = "field notes from the estuary";
-    let repo = one_commit(summary);
-    let (summary, short_oid, author, branch) = row_text(&repo);
-    let row = RowText {
-        summary: &summary,
-        short_oid: &short_oid,
-        author: &author,
-        branch: &branch,
-    };
-    let mut harness = harness(
-        egui::vec2(900.0, HEIGHT),
-        screen(repo, HistoryColumns::default(), true, true),
-    );
-    let before = aligned_edges(&harness, "before wheel frame", &row, true, false);
-    let at = pointer_over_history(&harness, HEIGHT);
-    wheel_x(&mut harness, at, -80.0);
-    // The wheel changes the scroll offset after the rows are placed, and the
-    // header uses that same placement. Titles and cells must still agree on
-    // this frame; the movement shows up on the next one.
-    let during = aligned_edges(&harness, "wheel frame", &row, false, false);
-    assert_scrolled_together(&before, &during, false);
-}
-
-#[test]
-fn dragging_the_message_divider_widens_only_that_column() {
-    let mut harness = harness(
-        egui::vec2(1700.0, HEIGHT),
-        screen(
-            one_commit("field notes from the estuary"),
-            HistoryColumns::default(),
-            false,
-            false,
-        ),
-    );
-    let before = header_row(&harness);
-    let panel = panel_width(&before);
-    let from = harness
-        .get_by_label("Resize Commit Message")
-        .rect()
-        .center();
-    harness.state_mut().actions.clear();
-    drag(&mut harness, from, from + egui::vec2(120.0, 0.0));
-
-    let changed = take_column_change(&mut harness);
-    let defaults = HistoryColumns::default();
-    assert_eq!(changed.branch, defaults.branch);
-    assert_eq!(changed.graph, defaults.graph);
-    assert_eq!(changed.hash, defaults.hash);
-    assert_eq!(changed.author, defaults.author);
-    assert!(
-        changed.message > defaults.message,
-        "message per-mille {} should grow past {}",
-        changed.message,
-        defaults.message
-    );
-
-    let after = header_row(&harness);
-    assert_left_titles_stayed(&before, &after);
-    let moved = title_left(&after, "Author") - title_left(&before, "Author");
-    let slop = panel / 1000.0 + TOL;
-    assert!(
-        (moved - 120.0).abs() <= slop,
-        "Author moved {moved:.2}px when the divider moved 120px (panel {panel:.1}, slop {slop:.2})"
-    );
-}
-
-struct Shrink {
-    changed: HistoryColumns,
-    panel: f32,
-    before: Vec<(&'static str, egui::Rect)>,
-    after: Vec<(&'static str, egui::Rect)>,
-    travel: f32,
-}
-
-fn drag_message_below_its_minimum() -> Shrink {
-    let mut harness = harness(
-        egui::vec2(1700.0, HEIGHT),
-        screen(
-            one_commit("field notes from the estuary"),
-            HistoryColumns::default(),
-            false,
-            false,
-        ),
-    );
-    let before = header_row(&harness);
-    let panel = panel_width(&before);
-    let minimum = message_min();
-    let from = harness
-        .get_by_label("Resize Commit Message")
-        .rect()
-        .center();
-    let column_left = title_left(&before, "Commit Message") - super::history::CELL_PAD;
-    let to = Pos2::new(column_left - 80.0, from.y);
-    assert!(
-        from.x - to.x > minimum + 50.0,
-        "the drag should ask for less than the message minimum"
-    );
-    harness.state_mut().actions.clear();
-    drag(&mut harness, from, to);
-    let changed = take_column_change(&mut harness);
-    let after = header_row(&harness);
-    Shrink {
-        changed,
-        panel,
-        before,
-        after,
-        travel: to.x - from.x,
-    }
-}
-
-#[test]
-fn dragging_below_the_minimum_keeps_the_painted_width() {
-    let shrink = drag_message_below_its_minimum();
-    let defaults = HistoryColumns::default();
-    assert_eq!(shrink.changed.branch, defaults.branch);
-    assert_eq!(shrink.changed.graph, defaults.graph);
-    assert_eq!(shrink.changed.hash, defaults.hash);
-    assert_eq!(shrink.changed.author, defaults.author);
-    assert_left_titles_stayed(&shrink.before, &shrink.after);
-    let width = title_left(&shrink.after, "Author") - title_left(&shrink.after, "Commit Message");
-    let minimum = message_min();
-    assert!(
-        width + TOL >= minimum,
-        "message column is {width:.2}px, minimum is {minimum:.1}px"
-    );
-    let author_delta = title_left(&shrink.after, "Author") - title_left(&shrink.before, "Author");
-    assert!(author_delta < -TOL, "Author did not move left");
-    assert!(
-        author_delta > shrink.travel + 50.0,
-        "Author followed the pointer past the minimum (moved {author_delta:.1}, pointer {:.1})",
-        shrink.travel
-    );
-}
-
-#[test]
-fn dragging_below_the_minimum_stores_the_minimum_share() {
-    let shrink = drag_message_below_its_minimum();
-    let minimum = message_min();
-    let implied = super::history::per_mille_for(minimum, shrink.panel);
-    assert!(
-        shrink.changed.message >= implied,
-        "message per-mille {} is below the minimum width's share {implied} (min {minimum:.1}px, panel {:.1}px)",
-        shrink.changed.message,
-        shrink.panel
-    );
-    assert!(
-        shrink.changed.message < HistoryColumns::default().message,
-        "stored message {} did not shrink",
-        shrink.changed.message
-    );
-}
-
-#[test]
-fn double_clicking_a_divider_resets_only_that_column() {
-    let columns = HistoryColumns {
+#[expect(
+    clippy::too_many_lines,
+    reason = "one divider dragged, reset and dragged again; each step starts from the table the last one left"
+)]
+fn the_message_divider_resizes_and_resets_only_its_column() {
+    let start = HistoryColumns {
         branch: 160,
         graph: 100,
         hash: 120,
-        message: 520,
+        message: 400,
         author: 160,
     };
     let mut harness = harness(
         egui::vec2(1700.0, HEIGHT),
         screen(
             one_commit("field notes from the estuary"),
-            columns,
+            start,
             false,
             false,
         ),
     );
     let before = header_row(&harness);
-    let at = harness
-        .get_by_label("Resize Commit Message")
-        .rect()
-        .center();
+    let panel = panel_width(&before, start);
+    let slop = panel / 1000.0 + TOL;
     harness.state_mut().actions.clear();
+
+    // Wider: Author follows the pointer, within one share of the panel.
+    let from = divider(&harness, "Commit Message");
+    drag(&mut harness, from, from + egui::vec2(120.0, 0.0));
+    let wider = take_column_change(&mut harness);
+    assert_eq!(
+        HistoryColumns {
+            message: start.message,
+            ..wider
+        },
+        start,
+        "dragging the message divider changed another column"
+    );
+    assert!(
+        wider.message > start.message,
+        "message per-mille {} should grow past {}",
+        wider.message,
+        start.message
+    );
+    let after = header_row(&harness);
+    assert_left_titles_stayed(&before, &after);
+    let moved = title_left(&after, "Author") - title_left(&before, "Author");
+    assert!(
+        (moved - 120.0).abs() <= slop,
+        "Author moved {moved:.2}px when the divider moved 120px (panel {panel:.1}, slop {slop:.2})"
+    );
+
+    // A double click puts back the default share of this column only.
+    let before = after;
+    let at = divider(&harness, "Commit Message");
     move_pointer(&mut harness, at);
     harness.step();
-    click_at(&mut harness, at);
-    click_at(&mut harness, at);
+    double_click_at(&mut harness, at);
     // The double-click is on the second click's response, which `show` reads
     // on the following frame and paints in the same pass.
     harness.step();
-
-    let changed = take_column_change(&mut harness);
+    let reset = take_column_change(&mut harness);
+    let defaults = HistoryColumns::default();
     assert_eq!(
-        changed,
+        reset,
         HistoryColumns {
-            message: HistoryColumns::default().message,
-            ..columns
+            message: defaults.message,
+            ..start
         }
     );
-
     let after = header_row(&harness);
     assert_left_titles_stayed(&before, &after);
-    let before_width = title_left(&before, "Author") - title_left(&before, "Commit Message");
-    let after_width = title_left(&after, "Author") - title_left(&after, "Commit Message");
-    let expected = before_width * f32::from(HistoryColumns::default().message) / 520.0;
+    let width = title_left(&after, "Author") - title_left(&after, "Commit Message");
+    let expected = panel * f32::from(defaults.message) / 1000.0;
     assert!(
-        (after_width - expected).abs() <= before_width * 0.02 + 2.0,
-        "reset message width {after_width:.1}px, expected about {expected:.1}px from {before_width:.1}px"
+        (width - expected).abs() <= slop,
+        "reset message width {width:.1}px, expected {expected:.1}px"
+    );
+
+    // Past its minimum the column stops there, and the stored share is the
+    // minimum's, not the pointer's.
+    let before = after;
+    let minimum = message_min();
+    let from = divider(&harness, "Commit Message");
+    let column_left = title_left(&before, "Commit Message") - super::history::CELL_PAD;
+    let to = Pos2::new(column_left - 80.0, from.y);
+    assert!(
+        from.x - to.x > minimum + 50.0,
+        "the drag should ask for less than the message minimum"
+    );
+    drag(&mut harness, from, to);
+    let shrunk = take_column_change(&mut harness);
+    assert_eq!(
+        HistoryColumns {
+            message: reset.message,
+            ..shrunk
+        },
+        reset,
+        "dragging past the minimum changed another column"
+    );
+    let implied = super::history::per_mille_for(minimum, panel);
+    assert!(
+        (implied..reset.message).contains(&shrunk.message),
+        "message per-mille {} should shrink to {implied}, {minimum:.1}px of {panel:.1}px",
+        shrunk.message
+    );
+    let after = header_row(&harness);
+    assert_left_titles_stayed(&before, &after);
+    let width = title_left(&after, "Author") - title_left(&after, "Commit Message");
+    assert!(
+        width + TOL >= minimum,
+        "message column is {width:.2}px, minimum is {minimum:.1}px"
     );
     let author_delta = title_left(&after, "Author") - title_left(&before, "Author");
+    let travel = to.x - from.x;
     assert!(
-        author_delta < -20.0,
-        "Author should move left when the message column resets, moved {author_delta:.1}"
+        author_delta < -TOL && author_delta > travel + 50.0,
+        "Author moved {author_delta:.1} for a pointer travel of {travel:.1}"
     );
 }
 
 #[test]
 fn a_thousand_commits_stay_virtualized() {
-    let commits: Vec<Commit> = (0..1000)
-        .map(|index| Commit {
-            oid: format!("{index:040x}"),
-            summary: format!("row-{index:04}"),
-        })
+    let commits: Vec<(String, String)> = (0..1000)
+        .map(|index| (format!("{index:040x}"), format!("row-{index:04}")))
         .collect();
     let repo = opened("bulk-history", &commits, true);
-    let (summary, short_oid, author, branch) = row_text(&repo);
-    let row = RowText {
-        summary: &summary,
-        short_oid: &short_oid,
-        author: &author,
-        branch: &branch,
-    };
+    let row = row_text(&repo);
     let harness = harness(
         egui::vec2(1400.0, HEIGHT),
         screen(repo, HistoryColumns::default(), false, false),
@@ -1017,6 +891,10 @@ fn a_thousand_commits_stay_virtualized() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one row with every cell too long, checked column by column"
+)]
 fn long_cells_stay_inside_their_columns() {
     let oid = "abcdef0123456789abcdef0123456789abcdef01";
     let summary = format!("{}{}", "字".repeat(80), "W".repeat(400));
@@ -1050,9 +928,9 @@ fn long_cells_stay_inside_their_columns() {
     let graph = HistoryGraph {
         rows: vec![GraphRow {
             oid: oid.to_owned(),
-            summary: summary.clone(),
-            author: author.clone(),
-            co_authors: co_authors.clone(),
+            summary,
+            author,
+            co_authors,
             branches,
             commit_lane: 0,
             commit_color: 0,
@@ -1062,13 +940,7 @@ fn long_cells_stay_inside_their_columns() {
         columns: 1,
     };
     let repo = opened_graph("long-cells", graph);
-    let (summary, short_oid, author_label, branch_label) = row_text(&repo);
-    let row = RowText {
-        summary: &summary,
-        short_oid: &short_oid,
-        author: &author_label,
-        branch: &branch_label,
-    };
+    let row = row_text(&repo);
     // Shares of 20 sit under every minimum, so each column is as narrow as
     // it is allowed to be and the long text has to be elided.
     let columns = HistoryColumns {
@@ -1078,7 +950,10 @@ fn long_cells_stay_inside_their_columns() {
         message: 20,
         author: 20,
     };
-    let harness = harness(
+    // No bundled face has 字; the app draws it from the system fonts, which
+    // the harness does not load. Its tofu is as wide as a glyph to elide.
+    let harness = harness_from(
+        Harness::builder().allow_missing_glyphs(),
         egui::vec2(1600.0, HEIGHT),
         screen(repo, columns, false, false),
     );
@@ -1091,68 +966,26 @@ fn long_cells_stay_inside_their_columns() {
     );
     let _ = aligned_edges(&harness, "long cells", &row, true, false);
 
-    let branch = title_left(&headers, "Branch");
-    let graph = title_left(&headers, "Graph");
-    let message = title_left(&headers, "Commit Message");
-    let author_title = title_left(&headers, "Author");
-    let author_edge = harness.get_by_label("Resize Author").rect().center().x;
     let row_y = content_rect(
         &harness,
-        &summary,
-        headers
-            .iter()
-            .find(|(name, _)| *name == "Commit Message")
-            .unwrap()
-            .1,
+        &row.summary,
+        title_rect(&headers, "Commit Message"),
         None,
     )
     .center()
     .y;
+    let cell = |text: &str, title: &str| {
+        content_rect(&harness, text, title_rect(&headers, title), Some(row_y))
+    };
+    let chip = cell(&row.branch, "Branch");
+    let hash_cell = cell(&row.short_oid, "Commit Hash");
+    let message_cell = cell(&row.summary, "Commit Message");
+    let author_cell = cell(&row.author, "Author");
 
-    let chip = content_rect(
-        &harness,
-        &branch_label,
-        headers
-            .iter()
-            .find(|(name, _)| *name == "Branch")
-            .unwrap()
-            .1,
-        Some(row_y),
-    );
-    let hash_cell = content_rect(
-        &harness,
-        &short_oid,
-        headers
-            .iter()
-            .find(|(name, _)| *name == "Commit Hash")
-            .unwrap()
-            .1,
-        Some(row_y),
-    );
-    let message_cell = content_rect(
-        &harness,
-        &summary,
-        headers
-            .iter()
-            .find(|(name, _)| *name == "Commit Message")
-            .unwrap()
-            .1,
-        Some(row_y),
-    );
-    let author_cell = content_rect(
-        &harness,
-        &author_label,
-        headers
-            .iter()
-            .find(|(name, _)| *name == "Author")
-            .unwrap()
-            .1,
-        Some(row_y),
-    );
-
-    let graph_left = graph - super::history::CELL_PAD;
-    let message_left = message - super::history::CELL_PAD;
-    let author_left = author_title - super::history::CELL_PAD;
+    let graph_left = title_left(&headers, "Graph") - super::history::CELL_PAD;
+    let message_left = title_left(&headers, "Commit Message") - super::history::CELL_PAD;
+    let author_left = title_left(&headers, "Author") - super::history::CELL_PAD;
+    let author_edge = divider(&harness, "Author").x;
     assert!(
         chip.right() <= graph_left + TOL,
         "branch chip right {:.2} crosses the graph column at {graph_left:.2}",
@@ -1174,7 +1007,7 @@ fn long_cells_stay_inside_their_columns() {
         author_cell.right()
     );
     assert!(
-        chip.left() + TOL >= branch - super::history::CELL_PAD,
+        chip.left() + TOL >= title_left(&headers, "Branch") - super::history::CELL_PAD,
         "branch chip starts in the previous column"
     );
     assert!(
@@ -1294,55 +1127,11 @@ fn assert_opening_line_inside_panel(harness: &Harness<'_, Screen>, window: egui:
     }
 }
 
-fn assert_titles_do_not_move(
-    loading: &[(&'static str, egui::Rect)],
-    idle: &[(&'static str, egui::Rect)],
-) {
-    let loading_names: Vec<_> = loading.iter().map(|(name, _)| *name).collect();
-    let idle_names: Vec<_> = idle.iter().map(|(name, _)| *name).collect();
-    assert_eq!(
-        loading_names,
-        idle_names,
-        "column titles changed while history was opening: loading {}, idle {}",
-        header_names(loading),
-        header_names(idle)
-    );
-    let mut previous = -1isize;
-    for name in &loading_names {
-        let index = TITLES
-            .iter()
-            .position(|title| title == name)
-            .unwrap_or_else(|| panic!("unexpected title {name}")) as isize;
-        assert!(
-            index > previous,
-            "titles out of left-to-right order: {}",
-            header_names(loading)
-        );
-        previous = index;
-    }
-    for pair in loading.windows(2) {
-        assert!(
-            pair[0].1.left() < pair[1].1.left(),
-            "{} is not left of {}",
-            pair[0].0,
-            pair[1].0
-        );
-        let idle_gap = title_left(idle, pair[1].0) - title_left(idle, pair[0].0);
-        let loading_gap = pair[1].1.left() - pair[0].1.left();
-        assert!(
-            (loading_gap - idle_gap).abs() <= TOL,
-            "{} to {} gap changed from {idle_gap:.2} to {loading_gap:.2}",
-            pair[0].0,
-            pair[1].0
-        );
-    }
-}
-
 #[test]
 fn opening_history_stays_inside_the_minimum_window() {
-    // Same 520×400 window as the narrow-history kittest, with both sidebars
-    // open. An empty graph draws no columns, so the opening line itself has
-    // to stay inside the history panel.
+    // The app's minimum 520×400 window, with both sidebars open. An empty
+    // graph draws no columns, so the opening line itself has to stay inside
+    // the history panel.
     let mut loading_screen = screen(
         opened_while_history_loads("opening"),
         HistoryColumns::default(),
@@ -1388,12 +1177,6 @@ fn opening_history_stays_inside_the_minimum_window() {
     );
 
     assert_opening_line_inside_panel(&loading, MIN_WINDOW);
-
-    let loading_titles = header_row(&loading);
-    let idle_titles = header_row(&idle);
-    if !loading_titles.is_empty() || !idle_titles.is_empty() {
-        assert_titles_do_not_move(&loading_titles, &idle_titles);
-    }
 }
 
 #[test]
@@ -1447,16 +1230,16 @@ fn hovering_a_panel_toggle_does_not_grow_the_top_bar() {
             after.height()
         );
         assert!(
-            harness.query_by_label(tip).is_some(),
+            harness.query_by_role_and_label(Role::Label, tip).is_some(),
             "missing hover label {tip:?}\n{}",
             labels(&harness)
         );
     }
 }
 
-/// The two icon buttons in the top bar, not the ones in the bottom bar.
-/// `main` on the spine and `feature` on its own color, joined at the root.
-fn fork_graph() -> HistoryGraph {
+/// `main` on the spine, `mains` commits down to the root, and `feature` on its
+/// own color, forking off the root below all of them.
+fn fork_graph(mains: u8) -> HistoryGraph {
     let author = person("Ada Lovelace", "ada@example.invalid");
     let commit = |oid: u8, summary: &str, parents: &[u8]| GraphCommit {
         oid: format!("{oid:040x}"),
@@ -1468,13 +1251,14 @@ fn fork_graph() -> HistoryGraph {
         author: author.clone(),
         co_authors: Vec::new(),
     };
+    let base = mains + 1;
+    let mut commits: Vec<_> = (1..=mains)
+        .map(|oid| commit(oid, &format!("main {oid}"), &[oid + 1]))
+        .collect();
+    commits.push(commit(u8::MAX, "on feature", &[base]));
+    commits.push(commit(base, "base", &[]));
     layout_graph(
-        &[
-            commit(1, "on main", &[2]),
-            commit(3, "on feature", &[4]),
-            commit(2, "mid main", &[4]),
-            commit(4, "base", &[]),
-        ],
+        &commits,
         &[
             GraphTip {
                 name: "main".to_owned(),
@@ -1485,7 +1269,7 @@ fn fork_graph() -> HistoryGraph {
             },
             GraphTip {
                 name: "feature".to_owned(),
-                oid: format!("{:040x}", 3),
+                oid: format!("{:040x}", u8::MAX),
                 color: 3,
                 principal: false,
                 current: false,
@@ -1519,109 +1303,58 @@ fn history_chip_center(harness: &Harness<'_, Screen>, name: &str) -> Pos2 {
     chips[0].center()
 }
 
+/// Frames a lane takes to light up or go out at the harness's 60 per second,
+/// and one to spare for the rounding of the steps.
+fn fade_frames() -> usize {
+    (super::history::GLOW_FADE * 60.0).ceil() as usize + 1
+}
+
+/// The click lands after the lanes are painted, so the light starts on the
+/// next frame; this returns once the fade is through.
 fn click_branch(harness: &mut Harness<'_, Screen>, name: &str) {
     let at = history_chip_center(harness, name);
     click_at(harness, at);
-    // The click lands after the lanes are painted, so the halo shows on the next frame.
-    harness.step();
+    harness.run_steps(1 + fade_frames());
 }
 
-fn glow_vertices(harness: &Harness<'_, Screen>) -> Vec<egui::epaint::Vertex> {
-    let mut found = Vec::new();
-    for clipped in &harness.output().shapes {
-        collect_glow(&clipped.shape, &mut found);
-    }
-    found
-}
-
-fn collect_glow(shape: &egui::Shape, found: &mut Vec<egui::epaint::Vertex>) {
-    match shape {
-        egui::Shape::Mesh(mesh) if mesh.texture_id == egui::TextureId::default() => {
-            found.extend(mesh.vertices.iter().copied());
-        }
-        egui::Shape::Vec(shapes) => {
-            for shape in shapes {
-                collect_glow(shape, found);
-            }
-        }
-        _ => {}
-    }
-}
-
-struct LaneMarks {
-    segments: Vec<[Pos2; 2]>,
-    dots: Vec<Pos2>,
-}
-
-fn lane_marks(harness: &Harness<'_, Screen>, color: egui::Color32) -> LaneMarks {
-    let mut marks = LaneMarks {
-        segments: Vec::new(),
-        dots: Vec::new(),
-    };
-    for clipped in &harness.output().shapes {
-        collect_lane_marks(&clipped.shape, color, &mut marks);
-    }
-    marks
-}
-
-fn collect_lane_marks(shape: &egui::Shape, color: egui::Color32, marks: &mut LaneMarks) {
-    match shape {
-        egui::Shape::LineSegment { points, stroke } if stroke.color == color => {
-            marks.segments.push(*points);
-        }
-        egui::Shape::Circle(circle) if circle.fill == color => {
-            marks.dots.push(circle.center);
-        }
-        egui::Shape::Vec(shapes) => {
-            for shape in shapes {
-                collect_lane_marks(shape, color, marks);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn distance_to_segment(point: Pos2, start: Pos2, end: Pos2) -> f32 {
-    let delta = end - start;
-    let len2 = delta.length_sq();
-    if len2 <= f32::EPSILON {
-        return point.distance(start);
-    }
-    let t = ((point - start).dot(delta) / len2).clamp(0.0, 1.0);
-    point.distance(start + delta * t)
-}
-
-/// The commit dot is 8 points and the aura extends 5 past a stroke, plus a point of slack.
-const HALO_REACH: f32 = 14.0;
-
-fn near_lane(point: Pos2, marks: &LaneMarks) -> bool {
-    marks
-        .segments
+/// Vertex colors of the meshes clipped to the Graph column: the lit lane's
+/// light. Its geometry is pinned by `lane_glow`'s golden test; these tests
+/// only ask which lane is lit. The open detail sidebar paints meshes of its
+/// own, outside the column.
+fn glow_colors(harness: &Harness<'_, Screen>) -> Vec<egui::Color32> {
+    let headers = header_row(harness);
+    let left = title_left(&headers, "Graph") - super::history::CELL_PAD - TOL;
+    let right = title_left(&headers, "Commit Hash") - super::history::CELL_PAD + TOL;
+    let in_graph = |clip: egui::Rect| clip.left() >= left && clip.right() <= right;
+    harness
+        .output()
+        .shapes
         .iter()
-        .any(|segment| distance_to_segment(point, segment[0], segment[1]) <= HALO_REACH)
-        || marks
-            .dots
-            .iter()
-            .any(|dot| point.distance(*dot) <= HALO_REACH)
+        .filter_map(|clipped| match &clipped.shape {
+            egui::Shape::Mesh(mesh) if in_graph(clipped.clip_rect) => Some(&mesh.vertices),
+            _ => None,
+        })
+        .flatten()
+        .map(|vertex| vertex.color)
+        .collect()
 }
 
-/// Glow vertices of `lane` that sit on that lane. The open detail sidebar
-/// paints other meshes, so an empty mesh list is not the signal.
+/// Visible vertices of the light in `lane`'s color.
 fn lane_glow_near(harness: &Harness<'_, Screen>, lane: egui::Color32) -> usize {
-    let marks = lane_marks(harness, lane);
-    glow_vertices(harness)
+    glow_colors(harness)
         .into_iter()
-        .filter(|vertex| {
-            vertex.color.a() > 0
-                && is_lane_glow(vertex.color, lane)
-                && near_lane(vertex.pos, &marks)
-        })
+        .filter(|color| color.a() > 0 && is_lane_glow(*color, lane))
         .count()
+}
+
+fn brightest_glow(harness: &Harness<'_, Screen>) -> u8 {
+    let colors = glow_colors(harness);
+    colors.iter().map(egui::Color32::a).max().unwrap_or(0)
 }
 
 fn assert_no_glow(harness: &Harness<'_, Screen>) {
     assert!(
-        glow_vertices(harness).is_empty(),
+        glow_colors(harness).is_empty(),
         "a halo is drawn with no branch lit"
     );
 }
@@ -1644,37 +1377,22 @@ fn is_lane_glow(color: egui::Color32, lane: egui::Color32) -> bool {
 }
 
 fn assert_glow_is(harness: &Harness<'_, Screen>, lane: egui::Color32) {
-    let vertices = glow_vertices(harness);
-    let colored: Vec<_> = vertices
-        .iter()
-        .filter(|vertex| vertex.color.a() > 0)
-        .copied()
-        .collect();
-    assert!(!colored.is_empty(), "the lit branch has no halo");
-    for vertex in &colored {
-        assert!(
-            is_lane_glow(vertex.color, lane),
-            "halo vertex {:?} is not the lit lane color",
-            vertex.color
-        );
-    }
-    let marks = lane_marks(harness, lane);
+    let colors = glow_colors(harness);
     assert!(
-        !marks.segments.is_empty(),
-        "the lit lane has no stroke to follow"
+        lane_glow_near(harness, lane) > 0,
+        "the lit branch has no halo"
     );
-    for vertex in &vertices {
+    for color in colors {
         assert!(
-            near_lane(vertex.pos, &marks),
-            "halo point {:?} is away from the lit lane",
-            vertex.pos
+            is_lane_glow(color, lane),
+            "halo vertex {color:?} is not the lit lane color"
         );
     }
 }
 
 #[test]
 fn clicking_a_branch_tag_lights_only_that_lanes_halo() {
-    let repo = opened_graph("lane-glow", fork_graph());
+    let repo = opened_graph("lane-glow", fork_graph(2));
     let mut harness = harness(
         egui::vec2(1400.0, HEIGHT),
         screen(repo, HistoryColumns::default(), false, false),
@@ -1684,11 +1402,32 @@ fn clicking_a_branch_tag_lights_only_that_lanes_halo() {
     let feature = palette.graph_color(3);
 
     assert_no_glow(&harness);
+    // The checked-out branch's tag at rest, and with 40 more alpha when lit.
+    let rest = palette.graph_chip(0, true);
+    let tag_lit =
+        egui::Color32::from_rgba_unmultiplied(main.r(), main.g(), main.b(), rest.a() + 40);
+    assert_eq!(rects_filled(&harness, rest).len(), 1, "main's tag at rest");
 
-    click_branch(&mut harness, "main");
+    // A third of the way into the fade the light is there, but weaker than
+    // the floor it reaches when fully lit.
+    let tag = history_chip_center(&harness, "main");
+    click_at(&mut harness, tag);
+    harness.run_steps(fade_frames() / 3);
+    let fading_in = brightest_glow(&harness);
+    harness.run_steps(fade_frames());
     assert_glow_is(&harness, main);
+    assert_eq!(rects_filled(&harness, tag_lit).len(), 1, "main's lit tag");
+    let lit = brightest_glow(&harness);
+    assert!(
+        0 < fading_in && fading_in < lit,
+        "fading in at {fading_in}, lit at {lit}"
+    );
 
-    click_branch(&mut harness, "main");
+    // Going out, the light stays until the fade is through.
+    click_at(&mut harness, tag);
+    harness.run_steps(fade_frames() / 3);
+    assert_glow_is(&harness, main);
+    harness.run_steps(fade_frames());
     assert_no_glow(&harness);
 
     click_branch(&mut harness, "feature");
@@ -1698,41 +1437,67 @@ fn clicking_a_branch_tag_lights_only_that_lanes_halo() {
     assert_glow_is(&harness, main);
 }
 
+/// The crest asks for its next frame only while a painted row glows and the
+/// window has focus: (lit branch, window focused, frame requested). Forty
+/// commits of `main` keep `feature`'s rows below the window. At 34.1 s the
+/// crest's head is 420 points down the branch, below the rows on screen, and
+/// the lit lane still asks: its halo glows there.
+#[test]
+fn the_glow_asks_for_frames_only_while_seen() {
+    for (lit, focused, requested) in [
+        (None, true, false),
+        (Some("main"), true, true),
+        (Some("main"), false, false),
+        (Some("feature"), true, false),
+    ] {
+        let mut repo = opened_graph("glow-frames", fork_graph(40));
+        repo.lit_branch = lit.map(str::to_owned);
+        let mut harness = harness(
+            egui::vec2(1400.0, 400.0),
+            screen(repo, HistoryColumns::default(), false, false),
+        );
+        harness.input_mut().focused = focused;
+        harness.input_mut().time = Some(34.1);
+        harness.step();
+        let delay = harness.output().viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert_eq!(
+            delay < std::time::Duration::MAX,
+            requested,
+            "{lit:?} lit, focused {focused}: next frame in {delay:?}"
+        );
+    }
+}
+
+/// Two commits on `main`, in a repository with a GitHub remote, so the
+/// sidebar and the author card carry their links.
 fn two_commits() -> (OpenedRepo, String, String) {
     let newer = "a".repeat(40);
     let older = "b".repeat(40);
-    let repo = opened(
+    let mut repo = opened(
         "pick-commit",
         &[
-            Commit {
-                oid: newer.clone(),
-                summary: "newer estuary note".to_owned(),
-            },
-            Commit {
-                oid: older.clone(),
-                summary: "older estuary note".to_owned(),
-            },
+            (newer.clone(), "newer estuary note".to_owned()),
+            (older.clone(), "older estuary note".to_owned()),
         ],
         false,
     );
+    repo.github = Some(GitHubRepo {
+        owner: "ada".to_owned(),
+        name: "notes".to_owned(),
+    });
     (repo, newer, older)
 }
 
-fn history_window() -> egui::Vec2 {
-    egui::vec2(1400.0, HEIGHT)
+fn pick_harness(repo: OpenedRepo, detail_open: bool) -> Harness<'static, Screen> {
+    harness(
+        PICK_WINDOW,
+        screen(repo, HistoryColumns::default(), false, detail_open),
+    )
 }
 
 /// One frame later the sidebar and the row fill show the click.
 fn settle(harness: &mut Harness<'_, Screen>) {
     harness.step();
-}
-
-fn header_title(harness: &Harness<'_, Screen>, name: &str) -> egui::Rect {
-    header_row(harness)
-        .into_iter()
-        .find(|(title, _)| *title == name)
-        .map(|(_, rect)| rect)
-        .unwrap_or_else(|| panic!("missing {name} title\n{}", labels(harness)))
 }
 
 /// Right-hand padding of the hash column, past the glyphs.
@@ -1750,12 +1515,17 @@ fn hash_padding(harness: &Harness<'_, Screen>, short_oid: &str) -> Pos2 {
     Pos2::new(x, text.center().y)
 }
 
+fn pick_hash(harness: &mut Harness<'_, Screen>, short_oid: &str) {
+    let at = hash_padding(harness, short_oid);
+    click_at(harness, at);
+}
+
 fn graph_point(harness: &Harness<'_, Screen>, row_y: f32) -> Pos2 {
     let graph = header_title(harness, "Graph");
     let hash = header_title(harness, "Commit Hash");
     let left = graph.left() - super::history::CELL_PAD;
     let right = hash.left() - super::history::CELL_PAD;
-    Pos2::new((left + right) / 2.0, row_y)
+    Pos2::new(f32::midpoint(left, right), row_y)
 }
 
 fn selection_rows(harness: &Harness<'_, Screen>) -> Vec<egui::Rect> {
@@ -1804,10 +1574,10 @@ fn assert_latest(harness: &Harness<'_, Screen>) {
     );
 }
 
-fn detail_toggles(actions: &[Action]) -> usize {
+fn panel_changes(actions: &[Action]) -> usize {
     actions
         .iter()
-        .filter(|action| matches!(action, Action::ToggleDetailSidebar))
+        .filter(|action| matches!(action, Action::SetPanels(_)))
         .count()
 }
 
@@ -1829,42 +1599,52 @@ fn copied_notice(oid: &str) -> String {
     format!("Copied {}", short_oid(oid))
 }
 
+/// One window, clicked in this order. Each step starts from what the step
+/// before it left.
 #[test]
-fn clicking_hash_padding_selects_that_commit() {
-    let (repo, newer, _) = two_commits();
-    let mut harness = harness(
-        history_window(),
-        screen(repo, HistoryColumns::default(), false, true),
-    );
-    let at = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
-    let before = harness.state().actions.len();
-    click_at(&mut harness, at);
+fn each_click_in_the_history_picks_keeps_or_releases_the_commit() {
+    let (repo, newer, older) = two_commits();
+    let mut harness = pick_harness(repo, false);
+    let short = &newer[..SHORT_OID_LEN];
+    let lane = theme::DEFAULT_THEME.palette.graph_color(0);
+
+    // The first pick opens the closed detail sidebar. One click on the hash
+    // does not copy it.
+    assert!(harness.query_by_label("Latest commit").is_none());
+    let closed = harness.state().actions.len();
+    pick_hash(&mut harness, short);
     assert!(
         copied_texts(&harness).is_empty(),
         "a single hash click copied {:?}",
         copied_texts(&harness)
     );
+    assert_eq!(panel_changes(&harness.state().actions[closed..]), 1);
+    settle(&mut harness);
+    assert_selected(&harness, &newer);
+    let open = harness.state().actions.len();
+
+    // The chosen cell again keeps the commit.
+    let hash = hash_padding(&harness, short);
+    click_at(&mut harness, hash);
+    settle(&mut harness);
+    assert_selected(&harness, &newer);
+
+    // The graph column picks nothing and lights no lane.
+    let graph = graph_point(&harness, hash.y);
+    click_at(&mut harness, graph);
     settle(&mut harness);
     assert_selected(&harness, &newer);
     assert_eq!(
-        detail_toggles(&harness.state().actions[before..]),
+        lane_glow_near(&harness, lane),
         0,
-        "choosing a commit closed or opened a sidebar that was already open"
+        "clicking the graph lit a branch"
     );
-}
 
-#[test]
-fn clicking_another_message_switches_the_selected_commit() {
-    let (repo, newer, older) = two_commits();
-    let mut harness = harness(
-        history_window(),
-        screen(repo, HistoryColumns::default(), false, true),
-    );
-    let at = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
-    click_at(&mut harness, at);
-    settle(&mut harness);
+    // Another message switches the commit and the row fill, which stays when
+    // the pointer leaves the row.
     let message = harness.get_by_label("older estuary note").rect().center();
     click_at(&mut harness, message);
+    move_pointer(&mut harness, Pos2::new(8.0, 8.0));
     settle(&mut harness);
     assert_selected(&harness, &older);
     assert!(
@@ -1877,60 +1657,32 @@ fn clicking_another_message_switches_the_selected_commit() {
             .any(|rect| (rect.center().y - message.y).abs() <= 22.0),
         "the selection fill is not on the older commit"
     );
-}
-
-#[test]
-fn clicking_the_selected_cell_again_keeps_the_commit() {
-    let (repo, newer, _) = two_commits();
-    let mut harness = harness(
-        history_window(),
-        screen(repo, HistoryColumns::default(), false, true),
-    );
-    let at = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
-    click_at(&mut harness, at);
-    settle(&mut harness);
-    let before = harness.state().actions.len();
-    click_at(&mut harness, at);
-    settle(&mut harness);
-    assert_selected(&harness, &newer);
-    assert_eq!(detail_toggles(&harness.state().actions[before..]), 0);
-}
-
-#[test]
-fn clicking_the_graph_leaves_the_selected_commit() {
-    let (repo, newer, _) = two_commits();
-    let mut harness = harness(
-        history_window(),
-        screen(repo, HistoryColumns::default(), false, true),
-    );
-    let hash = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
-    click_at(&mut harness, hash);
-    settle(&mut harness);
-    let graph = graph_point(&harness, hash.y);
-    click_at(&mut harness, graph);
-    settle(&mut harness);
-    assert_selected(&harness, &newer);
-    let lane = theme::DEFAULT_THEME.palette.graph_color(0);
     assert_eq!(
-        lane_glow_near(&harness, lane),
+        panel_changes(&harness.state().actions[open..]),
         0,
-        "clicking the graph lit a branch"
+        "choosing a commit closed or opened a sidebar that was already open"
     );
-}
 
-#[test]
-fn clicking_the_author_returns_to_the_latest_commit() {
-    let (repo, newer, _) = two_commits();
-    let mut harness = harness(
-        history_window(),
-        screen(repo, HistoryColumns::default(), false, true),
+    // The branch tag returns to the latest commit and lights its lane.
+    click_branch(&mut harness, "main");
+    assert_latest(&harness);
+    harness.get_by_label(&newer);
+    assert!(
+        lane_glow_near(&harness, lane) > 0,
+        "clicking the branch tag did not light its lane"
     );
-    let at = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
-    click_at(&mut harness, at);
+
+    // So does the author, after another pick.
+    pick_hash(&mut harness, short);
     settle(&mut harness);
-    let author = header_title(&harness, "Author");
-    let at = content_rect(&harness, "Ada Lovelace", author, None).center();
-    click_at(&mut harness, at);
+    assert_selected(&harness, &newer);
+    let author = content_rect(
+        &harness,
+        "Ada Lovelace",
+        header_title(&harness, "Author"),
+        None,
+    );
+    click_at(&mut harness, author.center());
     settle(&mut harness);
     assert_latest(&harness);
     // The author card stays open under the pointer and repeats this hash.
@@ -1939,83 +1691,52 @@ fn clicking_the_author_returns_to_the_latest_commit() {
         (1..=2).contains(&shown),
         "the latest hash should be on the sidebar, found {shown}"
     );
-}
 
-#[test]
-fn clicking_the_branch_tag_returns_to_the_latest_commit() {
-    let (repo, newer, older) = two_commits();
-    let mut harness = harness(
-        history_window(),
-        screen(repo, HistoryColumns::default(), false, true),
-    );
-    let message = harness.get_by_label("older estuary note").rect().center();
-    click_at(&mut harness, message);
-    settle(&mut harness);
-    assert_selected(&harness, &older);
-    click_branch(&mut harness, "main");
-    assert_latest(&harness);
-    harness.get_by_label(&newer);
-    let lane = theme::DEFAULT_THEME.palette.graph_color(0);
-    assert!(
-        lane_glow_near(&harness, lane) > 0,
-        "clicking the branch tag did not light its lane"
-    );
-}
-
-#[test]
-fn selecting_a_commit_opens_a_closed_detail_sidebar() {
-    let (repo, newer, _) = two_commits();
-    let mut harness = harness(
-        history_window(),
-        screen(repo, HistoryColumns::default(), false, false),
-    );
-    assert!(harness.query_by_label("Latest commit").is_none());
-    let at = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
-    let before = harness.state().actions.len();
-    click_at(&mut harness, at);
-    assert_eq!(detail_toggles(&harness.state().actions[before..]), 1);
-    settle(&mut harness);
-    assert_selected(&harness, &newer);
+    // A reload keeps the chosen commit while the table is empty and loading.
+    // Rows that do not carry it, or the lit branch, forget them.
+    pick_hash(&mut harness, short);
+    let older = harness.state().repo.graph.rows[1].clone();
+    let screen = harness.state_mut();
+    (screen.history_loading, screen.repo.graph.rows) = (true, Vec::new());
+    harness.step();
+    let repo = &harness.state().repo;
+    assert_eq!(repo.selected_commit.as_deref(), Some(newer.as_str()));
+    assert_eq!(repo.lit_branch, None, "no row carries the lit branch");
+    harness.state_mut().repo.graph.rows.push(older);
+    harness.step();
+    assert_eq!(harness.state().repo.selected_commit, None);
 }
 
 #[test]
 fn selected_commit_shows_the_hover_details() {
     let (mut repo, newer, _) = two_commits();
-    repo.github = Some(GitHubRepo {
-        owner: "ada".to_owned(),
-        name: "notes".to_owned(),
-    });
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    repo.hover.store_ready(CommitHover {
+    let now = super::clock::now_unix().cast_signed();
+    let hover = CommitHover {
         oid: newer.clone(),
         author: person("Ada Lovelace", "ada@example.invalid"),
         co_authors: vec![person("Grace Hopper", "grace@example.invalid")],
-        authored_unix: now,
+        // Three hours back: a clock that read 0 would say "just now".
+        authored_unix: now - 3 * 60 * 60,
         authored_at: "2024-05-01 09:30".to_owned(),
         message: "newer estuary note\n\nFixes #12".to_owned(),
         files: Vec::new(),
         stats: Some(CommitStats {
             files: 2,
             insertions: 4,
-            deletions: 1,
+            deletions: 0,
         }),
         tags: Vec::new(),
-    });
-    let mut harness = harness(
-        history_window(),
-        screen(repo, HistoryColumns::default(), false, true),
-    );
-    let at = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
-    click_at(&mut harness, at);
+    };
+    repo.hover.store_ready(hover.oid.clone(), hover);
+    let mut harness = pick_harness(repo, true);
+    pick_hash(&mut harness, &newer[..SHORT_OID_LEN]);
     settle(&mut harness);
     assert_selected(&harness, &newer);
-    harness.get_by_label("just now · 2024-05-01 09:30");
+    harness.get_by_label("3 hours ago · 2024-05-01 09:30");
     harness.get_by_label("2 files changed");
     harness.get_by_label("4 insertions(+)");
-    harness.get_by_label("1 deletion(-)");
+    let deletions = harness.query_all_by_label_contains("deletion").count();
+    assert_eq!(deletions, 0, "a count of zero is listed");
     harness.get_by_label("Grace Hopper");
     harness.get_by_label("#12");
     harness.get_by_label("Open on GitHub");
@@ -2040,10 +1761,7 @@ fn selected_commit_shows_the_hover_details() {
 #[test]
 fn double_clicking_the_hash_copies_it_and_keeps_the_commit() {
     let (repo, newer, _) = two_commits();
-    let mut harness = harness(
-        history_window(),
-        screen(repo, HistoryColumns::default(), false, true),
-    );
+    let mut harness = pick_harness(repo, true);
     let at = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
     let before = harness.state().actions.len();
     double_click_at(&mut harness, at);
@@ -2051,7 +1769,7 @@ fn double_clicking_the_hash_copies_it_and_keeps_the_commit() {
     settle(&mut harness);
     assert_selected(&harness, &newer);
     harness.get_by_label(&copied_notice(&newer));
-    assert_eq!(detail_toggles(&harness.state().actions[before..]), 0);
+    assert_eq!(panel_changes(&harness.state().actions[before..]), 0);
     assert!(
         !harness.state().actions[before..]
             .iter()
@@ -2067,17 +1785,14 @@ fn double_clicking_the_hash_copies_it_and_keeps_the_commit() {
     );
     settle(&mut harness);
     assert_selected(&harness, &newer);
-    assert_eq!(detail_toggles(&harness.state().actions[before..]), 0);
+    assert_eq!(panel_changes(&harness.state().actions[before..]), 0);
     harness.get_by_label(&copied_notice(&newer));
 }
 
 #[test]
 fn double_clicking_the_message_does_not_copy_the_hash() {
     let (repo, _, older) = two_commits();
-    let mut harness = harness(
-        history_window(),
-        screen(repo, HistoryColumns::default(), false, true),
-    );
+    let mut harness = pick_harness(repo, true);
     let message = harness.get_by_label("older estuary note").rect().center();
     double_click_at(&mut harness, message);
     assert!(
@@ -2092,28 +1807,13 @@ fn double_clicking_the_message_does_not_copy_the_hash() {
 
 #[test]
 fn clicking_the_sidebar_hash_copies_it() {
-    let (mut repo, newer, _) = two_commits();
-    repo.github = Some(GitHubRepo {
-        owner: "ada".to_owned(),
-        name: "notes".to_owned(),
-    });
-    let mut harness = harness(
-        history_window(),
-        screen(repo, HistoryColumns::default(), false, true),
-    );
-    let at = hash_padding(&harness, &newer[..SHORT_OID_LEN]);
-    click_at(&mut harness, at);
-    assert!(copied_texts(&harness).is_empty());
+    let (repo, newer, _) = two_commits();
+    let mut harness = pick_harness(repo, true);
+    pick_hash(&mut harness, &newer[..SHORT_OID_LEN]);
     settle(&mut harness);
     assert_selected(&harness, &newer);
-    assert!(
-        harness.query_by_label("Copy").is_none(),
-        "the sidebar hash still has a copy button\n{}",
-        labels(&harness)
-    );
-    harness.get_by_label("Open on GitHub");
-    let hash = harness.get_by_label(&newer).rect().center();
-    click_at(&mut harness, hash);
+    harness.get_by_label(&newer).click_accesskit();
+    harness.step();
     assert_eq!(copied_texts(&harness), vec![newer.clone()]);
     settle(&mut harness);
     harness.get_by_label(&copied_notice(&newer));
@@ -2136,15 +1836,8 @@ fn hover_until(harness: &mut Harness<'_, Screen>, at: Pos2, label: &str) {
 
 #[test]
 fn clicking_the_author_card_hash_copies_it() {
-    let (mut repo, _, older) = two_commits();
-    repo.github = Some(GitHubRepo {
-        owner: "ada".to_owned(),
-        name: "notes".to_owned(),
-    });
-    let mut harness = harness(
-        history_window(),
-        screen(repo, HistoryColumns::default(), false, false),
-    );
+    let (repo, _, older) = two_commits();
+    let mut harness = pick_harness(repo, false);
     let message = harness.get_by_label("older estuary note").rect();
     let author = header_title(&harness, "Author");
     let at = content_rect(&harness, "Ada Lovelace", author, Some(message.center().y)).center();
@@ -2155,19 +1848,13 @@ fn clicking_the_author_card_hash_copies_it() {
         "the author card still has a copy button\n{}",
         labels(&harness)
     );
-    let hashes = label_rects(&harness, &older);
-    assert_eq!(
-        hashes.len(),
-        1,
-        "expected the card hash once\n{}",
-        labels(&harness)
-    );
-    click_at(&mut harness, hashes[0].center());
+    // With the sidebar closed, the card's hash is the only full hash shown.
+    harness.get_by_label(&older).click_accesskit();
+    harness.step();
     assert_eq!(
         copied_texts(&harness),
         vec![older.clone()],
-        "clicked {:?}\nlabels:\n{}",
-        hashes[0],
+        "labels:\n{}",
         labels(&harness)
     );
     settle(&mut harness);
@@ -2175,10 +1862,16 @@ fn clicking_the_author_card_hash_copies_it() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one commit followed from its row to its colored diff"
+)]
 fn view_changes_shows_tags_and_a_colored_diff() {
     let mut repo = one_commit("field notes from the estuary");
     let oid = repo.latest.as_ref().expect("commit").oid.clone();
-    repo.hover.store_ready(CommitHover {
+    // Wider than the file list, so the list cuts it.
+    let path = format!("notes/{}seal.txt", "deep/".repeat(12));
+    let hover = CommitHover {
         oid: oid.clone(),
         author: person("Ada Lovelace", "ada@example.invalid"),
         co_authors: vec![person("Grace Hopper", "grace@example.invalid")],
@@ -2186,21 +1879,24 @@ fn view_changes_shows_tags_and_a_colored_diff() {
         authored_at: "2024-05-01 09:30".to_owned(),
         message: "field notes from the estuary".to_owned(),
         files: vec![CommitFile {
-            path: "notes/seal.txt".to_owned(),
+            path: path.clone(),
             previous: None,
             insertions: Some(1),
             deletions: Some(1),
         }],
         stats: Some(CommitStats {
             files: 1,
-            insertions: 1,
+            insertions: 0,
             deletions: 1,
         }),
         tags: vec!["v1,0".to_owned()],
-    });
+    };
+    repo.hover.store_ready(hover.oid.clone(), hover);
     repo.diffs.store_ready(
-        &oid,
-        "notes/seal.txt",
+        super::changes::DiffKey {
+            oid: oid.clone(),
+            path: path.clone(),
+        },
         FileDiff {
             notice: None,
             columns: "vault door opens".chars().count(),
@@ -2220,34 +1916,46 @@ fn view_changes_shows_tags_and_a_colored_diff() {
             ],
         },
     );
-    let mut harness = harness(
-        history_window(),
-        screen(repo, HistoryColumns::default(), false, true),
-    );
+    let mut harness = pick_harness(repo, true);
     harness.get_by_label("v1,0");
     harness.get_by_label("1 file changed");
+    harness.get_by_label("1 deletion(-)");
+    let insertions = harness.query_all_by_label_contains("insertion").count();
+    assert_eq!(insertions, 0, "a count of zero is listed");
     let author_title = header_title(&harness, "Author");
     let row_author = label_rects(&harness, "Ada Lovelace")
         .into_iter()
         .find(|rect| (rect.left() - author_title.left()).abs() < 80.0)
         .expect("history author");
     hover_until(&mut harness, row_author.center(), "Co-author");
+    // The card dates the commit from the read; the sidebar has the row's date.
+    let dated = harness.query_all_by_role(Role::Label).any(|node| {
+        node.value()
+            .is_some_and(|text| text.ends_with(" · 2024-05-01 09:30"))
+    });
+    assert!(dated, "the card has no date\n{}", labels(&harness));
     assert!(
         label_rects(&harness, "v1,0").len() >= 2,
         "the tag should be on the sidebar and the card\n{}",
         labels(&harness)
     );
-    // The author card can cover the sidebar. Leave it before clicking.
-    move_pointer(&mut harness, egui::pos2(8.0, 8.0));
+    // The author card can cover the sidebar; an accessibility click reaches
+    // the button under it.
+    harness.get_by_label("View changes").click_accesskit();
     harness.step();
-    let button = harness.get_by_label("View changes").rect().center();
-    click_at(&mut harness, button);
     settle(&mut harness);
-    assert!(
-        !label_rects(&harness, "notes/seal.txt").is_empty(),
-        "the file list did not open\n{}",
-        labels(&harness)
-    );
+    let file = harness.get_by_role_and_label(Role::Button, &path);
+    let selected = file.accesskit_node().toggled() == Some(Toggled::True);
+    assert!(selected, "the shown file is not selected");
+    // The listed path is cut where the counts' 88-point slot starts.
+    let counts = harness.get_by_label("+1").rect();
+    let listed = painted_text(&harness, &path)
+        .into_iter()
+        .map(|text| text.bounds)
+        .min_by(|left, right| left.left().total_cmp(&right.left()))
+        .expect("the listed path");
+    let gap = counts.left() - listed.right();
+    assert!((0.0..88.0).contains(&gap), "the path ends {gap} before +1");
     let added = harness.get_by_label("vault door opens").rect();
     let removed = harness.get_by_label("vault door shuts").rect();
     let palette = theme::DEFAULT_THEME.palette;
@@ -2262,6 +1970,15 @@ fn view_changes_shows_tags_and_a_colored_diff() {
             .iter()
             .any(|rect| rect.contains(removed.center())),
         "the removed line has no red background"
+    );
+    // A pull that moves the latest commit closes the old one's changes.
+    if let Some(latest) = &mut harness.state_mut().repo.latest {
+        latest.oid = "b".repeat(40);
+    }
+    harness.step();
+    assert!(
+        harness.state().repo.changes.is_none(),
+        "the changes stayed open"
     );
 }
 
@@ -2285,15 +2002,13 @@ fn collect_filled(shape: &egui::Shape, color: egui::Color32, found: &mut Vec<egu
     }
 }
 
+/// The two icon buttons in the top bar, not the ones in the bottom bar.
 fn panel_toggle_rects(harness: &Harness<'_, Screen>) -> Vec<egui::Rect> {
     let buttons: Vec<_> = harness
         .query_all_by_role(Role::Button)
         .map(|node| node.rect())
         .collect();
-    let top = buttons
-        .iter()
-        .map(|rect| rect.top())
-        .fold(f32::MAX, f32::min);
+    let top = buttons.iter().map(egui::Rect::top).fold(f32::MAX, f32::min);
     buttons
         .into_iter()
         .filter(|rect| rect.top() < top + 4.0)

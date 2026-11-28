@@ -9,10 +9,10 @@
 use std::path::Path;
 use std::time::Duration;
 
-use super::exec::{Git, GitError, rejected};
+use super::exec::{Git, GitError, classify_failure, rejected};
 
 /// Fetch and pull talk to a network. A local read stays on the shorter limit.
-const NETWORK_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+const NETWORK_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// `git pull --ff-only --no-rebase`, with no remote and no branch: git uses
 /// the upstream. `--no-rebase` skips `pull.rebase` and `branch.<name>.rebase`
@@ -20,67 +20,88 @@ const NETWORK_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 /// so a divergence is an error and not a merge commit.
 const PULL_FF_ONLY_ARGS: &[&str] = &["pull", "--ff-only", "--no-rebase"];
 
-/// One `git fetch -- <remote> <refspec>` for the current branch's upstream.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FetchRequest {
-    remote: String,
-    refspec: String,
-}
-
-impl FetchRequest {
-    pub fn remote(&self) -> &str {
-        &self.remote
-    }
-
-    pub fn refspec(&self) -> &str {
-        &self.refspec
-    }
-
-    /// Argv after `git`. `--` keeps a strange remote from being read as an option.
-    pub fn args(&self) -> [&str; 4] {
-        ["fetch", "--", &self.remote, &self.refspec]
-    }
-}
-
-/// Builds the fetch for `%(upstream:short)`, such as `origin/main`.
+/// `git fetch -- <remote> <refspec>` (argv after `git`) for the branch's
+/// upstream configuration: the remote (`branch.<name>.remote`), the ref on
+/// that remote (`branch.<name>.merge`), and the remote-tracking ref git maps
+/// it to (`%(upstream)`). `--` keeps a strange remote from being read as an
+/// option.
 ///
-/// The remote is the part before the first `/`. The refspec writes that remote
-/// branch into its remote-tracking ref, with `+`, so a rewritten upstream still
-/// updates. A plain `git fetch origin main` would only fill `FETCH_HEAD`.
+/// `%(upstream:short)` cannot be split into remote and branch: a remote may be
+/// called `team/origin`. The refspec writes the remote ref into its tracking
+/// ref with `+`, so a rewritten upstream still updates. A plain
+/// `git fetch origin main` would only fill `FETCH_HEAD`.
 ///
-/// `None` when the name is empty, has no remote, starts like an option, or
-/// contains a character that would change the refspec.
-pub fn fetch_request(upstream_short: &str) -> Option<FetchRequest> {
-    if upstream_short.is_empty()
-        || upstream_short.chars().any(refspec_forbidden)
-        || upstream_short.split('/').any(str::is_empty)
-    {
-        return None;
-    }
-    let (remote, branch) = upstream_short.split_once('/')?;
-    if remote.starts_with('-') {
-        return None;
-    }
-    Some(FetchRequest {
-        remote: remote.to_owned(),
-        refspec: format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}"),
+/// `None` for a local upstream (`.`), a remote that starts like an option, a
+/// merge ref outside `refs/`, a tracking ref outside `refs/remotes/`, or a
+/// character that would change the refspec.
+fn fetch_args(remote: &str, merge: &str, tracking: &str) -> Option<[String; 4]> {
+    let plain = |text: &str| !text.is_empty() && !text.chars().any(ref_char_forbidden);
+    let usable = remote != "."
+        && !remote.starts_with('-')
+        && plain(remote)
+        && merge.starts_with("refs/")
+        && plain(merge)
+        && tracking.starts_with("refs/remotes/")
+        && plain(tracking);
+    usable.then(|| {
+        [
+            "fetch".to_owned(),
+            "--".to_owned(),
+            remote.to_owned(),
+            format!("+{merge}:{tracking}"),
+        ]
     })
 }
 
-/// ASCII controls, whitespace, and the characters git treats specially in a refspec.
-fn refspec_forbidden(ch: char) -> bool {
-    ch.is_ascii_control()
-        || ch.is_whitespace()
-        || matches!(ch, ':' | '?' | '*' | '[' | '\\' | '^' | '~')
+/// Fetches the upstream of local `branch` into its remote-tracking ref.
+pub fn fetch(git: &Git, root: &Path, branch: &str) -> Result<(), GitError> {
+    // `%(upstream)` comes from the last `remote` and the first `merge`, the
+    // pair git itself uses, so the refspec matches the tracking ref.
+    let remote = config_values(git, root, &format!("branch.{branch}.remote"))?.pop();
+    let merge = config_values(git, root, &format!("branch.{branch}.merge"))?
+        .into_iter()
+        .next();
+    let tracking = git.require_ok(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(upstream)",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    let tracking = String::from_utf8_lossy(&tracking.stdout);
+    let args = remote
+        .zip(merge)
+        .and_then(|(remote, merge)| fetch_args(&remote, &merge, tracking.trim_end()))
+        .ok_or_else(|| {
+            rejected(
+                "git fetch",
+                "the branch has no upstream that can be fetched",
+            )
+        })?;
+    git.require_ok_for(root, &args.each_ref().map(String::as_str), NETWORK_TIMEOUT)?;
+    Ok(())
 }
 
-/// Fetches the upstream named by `upstream_short` into its remote-tracking ref.
-pub fn fetch(git: &Git, root: &Path, upstream_short: &str) -> Result<(), GitError> {
-    let request = fetch_request(upstream_short)
-        .ok_or_else(|| rejected("git fetch", "the upstream name cannot be fetched"))?;
-    let args = request.args();
-    git.require_ok_for(root, &args, NETWORK_TIMEOUT)?;
-    Ok(())
+/// Every value of `key`, in the order git reads them. Empty when the key is
+/// not set; any other failure, such as a broken config file, is an error.
+fn config_values(git: &Git, root: &Path, key: &str) -> Result<Vec<String>, GitError> {
+    let args = ["config", "--get-all", "-z", key];
+    let output = git.run(root, &args)?;
+    if output.status.code() == Some(1) {
+        return Ok(Vec::new());
+    }
+    if !output.status.success() {
+        return Err(classify_failure(root, &args, output.status, &output.stderr));
+    }
+    let mut values: Vec<String> = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .map(|value| String::from_utf8_lossy(value).into_owned())
+        .collect();
+    // `-z` ends every value with NUL, so the last piece is empty.
+    values.pop();
+    Ok(values)
 }
 
 /// Fast-forwards the current branch to its upstream. Anything else is an error
@@ -107,20 +128,15 @@ enum SwitchKind {
 /// worktree lock. `git switch --no-guess -- <name>` stays attached, refuses a
 /// branch checked out elsewhere, and does not create a branch from
 /// `checkout.defaultRemote`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SwitchRequest {
+struct SwitchRequest {
     name: String,
     kind: SwitchKind,
 }
 
 impl SwitchRequest {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     /// Argv after `git`. The branch is one argument after `--` on Git 2.23+,
     /// so a name such as `-switch` is not an option.
-    pub fn args(&self) -> Vec<&str> {
+    fn args(&self) -> Vec<&str> {
         match self.kind {
             SwitchKind::Switch => vec!["switch", "--no-guess", "--", self.name.as_str()],
             SwitchKind::Checkout => vec!["checkout", self.name.as_str(), "--"],
@@ -132,7 +148,7 @@ impl SwitchRequest {
 ///
 /// `None` when the name cannot be a ref under `refs/heads/`, and, on Git older
 /// than 2.23, when the name starts with `-` (checkout would read it as an option).
-pub fn switch_request(version: (u32, u32, u32), name: &str) -> Option<SwitchRequest> {
+fn switch_request(version: (u32, u32, u32), name: &str) -> Option<SwitchRequest> {
     if !branch_name_is_switchable(name) {
         return None;
     }
@@ -179,6 +195,10 @@ pub fn switch_branch(git: &Git, root: &Path, name: &str) -> Result<(), GitError>
 ///
 /// `check-ref-format --branch` rejects that dash. A name such as `-switch` is
 /// still a legal ref, and `git switch --` can take it.
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "git rejects only a lowercase `.lock` component; `a.LOCK` is a legal ref"
+)]
 fn branch_name_is_switchable(name: &str) -> bool {
     if name.is_empty() || name == "@" {
         return false;
@@ -200,6 +220,8 @@ fn branch_name_is_switchable(name: &str) -> bool {
     })
 }
 
+/// ASCII controls, whitespace, and the characters git treats specially in a
+/// ref name or a refspec.
 fn ref_char_forbidden(ch: char) -> bool {
     ch.is_ascii_control()
         || ch.is_whitespace()
@@ -210,126 +232,144 @@ fn ref_char_forbidden(ch: char) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn fetch_request_updates_the_remote_tracking_ref() {
-        let request = fetch_request("origin/main").expect("origin/main");
-        assert_eq!(request.remote(), "origin");
-        assert_eq!(
-            request.refspec(),
-            "+refs/heads/main:refs/remotes/origin/main"
-        );
-        assert_eq!(
-            request.args(),
-            [
-                "fetch",
-                "--",
-                "origin",
-                "+refs/heads/main:refs/remotes/origin/main"
-            ]
-        );
-        assert!(
-            !request
-                .args()
-                .iter()
-                .any(|arg| { arg.contains("prune") || arg == &"--all" || arg.contains("--all") })
-        );
-    }
+    const MAIN: &str = "refs/heads/main";
+    const ORIGIN_MAIN: &str = "refs/remotes/origin/main";
+
+    /// Remote, merge ref, tracking ref, and the refspec fetched. `None` is
+    /// refused: a local upstream, an option-shaped remote, or anything that
+    /// would change the refspec.
+    const FETCHES: &[(&str, &str, &str, Option<&str>)] = &[
+        (
+            "origin",
+            MAIN,
+            ORIGIN_MAIN,
+            Some("+refs/heads/main:refs/remotes/origin/main"),
+        ),
+        (
+            "origin",
+            "refs/heads/feature/foo",
+            "refs/remotes/origin/feature/foo",
+            Some("+refs/heads/feature/foo:refs/remotes/origin/feature/foo"),
+        ),
+        (
+            "team/origin",
+            MAIN,
+            "refs/remotes/team/origin/main",
+            Some("+refs/heads/main:refs/remotes/team/origin/main"),
+        ),
+        (".", MAIN, ORIGIN_MAIN, None),
+        ("-origin", MAIN, ORIGIN_MAIN, None),
+        ("--upload-pack=evil", MAIN, ORIGIN_MAIN, None),
+        ("", MAIN, ORIGIN_MAIN, None),
+        ("ori gin", MAIN, ORIGIN_MAIN, None),
+        ("origin", "", ORIGIN_MAIN, None),
+        ("origin", "main", ORIGIN_MAIN, None),
+        ("origin", "refs/heads/ma\nin", ORIGIN_MAIN, None),
+        ("origin", "refs/heads/ma:in", ORIGIN_MAIN, None),
+        ("origin", MAIN, "", None),
+        ("origin", MAIN, "refs/heads/main", None),
+        ("origin", MAIN, "refs/remotes/origin/m*", None),
+    ];
 
     #[test]
-    fn fetch_request_keeps_slashes_inside_the_branch() {
-        let request = fetch_request("origin/feature/foo").expect("nested branch");
-        assert_eq!(request.remote(), "origin");
-        assert_eq!(
-            request.refspec(),
-            "+refs/heads/feature/foo:refs/remotes/origin/feature/foo"
-        );
-    }
-
-    #[test]
-    fn fetch_request_rejects_a_remote_that_looks_like_an_option() {
-        assert!(fetch_request("-origin/main").is_none());
-        assert!(fetch_request("--upload-pack=evil/main").is_none());
-    }
-
-    #[test]
-    fn fetch_request_rejects_a_missing_slash_and_control_characters() {
-        assert!(fetch_request("origin").is_none());
-        assert!(fetch_request("").is_none());
-        assert!(fetch_request("origin/").is_none());
-        assert!(fetch_request("/main").is_none());
-        assert!(fetch_request("origin/ma\nin").is_none());
-        assert!(fetch_request("ori gin/main").is_none());
-        assert!(fetch_request("origin/ma:in").is_none());
-    }
-
-    #[test]
-    fn pull_is_fast_forward_only() {
-        assert_eq!(PULL_FF_ONLY_ARGS, ["pull", "--ff-only", "--no-rebase"]);
-    }
-
-    fn assert_switch_args(version: (u32, u32, u32), name: &str, expected: &[&str]) {
-        let request = switch_request(version, name).unwrap_or_else(|| panic!("request for {name}"));
-        let args = request.args();
-        assert_eq!(args, expected, "{name}");
-        let flags = &args[..args.len() - 1];
-        for forbidden in [
-            "-f", "--force", "--detach", "--orphan", "--guess", "--all", "--prune",
-        ] {
-            assert!(
-                !flags.contains(&forbidden),
-                "{name} flags include {forbidden}: {args:?}"
-            );
+    fn fetch_args_table() {
+        for &(remote, merge, tracking, refspec) in FETCHES {
+            let case = (remote, merge, tracking);
+            let expected =
+                refspec.map(|refspec| ["fetch", "--", remote, refspec].map(str::to_owned));
+            assert_eq!(fetch_args(remote, merge, tracking), expected, "{case:?}");
         }
     }
 
-    #[test]
-    fn checkout_args_prefix_the_branch_after_end_of_options() {
-        let modern = (2, 23, 0);
-        for name in [
+    type Version = (u32, u32, u32);
+
+    const OLD: Version = (2, 15, 0);
+    const SWITCH: Version = (2, 23, 0);
+
+    /// Git version, branch name, and the argv after `git`. `None` is refused.
+    const SWITCHES: &[(Version, &str, Option<&[&str]>)] = &[
+        (
+            SWITCH,
             "main",
+            Some(&["switch", "--no-guess", "--", "main"]),
+        ),
+        (
+            SWITCH,
             "feature/necronomicon",
+            Some(&["switch", "--no-guess", "--", "feature/necronomicon"]),
+        ),
+        (
+            SWITCH,
+            "HEAD",
+            Some(&["switch", "--no-guess", "--", "HEAD"]),
+        ),
+        // A branch named like an option stays one argument after `--`.
+        (
+            SWITCH,
             "-switch",
+            Some(&["switch", "--no-guess", "--", "-switch"]),
+        ),
+        (
+            SWITCH,
             "--upload-pack=evil",
+            Some(&["switch", "--no-guess", "--", "--upload-pack=evil"]),
+        ),
+        (
+            SWITCH,
             "--force",
-        ] {
-            assert_switch_args(modern, name, &["switch", "--no-guess", "--", name]);
-        }
-    }
+            Some(&["switch", "--no-guess", "--", "--force"]),
+        ),
+        (SWITCH, "-f", Some(&["switch", "--no-guess", "--", "-f"])),
+        (
+            SWITCH,
+            "--detach",
+            Some(&["switch", "--no-guess", "--", "--detach"]),
+        ),
+        (
+            SWITCH,
+            "--orphan",
+            Some(&["switch", "--no-guess", "--", "--orphan"]),
+        ),
+        (
+            SWITCH,
+            "--guess",
+            Some(&["switch", "--no-guess", "--", "--guess"]),
+        ),
+        (SWITCH, "-B", Some(&["switch", "--no-guess", "--", "-B"])),
+        // Before 2.23 checkout would read a leading `-` as an option.
+        (OLD, "main", Some(&["checkout", "main", "--"])),
+        (OLD, "feature/foo", Some(&["checkout", "feature/foo", "--"])),
+        (OLD, "HEAD", Some(&["checkout", "HEAD", "--"])),
+        (OLD, "-switch", None),
+        (OLD, "--upload-pack=evil", None),
+        (OLD, "-f", None),
+    ];
+
+    /// Not a ref under `refs/heads/`, on any Git.
+    const NOT_BRANCHES: [&str; 12] = [
+        "",
+        " ",
+        "ma\nin",
+        "..",
+        "../../.git",
+        "foo/../../.git",
+        "foo.lock",
+        ".hidden",
+        "a@{1}",
+        "star*",
+        "foo/",
+        "@",
+    ];
 
     #[test]
-    fn checkout_args_on_git_2_15_use_checkout_and_refuse_a_leading_dash() {
-        let old = (2, 15, 0);
-        assert_switch_args(old, "main", &["checkout", "main", "--"]);
-        assert_switch_args(old, "feature/foo", &["checkout", "feature/foo", "--"]);
-        assert!(switch_request(old, "-switch").is_none());
-        assert!(switch_request(old, "--upload-pack=evil").is_none());
-    }
-
-    #[test]
-    fn checkout_args_reject_dotdot_newline_and_check_ref_format() {
-        let versions = [(2, 15, 0), (2, 23, 0), (2, 53, 0)];
-        let rejected = [
-            "",
-            " ",
-            "ma\nin",
-            "..",
-            "../../.git",
-            "foo/../../.git",
-            "foo.lock",
-            ".hidden",
-            "a@{1}",
-            "star*",
-            "foo/",
-            "@",
-        ];
-        for version in versions {
-            for name in rejected {
-                assert!(
-                    switch_request(version, name).is_none(),
-                    "{name:?} on {version:?}"
-                );
-            }
-            assert!(switch_request(version, "HEAD").is_some());
+    fn switch_request_table() {
+        let refused = NOT_BRANCHES
+            .into_iter()
+            .flat_map(|name| [OLD, SWITCH, (2, 53, 0)].map(|version| (version, name, None)));
+        for (version, name, expected) in SWITCHES.iter().copied().chain(refused) {
+            let request = switch_request(version, name);
+            let args = request.as_ref().map(SwitchRequest::args);
+            assert_eq!(args.as_deref(), expected, "{version:?} {name:?}");
         }
     }
 }

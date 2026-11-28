@@ -9,8 +9,10 @@
 
 #[cfg(test)]
 mod adversarial_tests;
+mod async_cache;
 mod avatars;
 mod changes;
+mod clock;
 mod folder_picker;
 mod fonts;
 mod github_auth;
@@ -20,34 +22,40 @@ mod history_tests;
 mod home;
 mod hover;
 mod icons;
-#[cfg(test)]
-mod network_tests;
 mod repo_view;
 mod settings;
+mod task;
 mod terminal;
+#[cfg(test)]
+mod test_support;
+mod text;
 pub mod theme;
 mod widgets;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
 use cthulhu_git::git::{
-    self, Branch, CommitDetail, Git, GraphCandidate, GraphTip, Head, HistoryGraph, RepoInfo,
+    self, Branch, CommitDetail, Git, GitError, GraphCandidate, GraphTip, Head, HistoryGraph,
+    RepoInfo,
 };
 use cthulhu_git::github::{self as gh, GitHubRepo};
-use cthulhu_git::settings::{HistoryColumns, Settings, SettingsError};
+use cthulhu_git::settings::{HistoryColumns, Settings};
 use eframe::egui;
 
 use avatars::AvatarService;
-use folder_picker::FolderPicker;
 use github_auth::GitHubAuth;
+use task::{Stopped, Task};
 
 /// Newest commits read for the branch graph; the view says when there are more.
 const HISTORY_LIMIT: usize = 1000;
 
 pub struct OpenedRepo {
+    /// The git that opened the repository. Every later read and write uses it.
+    pub git: Git,
     pub info: RepoInfo,
     pub graph: HistoryGraph,
     /// Tips the displayed graph was built from.
@@ -59,6 +67,11 @@ pub struct OpenedRepo {
     pub detached_oid: Option<String>,
     pub branches: Vec<ListedBranch>,
     pub latest: Option<CommitDetail>,
+    /// The commit the detail sidebar shows instead of the latest one, picked
+    /// from its hash or message in the history.
+    pub selected_commit: Option<String>,
+    /// The branch whose lane glows, picked from its tag in the history.
+    pub lit_branch: Option<String>,
     /// New on every open, so the history starts scrolled to the top each time.
     pub view_id: egui::Id,
     /// Shell for this repository. `None` until the terminal strip is shown.
@@ -81,18 +94,17 @@ pub struct ListedBranch {
 }
 
 /// What a screen asks the app to do after drawing itself.
+#[derive(Debug, PartialEq)]
 pub enum Action {
     Browse,
     Open(PathBuf),
     Home,
     OpenSettings,
     CloseSettings,
-    ToggleBranchesSidebar,
-    ToggleDetailSidebar,
-    ToggleTerminal,
+    SetPanels(repo_view::Panels),
     SetUiFont(Option<String>),
     SetTerminalFont(Option<String>),
-    /// `upstream` is `%(upstream:short)`, for example `origin/main`.
+    /// The local branch whose upstream is fetched.
     Fetch(String),
     Pull,
     /// Local branch to check out. The name is the short ref, unchanged.
@@ -102,85 +114,192 @@ pub enum Action {
 }
 
 /// A fetch, pull, or branch switch running against the open repository.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncKind {
     Fetch,
     Pull,
     Checkout,
 }
 
+/// The work a screen starts belongs to it, so leaving the screen drops that
+/// work and a late result cannot land on another screen.
 enum Screen {
-    Home,
-    Repo(Box<OpenedRepo>),
+    Home(HomeScan),
+    Repo {
+        repo: Box<OpenedRepo>,
+        graph_load: Option<GraphLoad>,
+        sync: Option<SyncJob>,
+    },
 }
-
-type OpenResult = Result<Refreshed, String>;
 
 struct Opening {
     path: PathBuf,
-    receiver: Receiver<OpenResult>,
+    task: Task<Result<Refreshed, GitError>>,
 }
 
-/// One home-screen scan. Dropping it disconnects the worker, which stops
-/// after the git command it is already in.
-struct GlanceScan {
-    receiver: Receiver<GlanceMsg>,
+/// Branch and latest commit of each recent repository, read one after
+/// another on one thread. Dropping the scan disconnects that thread, which
+/// stops once the repository it is reading is done.
+#[derive(Default)]
+struct HomeScan {
+    /// Missing means the scan has not reported that path yet.
+    glances: HashMap<PathBuf, home::Glance>,
+    receiver: Option<Receiver<(PathBuf, home::Glance)>>,
 }
 
-struct GlanceMsg {
-    path: PathBuf,
-    glance: home::Glance,
+impl HomeScan {
+    fn start(ctx: &egui::Context, find_git: &Arc<GitFinder>, paths: Vec<PathBuf>) -> Self {
+        if paths.is_empty() {
+            return Self::default();
+        }
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        let find_git = Arc::clone(find_git);
+        thread::spawn(move || scan_glances(&find_git, paths, &sender, &ctx));
+        Self {
+            glances: HashMap::new(),
+            receiver: Some(receiver),
+        }
+    }
+
+    fn poll(&mut self) {
+        if let Some(receiver) = &self.receiver {
+            self.glances.extend(receiver.try_iter());
+        }
+    }
 }
 
 pub struct CthulhuApp {
     settings: Settings,
-    /// `None` when the OS reports no home folder; settings are then not saved.
-    settings_path: Option<PathBuf>,
-    /// `save_settings` writes the file only when this is true. A missing file
-    /// still counts as loaded. A read or parse error does not, so the next
-    /// action cannot replace the user's file with defaults.
-    loaded_ok: bool,
+    /// Where `save_settings` writes. `None` without a home folder, or when the
+    /// file could not be read: writing then would replace the user's file
+    /// with defaults.
+    save_path: Option<PathBuf>,
     screen: Screen,
     opening: Option<Opening>,
-    picker: Option<FolderPicker>,
+    /// The folder dialog: the chosen folder, or `None` when it was cancelled.
+    picker: Option<Task<Option<PathBuf>>>,
     error: Option<String>,
     opened_count: u64,
-    /// Covers the current screen. A repository underneath stays open.
-    settings_open: bool,
+    /// Open settings cover the current screen; a repository underneath stays
+    /// open. The chosen page is kept for the session in egui's memory.
+    settings_screen: Option<SettingsScreen>,
     fonts: fonts::FontService,
-    /// Shell drawn on the Terminal settings page. Separate from the repository
-    /// terminal so the preview size does not resize that session. Dropped when
-    /// settings closes; not saved.
-    font_preview: Option<terminal::Terminal>,
-    graph_load: Option<GraphLoad>,
-    graph_generation: u64,
-    sync_job: Option<SyncJob>,
     avatars: AvatarService,
     github: GitHubAuth,
-    /// `git --version` for the About page. `None` until Settings has asked.
+    find_git: Arc<GitFinder>,
+    /// `git --version` for the About page, once the probe started by the
+    /// first visit to Settings has answered.
     git_version: Option<String>,
-    git_probe: Option<Receiver<String>>,
-    /// Branch and latest commit for the recent list. Missing means the scan
-    /// has not reported that path yet.
-    glances: HashMap<PathBuf, home::Glance>,
-    /// Paths the current or previous home scan was started with, in order.
-    glance_paths: Vec<PathBuf>,
-    glance_scan: Option<GlanceScan>,
-    /// The previous frame was Home. Returning to it scans again.
-    was_home: bool,
+    git_probe: Option<Task<Result<String, GitError>>>,
 }
 
-/// Downloaded avatars, beside the settings in the per-user cache folder.
+#[derive(Default)]
+struct SettingsScreen {
+    /// Shell drawn on the Terminal page. Separate from the repository
+    /// terminal so the preview size does not resize that session. Not saved.
+    preview: Option<terminal::Terminal>,
+}
+
+/// Downloaded avatars, in the per-user cache folder (the settings are in the
+/// config folder).
 fn avatar_cache_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("io.github", "don-linux", "cthulhu-git")
-        .map(|dirs| dirs.cache_dir().join("avatars"))
+    cthulhu_git::settings::project_dirs().map(|dirs| dirs.cache_dir().join("avatars"))
+}
+
+/// What the app takes from the machine when it starts. [`Startup::system`] is
+/// the user's; tests point it at their own files.
+pub struct Startup {
+    /// A folder named on the command line. It wins over the last repository.
+    pub command_line: Option<PathBuf>,
+    /// Where settings are read and saved. `None` when there is no home folder.
+    pub settings_path: Option<PathBuf>,
+    /// Builds the avatar service once the settings say whether avatars are on.
+    pub avatars: fn(enabled: bool) -> AvatarService,
+    /// Finds git for opens, the recent list and the About page.
+    /// [`Git::discover`] reads `CTHULHU_GIT` and `PATH`.
+    pub find_git: fn() -> Result<Git, GitError>,
+}
+
+/// The git found first, kept so each open does not search and probe again.
+/// A git that a command could not start (moved or uninstalled) is looked
+/// for again on the next find.
+struct GitFinder {
+    find: fn() -> Result<Git, GitError>,
+    found: Mutex<Option<Git>>,
+}
+
+impl GitFinder {
+    fn new(find: fn() -> Result<Git, GitError>) -> Self {
+        Self {
+            find,
+            found: Mutex::new(None),
+        }
+    }
+
+    /// The lock is not held while searching, so the UI thread never waits
+    /// for a search running on a worker.
+    fn git(&self) -> Result<Git, GitError> {
+        if let Some(git) = self.found().clone() {
+            return Ok(git);
+        }
+        let git = (self.find)()?;
+        *self.found() = Some(git.clone());
+        Ok(git)
+    }
+
+    fn forget_if_gone(&self, error: &GitError) {
+        if matches!(error, GitError::Spawn(_)) {
+            *self.found() = None;
+        }
+    }
+
+    /// The text the UI shows for `error`.
+    fn describe(&self, error: &GitError) -> String {
+        self.forget_if_gone(error);
+        error.to_string()
+    }
+
+    /// A finished git job as the screen shows it: the error as text, and
+    /// `stopped` when the worker died without an answer.
+    fn outcome<T>(
+        &self,
+        done: Result<Result<T, GitError>, Stopped>,
+        stopped: &str,
+    ) -> Result<T, String> {
+        match done {
+            Ok(result) => result.map_err(|error| self.describe(&error)),
+            Err(Stopped) => Err(stopped.to_owned()),
+        }
+    }
+
+    fn found(&self) -> std::sync::MutexGuard<'_, Option<Git>> {
+        // A panic elsewhere cannot leave a half-written `Option<Git>` behind.
+        self.found.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Startup {
+    /// The user's settings file and avatars from the network.
+    pub fn system(command_line: Option<PathBuf>) -> Self {
+        Self {
+            command_line,
+            settings_path: Settings::default_path(),
+            avatars: |enabled| AvatarService::new(avatar_cache_dir(), enabled),
+            find_git: Git::discover,
+        }
+    }
 }
 
 impl CthulhuApp {
-    pub fn new(ctx: &egui::Context, command_line: Option<PathBuf>) -> Self {
-        let settings_path = Settings::default_path();
-        let (settings, loaded_ok, error) =
-            loaded_settings(settings_path.as_deref().map(Settings::load_from));
+    pub fn new(ctx: &egui::Context, startup: Startup) -> Self {
+        let Startup {
+            command_line,
+            settings_path,
+            avatars,
+            find_git,
+        } = startup;
+        let (settings, save_path, error) = load_settings(settings_path);
         theme::apply(ctx, theme::resolve(settings.theme.as_deref()));
         let mut fonts = fonts::FontService::default();
         fonts.sync(
@@ -189,13 +308,8 @@ impl CthulhuApp {
             settings.terminal_font.as_deref(),
         );
 
-        let startup = command_line.or_else(|| settings.last_repository.clone());
-        // Tests never reach the network.
-        let avatars = if cfg!(test) {
-            AvatarService::disabled()
-        } else {
-            AvatarService::new(avatar_cache_dir(), settings.author_avatars)
-        };
+        let first_open = command_line.or_else(|| settings.last_repository.clone());
+        let avatars = avatars(settings.author_avatars);
         let mut github = GitHubAuth::default();
         // Only a user who saved a token ever reaches the keychain.
         if settings.github_token_in_keyring {
@@ -203,39 +317,30 @@ impl CthulhuApp {
         }
         let mut app = Self {
             settings,
-            settings_path,
-            loaded_ok,
-            screen: Screen::Home,
+            save_path,
+            screen: Screen::Home(HomeScan::default()),
             opening: None,
             picker: None,
             error,
             opened_count: 0,
-            settings_open: false,
+            settings_screen: None,
             fonts,
-            font_preview: None,
-            graph_load: None,
-            graph_generation: 0,
-            sync_job: None,
             avatars,
             github,
+            find_git: Arc::new(GitFinder::new(find_git)),
             git_version: None,
             git_probe: None,
-            glances: HashMap::new(),
-            glance_paths: Vec::new(),
-            glance_scan: None,
-            was_home: false,
         };
-        if let Some(path) = startup {
-            // The window stays hidden until the first frame is painted.
-            // Finishing this open here means that frame is the repository
-            // chrome, or the home screen with the error. The history graph
-            // follows on the worker and is not part of that wait. A later
-            // open stays on a worker thread: the window is visible then,
-            // and blocking it would freeze the UI.
-            let result = load(&path);
-            if app.finish_open(path, result) {
-                app.start_open_graph(ctx);
-            }
+        if let Some(path) = first_open {
+            // The window stays hidden until its first frame is painted, so
+            // opening here makes that frame the repository or the home
+            // screen with the error, never a home screen that then flips.
+            let result = load(&app.find_git, &path).map_err(|error| app.find_git.describe(&error));
+            app.finish_open(ctx, &path, result);
+        }
+        // Home, with no first open or a failed one, scans from the start.
+        if let Screen::Home(scan) = &mut app.screen {
+            *scan = HomeScan::start(ctx, &app.find_git, app.settings.recent_repositories.clone());
         }
         app
     }
@@ -245,87 +350,29 @@ impl CthulhuApp {
         if self.git_version.is_some() || self.git_probe.is_some() {
             return;
         }
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
-        thread::spawn(move || {
-            let text = match Git::discover() {
-                Ok(git) => git.version.to_string(),
-                Err(_) => "Not found".to_owned(),
-            };
-            let _ = sender.send(text);
-            ctx.request_repaint();
-        });
-        self.git_probe = Some(receiver);
+        let find_git = Arc::clone(&self.find_git);
+        self.git_probe = Some(Task::spawn(ctx, move || {
+            find_git.git().map(|git| git.version.to_string())
+        }));
     }
 
     fn poll_git_version(&mut self) {
-        let Some(probe) = &self.git_probe else {
+        let Some(done) = self.git_probe.as_ref().and_then(Task::poll) else {
             return;
         };
-        let text = match probe.try_recv() {
-            Ok(text) => text,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => "Not found".to_owned(),
-        };
-        self.git_version = Some(text);
         self.git_probe = None;
+        self.git_version = Some(match done {
+            Ok(Ok(version)) => version,
+            Ok(Err(_)) | Err(Stopped) => "Not found".to_owned(),
+        });
     }
 
-    /// Starts a scan when Home appears or the recent list changes. Repos are
-    /// read one after another on one thread, and each result repaints.
-    fn sync_glances(&mut self, ctx: &egui::Context) {
-        self.poll_glances();
-        let on_home = matches!(self.screen, Screen::Home);
-        let entered = on_home && !self.was_home;
-        self.was_home = on_home;
-        if !on_home {
-            return;
-        }
-        if !entered && self.settings.recent_repositories == self.glance_paths {
-            return;
-        }
-        self.start_glance(ctx);
-    }
-
-    fn start_glance(&mut self, ctx: &egui::Context) {
-        let paths = self.settings.recent_repositories.clone();
-        self.glances.clear();
-        self.glance_paths.clone_from(&paths);
-        // Drop the previous receiver before the new thread starts, so the old
-        // worker notices and does not keep reading after the list changed.
-        self.glance_scan = None;
-        if paths.is_empty() {
-            return;
-        }
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
-        thread::spawn(move || scan_glances(paths, sender, ctx));
-        self.glance_scan = Some(GlanceScan { receiver });
-    }
-
-    fn poll_glances(&mut self) {
-        let Some(scan) = &self.glance_scan else {
-            return;
-        };
-        let mut incoming = Vec::new();
-        let mut disconnected = false;
-        loop {
-            match scan.receiver.try_recv() {
-                Ok(msg) => incoming.push(msg),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-        if disconnected {
-            self.glance_scan = None;
-        }
-        for msg in incoming {
-            if self.glance_paths.iter().any(|path| path == &msg.path) {
-                self.glances.insert(msg.path, msg.glance);
-            }
+    /// Home, with a scan of the recent list. Home already on screen keeps
+    /// the scan it has.
+    fn go_home(&mut self, ctx: &egui::Context) {
+        if !matches!(self.screen, Screen::Home(_)) {
+            let recent = self.settings.recent_repositories.clone();
+            self.screen = Screen::Home(HomeScan::start(ctx, &self.find_git, recent));
         }
     }
 
@@ -343,53 +390,39 @@ impl CthulhuApp {
         }
     }
 
-    /// Chrome runs on a worker thread: blocking the UI thread would freeze the
-    /// window. The history graph is a second worker, started once this open
-    /// has installed the repository.
+    /// On a worker: the window is visible now, and waiting would freeze it.
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
-        self.graph_generation = self.graph_generation.wrapping_add(1);
-        self.graph_load = None;
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
+        let find_git = Arc::clone(&self.find_git);
         let worker_path = path.clone();
-        thread::spawn(move || {
-            let _ = sender.send(load(&worker_path));
-            ctx.request_repaint();
-        });
-        self.opening = Some(Opening { path, receiver });
+        let task = Task::spawn(ctx, move || load(&find_git, &worker_path));
+        self.opening = Some(Opening { path, task });
     }
 
     fn poll_opening(&mut self, ctx: &egui::Context) {
-        let Some(opening) = &self.opening else {
-            return;
-        };
-        let result = match opening.receiver.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => {
-                Err("Opening stopped unexpectedly. Try again.".to_owned())
-            }
-        };
         let Some(opening) = self.opening.take() else {
             return;
         };
-        if self.finish_open(opening.path, result) {
-            self.start_open_graph(ctx);
-        }
+        let Some(done) = opening.task.poll() else {
+            self.opening = Some(opening);
+            return;
+        };
+        let result = self
+            .find_git
+            .outcome(done, "Opening stopped unexpectedly. Try again.");
+        self.finish_open(ctx, &opening.path, result);
     }
 
-    /// Installs the repository, or Home when opening failed.
-    ///
-    /// The history graph is not part of this result. A later log failure stays
-    /// on the repository screen and keeps `last_repository`.
-    fn finish_open(&mut self, path: PathBuf, result: OpenResult) -> bool {
+    /// Installs the repository and starts reading its history graph, or goes
+    /// Home when opening failed.
+    fn finish_open(&mut self, ctx: &egui::Context, path: &Path, result: Result<Refreshed, String>) {
         match result {
             Ok(refreshed) => {
                 self.error = None;
                 self.settings.remember_repository(&refreshed.info.root);
                 self.save_settings();
                 self.opened_count += 1;
-                self.screen = Screen::Repo(Box::new(OpenedRepo {
+                let repo = Box::new(OpenedRepo {
+                    git: refreshed.git,
                     info: refreshed.info,
                     // Empty until the history worker reports. Filling
                     // `graph_selection` would make `sync_graph` treat this
@@ -402,69 +435,58 @@ impl CthulhuApp {
                     branches: refreshed
                         .branches
                         .into_iter()
+                        // Only the current branch starts checked, so the graph
+                        // is one line until the user marks more.
                         .map(|branch| ListedBranch {
-                            checked: checked_when_opened(&branch),
+                            checked: branch.current,
                             branch,
                         })
                         .collect(),
                     latest: refreshed.latest,
-                    view_id: egui::Id::new(("repo-view", self.opened_count)),
+                    selected_commit: None,
+                    lit_branch: None,
+                    view_id: egui::Id::unique(("repo-view", self.opened_count)),
                     terminal: None,
                     github: refreshed.github,
                     hover: hover::HoverCache::default(),
                     diffs: changes::DiffCache::default(),
                     changes: None,
-                }));
-                true
+                });
+                // No tips means an unborn repository, so the center stays
+                // "No commits yet."
+                let tips = selected_tips(&repo.branches, repo.detached_oid.as_deref());
+                let graph_load = (!tips.is_empty()).then(|| GraphLoad::start(ctx, &repo, tips));
+                self.screen = Screen::Repo {
+                    repo,
+                    graph_load,
+                    sync: None,
+                };
             }
             Err(message) => {
                 self.error = Some(message);
-                if self.settings.last_repository.as_deref() == Some(path.as_path()) {
+                if self.settings.last_repository.as_deref() == Some(path) {
                     self.settings.forget_last_repository();
                     self.save_settings();
                 }
-                self.screen = Screen::Home;
-                false
+                self.go_home(ctx);
             }
         }
     }
 
-    /// One history worker for the repository just installed, when it has commits.
-    ///
-    /// No tips means an unborn repository, so the center stays "No commits yet."
-    fn start_open_graph(&mut self, ctx: &egui::Context) {
-        let tips = {
-            let Screen::Repo(repo) = &self.screen else {
-                return;
-            };
-            selected_tips(&repo.branches, repo.detached_oid.as_deref())
-        };
-        if tips.is_empty() {
-            return;
-        }
-        self.start_graph_load(ctx, tips);
-    }
-
     fn poll_picker(&mut self, ctx: &egui::Context) {
-        let Some(choice) = self.picker.as_ref().and_then(FolderPicker::poll) else {
+        let Some(done) = self.picker.as_ref().and_then(Task::poll) else {
             return;
         };
         self.picker = None;
-        if let Some(path) = choice {
+        // A dialog that failed opens nothing, like a cancelled one.
+        if let Ok(Some(path)) = done {
             self.open(ctx, path);
         }
     }
 
     /// A failed save keeps the app running; the message joins any current error.
-    ///
-    /// A failed load leaves `loaded_ok` false. Writing then would replace the
-    /// file the user still has, including recents, the theme, and
-    /// `github_token_in_keyring`.
     fn save_settings(&mut self) {
-        if !should_persist(self.loaded_ok) {
-            return;
-        }
-        let Some(path) = &self.settings_path else {
+        let Some(path) = &self.save_path else {
             return;
         };
         if let Err(save_error) = self.settings.save_to(path) {
@@ -483,29 +505,28 @@ impl CthulhuApp {
             .first()
             .and_then(|recent| recent.parent())
     }
+
+    /// A folder dialog or an open is running, so another one cannot start.
+    fn busy(&self) -> bool {
+        self.opening.is_some() || self.picker.is_some()
+    }
 }
 
-/// Whether `save_settings` may replace the file at the real settings path.
-fn should_persist(loaded_ok: bool) -> bool {
-    loaded_ok
-}
-
-/// Settings kept after startup, and whether a later save may write them.
+/// The settings at `path` (`None`: no home folder), where later saves may
+/// write them, and the error to show.
 ///
-/// `None` is "no home folder". `Err` is a file that could not be read or
-/// parsed: the window shows the error and keeps the defaults in memory, and
-/// [`should_persist`] stays false so the file is left as it is.
-fn loaded_settings(
-    loaded: Option<Result<Settings, SettingsError>>,
-) -> (Settings, bool, Option<String>) {
-    match loaded {
-        Some(Ok(settings)) => (settings, true, None),
-        Some(Err(error)) => (Settings::default(), false, Some(error.to_string())),
-        None => (
-            Settings::default(),
-            false,
-            Some("No home folder was found, so settings will not be saved.".to_owned()),
-        ),
+/// A missing file is the defaults and is written on the first change. A file
+/// that could not be read or parsed is the user's: the window shows the
+/// error and keeps the defaults in memory, and nothing is ever written over
+/// it, including recents, the theme, and `github_token_in_keyring`.
+fn load_settings(path: Option<PathBuf>) -> (Settings, Option<PathBuf>, Option<String>) {
+    let Some(path) = path else {
+        let error = "No home folder was found, so settings will not be saved.";
+        return (Settings::default(), None, Some(error.to_owned()));
+    };
+    match Settings::load_from(&path) {
+        Ok(settings) => (settings, Some(path), None),
+        Err(error) => (Settings::default(), None, Some(error.to_string())),
     }
 }
 
@@ -522,26 +543,29 @@ impl eframe::App for CthulhuApp {
             self.settings.ui_font.as_deref(),
             self.settings.terminal_font.as_deref(),
         );
-        if self.settings_open {
+        if self.settings_screen.is_some() {
             self.ensure_git_version(ui.ctx());
         }
         self.poll_git_version();
-        self.sync_glances(ui.ctx());
+        if let Screen::Home(scan) = &mut self.screen {
+            scan.poll();
+        }
 
         let syncing = self.sync_for_open_repo();
         let history_loading = self.history_loading();
-        let actions = if self.settings_open {
+        let busy = self.busy();
+        let actions = if let Some(settings_screen) = &mut self.settings_screen {
             // The repository stays underneath. Keep the shell alive and take
             // keystrokes away from the hidden terminal.
-            if let Screen::Repo(repo) = &mut self.screen {
+            if let Screen::Repo { repo, .. } = &mut self.screen {
                 terminal::service(ui.ctx(), &mut repo.terminal);
                 terminal::surrender_focus(ui.ctx(), repo.view_id);
             }
             let cwd = match &self.screen {
-                Screen::Repo(repo) => Some(repo.info.root.clone()),
-                Screen::Home => None,
+                Screen::Repo { repo, .. } => Some(repo.info.root.clone()),
+                Screen::Home(_) => None,
             };
-            terminal::service(ui.ctx(), &mut self.font_preview);
+            terminal::service(ui.ctx(), &mut settings_screen.preview);
             let git_label = self
                 .git_version
                 .as_deref()
@@ -553,44 +577,46 @@ impl eframe::App for CthulhuApp {
             let view = settings::SettingsView {
                 author_avatars: self.settings.author_avatars,
                 api_status: self.avatars.api_status(),
-                busy: self.opening.is_some() || self.picker.is_some(),
+                busy,
                 about: settings::AboutInfo::current(git_label),
             };
             settings::show(
                 ui,
                 self.settings.ui_font.as_deref(),
                 self.settings.terminal_font.as_deref(),
-                &mut self.font_preview,
+                &mut settings_screen.preview,
                 cwd.as_deref(),
                 &view,
                 &mut self.github,
             )
         } else {
             match &mut self.screen {
-                Screen::Home => home::show(
+                Screen::Home(scan) => home::show(
                     ui,
                     &home::HomeState {
                         recent: &self.settings.recent_repositories,
-                        glances: &self.glances,
-                        busy: self.opening.is_some() || self.picker.is_some(),
+                        glances: &scan.glances,
+                        busy,
                         opening: self.opening.as_ref().map(|opening| opening.path.as_path()),
                         error: self.error.as_deref(),
                     },
                 )
                 .into_iter()
                 .collect(),
-                Screen::Repo(repo) => repo_view::show(
+                Screen::Repo { repo, .. } => repo_view::show(
                     ui,
                     repo,
                     &repo_view::ViewState {
                         error: self.error.as_deref(),
-                        branches_open: !self.settings.history_sidebar_hidden,
-                        detail_open: !self.settings.detail_sidebar_hidden,
-                        terminal_open: !self.settings.terminal_hidden,
+                        panels: repo_view::Panels {
+                            branches: !self.settings.branches_sidebar_hidden,
+                            detail: !self.settings.detail_sidebar_hidden,
+                            terminal: !self.settings.terminal_hidden,
+                        },
                         syncing,
                         columns: self.settings.history_columns,
                         history_loading,
-                        busy: self.opening.is_some() || self.picker.is_some(),
+                        busy,
                     },
                     &mut self.avatars,
                 ),
@@ -599,81 +625,83 @@ impl eframe::App for CthulhuApp {
 
         for action in actions {
             match action {
+                // The folder dialog needs the window's frame.
                 Action::Browse => {
-                    if self.picker.is_none() && self.opening.is_none() {
+                    if !self.busy() {
                         self.error = None;
                         self.picker =
-                            Some(FolderPicker::open(ui.ctx(), frame, self.browse_start()));
+                            Some(folder_picker::open(ui.ctx(), frame, self.browse_start()));
                     }
                 }
-                Action::Open(path) => {
-                    self.error = None;
-                    self.open(ui.ctx(), path);
-                }
-                Action::Home => {
-                    self.error = None;
-                    self.settings_open = false;
-                    self.font_preview = None;
-                    self.screen = Screen::Home;
-                }
-                Action::OpenSettings => {
-                    self.settings_open = true;
-                }
-                Action::CloseSettings => {
-                    self.settings_open = false;
-                    self.font_preview = None;
-                }
-                Action::ToggleBranchesSidebar => {
-                    self.settings.history_sidebar_hidden = !self.settings.history_sidebar_hidden;
-                    self.save_settings();
-                }
-                Action::ToggleDetailSidebar => {
-                    self.settings.detail_sidebar_hidden = !self.settings.detail_sidebar_hidden;
-                    self.save_settings();
-                }
-                Action::ToggleTerminal => {
-                    self.settings.terminal_hidden = !self.settings.terminal_hidden;
-                    if !self.settings.terminal_hidden {
-                        self.settings.detail_sidebar_hidden = false;
-                    }
-                    self.save_settings();
-                }
-                Action::SetUiFont(name) => {
-                    self.settings.set_ui_font(name);
-                    self.save_settings();
-                }
-                Action::SetTerminalFont(name) => {
-                    self.settings.set_terminal_font(name);
-                    self.save_settings();
-                }
-                Action::Fetch(upstream) => {
-                    self.start_sync(ui.ctx(), SyncCommand::Fetch(upstream));
-                }
-                Action::Pull => {
-                    self.start_sync(ui.ctx(), SyncCommand::Pull);
-                }
-                Action::Checkout(name) => {
-                    self.start_sync(ui.ctx(), SyncCommand::Checkout(name));
-                }
-                Action::SetHistoryColumns(columns) => {
-                    let columns = columns.normalized();
-                    if self.settings.history_columns != columns {
-                        self.settings.history_columns = columns;
-                        self.save_settings();
-                    }
-                }
-                Action::SetAuthorAvatars(on) => {
-                    self.settings.author_avatars = on;
-                    self.avatars.set_enabled(on);
-                    self.save_settings();
-                }
+                action => self.apply_action(ui.ctx(), action),
             }
         }
         self.sync_graph(ui.ctx());
     }
 }
 
+impl CthulhuApp {
+    /// Every action except [`Action::Browse`], which [`eframe::App::ui`] handles
+    /// because it needs the frame.
+    fn apply_action(&mut self, ctx: &egui::Context, action: Action) {
+        match action {
+            Action::Browse => {}
+            Action::Open(path) => {
+                self.error = None;
+                self.open(ctx, path);
+            }
+            Action::Home => {
+                self.error = None;
+                self.settings_screen = None;
+                self.go_home(ctx);
+            }
+            Action::OpenSettings => {
+                self.settings_screen.get_or_insert_default();
+            }
+            Action::CloseSettings => {
+                self.settings_screen = None;
+            }
+            Action::SetPanels(panels) => {
+                self.settings.branches_sidebar_hidden = !panels.branches;
+                self.settings.detail_sidebar_hidden = !panels.detail;
+                self.settings.terminal_hidden = !panels.terminal;
+                self.save_settings();
+            }
+            Action::SetUiFont(name) => {
+                self.settings.set_ui_font(name);
+                self.save_settings();
+            }
+            Action::SetTerminalFont(name) => {
+                self.settings.set_terminal_font(name);
+                self.save_settings();
+            }
+            Action::Fetch(branch) => {
+                self.start_sync(ctx, SyncCommand::Fetch(branch));
+            }
+            Action::Pull => {
+                self.start_sync(ctx, SyncCommand::Pull);
+            }
+            Action::Checkout(name) => {
+                self.start_sync(ctx, SyncCommand::Checkout(name));
+            }
+            Action::SetHistoryColumns(columns) => {
+                let columns = columns.normalized();
+                if self.settings.history_columns != columns {
+                    self.settings.history_columns = columns;
+                    self.save_settings();
+                }
+            }
+            Action::SetAuthorAvatars(on) => {
+                self.settings.author_avatars = on;
+                self.avatars.set_enabled(on);
+                self.save_settings();
+            }
+        }
+    }
+}
+
 struct Refreshed {
+    git: Git,
     info: RepoInfo,
     branches: Vec<Branch>,
     latest: Option<CommitDetail>,
@@ -681,42 +709,47 @@ struct Refreshed {
     github: Option<GitHubRepo>,
 }
 
-/// One repository at a time. A dropped receiver stops the loop; the git
-/// command already running is left to finish under its own time limit.
-fn scan_glances(paths: Vec<PathBuf>, sender: Sender<GlanceMsg>, ctx: egui::Context) {
-    let git = Git::discover().ok();
+/// One repository at a time. A dropped receiver stops the loop once the
+/// repository being read is done; each of its git commands keeps its own
+/// time limit.
+fn scan_glances(
+    find_git: &GitFinder,
+    paths: Vec<PathBuf>,
+    sender: &Sender<(PathBuf, home::Glance)>,
+    ctx: &egui::Context,
+) {
+    let git = find_git.git().ok();
     for path in paths {
         let glance = match &git {
             Some(git) => match git::glance(git, &path) {
                 Ok(ready) => home::Glance::Ready(ready),
-                Err(_) => home::Glance::Unreadable,
+                Err(error) => {
+                    find_git.forget_if_gone(&error);
+                    home::Glance::Unreadable
+                }
             },
             None => home::Glance::Unreadable,
         };
-        if sender.send(GlanceMsg { path, glance }).is_err() {
+        if sender.send((path, glance)).is_err() {
             break;
         }
         ctx.request_repaint();
     }
 }
 
-/// Repository chrome. The history graph is not built here, so a log failure
-/// does not reject the open or forget the repository.
-fn load(path: &Path) -> OpenResult {
-    let git = Git::discover().map_err(|error| error.to_string())?;
-    reload_repo(&git, path)
+/// Repository chrome. The history graph is read later, so a log failure
+/// stays on the repository screen and keeps `last_repository`.
+fn load(find_git: &GitFinder, path: &Path) -> Result<Refreshed, GitError> {
+    reload_repo(&find_git.git()?, path)
 }
 
 /// HEAD, branches and the latest commit, without rebuilding the graph.
-fn reload_repo(git: &Git, path: &Path) -> Result<Refreshed, String> {
-    let info = git::inspect(git, path).map_err(|error| error.to_string())?;
-    let branches = git::branches(git, &info.root, &info.head).map_err(|error| error.to_string())?;
-    let latest =
-        git::latest_commit(git, &info.root, &info.head).map_err(|error| error.to_string())?;
+fn reload_repo(git: &Git, path: &Path) -> Result<Refreshed, GitError> {
+    let info = git::inspect(git, path)?;
+    let branches = git::branches(git, &info.root, &info.head)?;
+    let latest = git::latest_commit(git, &info.root, &info.head)?;
     let detached_oid = match &info.head {
-        Head::Detached { .. } => {
-            Some(git::head_commit_oid(git, &info.root).map_err(|error| error.to_string())?)
-        }
+        Head::Detached { .. } => Some(git::head_commit_oid(git, &info.root)?),
         Head::Branch(_) | Head::Unborn(_) => None,
     };
     // Remotes only enable avatars and links, so an unreadable config is not an error.
@@ -724,6 +757,7 @@ fn reload_repo(git: &Git, path: &Path) -> Result<Refreshed, String> {
         .ok()
         .and_then(|remotes| gh::github_repo(&remotes));
     Ok(Refreshed {
+        git: git.clone(),
         info,
         branches,
         latest,
@@ -739,33 +773,17 @@ enum SyncCommand {
 }
 
 struct SyncJob {
-    view_id: egui::Id,
     kind: SyncKind,
-    receiver: Receiver<Result<Refreshed, String>>,
+    task: Task<Result<Refreshed, GitError>>,
 }
 
-fn run_sync(root: &Path, command: SyncCommand) -> Result<Refreshed, String> {
-    let git = Git::discover().map_err(|error| error.to_string())?;
-    match &command {
-        SyncCommand::Fetch(upstream) => {
-            git::fetch(&git, root, upstream).map_err(|error| error.to_string())?;
-        }
-        SyncCommand::Pull => {
-            git::pull_ff_only(&git, root).map_err(|error| error.to_string())?;
-        }
-        SyncCommand::Checkout(name) => {
-            git::switch_branch(&git, root, name).map_err(|error| error.to_string())?;
-        }
+fn run_sync(git: &Git, root: &Path, command: &SyncCommand) -> Result<Refreshed, GitError> {
+    match command {
+        SyncCommand::Fetch(branch) => git::fetch(git, root, branch)?,
+        SyncCommand::Pull => git::pull_ff_only(git, root)?,
+        SyncCommand::Checkout(name) => git::switch_branch(git, root, name)?,
     }
-    reload_repo(&git, root)
-}
-
-/// The branch that is checked the first time a repository opens.
-///
-/// Every other branch starts off, so the graph is one line until the user
-/// marks more. A branch that appears later, after fetch or pull, stays off too.
-fn checked_when_opened(branch: &Branch) -> bool {
-    branch.current
+    reload_repo(git, root)
 }
 
 /// Keeps the sidebar checkboxes. A branch that was not in the list yet stays
@@ -783,8 +801,7 @@ fn apply_refresh(repo: &mut OpenedRepo, refreshed: Refreshed) {
             let checked = previous
                 .iter()
                 .find(|listed| listed.branch.name == branch.name)
-                .map(|listed| listed.checked)
-                .unwrap_or(false);
+                .is_some_and(|listed| listed.checked);
             ListedBranch { branch, checked }
         })
         .collect();
@@ -808,94 +825,78 @@ fn selected_tips(branches: &[ListedBranch], detached_oid: Option<&str>) -> Vec<G
     git::graph_tips(&candidates, detached_oid)
 }
 
+/// The history graph being read for `selection`.
 struct GraphLoad {
-    generation: u64,
-    view_id: egui::Id,
     selection: Vec<GraphTip>,
-    receiver: Receiver<Result<HistoryGraph, String>>,
+    task: Task<Result<HistoryGraph, GitError>>,
+}
+
+impl GraphLoad {
+    fn start(ctx: &egui::Context, repo: &OpenedRepo, selection: Vec<GraphTip>) -> Self {
+        let (git, root, tips) = (repo.git.clone(), repo.info.root.clone(), selection.clone());
+        let task = Task::spawn(ctx, move || {
+            git::branch_graph(&git, &root, &tips, HISTORY_LIMIT)
+        });
+        Self { selection, task }
+    }
 }
 
 impl CthulhuApp {
-    /// This view's history worker is in flight. A load for another repository
-    /// does not change the line in the center.
     fn history_loading(&self) -> bool {
-        let Screen::Repo(repo) = &self.screen else {
-            return false;
-        };
-        self.graph_load
-            .as_ref()
-            .is_some_and(|load| load.view_id == repo.view_id)
+        matches!(
+            self.screen,
+            Screen::Repo {
+                graph_load: Some(_),
+                ..
+            }
+        )
     }
 
     fn sync_for_open_repo(&self) -> Option<SyncKind> {
-        let Screen::Repo(repo) = &self.screen else {
-            return None;
-        };
-        self.sync_job
-            .as_ref()
-            .and_then(|job| (job.view_id == repo.view_id).then_some(job.kind))
+        match &self.screen {
+            Screen::Repo { sync, .. } => sync.as_ref().map(|job| job.kind),
+            Screen::Home(_) => None,
+        }
     }
 
     fn start_sync(&mut self, ctx: &egui::Context, command: SyncCommand) {
-        let Screen::Repo(repo) = &self.screen else {
+        let Screen::Repo { repo, sync, .. } = &mut self.screen else {
             return;
         };
-        if self
-            .sync_job
-            .as_ref()
-            .is_some_and(|job| job.view_id == repo.view_id)
-        {
+        if sync.is_some() {
             return;
         }
-        let view_id = repo.view_id;
         let root = repo.info.root.clone();
+        let git = repo.git.clone();
         let kind = match &command {
             SyncCommand::Fetch(_) => SyncKind::Fetch,
             SyncCommand::Pull => SyncKind::Pull,
             SyncCommand::Checkout(_) => SyncKind::Checkout,
         };
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
-        thread::spawn(move || {
-            let result = run_sync(&root, command);
-            let _ = sender.send(result);
-            ctx.request_repaint();
-        });
+        let task = Task::spawn(ctx, move || run_sync(&git, &root, &command));
+        *sync = Some(SyncJob { kind, task });
         self.error = None;
-        self.sync_job = Some(SyncJob {
-            view_id,
-            kind,
-            receiver,
-        });
     }
 
-    /// Applies a finished fetch or pull. A result for a repository that is no
-    /// longer on screen is dropped, including when the user went Home.
+    /// Applies a finished fetch, pull or checkout.
     fn poll_sync(&mut self) {
-        let Some(job) = &self.sync_job else {
+        let Screen::Repo { repo, sync, .. } = &mut self.screen else {
             return;
         };
-        let result = match job.receiver.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => {
-                Err("The Git command stopped unexpectedly. Try again.".to_owned())
-            }
-        };
-        let Some(job) = self.sync_job.take() else {
+        let Some(job) = sync.take() else {
             return;
         };
-        let Screen::Repo(repo) = &mut self.screen else {
+        let Some(done) = job.task.poll() else {
+            *sync = Some(job);
             return;
         };
-        if repo.view_id != job.view_id {
-            return;
-        }
-        match result {
+        match self
+            .find_git
+            .outcome(done, "The Git command stopped unexpectedly. Try again.")
+        {
             Ok(refreshed) => {
-                let switched = job.kind == SyncKind::Checkout;
                 apply_refresh(repo, refreshed);
-                if switched {
+                if job.kind == SyncKind::Checkout {
                     for listed in &mut repo.branches {
                         if listed.branch.current {
                             listed.checked = true;
@@ -908,178 +909,142 @@ impl CthulhuApp {
         }
     }
 
+    /// A graph read for checkboxes that changed since is dropped;
+    /// [`Self::sync_graph`] asks for the new selection.
     fn poll_graph(&mut self) {
-        if !matches!(self.screen, Screen::Repo(_)) {
-            if self.graph_load.is_some() {
-                self.graph_generation = self.graph_generation.wrapping_add(1);
-                self.graph_load = None;
-            }
-            return;
-        }
-
-        let result = {
-            let Some(load) = &self.graph_load else {
-                return;
-            };
-            match load.receiver.try_recv() {
-                Ok(result) => result,
-                Err(TryRecvError::Empty) => return,
-                Err(TryRecvError::Disconnected) => {
-                    Err("The history graph stopped unexpectedly. Try again.".to_owned())
-                }
-            }
-        };
-        let Some(load) = self.graph_load.take() else {
+        let Screen::Repo {
+            repo, graph_load, ..
+        } = &mut self.screen
+        else {
             return;
         };
-        if load.generation != self.graph_generation {
+        let Some(load) = graph_load.take() else {
+            return;
+        };
+        let Some(done) = load.task.poll() else {
+            *graph_load = Some(load);
+            return;
+        };
+        if selected_tips(&repo.branches, repo.detached_oid.as_deref()) != load.selection {
             return;
         }
-
-        let mut clear_error = false;
-        let mut failure = None;
-        if let Screen::Repo(repo) = &mut self.screen
-            && repo.view_id == load.view_id
-            && selected_tips(&repo.branches, repo.detached_oid.as_deref()) == load.selection
+        match self
+            .find_git
+            .outcome(done, "The history graph stopped unexpectedly. Try again.")
         {
-            match result {
-                Ok(graph) => {
-                    repo.graph = graph;
-                    repo.graph_selection = load.selection.clone();
-                    repo.graph_requested = load.selection;
-                    clear_error = true;
-                }
-                Err(message) => {
-                    repo.graph_requested = load.selection;
-                    failure = Some(message);
-                }
+            Ok(graph) => {
+                repo.graph = graph;
+                repo.graph_selection.clone_from(&load.selection);
+                repo.graph_requested = load.selection;
+                self.error = None;
             }
-        }
-        if clear_error {
-            self.error = None;
-        }
-        if let Some(message) = failure {
-            self.error = Some(message);
+            Err(message) => {
+                repo.graph_requested = load.selection;
+                self.error = Some(message);
+            }
         }
     }
 
+    /// Reads the graph again when the checkboxes changed. Neither the
+    /// selection in flight nor the last one that failed is asked again.
     fn sync_graph(&mut self, ctx: &egui::Context) {
-        enum Next {
-            Ignore,
-            Drop,
-            Clear,
-            Start(Vec<GraphTip>),
-        }
-
-        let next = match &self.screen {
-            Screen::Repo(repo) => {
-                let desired = selected_tips(&repo.branches, repo.detached_oid.as_deref());
-                if desired == repo.graph_selection {
-                    Next::Ignore
-                } else if desired.is_empty() {
-                    Next::Clear
-                } else if self
-                    .graph_load
-                    .as_ref()
-                    .is_some_and(|load| load.selection == desired)
-                    || (desired == repo.graph_requested && self.graph_load.is_none())
-                {
-                    Next::Ignore
-                } else {
-                    Next::Start(desired)
-                }
-            }
-            Screen::Home => {
-                if self.graph_load.is_some() {
-                    Next::Drop
-                } else {
-                    Next::Ignore
-                }
-            }
+        let Screen::Repo {
+            repo, graph_load, ..
+        } = &mut self.screen
+        else {
+            return;
         };
-
-        match next {
-            Next::Ignore => {}
-            Next::Drop => {
-                self.graph_generation = self.graph_generation.wrapping_add(1);
-                self.graph_load = None;
-            }
-            Next::Clear => {
-                self.graph_generation = self.graph_generation.wrapping_add(1);
-                self.graph_load = None;
-                if let Screen::Repo(repo) = &mut self.screen {
-                    repo.graph = HistoryGraph::default();
-                    repo.graph_selection.clear();
-                    repo.graph_requested.clear();
-                }
-            }
-            Next::Start(tips) => self.start_graph_load(ctx, tips),
+        let desired = selected_tips(&repo.branches, repo.detached_oid.as_deref());
+        if desired == repo.graph_selection {
+            return;
+        }
+        if desired.is_empty() {
+            *graph_load = None;
+            repo.graph = HistoryGraph::default();
+            repo.graph_selection.clear();
+            repo.graph_requested.clear();
+            return;
+        }
+        let asked = match graph_load {
+            Some(load) => load.selection == desired,
+            None => desired == repo.graph_requested,
+        };
+        if !asked {
+            *graph_load = Some(GraphLoad::start(ctx, repo, desired));
         }
     }
-
-    fn start_graph_load(&mut self, ctx: &egui::Context, tips: Vec<GraphTip>) {
-        let (root, view_id) = {
-            let Screen::Repo(repo) = &self.screen else {
-                return;
-            };
-            (repo.info.root.clone(), repo.view_id)
-        };
-        self.graph_generation = self.graph_generation.wrapping_add(1);
-        let generation = self.graph_generation;
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
-        let requested = tips.clone();
-        thread::spawn(move || {
-            let result = reload_graph(&root, &requested);
-            let _ = sender.send(result);
-            ctx.request_repaint();
-        });
-        self.graph_load = Some(GraphLoad {
-            generation,
-            view_id,
-            selection: tips,
-            receiver,
-        });
-    }
-}
-
-fn reload_graph(root: &Path, tips: &[GraphTip]) -> Result<HistoryGraph, String> {
-    let git = Git::discover().map_err(|error| error.to_string())?;
-    git::branch_graph(&git, root, tips, HISTORY_LIMIT).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
-mod selection_tests {
-    use super::{ListedBranch, checked_when_opened, selected_tips};
-    use cthulhu_git::git::{Branch, Upstream};
+mod tests {
+    use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
-    fn branch(name: &str, current: bool) -> Branch {
-        Branch {
-            name: name.to_owned(),
-            oid: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
-            committer_time: Some(10),
-            commit_count: 1,
-            upstream: Upstream::None,
-            current,
-        }
+    use cthulhu_git::git::{Git, GitError, Head, HistoryGraph, RepoInfo};
+    use cthulhu_git::settings::HistoryColumns;
+    use eframe::egui;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::avatars::AvatarService;
+    use super::home::Glance;
+    use super::repo_view::Panels;
+    use super::task::Task;
+    use super::test_support::{absent_git, commit, listed, opened};
+    use super::{
+        Action, CthulhuApp, GitFinder, GraphLoad, Opening, Refreshed, Screen, Startup, SyncJob,
+        SyncKind, selected_tips,
+    };
+
+    /// The app as it starts on `settings_path`, with a git that is installed nowhere.
+    fn app(ctx: &egui::Context, settings_path: Option<PathBuf>) -> CthulhuApp {
+        CthulhuApp::new(
+            ctx,
+            Startup {
+                command_line: None,
+                settings_path,
+                avatars: |_| AvatarService::disabled(),
+                find_git: || Ok(absent_git()),
+            },
+        )
     }
 
-    fn listed(name: &str, current: bool, checked: bool) -> ListedBranch {
-        ListedBranch {
-            branch: branch(name, current),
-            checked,
-        }
-    }
-
+    /// Git is looked for once, and again only after a command could not
+    /// start it.
     #[test]
-    fn opening_checks_only_the_current_branch() {
-        assert!(checked_when_opened(&branch("feature", true)));
-        assert!(!checked_when_opened(&branch("main", false)));
+    fn git_is_searched_again_only_once_it_cannot_start() {
+        static SEARCHES: AtomicUsize = AtomicUsize::new(0);
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "`GitFinder::new` takes a search with the signature of `Git::discover`"
+        )]
+        fn search() -> Result<Git, GitError> {
+            SEARCHES.fetch_add(1, Ordering::SeqCst);
+            Ok(absent_git())
+        }
+        let rejected = GitError::OutputLimit {
+            command: "git log".to_owned(),
+        };
+        let gone = GitError::Spawn(io::ErrorKind::NotFound.into());
+        // (the error a command returned before this find, searches so far)
+        let cases = [(None, 1), (None, 1), (Some(rejected), 1), (Some(gone), 2)];
+        let finder = GitFinder::new(search);
+        for (step, (error, searches)) in cases.into_iter().enumerate() {
+            if let Some(error) = error {
+                finder.describe(&error);
+            }
+            assert!(finder.git().is_ok(), "step {step}");
+            assert_eq!(SEARCHES.load(Ordering::SeqCst), searches, "step {step}");
+        }
     }
 
     #[test]
     fn checking_main_makes_it_the_principal_lane() {
-        let mut branches = vec![listed("feature", true, true), listed("main", false, false)];
+        let mut branches = vec![listed("feature", true), listed("main", false)];
         let alone = selected_tips(&branches, None);
         assert_eq!(alone.len(), 1);
         assert!(alone[0].principal);
@@ -1098,141 +1063,411 @@ mod selection_tests {
                 .any(|tip| tip.name == "feature" && !tip.principal && tip.current)
         );
     }
-}
 
-#[cfg(test)]
-mod settings_load_tests {
-    use std::fs;
-    use std::path::{Path, PathBuf};
-
-    use cthulhu_git::settings::Settings;
-    use tempfile::TempDir;
-
-    use super::avatars::AvatarService;
-    use super::github_auth::GitHubAuth;
-    use super::{CthulhuApp, Screen, loaded_settings, should_persist};
-
-    fn app_for_save(
-        settings: Settings,
-        settings_path: Option<PathBuf>,
-        loaded_ok: bool,
-        error: Option<String>,
-    ) -> CthulhuApp {
-        CthulhuApp {
-            settings,
-            settings_path,
-            loaded_ok,
-            screen: Screen::Home,
-            opening: None,
-            picker: None,
-            error,
-            opened_count: 0,
-            settings_open: false,
-            fonts: super::fonts::FontService::default(),
-            font_preview: None,
-            graph_load: None,
-            graph_generation: 0,
-            sync_job: None,
-            avatars: AvatarService::disabled(),
-            github: GitHubAuth::default(),
-            git_version: None,
-            git_probe: None,
-            glances: std::collections::HashMap::new(),
-            glance_paths: Vec::new(),
-            glance_scan: None,
-            was_home: false,
-        }
+    /// How the settings file stands when the app starts.
+    #[derive(Debug, Clone, Copy)]
+    enum Start {
+        Missing,
+        Bytes(&'static [u8]),
+        Directory,
+        NoHomeFolder,
     }
 
-    /// Makes `path` fail `Settings::load_from` and restores it on drop.
-    ///
-    /// Mode bits are restored only on Unix. Other platforms leave the field
-    /// unread: the load is pointed at a directory instead of a chmod'd file.
-    struct Unreadable<'a> {
-        #[cfg_attr(not(unix), expect(dead_code, reason = "mode restore is Unix-only"))]
-        path: &'a Path,
+    /// Each action that changes a saved setting, in order, and fields the
+    /// file holds after it.
+    fn persisting_actions() -> [(Action, serde_json::Value); 5] {
+        let columns = HistoryColumns {
+            branch: 5,
+            graph: 300,
+            ..HistoryColumns::default()
+        };
+        [
+            (
+                Action::SetPanels(Panels {
+                    branches: false,
+                    detail: true,
+                    terminal: true,
+                }),
+                json!({
+                    "history_sidebar_hidden": true, "detail_sidebar_hidden": false,
+                    "terminal_hidden": false
+                }),
+            ),
+            (
+                Action::SetUiFont(Some("inter".to_owned())),
+                json!({ "ui_font": "inter" }),
+            ),
+            (
+                Action::SetTerminalFont(Some("obel-mono".to_owned())),
+                json!({ "terminal_font": "obel-mono" }),
+            ),
+            // A width out of range goes back to its default.
+            (
+                Action::SetHistoryColumns(columns),
+                json!({ "history_columns": {
+                    "branch": 180, "graph": 300, "hash": 110, "message": 370, "author": 200
+                } }),
+            ),
+            (
+                Action::SetAuthorAvatars(false),
+                json!({ "author_avatars": false }),
+            ),
+        ]
     }
 
-    impl<'a> Unreadable<'a> {
-        fn block(path: &'a Path) -> Self {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut permissions = fs::metadata(path).expect("metadata").permissions();
-                permissions.set_mode(0o0);
-                fs::set_permissions(path, permissions).expect("chmod");
-            }
-            Self { path }
-        }
-    }
-
-    impl Drop for Unreadable<'_> {
-        fn drop(&mut self) {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut permissions = fs::metadata(self.path).expect("metadata").permissions();
-                permissions.set_mode(0o644);
-                fs::set_permissions(self.path, permissions).expect("restore mode");
-            }
-        }
-    }
-
+    /// A file that could not be read is the user's: no later action replaces
+    /// it with defaults. A missing file counts as read.
     #[test]
-    fn failed_load_never_overwrites_settings_file() {
-        let dir = TempDir::new().expect("temp dir");
-        let path = dir.path().join("settings.json");
-        let original = b"{\n  \"github_token_in_keyring\": true,\n  \"theme\": \"abyss\"\n}\n";
-        fs::write(&path, original).expect("write");
-
-        let load_path = blocked_load_path(&path, dir.path());
-        let _guard = Unreadable::block(&path);
-        let loaded = Settings::load_from(&load_path);
-        let (settings, loaded_ok, message) = loaded_settings(Some(loaded));
-        assert!(!loaded_ok);
-        assert!(message.is_some());
-        assert!(!should_persist(loaded_ok));
-
-        let mut app = app_for_save(settings, Some(path.clone()), loaded_ok, message.clone());
-        app.settings.theme = Some("ink".to_owned());
-        app.save_settings();
-        drop(_guard);
-
-        assert_eq!(fs::read(&path).expect("read"), original);
-        assert_eq!(app.error, message);
+    fn settings_are_written_only_after_a_good_load() {
+        // (start, loaded)
+        const STARTS: [(Start, bool); 5] = [
+            (Start::Missing, true),
+            (Start::Bytes(b"{}"), true),
+            (Start::Bytes(b"{"), false),
+            (Start::Directory, false),
+            (Start::NoHomeFolder, false),
+        ];
+        let ctx = egui::Context::default();
+        for (start, loaded) in STARTS {
+            let dir = TempDir::new().expect("temp dir");
+            let path = dir.path().join("settings.json");
+            match start {
+                Start::Bytes(bytes) => fs::write(&path, bytes).expect("seed settings"),
+                Start::Directory => fs::create_dir(&path).expect("directory"),
+                Start::Missing | Start::NoHomeFolder => {}
+            }
+            let home = !matches!(start, Start::NoHomeFolder);
+            let mut app = app(&ctx, home.then(|| path.clone()));
+            assert_eq!(app.save_path.is_some(), loaded, "{start:?}");
+            assert_eq!(app.error.is_none(), loaded, "{start:?}: {:?}", app.error);
+            let error = app.error.clone();
+            for (action, fields) in persisting_actions() {
+                let name = format!("{action:?}");
+                let before = fs::read(&path).ok();
+                app.apply_action(&ctx, action);
+                let after = fs::read(&path).ok();
+                if !loaded {
+                    assert_eq!(after, before, "{start:?}: {name} wrote the file");
+                    continue;
+                }
+                let saved: serde_json::Value = serde_json::from_slice(&after.unwrap_or_default())
+                    .unwrap_or_else(|error| panic!("{start:?}: {name}: {error}"));
+                for (field, value) in fields.as_object().expect("fields") {
+                    assert_eq!(&saved[field], value, "{start:?}: {name} saved {field}");
+                }
+            }
+            assert_eq!(app.error, error, "{start:?}");
+        }
     }
 
+    /// The folder chosen in the dialog opens, and an open waits for its
+    /// worker. Either one keeps the app busy. A worker that dies is an error
+    /// on Home.
     #[test]
-    fn load_failure_sets_loaded_ok_false() {
+    fn an_open_waits_for_its_worker() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx, None);
+        let path = PathBuf::from("/repos/slow");
+        app.picker = Some(Task::ready(Some(path.clone())));
+        assert!(app.busy(), "the dialog is open");
+        app.poll_picker(&ctx);
+        let opened = app.opening.as_ref().map(|opening| &opening.path);
+        assert_eq!(opened, Some(&path), "the chosen folder");
+        assert!(app.picker.is_none(), "the dialog is still open");
+        let (task, sender) = Task::pending();
+        app.opening = Some(Opening { path, task });
+        app.poll_opening(&ctx);
+        assert!(app.opening.is_some(), "the open ended before its worker");
+        assert!(app.busy(), "opening");
+        drop(sender);
+        app.poll_opening(&ctx);
+        assert!(app.opening.is_none(), "a dead worker left the open running");
+        let error = app.error.as_deref();
+        assert_eq!(error, Some("Opening stopped unexpectedly. Try again."));
+        assert!(matches!(app.screen, Screen::Home(_)));
+    }
+
+    /// The About page's git version and the recent cards' facts come from
+    /// workers.
+    #[test]
+    fn workers_fill_the_about_page_and_the_recent_cards() {
+        let ctx = egui::Context::default();
         let dir = TempDir::new().expect("temp dir");
-        let missing = dir.path().join("missing.json");
-        let (_, loaded_ok, message) = loaded_settings(Some(Settings::load_from(&missing)));
-        assert!(loaded_ok);
-        assert!(message.is_none());
-        assert!(should_persist(loaded_ok));
-
-        let blocked = dir.path().join("not-a-file");
-        fs::create_dir(&blocked).expect("dir");
-        let (settings, loaded_ok, message) = loaded_settings(Some(Settings::load_from(&blocked)));
-        assert_eq!(settings, Settings::default());
-        assert!(!loaded_ok);
-        assert!(message.is_some());
-        assert!(!should_persist(false));
-
-        let (_, loaded_ok, message) = loaded_settings(None);
-        assert!(!loaded_ok);
-        assert!(message.is_some());
+        let settings = dir.path().join("settings.json");
+        let gone = dir.path().join("gone");
+        let seed = json!({ "recent_repositories": [gone] }).to_string();
+        fs::write(&settings, seed).expect("seed settings");
+        let mut app = app(&ctx, Some(settings));
+        app.ensure_git_version(&ctx);
+        let reported = (0..500).any(|_| {
+            app.poll_git_version();
+            let Screen::Home(scan) = &mut app.screen else {
+                return false;
+            };
+            scan.poll();
+            let done = app.git_version.is_some() && scan.glances.contains_key(&gone);
+            if !done {
+                thread::sleep(Duration::from_millis(10));
+            }
+            done
+        });
+        assert!(reported, "the workers never reported");
+        assert_eq!(app.git_version.as_deref(), Some("2.43.0"));
+        let Screen::Home(scan) = &app.screen else {
+            panic!("not on Home");
+        };
+        assert!(matches!(scan.glances.get(&gone), Some(Glance::Unreadable)));
     }
 
-    /// On Unix the settings file itself is unreadable. Elsewhere a directory
-    /// is not JSON, and the save still targets the original file.
-    #[cfg(unix)]
-    fn blocked_load_path(file: &Path, _dir: &Path) -> PathBuf {
-        file.to_path_buf()
+    /// How a sync worker ends.
+    #[derive(Debug, Clone, Copy)]
+    enum Answer {
+        /// The repository, reloaded with this current branch.
+        Current(&'static str),
+        Fails,
+        Dies,
     }
 
-    #[cfg(not(unix))]
-    fn blocked_load_path(_file: &Path, dir: &Path) -> PathBuf {
-        dir.to_path_buf()
+    /// Each open has its own view and starts reading its history at once, so
+    /// its first frame says the history is loading. One sync runs at a time;
+    /// its result reloads the branches, and only a switch checks the new
+    /// current branch.
+    #[test]
+    fn an_opened_repository_reads_its_history_and_takes_sync_results() {
+        const REFUSED: &str = "`git pull` failed (rejected): refused";
+        const STOPPED: &str = "The Git command stopped unexpectedly. Try again.";
+        // (the job, how it ends, the error shown, `feature` checked after)
+        const CASES: [(SyncKind, Answer, Option<&str>, bool); 4] = [
+            (SyncKind::Checkout, Answer::Current("feature"), None, true),
+            (SyncKind::Fetch, Answer::Current("feature"), None, false),
+            (SyncKind::Pull, Answer::Fails, Some(REFUSED), false),
+            (SyncKind::Pull, Answer::Dies, Some(STOPPED), false),
+        ];
+        let refreshed = |current: &str| Refreshed {
+            git: absent_git(),
+            info: RepoInfo {
+                root: PathBuf::from("/repos/sync"),
+                name: "sync".to_owned(),
+                head: Head::Branch(current.to_owned()),
+            },
+            branches: ["main", "feature"]
+                .map(|name| listed(name, name == current).branch)
+                .into(),
+            latest: None,
+            detached_oid: None,
+            github: None,
+        };
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx, None);
+        let mut views = Vec::new();
+        for (kind, answer, error, checked) in CASES {
+            let case = format!("{kind:?} that {answer:?}");
+            app.finish_open(&ctx, Path::new("/repos/sync"), Ok(refreshed("main")));
+            assert!(app.history_loading(), "{case}: no history read at first");
+            app.apply_action(&ctx, Action::Checkout("feature".to_owned()));
+            app.apply_action(&ctx, Action::Pull);
+            assert_eq!(app.sync_for_open_repo(), Some(SyncKind::Checkout), "{case}");
+            let (task, sender) = Task::pending();
+            let _ = match answer {
+                Answer::Current(name) => sender.send(Ok(refreshed(name))),
+                Answer::Fails => sender.send(Err(GitError::Rejected {
+                    command: "git pull".to_owned(),
+                    reason: "refused".to_owned(),
+                })),
+                Answer::Dies => Ok(()),
+            };
+            drop(sender);
+            let Screen::Repo { repo, sync, .. } = &mut app.screen else {
+                panic!("{case}: not opened: {:?}", app.error);
+            };
+            views.push(repo.view_id);
+            *sync = Some(SyncJob { kind, task });
+            app.poll_sync();
+            assert_eq!(app.sync_for_open_repo(), None, "{case}");
+            assert_eq!(app.error.as_deref(), error, "{case}");
+            let Screen::Repo { repo, .. } = &app.screen else {
+                panic!("{case}: not on the repository");
+            };
+            let feature = repo
+                .branches
+                .iter()
+                .find(|listed| listed.branch.name == "feature");
+            assert_eq!(
+                feature.map(|listed| listed.checked),
+                Some(checked),
+                "{case}"
+            );
+        }
+        views.dedup();
+        assert_eq!(views.len(), CASES.len(), "opens share a view");
+    }
+
+    /// What happens on screen while the history worker reads the graph.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Meanwhile {
+        Nothing,
+        OpenAnother,
+        GoHome,
+        CheckTopic,
+        UncheckFeature,
+        UncheckAll,
+    }
+
+    /// How the worker ends.
+    #[derive(Debug, Clone, Copy)]
+    enum Worker {
+        Sends,
+        Fails,
+        Dies,
+        Busy,
+    }
+
+    /// The drawn graph after the next frame.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Graph {
+        Kept,
+        Applied,
+        Cleared,
+    }
+
+    /// The history load after the next frame.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Load {
+        Idle,
+        Same,
+        Restarted,
+    }
+
+    const EARLIER: &str = "an earlier error";
+    const FAILED: &str = "`git log` failed (rejected): the log failed";
+    const STOPPED: &str = "The history graph stopped unexpectedly. Try again.";
+
+    /// Meanwhile, worker, loading, graph, error, requested, load.
+    #[rustfmt::skip]
+    type GraphCase = (Meanwhile, Worker, bool, Graph, Option<&'static str>, bool, Load);
+
+    /// The repository shows the graph of `main`; the user has just checked
+    /// `feature`, and the worker is reading `main` and `feature`.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one table of what happens meanwhile and how the worker answers"
+    )]
+    fn a_graph_result_lands_only_on_the_selection_that_asked() {
+        #[rustfmt::skip]
+        const CASES: [GraphCase; 9] = [
+            (Meanwhile::Nothing, Worker::Sends, true, Graph::Applied, None, true, Load::Idle),
+            // A failure is not asked again until the checkboxes change.
+            (Meanwhile::Nothing, Worker::Fails, true, Graph::Kept, Some(FAILED), true, Load::Idle),
+            (Meanwhile::Nothing, Worker::Dies, true, Graph::Kept, Some(STOPPED), true, Load::Idle),
+            // The same selection is not asked twice while it is in flight.
+            (Meanwhile::Nothing, Worker::Busy, true, Graph::Kept, Some(EARLIER), false, Load::Same),
+            // The repository on screen keeps its load while another one opens.
+            (Meanwhile::OpenAnother, Worker::Sends, true, Graph::Applied, None, true, Load::Idle),
+            (Meanwhile::GoHome, Worker::Sends, false, Graph::Kept, None, false, Load::Idle),
+            (Meanwhile::CheckTopic, Worker::Busy, true, Graph::Kept, Some(EARLIER), false, Load::Restarted),
+            (Meanwhile::UncheckFeature, Worker::Sends, true, Graph::Kept, Some(EARLIER), false, Load::Idle),
+            (Meanwhile::UncheckAll, Worker::Sends, true, Graph::Cleared, Some(EARLIER), false, Load::Idle),
+        ];
+        let ctx = egui::Context::default();
+        for (meanwhile, worker, loading, graph, error, requested, load) in CASES {
+            let case = format!("{meanwhile:?}, then the worker {worker:?}");
+            let dir = TempDir::new().expect("temp dir");
+            let settings = dir.path().join("settings.json");
+            let mut app = app(&ctx, Some(settings.clone()));
+            let last = Some(PathBuf::from("/repos/history"));
+            app.settings.last_repository.clone_from(&last);
+            app.error = Some(EARLIER.to_owned());
+            let mut repo = opened("history", commit("one"));
+            let mut feature = listed("feature", false);
+            feature.checked = true;
+            feature.branch.oid = Some("b".repeat(40));
+            repo.branches.push(feature);
+            let selection = selected_tips(&repo.branches, None);
+            match meanwhile {
+                Meanwhile::CheckTopic => {
+                    let mut topic = listed("topic", false);
+                    topic.checked = true;
+                    topic.branch.oid = Some("c".repeat(40));
+                    repo.branches.push(topic);
+                }
+                Meanwhile::UncheckFeature => repo.branches[1].checked = false,
+                Meanwhile::UncheckAll => {
+                    for branch in &mut repo.branches {
+                        branch.checked = false;
+                    }
+                }
+                _ => {}
+            }
+            let (task, sender) = Task::pending();
+            let selection_load = GraphLoad {
+                selection: selection.clone(),
+                task,
+            };
+            let (repo, graph_load) = (Box::new(repo), Some(selection_load));
+            app.screen = Screen::Repo {
+                repo,
+                graph_load,
+                sync: None,
+            };
+            match meanwhile {
+                Meanwhile::OpenAnother => {
+                    app.apply_action(&ctx, Action::Open(PathBuf::from("/repos/another")));
+                }
+                Meanwhile::GoHome => {
+                    // The frame that handles Home ends with `sync_graph`.
+                    app.apply_action(&ctx, Action::Home);
+                    app.sync_graph(&ctx);
+                }
+                _ => {}
+            }
+            assert_eq!(app.history_loading(), loading, "{case}");
+
+            // A dropped load has no receiver left, so a send may fail.
+            let _ = match worker {
+                Worker::Sends => sender.send(Ok(HistoryGraph {
+                    truncated: true,
+                    ..HistoryGraph::default()
+                })),
+                Worker::Fails => sender.send(Err(GitError::Rejected {
+                    command: "git log".to_owned(),
+                    reason: "the log failed".to_owned(),
+                })),
+                Worker::Dies | Worker::Busy => Ok(()),
+            };
+            // Moved in either way, so a dead worker's sender is gone now.
+            let sender = (!matches!(worker, Worker::Dies)).then_some(sender);
+            app.poll_graph();
+            app.sync_graph(&ctx);
+
+            assert_eq!(app.error.as_deref(), error, "{case}");
+            // Only the load the test started still listens to its sender.
+            let same =
+                sender.is_some_and(|sender| sender.send(Ok(HistoryGraph::default())).is_ok());
+            let now = match (app.history_loading(), same) {
+                (false, _) => Load::Idle,
+                (true, true) => Load::Same,
+                (true, false) => Load::Restarted,
+            };
+            assert_eq!(now, load, "{case}");
+            match &app.screen {
+                Screen::Repo { repo, .. } => {
+                    let shown = if repo.graph.truncated {
+                        Graph::Applied
+                    } else if repo.graph.rows.is_empty() {
+                        Graph::Cleared
+                    } else {
+                        Graph::Kept
+                    };
+                    assert_eq!(shown, graph, "{case}");
+                    assert_eq!(repo.graph_requested == selection, requested, "{case}");
+                }
+                Screen::Home(_) => assert_eq!(meanwhile, Meanwhile::GoHome, "{case}"),
+            }
+            // Leaving the repository keeps it for the next launch, and nothing
+            // here is a reason to write the settings.
+            assert_eq!(app.settings.last_repository, last, "{case}");
+            assert!(!settings.exists(), "{case}: settings were written");
+        }
     }
 }

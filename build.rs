@@ -1,11 +1,15 @@
-//! Renders the SVGs under `assets/`.
+//! Renders `assets/icon.svg`, the single source of the application icon, and
+//! records the source revision for the About page.
 //!
-//! - Every target: `OUT_DIR/icon-256.png` from `assets/icon.svg`, the single
-//!   source of the application icon, embedded by `main.rs` as the window icon.
-//! - Every target: `OUT_DIR/icons/<name>.rgba` for each Lucide interface icon
-//!   in `assets/icons/`, embedded by `src/ui/icons.rs`.
+//! - Every target: `OUT_DIR/icon-256.png`, embedded by `main.rs` as the
+//!   window icon. Inside the window, `src/ui/icons.rs` draws the SVG itself.
 //! - Windows targets: a multi-size `.ico` plus `VERSIONINFO`, compiled into the
 //!   executable so Explorer, the taskbar and Task Manager show the icon and name.
+
+#![expect(
+    clippy::expect_used,
+    reason = "a build script reports failure by panicking; cargo stops the build and shows the message"
+)]
 
 use std::env;
 use std::fs;
@@ -16,56 +20,27 @@ use resvg::{tiny_skia, usvg};
 
 const ICON_SVG: &str = "assets/icon.svg";
 
-/// Host program name. The build script runs on the host, even when the
-/// target is Windows, so this is not `CARGO_CFG_TARGET_OS`.
-#[cfg(windows)]
-const GIT_PROGRAM: &str = "git.exe";
-#[cfg(not(windows))]
-const GIT_PROGRAM: &str = "git";
-
 /// The sizes Windows asks for across Explorer views, the taskbar and
 /// high-DPI scaling.
 const WINDOWS_ICON_SIZES: [u32; 8] = [16, 20, 24, 32, 40, 48, 64, 256];
 
-const UI_ICONS_DIR: &str = "assets/icons";
-
-/// Interface icons, by file name without `.svg`. Must match `src/ui/icons.rs`.
-const UI_ICONS: [&str; 15] = [
-    "panel-left",
-    "panel-right",
-    "house",
-    "git-branch",
-    "terminal",
-    "type",
-    "settings",
-    "arrow-left",
-    "cloud-download",
-    "arrow-down-to-line",
-    "circle-user-round",
-    "key-round",
-    "folder",
-    "github",
-    "info",
-];
-
-/// Side of the rendered interface icons. Drawn at about 18 points, this stays
-/// sharp up to 3x display scaling.
-const UI_ICON_SIZE: u32 = 64;
+/// Both values when the source tree is not a checkout git can read.
+const UNKNOWN: &str = "unknown";
 
 fn main() {
     println!("cargo::rerun-if-changed={ICON_SVG}");
-    println!("cargo::rerun-if-changed={UI_ICONS_DIR}");
     println!("cargo::rerun-if-changed=build.rs");
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-    let tree = load_svg(ICON_SVG, fs::read(ICON_SVG).expect("read assets/icon.svg"));
+    let svg = fs::read(ICON_SVG).expect("read assets/icon.svg");
+    let tree = usvg::Tree::from_data(&svg, &usvg::Options::default())
+        .unwrap_or_else(|error| panic!("parse {ICON_SVG}: {error}"));
 
     let png = render(&tree, 256)
         .encode_png()
         .expect("encode the window icon as PNG");
     fs::write(out_dir.join("icon-256.png"), png).expect("write icon-256.png");
 
-    render_ui_icons(&out_dir);
     embed_source_revision();
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
@@ -73,28 +48,7 @@ fn main() {
     }
 }
 
-fn load_svg(path: &str, data: Vec<u8>) -> usvg::Tree {
-    usvg::Tree::from_data(&data, &usvg::Options::default())
-        .unwrap_or_else(|error| panic!("parse {path}: {error}"))
-}
-
-/// Lucide strokes with `currentColor`, which resvg draws black. Rendered
-/// white instead, the app tints each icon with a palette color.
-fn render_ui_icons(out_dir: &Path) {
-    let icons_dir = out_dir.join("icons");
-    fs::create_dir_all(&icons_dir).expect("create OUT_DIR/icons");
-    for name in UI_ICONS {
-        let path = format!("{UI_ICONS_DIR}/{name}.svg");
-        let svg = fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
-        let tree = load_svg(&path, svg.replace("currentColor", "#ffffff").into_bytes());
-        let rgba = straight_rgba(&render(&tree, UI_ICON_SIZE));
-        fs::write(icons_dir.join(format!("{name}.rgba")), rgba)
-            .unwrap_or_else(|error| panic!("write the {name} icon: {error}"));
-    }
-}
-
-/// tiny-skia keeps premultiplied alpha; ICO files and egui textures want
-/// straight RGBA.
+/// tiny-skia keeps premultiplied alpha; ICO files want straight RGBA.
 fn straight_rgba(pixmap: &tiny_skia::Pixmap) -> Vec<u8> {
     pixmap
         .pixels()
@@ -132,8 +86,7 @@ fn embed_windows_resources(tree: &usvg::Tree, out_dir: &Path) {
         .expect("encode icon image");
         icon_dir.add_entry(entry);
     }
-    let ico_path = out_dir.join("cthulhu-git.ico");
-    let file = fs::File::create(&ico_path).expect("create cthulhu-git.ico");
+    let file = fs::File::create(out_dir.join("cthulhu-git.ico")).expect("create cthulhu-git.ico");
     icon_dir.write(file).expect("write cthulhu-git.ico");
 
     // The script is the icon and VERSIONINFO only. A longPathAware manifest
@@ -142,7 +95,7 @@ fn embed_windows_resources(tree: &usvg::Tree, out_dir: &Path) {
     // dropped with it. The Windows release job requires both, so the manifest
     // stays out.
     let rc_path = out_dir.join("cthulhu-git.rc");
-    fs::write(&rc_path, resource_script(&ico_path)).expect("write cthulhu-git.rc");
+    fs::write(&rc_path, resource_script()).expect("write cthulhu-git.rc");
     // A missing resource compiler only warns, so `cargo check --target
     // x86_64-pc-windows-gnu` keeps working on Linux without MinGW; the Windows
     // CI job verifies the icon is really in the release executable.
@@ -156,14 +109,15 @@ fn embed_windows_resources(tree: &usvg::Tree, out_dir: &Path) {
     }
 }
 
-fn resource_script(ico_path: &Path) -> String {
+/// `embed_resource` puts `OUT_DIR` on the resource compiler's include path, so
+/// the icon beside the script is found by its bare name.
+fn resource_script() -> String {
     let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
     let numeric = ["MAJOR", "MINOR", "PATCH"]
         .map(|part| env::var(format!("CARGO_PKG_VERSION_{part}")).expect("version part"))
         .join(",");
-    let ico_path = windres_quoted(&ico_path.display().to_string());
     format!(
-        r#"1 ICON "{ico_path}"
+        r#"1 ICON "cthulhu-git.ico"
 
 1 VERSIONINFO
 FILEVERSION {numeric},0
@@ -199,96 +153,49 @@ END
 /// A build without a checkout (a packaged tarball) still compiles. Both values
 /// are then `unknown`.
 fn embed_source_revision() {
-    let head = Path::new(".git/HEAD");
-    if head.is_file() {
-        println!("cargo:rerun-if-changed=.git/HEAD");
-        if let Ok(contents) = fs::read_to_string(head)
-            && let Some(reference) = contents.trim().strip_prefix("ref: ")
-        {
-            let ref_path = Path::new(".git").join(reference.trim());
-            if ref_path.is_file() {
-                println!("cargo:rerun-if-changed={}", ref_path.display());
-            }
-        }
-    }
-    let git = git_executable();
-    let commit = git
-        .as_deref()
-        .and_then(|program| git_line(program, &["rev-parse", "HEAD"]));
-    let date = git
-        .as_deref()
-        .and_then(|program| git_line(program, &["log", "-1", "--format=%cs"]));
-    println!(
-        "cargo:rustc-env=CTHULHU_GIT_COMMIT={}",
-        commit.map_or_else(|| "unknown".to_owned(), |value| sanitize_commit(&value))
-    );
-    println!(
-        "cargo:rustc-env=CTHULHU_GIT_COMMIT_DATE={}",
-        date.map_or_else(|| "unknown".to_owned(), |value| sanitize_date(&value))
-    );
+    let (commit, date) =
+        source_revision().unwrap_or_else(|| (UNKNOWN.to_owned(), UNKNOWN.to_owned()));
+    println!("cargo::rustc-env=CTHULHU_GIT_COMMIT={commit}");
+    println!("cargo::rustc-env=CTHULHU_GIT_COMMIT_DATE={date}");
 }
 
-/// windres strings are double-quoted. A quote or backslash in `OUT_DIR`
-/// would end the string early or escape the closing quote.
-fn windres_quoted(path: &str) -> String {
-    let mut escaped = String::with_capacity(path.len());
-    for character in path.chars() {
-        if character == '\\' || character == '"' {
-            escaped.push('\\');
-        }
-        escaped.push(character);
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a build script cannot use the crate it builds; this reads `git log -1` of the checkout"
+)]
+fn source_revision() -> Option<(String, String)> {
+    // Without its own `.git`, git would describe whichever repository
+    // contains this directory, such as a packaging tree.
+    if !Path::new(".git").exists() {
+        return None;
     }
-    escaped
-}
-
-/// Absolute `git` only. The build script's working directory is the crate
-/// root, so `Command::new("git")` would run a `git` planted next to
-/// `Cargo.toml`. Relative `PATH` entries are skipped for the same reason.
-/// No match still compiles: the embedded revision stays `unknown`.
-fn git_executable() -> Option<PathBuf> {
-    if let Some(path_var) = env::var_os("PATH") {
-        for entry in env::split_paths(&path_var) {
-            if !entry.is_absolute() {
-                continue;
-            }
-            let candidate = entry.join(GIT_PROGRAM);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+    // HEAD changes on checkout; logs/HEAD on every commit, reset or checkout,
+    // also when the branch ref is packed. In a linked worktree `.git` is a
+    // file and neither path exists, so nothing is watched there.
+    for watched in [".git/HEAD", ".git/logs/HEAD"] {
+        if Path::new(watched).is_file() {
+            println!("cargo::rerun-if-changed={watched}");
         }
     }
-    for fallback in [
-        "/usr/bin/git",
-        "/usr/local/bin/git",
-        "/opt/homebrew/bin/git",
-    ] {
-        let path = PathBuf::from(fallback);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    None
-}
-
-fn git_line(program: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
+    // `--no-show-signature` keeps a `log.showSignature` setting from putting
+    // gpg output in front of the format.
+    let output = Command::new("git")
+        .args(["log", "-1", "--no-show-signature", "--format=%H %cs"])
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
     let text = String::from_utf8(output.stdout).ok()?;
-    let line = text.trim();
-    if line.is_empty() {
-        None
-    } else {
-        Some(line.to_owned())
-    }
+    let (commit, date) = text.trim().split_once(' ')?;
+    Some((sanitize_commit(commit), sanitize_date(date)))
 }
 
 fn sanitize_commit(raw: &str) -> String {
     if raw.len() >= 7 && raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         raw.to_owned()
     } else {
-        "unknown".to_owned()
+        UNKNOWN.to_owned()
     }
 }
 
@@ -305,6 +212,6 @@ fn sanitize_date(raw: &str) -> String {
     if shaped {
         raw.to_owned()
     } else {
-        "unknown".to_owned()
+        UNKNOWN.to_owned()
     }
 }

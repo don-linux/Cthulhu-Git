@@ -29,7 +29,7 @@ const LOGO_SIDE: f32 = 128.0;
 const NARROW_COLUMN: f32 = 420.0;
 /// Exact card size. A minimum would still let the first card grow into the
 /// space the scroll area has left.
-const CARD_SIZE: Vec2 = Vec2::new(300.0, 168.0);
+pub(super) const CARD_SIZE: Vec2 = Vec2::new(300.0, 168.0);
 const CARD_GAP: f32 = 12.0;
 /// Interface icons are drawn at 18px. See `icons::ICON_SIZE`.
 const BRANCH_ICON: f32 = 18.0;
@@ -50,12 +50,6 @@ pub struct HomeState<'a> {
     pub busy: bool,
     pub opening: Option<&'a Path>,
     pub error: Option<&'a str>,
-}
-
-enum Facts<'a> {
-    Pending,
-    Unreadable,
-    Ready(&'a RepoGlance),
 }
 
 pub fn show(ui: &mut Ui, state: &HomeState<'_>) -> Option<Action> {
@@ -114,7 +108,7 @@ fn show_narrow(ui: &mut Ui, state: &HomeState<'_>) -> Option<Action> {
 /// Vertically centers the mark. The block's height is remembered from the
 /// previous frame; the first frame sits high and asks for another paint.
 fn show_brand(ui: &mut Ui, state: &HomeState<'_>) -> Option<Action> {
-    let height_id = egui::Id::new("home-brand-height");
+    let height_id = egui::Id::unique("home-brand-height");
     let known = ui
         .ctx()
         .data(|data| data.get_temp::<f32>(height_id))
@@ -157,20 +151,14 @@ fn remember_brand(
 }
 
 fn brand_block(ui: &mut Ui, state: &HomeState<'_>, action: &mut Option<Action>) {
-    let palette = theme::current(ui.ctx()).palette;
     ui.vertical_centered(|ui| {
         ui.spacing_mut().item_spacing.y = 6.0;
         icons::app_logo(ui, LOGO_SIDE);
         ui.add_space(10.0);
-        ui.label(
-            RichText::new("Cthulhu Git")
-                .size(32.0)
-                .strong()
-                .color(palette.text),
-        );
-        ui.label(RichText::new(env!("CARGO_PKG_VERSION")).color(palette.text_muted));
+        ui.label(RichText::new("Cthulhu Git").size(32.0).strong());
+        ui.label(RichText::new(env!("CARGO_PKG_VERSION")).weak());
         ui.add_space(2.0);
-        ui.label(RichText::new("Open a Git repository to get started.").color(palette.text_muted));
+        ui.label(RichText::new("Open a Git repository to get started.").weak());
         ui.add_space(18.0);
         if widgets::primary_button(ui, "Open repository…", !state.busy).clicked() {
             *action = Some(Action::Browse);
@@ -189,12 +177,7 @@ fn brand_block(ui: &mut Ui, state: &HomeState<'_>, action: &mut Option<Action>) 
 }
 
 fn show_recents(ui: &mut Ui, state: &HomeState<'_>, action: &mut Option<Action>, scroll: bool) {
-    let palette = theme::current(ui.ctx()).palette;
-    ui.label(
-        RichText::new("Recent repositories")
-            .strong()
-            .color(palette.text_muted),
-    );
+    ui.label(RichText::new("Recent repositories").weak());
     ui.add_space(8.0);
     if scroll {
         ScrollArea::vertical()
@@ -207,11 +190,8 @@ fn show_recents(ui: &mut Ui, state: &HomeState<'_>, action: &mut Option<Action>,
 }
 
 fn recent_cards(ui: &mut Ui, state: &HomeState<'_>, action: &mut Option<Action>) {
-    let palette = theme::current(ui.ctx()).palette;
     if state.recent.is_empty() {
-        ui.label(
-            RichText::new("Repositories you open will appear here.").color(palette.text_muted),
-        );
+        ui.label(RichText::new("Repositories you open will appear here.").weak());
         return;
     }
     // Top-aligned wrap. Centering on the cross axis would stretch the first
@@ -221,8 +201,8 @@ fn recent_cards(ui: &mut Ui, state: &HomeState<'_>, action: &mut Option<Action>)
         |ui| {
             ui.spacing_mut().item_spacing = Vec2::splat(CARD_GAP);
             for path in state.recent {
-                let facts = facts(state.glances, path);
-                if recent_card(ui, path, facts, !state.busy).clicked() {
+                let glance = state.glances.get(path);
+                if recent_card(ui, path, glance, !state.busy).clicked() {
                     *action = Some(Action::Open(path.clone()));
                 }
             }
@@ -230,15 +210,8 @@ fn recent_cards(ui: &mut Ui, state: &HomeState<'_>, action: &mut Option<Action>)
     );
 }
 
-fn facts<'a>(glances: &'a HashMap<PathBuf, Glance>, path: &Path) -> Facts<'a> {
-    match glances.get(path) {
-        Some(Glance::Ready(glance)) => Facts::Ready(glance),
-        Some(Glance::Unreadable) => Facts::Unreadable,
-        None => Facts::Pending,
-    }
-}
-
-fn recent_card(ui: &mut Ui, path: &Path, facts: Facts<'_>, enabled: bool) -> egui::Response {
+/// `glance` is `None` until the scan reports this path.
+fn recent_card(ui: &mut Ui, path: &Path, glance: Option<&Glance>, enabled: bool) -> egui::Response {
     let path_text = path.display().to_string();
     let palette = theme::current(ui.ctx()).palette;
     // Reserve the card on the wrapping layout itself. A nested scope is placed
@@ -249,14 +222,13 @@ fn recent_card(ui: &mut Ui, path: &Path, facts: Facts<'_>, enabled: bool) -> egu
     } else {
         Sense::hover()
     };
-    let mut response = ui.interact(rect, ui.id().with(&path_text), sense);
+    let mut response = ui.interact(rect, ui.scope_id().with(&path_text), sense);
     response = response.on_hover_text(&path_text);
     if enabled && ui.rect_contains_pointer(rect) {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, path_text.clone())
-    });
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, path_text.clone()));
     let hovered = enabled && ui.rect_contains_pointer(rect);
     paint_card(ui, rect, hovered, enabled, &palette);
     let inner = card_inner(rect);
@@ -270,7 +242,7 @@ fn recent_card(ui: &mut Ui, path: &Path, facts: Facts<'_>, enabled: bool) -> egu
     if !enabled {
         body.disable();
     }
-    card_body(&mut body, path, facts, hovered);
+    card_body(&mut body, path, glance, hovered);
     response
 }
 
@@ -303,36 +275,25 @@ fn paint_card(ui: &Ui, rect: Rect, hovered: bool, enabled: bool, palette: &theme
     );
 }
 
-fn card_body(ui: &mut Ui, path: &Path, facts: Facts<'_>, hovered: bool) {
+/// Lines that hold the place of a missing fact keep the lines after them
+/// where they always are.
+fn card_body(ui: &mut Ui, path: &Path, glance: Option<&Glance>, hovered: bool) {
     let palette = theme::current(ui.ctx()).palette;
     ui.spacing_mut().item_spacing.y = 2.0;
-    card_line(
-        ui,
-        RichText::new(display_name(path))
-            .strong()
-            .color(palette.text),
-    );
-    card_line(
-        ui,
-        RichText::new(path.display().to_string())
-            .small()
-            .color(palette.text_muted),
-    );
+    card_line(ui, RichText::new(display_name(path)).strong());
+    card_line(ui, RichText::new(path.display().to_string()).small().weak());
     ui.add_space(6.0);
-    match facts {
-        Facts::Pending => {
+    match glance {
+        None => {
             branch_line(ui, PENDING, palette.text_muted);
-            card_line(ui, muted_small(PENDING, palette.text_muted));
-            card_line(ui, RichText::new(PENDING).color(palette.text_muted));
-            card_line(ui, muted_small(PENDING, palette.text_muted));
+            card_line(ui, muted_small(PENDING));
+            card_line(ui, RichText::new(PENDING).weak());
+            card_line(ui, muted_small(PENDING));
         }
-        Facts::Unreadable => {
+        Some(Glance::Unreadable) => {
             card_line(ui, RichText::new(UNREADABLE).color(palette.error));
-            card_line(ui, muted_small(" ", palette.text_muted));
-            card_line(ui, RichText::new(" "));
-            card_line(ui, muted_small(" ", palette.text_muted));
         }
-        Facts::Ready(glance) => {
+        Some(Glance::Ready(glance)) => {
             let branch = if hovered {
                 palette.text
             } else {
@@ -341,26 +302,17 @@ fn card_body(ui: &mut Ui, path: &Path, facts: Facts<'_>, hovered: bool) {
             branch_line(ui, &glance.head.to_string(), branch);
             match glance.upstream {
                 Some(divergence) => {
-                    card_line(
-                        ui,
-                        muted_small(&upstream_line(divergence), palette.text_muted),
-                    );
+                    card_line(ui, muted_small(&upstream_line(divergence)));
                 }
-                None => card_line(ui, muted_small(" ", palette.text_muted)),
+                None => card_line(ui, muted_small(" ")),
             }
-            match &glance.latest {
-                Some(line) => {
-                    if line.subject.is_empty() {
-                        card_line(ui, RichText::new(" "));
-                    } else {
-                        card_line(ui, RichText::new(&line.subject).color(palette.text));
-                    }
-                    card_line(ui, muted_small(&line.when, palette.text_muted));
-                }
-                None => {
+            if let Some(line) = &glance.latest {
+                if line.subject.is_empty() {
                     card_line(ui, RichText::new(" "));
-                    card_line(ui, muted_small(" ", palette.text_muted));
+                } else {
+                    card_line(ui, RichText::new(&line.subject));
                 }
+                card_line(ui, muted_small(&line.when));
             }
         }
     }
@@ -374,7 +326,7 @@ fn branch_line(ui: &mut Ui, text: &str, color: Color32) {
         egui::pos2(rect.min.x + BRANCH_ICON * 0.5, rect.center().y),
         Vec2::splat(BRANCH_ICON),
     );
-    icons::paint_icon(ui.painter(), ui.ctx(), icon_rect, Icon::GitBranch, color);
+    icons::paint_icon(ui.painter(), icon_rect, Icon::GitBranch, color);
     let text_rect = Rect::from_min_max(
         egui::pos2(rect.min.x + BRANCH_ICON + 6.0, rect.min.y),
         rect.max,
@@ -399,8 +351,8 @@ fn truncated_label(text: RichText) -> Label {
         .truncate()
 }
 
-fn muted_small(text: &str, color: Color32) -> RichText {
-    RichText::new(text).small().color(color)
+fn muted_small(text: &str) -> RichText {
+    RichText::new(text).small().weak()
 }
 
 fn upstream_line(divergence: Divergence) -> String {
@@ -414,7 +366,6 @@ fn upstream_line(divergence: Divergence) -> String {
 
 /// Always takes the same height, so the page does not jump while loading.
 fn status_line(ui: &mut Ui, state: &HomeState<'_>) {
-    let palette = theme::current(ui.ctx()).palette;
     let text = match state.opening {
         Some(path) => format!("Opening {}…", display_name(path)),
         None if state.busy => "Waiting for the folder dialog…".to_owned(),
@@ -423,7 +374,7 @@ fn status_line(ui: &mut Ui, state: &HomeState<'_>) {
             return;
         }
     };
-    let galley = egui::WidgetText::from(RichText::new(text).color(palette.text_muted)).into_galley(
+    let galley = egui::WidgetText::from(RichText::new(text).weak()).into_galley(
         ui,
         Some(egui::TextWrapMode::Truncate),
         ui.available_width(),
@@ -439,7 +390,8 @@ fn status_line(ui: &mut Ui, state: &HomeState<'_>) {
 }
 
 fn display_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }

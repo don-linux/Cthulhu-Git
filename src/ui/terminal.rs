@@ -10,10 +10,11 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::ffi::OsStr;
+#[cfg(unix)]
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::{self, JoinHandle};
@@ -23,18 +24,19 @@ use std::time::Duration;
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::index::{Column, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{
-    Config as TermConfig, Osc52, RenderableCursor, Term, TermMode, color,
+    Config as TermConfig, Osc52, RenderableCursor, Term, TermMode, color, point_to_viewport,
+    viewport_to_point,
 };
 use alacritty_terminal::tty::{self, Pty};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, Event, FontId, Id, Key, Modifiers, Painter, PointerButton,
-    Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2,
+    self, Align2, Color32, CursorIcon, Event, EventFilter, FocusDirection, FontId, Id, Key,
+    Modifiers, Painter, PointerButton, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2,
 };
 
 use super::theme::Palette;
@@ -44,19 +46,42 @@ const TERMINAL_MIN_HEIGHT: f32 = 80.0;
 const SPLITTER_HEIGHT: f32 = 6.0;
 const INITIAL_FRACTION: f32 = 0.40;
 
-/// Which OS the shell choice is for. Tests pass each; the app passes its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HostOs {
-    Linux,
-    Macos,
-    Windows,
-}
-
 /// Program and arguments for the PTY child.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShellArgv {
-    pub program: String,
-    pub args: Vec<String>,
+struct ShellArgv {
+    program: String,
+    args: Vec<String>,
+}
+
+/// The shell for the PTY, from this process's environment.
+#[cfg(unix)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "one signature with the Windows `shell`, which fails without PowerShell"
+)]
+fn shell() -> Result<ShellArgv, String> {
+    let unset = vars_to_unset(std::env::vars_os());
+    let unset: Vec<&str> = unset.iter().map(String::as_str).collect();
+    Ok(shell_argv(
+        std::env::var_os("SHELL").as_deref(),
+        passwd_shell().as_deref(),
+        &unset,
+    ))
+}
+
+/// PowerShell, quoted for ConPTY. ConPTY merges `Options.env` into the
+/// parent environment, so no inherited name can be removed here.
+#[cfg(windows)]
+fn shell() -> Result<ShellArgv, String> {
+    let argv = windows_shell_argv(
+        std::env::var("ProgramFiles").ok().as_deref(),
+        std::env::var("SystemRoot").ok().as_deref(),
+        |path| Path::new(path).is_file(),
+    )?;
+    Ok(ShellArgv {
+        program: conpty_program(&argv.program),
+        args: argv.args,
+    })
 }
 
 /// Argv for the embedded shell.
@@ -67,121 +92,61 @@ pub struct ShellArgv {
 /// an absolute executable `passwd_shell`. macOS then tries `/bin/zsh`.
 /// `/bin/sh` is the last resort.
 /// `unset` is applied with `/usr/bin/env -u`, which can remove names.
-/// `Options.env` can only add them. On Windows that map is merged into the
-/// parent environment, so `unset` is not applied.
-pub fn shell_argv(
-    host: HostOs,
-    shell: Option<&OsStr>,
-    passwd_shell: Option<&str>,
-    unset: &[&str],
-) -> Result<ShellArgv, String> {
-    let argv = bare_shell(host, shell, passwd_shell)?;
-    if host == HostOs::Windows || unset.is_empty() {
-        // Windows `tty::Options.env` cannot drop inherited names.
-        return Ok(argv);
-    }
-    let mut args = Vec::with_capacity(unset.len() * 2 + 2 + argv.args.len());
-    for name in unset {
-        if !env_name_is_safe(name) {
-            continue;
-        }
-        args.push("-u".to_owned());
-        args.push((*name).to_owned());
-    }
+/// `Options.env` can only add them.
+#[cfg(unix)]
+fn shell_argv(shell: Option<&OsStr>, passwd_shell: Option<&str>, unset: &[&str]) -> ShellArgv {
+    let program = [
+        shell.and_then(OsStr::to_str),
+        passwd_shell,
+        cfg!(target_os = "macos").then_some("/bin/zsh"),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|candidate| Path::new(candidate).is_absolute() && is_executable(candidate))
+    .unwrap_or("/bin/sh")
+    .to_owned();
+    let login = cfg!(target_os = "macos").then(|| "-l".to_owned());
+    let mut args: Vec<String> = unset
+        .iter()
+        .filter(|name| env_name_is_safe(name))
+        .flat_map(|name| ["-u".to_owned(), (*name).to_owned()])
+        .collect();
     if args.is_empty() {
-        return Ok(argv);
+        return ShellArgv {
+            program,
+            args: login.into_iter().collect(),
+        };
     }
     args.push("--".to_owned());
-    args.push(argv.program);
-    args.extend(argv.args);
-    Ok(ShellArgv {
+    args.push(program);
+    args.extend(login);
+    ShellArgv {
         program: "/usr/bin/env".to_owned(),
         args,
-    })
+    }
 }
 
-fn bare_shell(
-    host: HostOs,
-    shell: Option<&OsStr>,
-    passwd_shell: Option<&str>,
-) -> Result<ShellArgv, String> {
-    if host == HostOs::Windows {
-        // `Command` searches the working directory before `PATH`. A bare
-        // `powershell.exe` would run a binary planted in the repository.
-        return windows_shell_argv(
-            std::env::var("ProgramFiles").ok().as_deref(),
-            std::env::var("SystemRoot").ok().as_deref(),
-            std::env::var("COMSPEC").ok().as_deref(),
-            |path| Path::new(path).is_file(),
-        );
-    }
-    let program = chosen_unix_shell(host, shell, passwd_shell);
-    let args = if host == HostOs::Macos {
-        vec!["-l".to_owned()]
-    } else {
-        Vec::new()
-    };
-    Ok(ShellArgv { program, args })
-}
-
-fn chosen_unix_shell(host: HostOs, shell: Option<&OsStr>, passwd_shell: Option<&str>) -> String {
-    chosen_unix_shell_with(host, shell, passwd_shell, unix_shell_is_executable)
-}
-
-fn chosen_unix_shell_with(
-    host: HostOs,
-    shell: Option<&OsStr>,
-    passwd_shell: Option<&str>,
-    executable: impl Fn(&str) -> bool,
-) -> String {
-    let shell_text = shell.and_then(OsStr::to_str);
-    let candidates = [
-        shell_text,
-        passwd_shell,
-        (host == HostOs::Macos).then_some("/bin/zsh"),
-        Some("/bin/sh"),
-    ];
-    for candidate in candidates.into_iter().flatten() {
-        if unix_shell_is_absolute(candidate) && executable(candidate) {
-            return candidate.to_owned();
-        }
-    }
-    "/bin/sh".to_owned()
-}
-
-/// Absolute and executable. A missing path or a mode without an execute bit
-/// falls through so the PTY is not pointed at a file `execve` will reject.
-fn unix_shell_is_executable(path: &str) -> bool {
-    if !unix_shell_is_absolute(path) {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let Ok(meta) = std::fs::metadata(path) else {
-            return false;
-        };
-        meta.is_file() && meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        // Permission bits are a Unix property. Callers on this target still
-        // require an absolute path via [`unix_shell_is_absolute`].
-        let _ = path;
-        true
-    }
+/// A file with an execute bit. A missing path or a mode without one falls
+/// through, so the PTY is not pointed at a file `execve` will reject.
+#[cfg(unix)]
+fn is_executable(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 /// PowerShell, as a pure function of the Windows environment.
 ///
-/// Order is `%ProgramFiles%\PowerShell\7\pwsh.exe`, then
+/// `Command` searches the working directory before `PATH`, so a bare
+/// `powershell.exe` would run a binary planted in the repository. Order is
+/// `%ProgramFiles%\PowerShell\7\pwsh.exe`, then
 /// `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`.
 /// Relative paths are skipped. `COMSPEC` is not a candidate: a relative
 /// value would search the repository, and an absolute one is often `cmd.exe`.
+#[cfg(any(windows, test))]
 fn windows_shell_argv(
     program_files: Option<&str>,
     system_root: Option<&str>,
-    _comspec: Option<&str>,
     exists: impl Fn(&str) -> bool,
 ) -> Result<ShellArgv, String> {
     let candidates = [
@@ -200,6 +165,15 @@ fn windows_shell_argv(
     Err("Could not find an absolute PowerShell.".to_owned())
 }
 
+/// alacritty builds the ConPTY command line by pasting the program in
+/// unquoted, and `CreateProcessW` then splits `C:\Program Files\...` at the
+/// space and tries `C:\Program.exe` first. Windows paths cannot contain `"`.
+#[cfg(any(windows, test))]
+fn conpty_program(path: &str) -> String {
+    format!("\"{path}\"")
+}
+
+#[cfg(any(windows, test))]
 fn windows_join(base: &str, child: &str) -> String {
     let base = base.trim_end_matches(['\\', '/']);
     format!("{base}\\{child}")
@@ -207,6 +181,7 @@ fn windows_join(base: &str, child: &str) -> String {
 
 /// Drive path (`C:\...`) or UNC (`\\server\share`). `Path::is_absolute` is
 /// false for both when this code is tested on Unix.
+#[cfg(any(windows, test))]
 fn windows_path_is_absolute(path: &str) -> bool {
     let bytes = path.as_bytes();
     if bytes.len() >= 3
@@ -235,18 +210,7 @@ fn windows_taskkill_path(
     }
 }
 
-/// Absolute Unix path. On Unix this is [`Path::is_absolute`].
-///
-/// The Linux shell choice is also unit-tested on Windows, where `Path` does
-/// not treat `/bin/sh` as absolute.
-fn unix_shell_is_absolute(text: &str) -> bool {
-    if cfg!(unix) {
-        Path::new(text).is_absolute()
-    } else {
-        text.starts_with('/')
-    }
-}
-
+#[cfg(unix)]
 fn env_name_is_safe(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -254,28 +218,22 @@ fn env_name_is_safe(name: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-fn this_host() -> HostOs {
-    if cfg!(windows) {
-        HostOs::Windows
-    } else if cfg!(target_os = "macos") {
-        HostOs::Macos
-    } else {
-        HostOs::Linux
-    }
-}
-
-fn vars_to_unset() -> Vec<String> {
-    let mut names: Vec<String> = std::env::vars()
-        .map(|(name, _)| name)
-        .filter(|name| cthulhu_git::git::inherited_git_var_is_cleared(name))
+/// Inherited names the shell must not see: what git commands scrub, plus the
+/// GitHub token variables. A name that is not Unicode is skipped, as the git
+/// scrub does; a value that is not Unicode does not matter.
+#[cfg(unix)]
+fn vars_to_unset(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<String> {
+    let mut names: Vec<String> = vars
+        .into_iter()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| {
+            cthulhu_git::git::inherited_git_var_is_cleared(name)
+                || ["GH_TOKEN", "GITHUB_TOKEN"]
+                    .iter()
+                    .any(|token| cthulhu_git::git::env_names_match(token, name))
+        })
         .collect();
-    for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
-        if std::env::var_os(name).is_some() {
-            names.push(name.to_owned());
-        }
-    }
     names.sort();
-    names.dedup();
     names
 }
 
@@ -299,11 +257,6 @@ fn passwd_shell() -> Option<String> {
     None
 }
 
-#[cfg(not(unix))]
-fn passwd_shell() -> Option<String> {
-    None
-}
-
 fn ensure_cwd(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -322,90 +275,29 @@ fn ensure_cwd(path: &Path) -> Result<(), String> {
 
 /// Environment applied only to the PTY child.
 ///
-/// `clear` and the shell binding for Ctrl+L (`clear-screen`) write the
-/// terminfo `clear` capability. A parent `TERM` of `dumb`, or an empty one,
-/// writes nothing, so the screen stays as it was. Alacritty's `setup_env`
-/// chooses the same name and also sets `COLORTERM`, but it stores both on the
-/// whole process. `tty::Options.env` overrides them for the child only.
-fn shell_env() -> HashMap<String, String> {
-    shell_env_from(
-        alacritty_terminfo_installed(),
-        std::env::var("LANG").ok().as_deref(),
-        std::env::var("LC_ALL").ok().as_deref(),
-        std::env::var("LC_CTYPE").ok().as_deref(),
-    )
-}
-
-/// `TERM` and `COLORTERM` for the PTY child.
+/// `TERM` is `xterm-256color`, whose terminfo every system ships. `clear` and
+/// the shell binding for Ctrl+L (`clear-screen`) write its `clear`
+/// capability; a parent `TERM` of `dumb`, or an empty one, writes nothing.
+/// Alacritty's `setup_env` also sets `TERM` and `COLORTERM`, but on the whole
+/// process; `tty::Options.env` sets them for the child only.
 ///
 /// A Dock launch leaves `LANG`, `LC_ALL`, and `LC_CTYPE` unset, and the shell
 /// then treats the stream as ASCII. An existing locale is left alone so the
 /// child inherits it.
-fn shell_env_from(
-    alacritty_installed: bool,
+fn shell_env(
     lang: Option<&str>,
     lc_all: Option<&str>,
     lc_ctype: Option<&str>,
 ) -> HashMap<String, String> {
-    let mut env = HashMap::new();
-    env.insert("TERM".to_owned(), term_name(alacritty_installed).to_owned());
-    env.insert("COLORTERM".to_owned(), "truecolor".to_owned());
-    if locale_is_unset(lang, lc_all, lc_ctype) {
+    let mut env = HashMap::from([
+        ("TERM".to_owned(), "xterm-256color".to_owned()),
+        ("COLORTERM".to_owned(), "truecolor".to_owned()),
+    ]);
+    let blank = |value: Option<&str>| value.is_none_or(str::is_empty);
+    if blank(lang) && blank(lc_all) && blank(lc_ctype) {
         env.insert("LANG".to_owned(), "en_US.UTF-8".to_owned());
     }
     env
-}
-
-fn locale_is_unset(lang: Option<&str>, lc_all: Option<&str>, lc_ctype: Option<&str>) -> bool {
-    fn blank(value: Option<&str>) -> bool {
-        value.is_none_or(|text| text.is_empty())
-    }
-    blank(lang) && blank(lc_all) && blank(lc_ctype)
-}
-
-/// `alacritty` when that terminfo entry is installed, otherwise `xterm-256color`.
-fn term_name(alacritty_installed: bool) -> &'static str {
-    if alacritty_installed {
-        "alacritty"
-    } else {
-        "xterm-256color"
-    }
-}
-
-fn alacritty_terminfo_installed() -> bool {
-    terminfo_installed("alacritty")
-}
-
-/// Same lookup as `alacritty_terminal::tty::setup_env`: `TERMINFO`, otherwise
-/// `~/.terminfo`, then `TERMINFO_DIRS`, `PREFIX`, and the system databases.
-fn terminfo_installed(name: &str) -> bool {
-    let Some(first) = name.chars().next() else {
-        return false;
-    };
-    let letter = first.to_string();
-    let hex = format!("{:x}", u32::from(first));
-    let mut dirs = Vec::new();
-    if let Some(dir) = std::env::var_os("TERMINFO") {
-        dirs.push(PathBuf::from(dir));
-    } else if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
-    {
-        dirs.push(PathBuf::from(home).join(".terminfo"));
-    }
-    if let Ok(list) = std::env::var("TERMINFO_DIRS") {
-        dirs.extend(list.split(':').map(PathBuf::from));
-    }
-    if let Ok(prefix) = std::env::var("PREFIX") {
-        let prefix = PathBuf::from(prefix);
-        dirs.push(prefix.join("etc/terminfo"));
-        dirs.push(prefix.join("lib/terminfo"));
-        dirs.push(prefix.join("share/terminfo"));
-    }
-    dirs.push(PathBuf::from("/etc/terminfo"));
-    dirs.push(PathBuf::from("/lib/terminfo"));
-    dirs.push(PathBuf::from("/usr/share/terminfo"));
-    dirs.push(PathBuf::from("/boot/system/data/terminfo"));
-    dirs.iter()
-        .any(|dir| dir.join(&letter).join(name).exists() || dir.join(&hex).join(name).exists())
 }
 
 /// One shell for the open repository, or the message left after it exits.
@@ -536,18 +428,15 @@ impl ShellSession {
             &grid,
             bridge.clone(),
         )));
-        let unset = vars_to_unset();
-        let unset_refs: Vec<&str> = unset.iter().map(String::as_str).collect();
-        let argv = shell_argv(
-            this_host(),
-            std::env::var_os("SHELL").as_deref(),
-            passwd_shell().as_deref(),
-            &unset_refs,
-        )?;
+        let argv = shell()?;
         let options = tty::Options {
             shell: Some(tty::Shell::new(argv.program, argv.args)),
             working_directory: Some(cwd.to_path_buf()),
-            env: shell_env(),
+            env: shell_env(
+                std::env::var("LANG").ok().as_deref(),
+                std::env::var("LC_ALL").ok().as_deref(),
+                std::env::var("LC_CTYPE").ok().as_deref(),
+            ),
             ..tty::Options::default()
         };
         let size = window_size(metrics, ctx.pixels_per_point());
@@ -580,7 +469,8 @@ impl ShellSession {
                     exited = true;
                 }
                 Ok(Notice::Color(index, format)) => {
-                    let rgb = self.color_rgb(index);
+                    let palette = super::theme::current(ctx).palette;
+                    let rgb = reported_color(self.term.lock().colors(), index, &palette);
                     self.write(format(rgb).as_bytes());
                 }
                 Ok(Notice::Size(format)) => self.write(format(self.size).as_bytes()),
@@ -595,17 +485,6 @@ impl ShellSession {
         exited
     }
 
-    fn color_rgb(&self, index: usize) -> Rgb {
-        let term = self.term.lock();
-        let colors = term.renderable_content().colors;
-        if index < color::COUNT
-            && let Some(rgb) = colors[index]
-        {
-            return rgb;
-        }
-        Rgb { r: 0, g: 0, b: 0 }
-    }
-
     fn write(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -614,15 +493,10 @@ impl ShellSession {
     }
 
     fn resize(&mut self, metrics: &Metrics, pixels_per_point: f32) {
-        // `Msg::Resize` runs `TIOCSWINSZ` on the event-loop thread. alacritty
-        // exits the process when that ioctl fails: EINVAL for a 0-size, EIO
-        // after the slave hangs up. Compare cell pixels too, so a move
-        // between 1x and 2x still updates `ws_xpixel`.
-        if self.child_exited || !child_can_be_resized(self.pid) {
-            return;
-        }
         let size = window_size(metrics, pixels_per_point);
-        if !pty_size_is_safe(size) || same_window_size(self.size, size) {
+        if !should_resize(self.size, size, self.child_exited, || {
+            child_can_be_resized(self.pid)
+        }) {
             return;
         }
         self.size = size;
@@ -657,19 +531,13 @@ fn window_size(metrics: &Metrics, pixels_per_point: f32) -> WindowSize {
     }
 }
 
+/// Rounded pixels, at least one. `as u16` would turn NaN into 0, and a zero
+/// cell size makes `TIOCSWINSZ` fail and alacritty exit the process.
 fn px(points: f32) -> u16 {
-    // `as u16` turns NaN and infinities into 0. A zero cell size makes
-    // `TIOCSWINSZ` fail and alacritty exit the process.
-    if !points.is_finite() {
-        return 1;
-    }
-    let pixels = points.round();
-    if !pixels.is_finite() || pixels <= 1.0 {
-        1
-    } else if pixels >= f32::from(u16::MAX) {
-        u16::MAX
+    if points.is_finite() {
+        points.round().clamp(1.0, f32::from(u16::MAX)) as u16
     } else {
-        pixels as u16
+        1
     }
 }
 
@@ -681,24 +549,24 @@ fn clamp_cell_px(cells: u16, cell_px: u16) -> u16 {
     cell_px.min(max_cell.max(1)).max(1)
 }
 
-fn same_window_size(left: WindowSize, right: WindowSize) -> bool {
-    left.num_cols == right.num_cols
-        && left.num_lines == right.num_lines
-        && left.cell_width == right.cell_width
-        && left.cell_height == right.cell_height
-}
-
-fn pty_size_is_safe(size: WindowSize) -> bool {
-    let cols = u32::from(size.num_cols);
-    let rows = u32::from(size.num_lines);
-    let width = u32::from(size.cell_width);
-    let height = u32::from(size.cell_height);
-    cols >= 1
-        && rows >= 1
-        && width >= 1
-        && height >= 1
-        && cols * width <= u32::from(u16::MAX)
-        && rows * height <= u32::from(u16::MAX)
+/// Whether the PTY should take `size`. `Msg::Resize` runs `TIOCSWINSZ` on
+/// the event-loop thread, and alacritty exits the process when that ioctl
+/// fails: EINVAL for a 0-size, which [`window_size`] never reports, and EIO
+/// after the slave hangs up, so an exited or dead child is left alone. Cell
+/// pixels count, so a move between 1x and 2x still updates `ws_xpixel`. The
+/// size is compared first: it is the same on almost every frame, and `alive`
+/// reads `/proc`.
+fn should_resize(
+    current: WindowSize,
+    size: WindowSize,
+    child_exited: bool,
+    alive: impl FnOnce() -> bool,
+) -> bool {
+    let same = current.num_cols == size.num_cols
+        && current.num_lines == size.num_lines
+        && current.cell_width == size.cell_width
+        && current.cell_height == size.cell_height;
+    !same && !child_exited && alive()
 }
 
 fn child_can_be_resized(pid: u32) -> bool {
@@ -750,8 +618,7 @@ fn pty_pid(pty: &Pty) -> u32 {
     {
         pty.child_watcher()
             .pid()
-            .map(std::num::NonZeroU32::get)
-            .unwrap_or(0)
+            .map_or(0, std::num::NonZeroU32::get)
     }
 }
 
@@ -762,7 +629,10 @@ fn should_signal(pid: u32) -> bool {
     if pid <= 1 {
         return false;
     }
-    let Some(parsed) = rustix::process::Pid::from_raw(pid as i32) else {
+    let Some(parsed) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
         return false;
     };
     if parsed == rustix::process::getpid() || parsed == rustix::process::getpgrp() {
@@ -810,7 +680,10 @@ fn signal_pid(pid: u32, signal: rustix::process::Signal) {
     if !should_signal(pid) {
         return;
     }
-    let Some(pid) = rustix::process::Pid::from_raw(pid as i32) else {
+    let Some(pid) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
         return;
     };
     let _ = rustix::process::kill_process(pid, signal);
@@ -847,6 +720,10 @@ fn session_of(pid: u32) -> Option<i32> {
 }
 
 #[cfg(target_os = "macos")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "`/bin/ps` by absolute path, not git"
+)]
 fn session_of_ps(pid: u32) -> Option<i32> {
     let output = std::process::Command::new("/bin/ps")
         .args(["-o", "sess=", "-p", &pid.to_string()])
@@ -879,6 +756,10 @@ fn processes_in_session(session: i32) -> Vec<u32> {
 }
 
 #[cfg(target_os = "macos")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "`/bin/ps` by absolute path, not git"
+)]
 fn processes_in_session(session: i32) -> Vec<u32> {
     let Ok(output) = std::process::Command::new("/bin/ps")
         .args(["-ax", "-o", "pid=,sess="])
@@ -908,7 +789,13 @@ fn processes_in_session(_session: i32) -> Vec<u32> {
 }
 
 #[cfg(windows)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "`taskkill` from `SystemRoot`, not git"
+)]
 fn kill_process_tree(pid: u32) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     if pid <= 1 {
         return Ok(());
     }
@@ -916,8 +803,6 @@ fn kill_process_tree(pid: u32) -> Result<(), String> {
     let program = windows_taskkill_path(std::env::var("SystemRoot").ok().as_deref(), |path| {
         Path::new(path).is_file()
     })?;
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let status = std::process::Command::new(&program)
         .args(["/F", "/T", "/PID", &pid.to_string()])
         .stdin(std::process::Stdio::null())
@@ -985,7 +870,7 @@ const PREVIEW_MAX_LINES: usize = 8;
 ///
 /// One row until the shell is on screen. A live shell reports the prompt
 /// block that ends at the cursor.
-pub fn preview_line_count(terminal: &Option<Terminal>) -> usize {
+pub fn preview_line_count(terminal: Option<&Terminal>) -> usize {
     let Some(Terminal::Live(session)) = terminal else {
         return 1;
     };
@@ -1000,14 +885,11 @@ pub fn preview_line_count(terminal: &Option<Terminal>) -> usize {
 /// preview. A block longer than [`PREVIEW_MAX_LINES`] keeps the rows nearest
 /// the cursor.
 fn prompt_span<T: EventListener>(term: &Term<T>) -> Range<usize> {
-    let rows = term.screen_lines();
-    if rows == 0 {
-        return 0..1;
-    }
     let content = term.renderable_content();
-    let offset = content.display_offset as i32;
-    let cursor_line = content.cursor.point.line.0;
-    let mut filled = vec![false; rows];
+    let offset = content.display_offset;
+    // prompt_rows keeps the row inside the screen.
+    let cursor_row = point_to_viewport(offset, content.cursor.point).map_or(0, |point| point.line);
+    let mut filled = vec![false; term.screen_lines()];
     for indexed in content.display_iter {
         if indexed
             .flags
@@ -1015,15 +897,13 @@ fn prompt_span<T: EventListener>(term: &Term<T>) -> Range<usize> {
         {
             continue;
         }
-        let row = indexed.point.line.0 + offset;
-        if row < 0 || row >= rows as i32 {
-            continue;
-        }
-        if cell_holds_prompt(indexed.cell) {
-            filled[row as usize] = true;
+        if let Some(point) = point_to_viewport(offset, indexed.point)
+            && cell_holds_prompt(indexed.cell)
+            && let Some(row) = filled.get_mut(point.line)
+        {
+            *row = true;
         }
     }
-    let cursor_row = (cursor_line + offset).clamp(0, rows as i32 - 1) as usize;
     prompt_rows(&filled, cursor_row, PREVIEW_MAX_LINES)
 }
 
@@ -1064,31 +944,121 @@ fn prompt_rows(filled: &[bool], cursor_row: usize, max_lines: usize) -> Range<us
     start..cursor + 1
 }
 
-/// Paint the strip and, the first time, start the shell.
-///
-/// When `interactive` is false the shell still runs, so the prompt uses the
-/// current face, but pointer and keyboard are ignored. The widget shows the
-/// prompt block. The PTY stays [`PREVIEW_SCREEN_ROWS`] tall so that block is
-/// not scrolled away.
+/// Paints the strip and, the first time, starts the shell. The strip takes
+/// the pointer and, once clicked, the keyboard.
 pub fn show(
     ui: &mut Ui,
     terminal: &mut Option<Terminal>,
     cwd: &Path,
     view_id: Id,
     palette: &Palette,
-    interactive: bool,
 ) {
     let visible = ui.available_rect_before_wrap();
-    let mut metrics = metrics(ui, visible);
-    if !interactive {
-        metrics.rows = PREVIEW_SCREEN_ROWS;
+    let metrics = metrics(ui, visible);
+    let painter = start(ui, terminal, cwd, visible, &metrics, palette);
+    match terminal {
+        Some(Terminal::Exited { message }) => {
+            if exited_prompt(ui, visible, message, palette) {
+                *terminal = Some(begin_shell(ui.ctx(), cwd, &metrics));
+            }
+        }
+        Some(Terminal::Live(session)) => {
+            // Before `interact`: egui moves focus when the focused widget
+            // registers, and Tab itself belongs to the shell.
+            if ui.memory(|memory| memory.has_focus(focus_id(view_id)))
+                && let Some(direction) = leave_direction(ui)
+            {
+                ui.memory_mut(|memory| memory.move_focus(direction));
+            }
+            let response = ui.interact(visible, focus_id(view_id), Sense::click_and_drag());
+            let response = response.on_hover_cursor(CursorIcon::Text);
+            if response.hovered() && ui.input(|input| input.pointer.primary_pressed()) {
+                response.request_focus();
+            }
+            session.resize(&metrics, ui.pixels_per_point());
+            let focused = response.has_focus();
+            handle_pointer(ui, session, &response, visible, &metrics);
+            if focused {
+                // egui moves focus on Tab and the arrows and drops it on
+                // Escape. In a terminal those keys belong to the shell.
+                let shell_keys = EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: true,
+                };
+                ui.memory_mut(|memory| memory.set_focus_lock_filter(response.id, shell_keys));
+                handle_keys(ui, session);
+            }
+            paint(&painter, session, visible.min, &metrics, palette);
+        }
+        Some(Terminal::Starting(_)) | None => {}
     }
+}
+
+/// The settings preview: the same shell in the current face, drawn as the
+/// prompt block that ends at the cursor. Pointer and keyboard are ignored.
+/// The PTY stays [`PREVIEW_SCREEN_ROWS`] tall so that block is not scrolled
+/// away.
+pub fn show_preview(ui: &mut Ui, terminal: &mut Option<Terminal>, cwd: &Path, palette: &Palette) {
+    let visible = ui.available_rect_before_wrap();
+    let metrics = Metrics {
+        rows: PREVIEW_SCREEN_ROWS,
+        ..metrics(ui, visible)
+    };
+    let painter = start(ui, terminal, cwd, visible, &metrics, palette);
+    match terminal {
+        Some(Terminal::Exited { message }) => {
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            ui.painter().text(
+                visible.left_top(),
+                Align2::LEFT_TOP,
+                message,
+                font,
+                palette.text_muted,
+            );
+        }
+        Some(Terminal::Live(session)) => {
+            session.resize(&metrics, ui.pixels_per_point());
+            let span = {
+                let term = session.term.lock();
+                prompt_span(&term)
+            };
+            let (origin, resized) = place_prompt(visible, &span, metrics.cell_h);
+            if resized {
+                ui.ctx().request_repaint();
+            }
+            paint(&painter, session, origin, &metrics, palette);
+        }
+        Some(Terminal::Starting(_)) | None => {}
+    }
+}
+
+/// Where the screen is drawn so the prompt block `span` starts at the top of
+/// `visible`, and whether `visible` is more than half a row off the block's
+/// height. A column change reflows the prompt after the settings page sized
+/// the box, so one more frame is needed.
+fn place_prompt(visible: Rect, span: &Range<usize>, cell_h: f32) -> (Pos2, bool) {
+    let origin = visible.min - Vec2::new(0.0, span.start as f32 * cell_h);
+    let resized = (visible.height() / cell_h - span.len() as f32).abs() > 0.5;
+    (origin, resized)
+}
+
+/// Fills the strip, starts the shell the first time, and says so until it
+/// runs.
+fn start(
+    ui: &Ui,
+    terminal: &mut Option<Terminal>,
+    cwd: &Path,
+    visible: Rect,
+    metrics: &Metrics,
+    palette: &Palette,
+) -> Painter {
     let painter = ui.painter().with_clip_rect(visible);
     painter.rect_filled(visible, 0.0, palette.background);
-
     adopt_starting(terminal);
     if terminal.is_none() {
-        *terminal = Some(begin_shell(ui.ctx(), cwd, &metrics));
+        *terminal = Some(begin_shell(ui.ctx(), cwd, metrics));
         adopt_starting(terminal);
     }
     if matches!(terminal, Some(Terminal::Starting(_))) {
@@ -1101,59 +1071,21 @@ pub fn show(
             palette.text_muted,
         );
     }
+    painter
+}
 
-    if !interactive {
-        surrender_focus(ui.ctx(), view_id);
-    }
-
-    let mut restart = false;
-    match terminal {
-        Some(Terminal::Exited { message }) => {
-            restart = exited_prompt(ui, visible, message, palette, interactive);
+/// Ctrl+Tab and Ctrl+Shift+Tab move focus out of the terminal, as they do
+/// out of GTK and Qt text views, which keep Tab for themselves.
+fn leave_direction(ui: &mut Ui) -> Option<FocusDirection> {
+    ui.input_mut(|input| {
+        if input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab) {
+            Some(FocusDirection::Previous)
+        } else if input.consume_key(Modifiers::CTRL, Key::Tab) {
+            Some(FocusDirection::Next)
+        } else {
+            None
         }
-        Some(Terminal::Live(session)) => {
-            let mut origin = visible;
-            if interactive {
-                let response = ui.interact(visible, focus_id(view_id), Sense::click_and_drag());
-                let response = response.on_hover_cursor(CursorIcon::Text);
-                if response.hovered() && ui.input(|input| input.pointer.primary_pressed()) {
-                    response.request_focus();
-                }
-                session.resize(&metrics, ui.pixels_per_point());
-                let focused = response.has_focus();
-                handle_pointer(ui, session, &response, visible, &metrics);
-                if focused {
-                    handle_keys(ui, session);
-                }
-            } else {
-                session.resize(&metrics, ui.pixels_per_point());
-                let span = {
-                    let term = session.term.lock();
-                    prompt_span(&term)
-                };
-                origin = Rect::from_min_size(
-                    Pos2::new(
-                        visible.min.x,
-                        visible.min.y - span.start as f32 * metrics.cell_h,
-                    ),
-                    Vec2::new(
-                        visible.width().max(1.0),
-                        metrics.rows as f32 * metrics.cell_h,
-                    ),
-                );
-                // A column change reflows the prompt after the box was sized.
-                let reserved = visible.height() / metrics.cell_h;
-                if (reserved - span.len() as f32).abs() > 0.5 {
-                    ui.ctx().request_repaint();
-                }
-            }
-            paint(&painter, session, origin, &metrics, palette);
-        }
-        Some(Terminal::Starting(_)) | None => {}
-    }
-    if restart {
-        *terminal = Some(begin_shell(ui.ctx(), cwd, &metrics));
-    }
+    })
 }
 
 fn begin_shell(ctx: &egui::Context, cwd: &Path, metrics: &Metrics) -> Terminal {
@@ -1173,24 +1105,8 @@ fn begin_shell(ctx: &egui::Context, cwd: &Path, metrics: &Metrics) -> Terminal {
     Terminal::Starting(StartingShell { rx })
 }
 
-fn exited_prompt(
-    ui: &mut Ui,
-    rect: Rect,
-    message: &str,
-    palette: &Palette,
-    interactive: bool,
-) -> bool {
-    if !interactive {
-        let font = egui::TextStyle::Body.resolve(ui.style());
-        ui.painter().text(
-            rect.left_top(),
-            Align2::LEFT_TOP,
-            message,
-            font,
-            palette.text_muted,
-        );
-        return false;
-    }
+/// The exit message and a button to start again. `true` on a click.
+fn exited_prompt(ui: &mut Ui, rect: Rect, message: &str, palette: &Palette) -> bool {
     let mut restart = false;
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
         ui.vertical_centered(|ui| {
@@ -1222,10 +1138,11 @@ fn metrics(ui: &Ui, rect: Rect) -> Metrics {
     }
 }
 
+/// The screen, its top-left cell at `origin`.
 fn paint(
     painter: &Painter,
     session: &ShellSession,
-    rect: Rect,
+    origin: Pos2,
     metrics: &Metrics,
     palette: &Palette,
 ) {
@@ -1242,11 +1159,14 @@ fn paint(
         {
             continue;
         }
-        let row = indexed.point.line.0 + offset as i32;
-        let col = indexed.point.column.0;
-        if row < 0 || row >= metrics.rows as i32 || col >= metrics.cols {
+        // The grid has the strip's size, and the painter clips to the strip.
+        let Some(Point {
+            line: row,
+            column: Column(col),
+        }) = point_to_viewport(offset, indexed.point)
+        else {
             continue;
-        }
+        };
         let selected = selection
             .is_some_and(|range| range.contains_cell(&indexed, cursor.point, cursor.shape));
         let mut fg = resolve_color(indexed.fg, colors, palette);
@@ -1262,7 +1182,7 @@ fn paint(
             std::mem::swap(&mut fg, &mut bg);
         }
         let wide = indexed.flags.contains(Flags::WIDE_CHAR);
-        let cell = cell_rect(rect, metrics, col, row as usize, wide);
+        let cell = cell_rect(origin, metrics, col, row, wide);
         if bg != palette.background || selected || on_cursor {
             painter.rect_filled(cell, 0.0, bg);
         }
@@ -1295,77 +1215,62 @@ fn paint_cursor(painter: &Painter, cell: Rect, cursor: RenderableCursor, color: 
     painter.rect_filled(rect, 0.0, color);
 }
 
-fn cell_rect(origin: Rect, metrics: &Metrics, col: usize, row: usize, wide: bool) -> Rect {
+fn cell_rect(origin: Pos2, metrics: &Metrics, col: usize, row: usize, wide: bool) -> Rect {
     let span = if wide { 2.0 } else { 1.0 };
     let min = Pos2::new(
-        origin.min.x + col as f32 * metrics.cell_w,
-        origin.min.y + row as f32 * metrics.cell_h,
+        origin.x + col as f32 * metrics.cell_w,
+        origin.y + row as f32 * metrics.cell_h,
     );
     Rect::from_min_size(min, Vec2::new(metrics.cell_w * span, metrics.cell_h))
 }
 
+/// What `color` paints with: the color the program set, else this widget's.
+/// Text, bright text and the cursor are the palette's text; the ANSI colors
+/// and the 256-color cube are [`ansi_color`], the dim ones at normal strength.
 fn resolve_color(color: Color, colors: &color::Colors, palette: &Palette) -> Color32 {
-    match color {
-        Color::Spec(rgb) => Color32::from_rgb(rgb.r, rgb.g, rgb.b),
-        Color::Indexed(index) => stored_or_ansi(colors, usize::from(index), index),
-        Color::Named(named) => {
-            if let Some(rgb) = colors[named] {
-                return Color32::from_rgb(rgb.r, rgb.g, rgb.b);
-            }
-            named_color(named, palette)
-        }
-    }
-}
-
-fn stored_or_ansi(colors: &color::Colors, index: usize, ansi_index: u8) -> Color32 {
-    if index < color::COUNT
-        && let Some(rgb) = colors[index]
-    {
+    let index = match color {
+        Color::Spec(rgb) => return Color32::from_rgb(rgb.r, rgb.g, rgb.b),
+        Color::Indexed(index) => usize::from(index),
+        Color::Named(named) => named as usize,
+    };
+    if let Some(rgb) = colors[index] {
         return Color32::from_rgb(rgb.r, rgb.g, rgb.b);
     }
-    let (r, g, b) = ansi_rgb(ansi_index);
-    Color32::from_rgb(r, g, b)
-}
-
-fn named_color(named: NamedColor, palette: &Palette) -> Color32 {
-    match named {
-        NamedColor::Foreground | NamedColor::BrightForeground => palette.text,
-        NamedColor::Background => palette.background,
-        NamedColor::DimForeground => palette.text_muted,
-        NamedColor::Cursor => palette.text,
-        NamedColor::Black => stored_fallback(0),
-        NamedColor::Red => stored_fallback(1),
-        NamedColor::Green => stored_fallback(2),
-        NamedColor::Yellow => stored_fallback(3),
-        NamedColor::Blue => stored_fallback(4),
-        NamedColor::Magenta => stored_fallback(5),
-        NamedColor::Cyan => stored_fallback(6),
-        NamedColor::White => stored_fallback(7),
-        NamedColor::BrightBlack => stored_fallback(8),
-        NamedColor::BrightRed => stored_fallback(9),
-        NamedColor::BrightGreen => stored_fallback(10),
-        NamedColor::BrightYellow => stored_fallback(11),
-        NamedColor::BrightBlue => stored_fallback(12),
-        NamedColor::BrightMagenta => stored_fallback(13),
-        NamedColor::BrightCyan => stored_fallback(14),
-        NamedColor::BrightWhite => stored_fallback(15),
-        NamedColor::DimBlack => stored_fallback(0),
-        NamedColor::DimRed => stored_fallback(1),
-        NamedColor::DimGreen => stored_fallback(2),
-        NamedColor::DimYellow => stored_fallback(3),
-        NamedColor::DimBlue => stored_fallback(4),
-        NamedColor::DimMagenta => stored_fallback(5),
-        NamedColor::DimCyan => stored_fallback(6),
-        NamedColor::DimWhite => stored_fallback(7),
+    let dim = NamedColor::DimBlack as usize;
+    match color {
+        Color::Named(NamedColor::Background) => palette.background,
+        Color::Named(NamedColor::DimForeground) => palette.text_muted,
+        // Past the 256 colors: read as a color number, the cursor would be
+        // green and the bright text yellow.
+        Color::Named(
+            NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::Cursor,
+        ) => palette.text,
+        Color::Named(_) if index >= dim => ansi_color((index - dim) as u8),
+        // A color number: below 256.
+        _ => ansi_color(index as u8),
     }
 }
 
-fn stored_fallback(index: u8) -> Color32 {
-    let (r, g, b) = ansi_rgb(index);
-    Color32::from_rgb(r, g, b)
+/// The answer to a color query (OSC 4, 10, 11, 12): the color the program set,
+/// or else the one this widget paints.
+fn reported_color(colors: &color::Colors, index: usize, palette: &Palette) -> Rgb {
+    let color = match u8::try_from(index) {
+        Ok(ansi) => Color::Indexed(ansi),
+        Err(_) if index == NamedColor::Background as usize => Color::Named(NamedColor::Background),
+        Err(_) if index == NamedColor::Cursor as usize => Color::Named(NamedColor::Cursor),
+        Err(_) => Color::Named(NamedColor::Foreground),
+    };
+    let painted = resolve_color(color, colors, palette);
+    Rgb {
+        r: painted.r(),
+        g: painted.g(),
+        b: painted.b(),
+    }
 }
 
-fn ansi_rgb(index: u8) -> (u8, u8, u8) {
+/// The sixteen ANSI colors, the 6×6×6 cube and the gray ramp, as xterm
+/// numbers them.
+fn ansi_color(index: u8) -> Color32 {
     const ANSI: [[u8; 3]; 16] = [
         [0x1a, 0x1b, 0x26],
         [0xf7, 0x76, 0x8e],
@@ -1385,18 +1290,18 @@ fn ansi_rgb(index: u8) -> (u8, u8, u8) {
         [0xd5, 0xdb, 0xe6],
     ];
     if index < 16 {
-        let rgb = ANSI[usize::from(index)];
-        return (rgb[0], rgb[1], rgb[2]);
+        let [r, g, b] = ANSI[usize::from(index)];
+        return Color32::from_rgb(r, g, b);
     }
     if index < 232 {
         let cube = index - 16;
         let level = |step: u8| {
             if step == 0 { 0 } else { 55 + step * 40 }
         };
-        return (level(cube / 36), level((cube / 6) % 6), level(cube % 6));
+        return Color32::from_rgb(level(cube / 36), level((cube / 6) % 6), level(cube % 6));
     }
     let gray = 8 + 10 * (index - 232);
-    (gray, gray, gray)
+    Color32::from_gray(gray)
 }
 
 fn handle_pointer(
@@ -1424,7 +1329,11 @@ fn handle_pointer(
             input.modifiers,
         )
     });
-    let mouse_mode = session.term.lock().mode().intersects(TermMode::MOUSE_MODE);
+    let (mouse_mode, offset) = {
+        let term = session.term.lock();
+        let mouse_mode = term.mode().intersects(TermMode::MOUSE_MODE);
+        (mouse_mode, term.grid().display_offset())
+    };
     let selecting = !mouse_mode || modifiers.shift;
     let over = response.hovered() || response.dragged();
     let Some(pos) = response
@@ -1439,7 +1348,7 @@ fn handle_pointer(
     if !over && scroll_y == 0.0 && !pressed.iter().any(|pressed| *pressed) && !released[0] {
         return;
     }
-    let hit = hit_at(rect, pos, metrics, session);
+    let hit = hit_at(rect, pos, metrics, offset);
 
     if selecting {
         if pressed[0] {
@@ -1461,7 +1370,7 @@ fn handle_pointer(
             session.anchor = None;
         }
     } else if over {
-        report_buttons(session, hit.col, hit.row, &pressed, &released, modifiers);
+        report_buttons(session, hit.col, hit.row, pressed, released, modifiers);
         if response.dragged() && down {
             session.write(&sgr(
                 button_code(0, modifiers) + 32,
@@ -1490,8 +1399,8 @@ fn report_buttons(
     session: &ShellSession,
     col: usize,
     row: usize,
-    pressed: &[bool; 3],
-    released: &[bool; 3],
+    pressed: [bool; 3],
+    released: [bool; 3],
     modifiers: Modifiers,
 ) {
     for (index, code) in [0_u8, 1, 2].into_iter().enumerate() {
@@ -1536,14 +1445,15 @@ struct CellHit {
     row: usize,
 }
 
-fn hit_at(rect: Rect, pos: Pos2, metrics: &Metrics, session: &ShellSession) -> CellHit {
+/// The cell under `pos`, clamped to the screen, and its grid point while the
+/// view is scrolled `offset` lines back.
+fn hit_at(rect: Rect, pos: Pos2, metrics: &Metrics, offset: usize) -> CellHit {
     let col = ((pos.x - rect.min.x) / metrics.cell_w).floor();
     let row = ((pos.y - rect.min.y) / metrics.cell_h).floor();
     let col = col.clamp(0.0, (metrics.cols - 1) as f32) as usize;
     let row = row.clamp(0.0, (metrics.rows - 1) as f32) as usize;
-    let offset = session.term.lock().renderable_content().display_offset as i32;
     CellHit {
-        point: Point::new(Line(row as i32 - offset), Column(col)),
+        point: viewport_to_point(offset, Point::new(row, Column(col))),
         col,
         row,
     }
@@ -1614,15 +1524,15 @@ fn apply_key(ctx: &egui::Context, session: &mut ShellSession, event: Event, modi
         }
         Event::Key {
             key,
-            pressed,
+            pressed: true,
             modifiers,
             ..
-        } if pressed => {
-            if let Some(bytes) = encode_key(session, key, modifiers) {
+        } => {
+            let app_cursor = session.term.lock().mode().contains(TermMode::APP_CURSOR);
+            if let Some(bytes) = encode_key(key, modifiers, app_cursor) {
                 session.write(&bytes);
             }
         }
-        Event::Key { .. } => {}
         _ => {}
     }
 }
@@ -1702,46 +1612,32 @@ fn paste_char_is_allowed(ch: char) -> bool {
     }
 }
 
-fn encode_key(session: &ShellSession, key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
-    if key == Key::C && modifiers.ctrl && !modifiers.shift && !modifiers.alt && !modifiers.mac_cmd {
-        let selected = session
-            .term
-            .lock()
-            .selection_to_string()
-            .is_some_and(|text| !text.is_empty());
-        if cfg!(target_os = "macos") || !selected {
-            return Some(vec![0x03]);
-        }
-        return None;
-    }
-    if let Some(bytes) = special_key(session, key, modifiers) {
-        return Some(bytes);
-    }
-    letter_key(key, modifiers)
-}
-
-fn special_key(session: &ShellSession, key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
-    let app_cursor = session.term.lock().mode().contains(TermMode::APP_CURSOR);
+/// The bytes xterm sends for `key`. `app_cursor` is the terminal's
+/// application cursor mode (DECCKM). A plain letter is text, not a key, so it
+/// sends nothing here.
+fn encode_key(key: Key, modifiers: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
     let modified = xterm_mod(modifiers);
     let bytes = match key {
         Key::Enter => enter_bytes(modified),
         Key::Backspace => backspace_bytes(modifiers),
         Key::Tab => tab_bytes(modified),
         Key::Escape => vec![0x1b],
-        Key::ArrowUp => arrow(b'A', modified, app_cursor),
-        Key::ArrowDown => arrow(b'B', modified, app_cursor),
-        Key::ArrowRight => arrow(b'C', modified, app_cursor),
-        Key::ArrowLeft => arrow(b'D', modified, app_cursor),
-        Key::Home => csi_tilde_or_letter(b'H', modified),
-        Key::End => csi_tilde_or_letter(b'F', modified),
+        Key::ArrowUp => cursor_key(b'A', modified, app_cursor),
+        Key::ArrowDown => cursor_key(b'B', modified, app_cursor),
+        Key::ArrowRight => cursor_key(b'C', modified, app_cursor),
+        Key::ArrowLeft => cursor_key(b'D', modified, app_cursor),
+        Key::Home => cursor_key(b'H', modified, app_cursor),
+        Key::End => cursor_key(b'F', modified, app_cursor),
         Key::PageUp => csi_tilde(5, modified),
         Key::PageDown => csi_tilde(6, modified),
         Key::Delete => csi_tilde(3, modified),
         Key::Insert => csi_tilde(2, modified),
-        Key::F1 => function_key(11, b'P', modified),
-        Key::F2 => function_key(12, b'Q', modified),
-        Key::F3 => function_key(13, b'R', modified),
-        Key::F4 => function_key(14, b'S', modified),
+        // F1–F4 are SS3 alone (`kf1`) and `CSI 1;<mod>` with modifiers
+        // (`kf13`, `kf25`, …), as xterm's terminfo describes them.
+        Key::F1 => cursor_key(b'P', modified, true),
+        Key::F2 => cursor_key(b'Q', modified, true),
+        Key::F3 => cursor_key(b'R', modified, true),
+        Key::F4 => cursor_key(b'S', modified, true),
         Key::F5 => csi_tilde(15, modified),
         Key::F6 => csi_tilde(17, modified),
         Key::F7 => csi_tilde(18, modified),
@@ -1750,7 +1646,7 @@ fn special_key(session: &ShellSession, key: Key, modifiers: Modifiers) -> Option
         Key::F10 => csi_tilde(21, modified),
         Key::F11 => csi_tilde(23, modified),
         Key::F12 => csi_tilde(24, modified),
-        _ => return None,
+        _ => return letter_key(key, modifiers),
     };
     Some(bytes)
 }
@@ -1781,7 +1677,10 @@ fn tab_bytes(modified: u8) -> Vec<u8> {
     }
 }
 
-fn arrow(letter: u8, modified: u8, app_cursor: bool) -> Vec<u8> {
+/// The arrows, Home and End, as xterm sends them: `CSI <letter>`, or SS3
+/// (`ESC O <letter>`) in application cursor mode. With modifiers,
+/// `CSI 1;<mod> <letter>` in either mode.
+fn cursor_key(letter: u8, modified: u8, app_cursor: bool) -> Vec<u8> {
     if modified == 1 {
         if app_cursor {
             vec![0x1b, b'O', letter]
@@ -1793,25 +1692,9 @@ fn arrow(letter: u8, modified: u8, app_cursor: bool) -> Vec<u8> {
     }
 }
 
-fn csi_tilde_or_letter(letter: u8, modified: u8) -> Vec<u8> {
-    if modified == 1 {
-        vec![0x1b, b'[', letter]
-    } else {
-        format!("\x1b[1;{modified}{}", letter as char).into_bytes()
-    }
-}
-
 fn csi_tilde(number: u8, modified: u8) -> Vec<u8> {
     if modified == 1 {
         format!("\x1b[{number}~").into_bytes()
-    } else {
-        format!("\x1b[{number};{modified}~").into_bytes()
-    }
-}
-
-fn function_key(number: u8, ss3: u8, modified: u8) -> Vec<u8> {
-    if modified == 1 {
-        vec![0x1b, b'O', ss3]
     } else {
         format!("\x1b[{number};{modified}~").into_bytes()
     }
@@ -1831,60 +1714,27 @@ fn xterm_mod(modifiers: Modifiers) -> u8 {
     value
 }
 
+/// Ctrl and a letter is that letter's control code, A as 1 through Z as 26;
+/// Alt puts ESC before it, or before the letter itself.
 fn letter_key(key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
     let letter = letter(key)?;
+    let escape = modifiers.alt.then_some(0x1b);
     if modifiers.ctrl {
-        let mut bytes = Vec::new();
-        if modifiers.alt {
-            bytes.push(0x1b);
-        }
-        bytes.push(letter as u8 - b'a' + 1);
-        return Some(bytes);
+        return Some(escape.into_iter().chain([letter - b'a' + 1]).collect());
     }
-    if modifiers.alt {
-        let ch = if modifiers.shift {
-            letter.to_ascii_uppercase()
-        } else {
-            letter
-        };
-        let mut bytes = vec![0x1b];
-        let mut buf = [0; 4];
-        bytes.extend(ch.encode_utf8(&mut buf).as_bytes());
-        return Some(bytes);
-    }
-    None
+    let letter = if modifiers.shift {
+        letter.to_ascii_uppercase()
+    } else {
+        letter
+    };
+    escape.map(|escape| vec![escape, letter])
 }
 
-fn letter(key: Key) -> Option<char> {
-    Some(match key {
-        Key::A => 'a',
-        Key::B => 'b',
-        Key::C => 'c',
-        Key::D => 'd',
-        Key::E => 'e',
-        Key::F => 'f',
-        Key::G => 'g',
-        Key::H => 'h',
-        Key::I => 'i',
-        Key::J => 'j',
-        Key::K => 'k',
-        Key::L => 'l',
-        Key::M => 'm',
-        Key::N => 'n',
-        Key::O => 'o',
-        Key::P => 'p',
-        Key::Q => 'q',
-        Key::R => 'r',
-        Key::S => 's',
-        Key::T => 't',
-        Key::U => 'u',
-        Key::V => 'v',
-        Key::W => 'w',
-        Key::X => 'x',
-        Key::Y => 'y',
-        Key::Z => 'z',
-        _ => return None,
-    })
+/// The lowercase letter of `A` to `Z`, which egui declares in order.
+fn letter(key: Key) -> Option<u8> {
+    (Key::A..=Key::Z)
+        .contains(&key)
+        .then(|| b'a' + (key as u8 - Key::A as u8))
 }
 
 /// Height of the terminal strip. Dragging the value never hides it.
@@ -1923,142 +1773,69 @@ fn clamp_fraction(fraction: f32, usable: f32) -> f32 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn shell_argv_follows_shell_login_and_unset() {
-        let bash =
-            shell_argv(HostOs::Linux, Some(OsStr::new("/bin/bash")), None, &[]).expect("bash");
-        assert_eq!(bash.program, "/bin/bash");
-        assert!(bash.args.is_empty());
+    /// What runs when neither `SHELL` nor the passwd shell can.
+    #[cfg(unix)]
+    const FALLBACK: &str = if cfg!(target_os = "macos") {
+        "/bin/zsh"
+    } else {
+        "/bin/sh"
+    };
 
-        let login =
-            shell_argv(HostOs::Macos, Some(OsStr::new("/bin/bash")), None, &[]).expect("login");
-        assert_eq!(login.program, "/bin/bash");
-        assert_eq!(login.args, ["-l"]);
-
-        let scrubbed = shell_argv(
-            HostOs::Macos,
-            Some(OsStr::new("/bin/bash")),
-            None,
-            &["GIT_DIR", "GH_TOKEN"],
-        )
-        .expect("scrubbed");
-        assert_eq!(scrubbed.program, "/usr/bin/env");
-        assert_eq!(
-            scrubbed.args,
-            ["-u", "GIT_DIR", "-u", "GH_TOKEN", "--", "/bin/bash", "-l"]
-        );
-
-        let passwd =
-            shell_argv(HostOs::Linux, None, Some("/bin/bash"), &["GIT_EXEC_PATH"]).expect("passwd");
-        assert_eq!(passwd.program, "/usr/bin/env");
-        assert_eq!(passwd.args, ["-u", "GIT_EXEC_PATH", "--", "/bin/bash"]);
-
-        let fallback =
-            shell_argv(HostOs::Linux, Some(OsStr::new("")), None, &[]).expect("fallback");
-        assert_eq!(fallback.program, "/bin/sh");
-
-        let windows = shell_argv(
-            HostOs::Windows,
-            Some(OsStr::new("/bin/bash")),
-            None,
-            &["GIT_DIR"],
-        );
-        assert_windows_shell(windows);
+    /// Program, then arguments.
+    #[cfg(unix)]
+    fn argv(shell: Option<&OsStr>, passwd: Option<&str>, unset: &[&str]) -> Vec<String> {
+        let argv = shell_argv(shell, passwd, unset);
+        std::iter::once(argv.program).chain(argv.args).collect()
     }
 
+    /// Names are unset through `env -u`, and an unsafe name is skipped. A
+    /// relative `SHELL` is never run: an absolute passwd shell comes next,
+    /// then the fallback. macOS logs in (`-l`), Linux does not.
+    #[cfg(unix)]
     #[test]
-    fn shell_argv_skips_an_unsafe_unset_name() {
-        let argv = shell_argv(
-            HostOs::Linux,
-            Some(OsStr::new("/bin/sh")),
-            None,
-            &["GIT_DIR;touch /tmp/x", "GH_TOKEN"],
-        )
-        .expect("argv");
-        assert_eq!(argv.args, ["-u", "GH_TOKEN", "--", "/bin/sh"]);
-    }
+    fn shell_argv_runs_an_absolute_shell_without_the_unset_names() {
+        use std::os::unix::ffi::OsStrExt;
 
-    #[test]
-    fn shell_argv_rejects_a_relative_shell() {
-        for relative in ["./sh", "bash", "bin/zsh", "../sh"] {
-            let argv =
-                shell_argv(HostOs::Linux, Some(OsStr::new(relative)), None, &[]).expect("relative");
-            assert_eq!(argv.program, "/bin/sh", "{relative}");
-            assert!(argv.args.iter().all(|arg| arg != relative), "{relative}");
-
-            let wrapped = shell_argv(
-                HostOs::Linux,
-                Some(OsStr::new(relative)),
-                None,
-                &["GIT_DIR"],
-            )
-            .expect("wrapped");
-            assert_eq!(wrapped.program, "/usr/bin/env", "{relative}");
-            let rendered = format!("{} {}", wrapped.program, wrapped.args.join(" "));
-            assert!(
-                !rendered.contains(relative),
-                "{relative} leaked into {rendered}"
-            );
+        // Case, `SHELL`, passwd shell, names to unset, program then arguments.
+        type Row = (
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+            &'static [&'static str],
+            &'static [&'static str],
+        );
+        const ENV: &str = "/usr/bin/env";
+        #[rustfmt::skip]
+        const SHELLS: &[Row] = &[
+            ("bash", Some("/bin/bash"), None, &[], &["/bin/bash"]),
+            ("scrubbed", Some("/bin/bash"), None, &["GIT_DIR", "GH_TOKEN"],
+                &[ENV, "-u", "GIT_DIR", "-u", "GH_TOKEN", "--", "/bin/bash"]),
+            ("passwd shell", None, Some("/bin/bash"), &["GIT_EXEC_PATH"],
+                &[ENV, "-u", "GIT_EXEC_PATH", "--", "/bin/bash"]),
+            ("empty SHELL", Some(""), None, &[], &[FALLBACK]),
+            ("unsafe name", Some("/bin/sh"), None,
+                &["GIT_DIR;touch /tmp/x", "GH_TOKEN"], &[ENV, "-u", "GH_TOKEN", "--", "/bin/sh"]),
+            ("relative SHELL", Some("./sh"), Some("/bin/bash"), &[], &["/bin/bash"]),
+            ("relative passwd", Some("bash"), Some("bin/zsh"), &[], &[FALLBACK]),
+            ("parent SHELL", Some("../sh"), None, &["GIT_DIR"], &[ENV, "-u", "GIT_DIR", "--", FALLBACK]),
+        ];
+        let login: &[&str] = if cfg!(target_os = "macos") {
+            &["-l"]
+        } else {
+            &[]
+        };
+        for &(case, shell, passwd, unset, expected) in SHELLS {
             assert_eq!(
-                wrapped.args,
-                ["-u", "GIT_DIR", "--", "/bin/sh"],
-                "{relative}"
+                argv(shell.map(OsStr::new), passwd, unset),
+                [expected, login].concat(),
+                "{case}"
             );
         }
-
-        let bash =
-            shell_argv(HostOs::Linux, Some(OsStr::new("/bin/bash")), None, &[]).expect("bash");
-        assert_eq!(bash.program, "/bin/bash");
-        let wrapped_bash = shell_argv(
-            HostOs::Linux,
-            Some(OsStr::new("/bin/bash")),
-            None,
-            &["GIT_DIR"],
-        )
-        .expect("wrapped bash");
-        assert_eq!(wrapped_bash.program, "/usr/bin/env");
-        assert_eq!(wrapped_bash.args, ["-u", "GIT_DIR", "--", "/bin/bash"]);
-
-        let passwd = shell_argv(
-            HostOs::Linux,
-            Some(OsStr::new("./sh")),
-            Some("/bin/bash"),
-            &[],
-        )
-        .expect("passwd");
-        assert_eq!(passwd.program, "/bin/bash");
-
-        let relative_passwd = shell_argv(
-            HostOs::Linux,
-            Some(OsStr::new("bash")),
-            Some("bin/zsh"),
-            &[],
-        )
-        .expect("relative passwd");
-        assert_eq!(relative_passwd.program, "/bin/sh");
-
-        let windows = shell_argv(
-            HostOs::Windows,
-            Some(OsStr::new("./sh")),
-            None,
-            &["GIT_DIR"],
+        assert_eq!(
+            argv(Some(OsStr::from_bytes(b"\xff")), None, &[]),
+            [&[FALLBACK], login].concat(),
+            "non-Unicode SHELL"
         );
-        assert_windows_shell(windows);
-    }
-
-    fn assert_windows_shell(argv: Result<ShellArgv, String>) {
-        match argv {
-            Ok(argv) => {
-                assert!(
-                    windows_path_is_absolute(&argv.program),
-                    "relative program {}",
-                    argv.program
-                );
-                assert_eq!(argv.args, ["-NoLogo"]);
-                assert_ne!(argv.program, "powershell.exe");
-            }
-            Err(error) => assert!(error.contains("PowerShell"), "{error}"),
-        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2078,6 +1855,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a `setsid` session to stop, not git"
+    )]
     fn stop_session_kills_a_background_job_that_ignores_hup() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let sleeper = dir.path().join("sleeper");
@@ -2110,6 +1891,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "re-runs this test binary in another working directory"
+    )]
     fn relative_shell_does_not_execute_a_planted_binary() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2154,7 +1939,7 @@ mod tests {
         let Some(dir) = std::env::var_os("CTHULHU_TERMINAL_RELATIVE_SHELL_DIR") else {
             return;
         };
-        let dir = PathBuf::from(dir);
+        let dir = std::path::PathBuf::from(dir);
         let marker = dir.join("marker");
         let ctx = egui::Context::default();
         let metrics = test_metrics();
@@ -2179,13 +1964,27 @@ mod tests {
         let escaped = dir.path().join("escaped");
         let ctx = egui::Context::default();
         let metrics = test_metrics();
-        let session = match ShellSession::spawn(dir.path(), &ctx, &metrics) {
+        let mut session = match ShellSession::spawn(dir.path(), &ctx, &metrics) {
             Ok(session) => session,
             Err(error) => panic!("{error}"),
         };
         assert_eq!(std::env::var_os("SHELL"), shell_before);
 
         wait_for_shell_output(&session);
+        // The shell runs in the repository, with the terminal's TERM, and
+        // follows the strip's size.
+        let cwd = std::fs::read_link(format!("/proc/{}/cwd", session.pid));
+        assert_eq!(cwd.ok(), dir.path().canonicalize().ok(), "shell directory");
+        let environ = std::fs::read(format!("/proc/{}/environ", session.pid));
+        let term = b"TERM=xterm-256color".as_slice();
+        let named = environ.is_ok_and(|vars| vars.split(|byte| *byte == 0).any(|var| var == term));
+        assert!(named, "the shell has no TERM=xterm-256color");
+        let taller = Metrics {
+            rows: 40,
+            ..metrics
+        };
+        session.resize(&taller, 1.0);
+        assert_eq!(session.term.lock().screen_lines(), 40);
         // Fork before setsid. An interactive shell makes a background job the
         // process-group leader, and setsid then returns EPERM. The parent
         // perl waits so both sleeps stay descendants of the session leader.
@@ -2276,6 +2075,7 @@ END
 
     #[cfg(target_os = "linux")]
     fn screen_text(session: &ShellSession) -> String {
+        use alacritty_terminal::index::Line;
         let term = session.term.lock();
         let mut text = String::new();
         for index in 0..24i32 {
@@ -2308,13 +2108,12 @@ END
             {
                 return pid;
             }
-            if started.elapsed() > Duration::from_secs(2) {
-                panic!(
-                    "pid file {} was not written\n{}",
-                    path.display(),
-                    screen_text(session)
-                );
-            }
+            assert!(
+                started.elapsed() <= Duration::from_secs(2),
+                "pid file {} was not written\n{}",
+                path.display(),
+                screen_text(session)
+            );
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -2366,9 +2165,11 @@ END
             {
                 return pid;
             }
-            if started.elapsed() > Duration::from_secs(2) {
-                panic!("pid file {} was not written", path.display());
-            }
+            assert!(
+                started.elapsed() <= Duration::from_secs(2),
+                "pid file {} was not written",
+                path.display()
+            );
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -2380,38 +2181,103 @@ END
         assert!(error.contains("Cannot enter"), "{error}");
     }
 
+    /// (`LANG`, `LC_ALL`, `LC_CTYPE`, `LANG` for the shell). A Dock launch has no
+    /// locale, so the shell gets UTF-8; a locale that is set is inherited.
     #[test]
-    fn term_name_prefers_alacritty_when_that_terminfo_exists() {
-        assert_eq!(term_name(true), "alacritty");
-        assert_eq!(term_name(false), "xterm-256color");
+    fn shell_env_names_the_terminal_and_fills_a_missing_locale() {
+        const UTF8: Option<&str> = Some("en_US.UTF-8");
+        #[rustfmt::skip]
+        let cases = [
+            (None, None, None, UTF8),
+            (Some(""), Some(""), Some(""), UTF8),
+            (Some("fr_FR.UTF-8"), None, None, None),
+            (None, Some("C"), None, None),
+            (None, None, UTF8, None),
+        ];
+        for (lang, lc_all, lc_ctype, given) in cases {
+            let env = shell_env(lang, lc_all, lc_ctype);
+            let case = format!("{lang:?} {lc_all:?} {lc_ctype:?}");
+            assert_eq!(env["TERM"], "xterm-256color", "{case}");
+            assert_eq!(env["COLORTERM"], "truecolor", "{case}");
+            assert_eq!(env.get("LANG").map(String::as_str), given, "{case}");
+        }
     }
 
+    /// (key, modifiers, application cursor mode, bytes), as xterm sends them.
+    /// A plain letter is text, not a key, so it sends nothing here.
     #[test]
-    fn ctrl_l_is_form_feed() {
-        assert_eq!(
-            letter_key(
-                Key::L,
-                Modifiers {
-                    ctrl: true,
-                    ..Modifiers::NONE
-                }
-            ),
-            Some(vec![0x0c])
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn shell_program_ignores_non_unicode_shell() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-        let raw = OsString::from_vec(vec![0xff]);
-        assert_eq!(
-            shell_argv(HostOs::Linux, Some(raw.as_os_str()), None, &[])
-                .expect("argv")
-                .program,
-            "/bin/sh"
-        );
+    fn keys_send_the_xterm_sequences() {
+        const NONE: Modifiers = Modifiers::NONE;
+        const SHIFT: Modifiers = Modifiers::SHIFT;
+        const ALT: Modifiers = Modifiers::ALT;
+        const CTRL: Modifiers = Modifiers::CTRL;
+        #[rustfmt::skip]
+        const KEYS: &[(Key, Modifiers, bool, &[u8])] = &[
+            (Key::Enter, NONE, false, b"\r"),
+            (Key::Enter, CTRL.plus(ALT).plus(SHIFT), false, b"\x1b[27;8;13~"),
+            (Key::Backspace, NONE, false, b"\x7f"),
+            (Key::Backspace, ALT, false, b"\x1b\x7f"),
+            (Key::Tab, NONE, false, b"\t"),
+            (Key::Tab, SHIFT, false, b"\x1b[Z"),
+            (Key::Tab, CTRL, false, b"\x1b[27;5;9~"),
+            (Key::Escape, NONE, false, b"\x1b"),
+            (Key::ArrowUp, NONE, false, b"\x1b[A"),
+            (Key::ArrowDown, NONE, true, b"\x1bOB"),
+            (Key::ArrowRight, NONE, false, b"\x1b[C"),
+            (Key::ArrowLeft, NONE, true, b"\x1bOD"),
+            (Key::ArrowLeft, CTRL, true, b"\x1b[1;5D"),
+            (Key::Home, NONE, false, b"\x1b[H"),
+            (Key::Home, NONE, true, b"\x1bOH"),
+            (Key::End, NONE, true, b"\x1bOF"),
+            (Key::End, NONE, false, b"\x1b[F"),
+            (Key::Home, CTRL, true, b"\x1b[1;5H"),
+            (Key::End, SHIFT, false, b"\x1b[1;2F"),
+            (Key::PageUp, NONE, false, b"\x1b[5~"),
+            (Key::PageDown, ALT, false, b"\x1b[6;3~"),
+            (Key::Delete, NONE, false, b"\x1b[3~"),
+            (Key::Insert, NONE, false, b"\x1b[2~"),
+            (Key::F1, NONE, true, b"\x1bOP"),
+            (Key::F1, SHIFT, false, b"\x1b[1;2P"),
+            (Key::F1, CTRL, false, b"\x1b[1;5P"),
+            (Key::F2, NONE, false, b"\x1bOQ"),
+            (Key::F2, SHIFT, false, b"\x1b[1;2Q"),
+            (Key::F3, NONE, false, b"\x1bOR"),
+            (Key::F4, NONE, false, b"\x1bOS"),
+            (Key::F4, SHIFT, false, b"\x1b[1;2S"),
+            (Key::F5, NONE, false, b"\x1b[15~"),
+            (Key::F6, NONE, false, b"\x1b[17~"),
+            (Key::F7, NONE, false, b"\x1b[18~"),
+            (Key::F8, NONE, false, b"\x1b[19~"),
+            (Key::F9, NONE, false, b"\x1b[20~"),
+            (Key::F10, NONE, false, b"\x1b[21~"),
+            (Key::F11, NONE, false, b"\x1b[23~"),
+            (Key::F12, CTRL.plus(SHIFT), false, b"\x1b[24;6~"),
+            (Key::A, CTRL.plus(ALT), false, b"\x1b\x01"),
+            (Key::B, ALT, false, b"\x1bb"),
+            (Key::B, ALT.plus(SHIFT), false, b"\x1bB"),
+            (Key::C, NONE, false, b""),
+            (Key::Space, NONE, false, b""),
+        ];
+        for &(key, modifiers, app_cursor, expected) in KEYS {
+            let bytes = encode_key(key, modifiers, app_cursor);
+            assert_eq!(
+                bytes.unwrap_or_default(),
+                expected,
+                "{key:?} {modifiers:?}, application cursor {app_cursor}"
+            );
+        }
+        // Ctrl and a letter is that letter's control code, A as 1 through Z as 26.
+        let letters: Vec<(Key, u8)> = Key::ALL
+            .iter()
+            .filter_map(|key| match key.name().as_bytes() {
+                [byte] if byte.is_ascii_uppercase() => Some((*key, byte - b'@')),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(letters.len(), 26);
+        for (key, code) in letters {
+            assert_eq!(letter_key(key, CTRL), Some(vec![code]), "Ctrl+{key:?}");
+        }
     }
 
     fn grid_metrics(cols: usize, rows: usize, cell_w: f32, cell_h: f32) -> Metrics {
@@ -2424,58 +2290,61 @@ END
         }
     }
 
+    /// At every scale each side is at least one cell of at least one pixel,
+    /// and its pixel product fits the `u16` alacritty stores it in.
     #[test]
     fn window_size_never_reports_a_zero_grid() {
-        let metrics = grid_metrics(80, 24, 8.0, 16.0);
-        for scale in [0.0_f32, -1.0, 2.0, f32::NAN, f32::INFINITY] {
-            let size = window_size(&metrics, scale);
-            assert!((1..=u16::MAX).contains(&size.num_cols), "cols at {scale}");
-            assert!((1..=u16::MAX).contains(&size.num_lines), "rows at {scale}");
-            assert!(pty_size_is_safe(size), "unsafe size at {scale}: {size:?}");
-        }
-
+        let fits = |cells: u16, px: u16| {
+            cells >= 1 && px >= 1 && u16::try_from(u32::from(cells) * u32::from(px)).is_ok()
+        };
+        let small = grid_metrics(80, 24, 8.0, 16.0);
         let huge = grid_metrics(1_000, 400, 1_000.0, 1_000.0);
-        let size = window_size(&huge, 10.0);
-        assert!(pty_size_is_safe(size), "{size:?}");
-        assert!(size.cell_width < 1_000, "cell width was not clamped");
+        for (metrics, scale) in [
+            (&small, 0.0_f32),
+            (&small, -1.0),
+            (&small, 2.0),
+            (&small, f32::NAN),
+            (&small, f32::INFINITY),
+            (&huge, 10.0),
+        ] {
+            let size = window_size(metrics, scale);
+            assert!(
+                fits(size.num_cols, size.cell_width) && fits(size.num_lines, size.cell_height),
+                "{scale}: {size:?}"
+            );
+        }
+        assert!(
+            window_size(&huge, 10.0).cell_width < 1_000,
+            "cell width was not clamped"
+        );
     }
 
     #[test]
     fn windows_shell_prefers_pwsh_then_windows_powershell() {
         let pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe";
         let powershell = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
-        let both = windows_shell_argv(
-            Some(r"C:\Program Files"),
-            Some(r"C:\Windows"),
-            Some(r".\powershell.exe"),
-            |path| path == pwsh || path == powershell,
-        )
+        let both = windows_shell_argv(Some(r"C:\Program Files"), Some(r"C:\Windows"), |path| {
+            path == pwsh || path == powershell
+        })
         .expect("pwsh");
         assert_eq!(both.program, pwsh);
         assert_eq!(both.args, ["-NoLogo"]);
+        assert_eq!(
+            conpty_program(&both.program),
+            r#""C:\Program Files\PowerShell\7\pwsh.exe""#
+        );
 
-        let second = windows_shell_argv(
-            Some(r"C:\Program Files"),
-            Some(r"C:\Windows"),
-            Some(r"C:\Windows\System32\cmd.exe"),
-            |path| path == powershell,
-        )
+        let second = windows_shell_argv(Some(r"C:\Program Files"), Some(r"C:\Windows"), |path| {
+            path == powershell
+        })
         .expect("powershell");
         assert_eq!(second.program, powershell);
         assert_eq!(second.args, ["-NoLogo"]);
 
-        let relative = windows_shell_argv(
-            Some(r"Program Files"),
-            Some("Windows"),
-            Some("powershell.exe"),
-            |_| true,
-        );
+        let relative = windows_shell_argv(Some(r"Program Files"), Some("Windows"), |_| true);
         assert!(relative.is_err(), "{relative:?}");
 
-        let missing =
-            windows_shell_argv(Some(r"C:\Program Files"), Some(r"C:\Windows"), None, |_| {
-                false
-            });
+        let missing = windows_shell_argv(Some(r"C:\Program Files"), Some(r"C:\Windows"), |_| false);
         assert!(missing.is_err(), "{missing:?}");
     }
 
@@ -2489,19 +2358,6 @@ END
         assert!(windows_taskkill_path(Some("Windows"), present).is_err());
         assert!(windows_taskkill_path(None, present).is_err());
         assert!(windows_taskkill_path(Some(r"C:\Windows"), |_| false).is_err());
-    }
-
-    #[test]
-    fn dock_launch_shell_gets_utf8_locale() {
-        let env = shell_env_from(false, None, None, None);
-        assert_eq!(env.get("LANG").map(String::as_str), Some("en_US.UTF-8"));
-
-        let kept = shell_env_from(false, Some("fr_FR.UTF-8"), None, None);
-        assert_eq!(kept.get("LANG"), None);
-        let lc_all = shell_env_from(false, None, Some("C"), None);
-        assert_eq!(lc_all.get("LANG"), None);
-        let lc_ctype = shell_env_from(false, None, None, Some("en_US.UTF-8"));
-        assert_eq!(lc_ctype.get("LANG"), None);
     }
 
     #[cfg(unix)]
@@ -2519,27 +2375,10 @@ END
         std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o755)).expect("mode 0755");
         let locked = locked.to_str().expect("utf-8 locked path");
         let next = next.to_str().expect("utf-8 next path");
-
-        let argv =
-            shell_argv(HostOs::Linux, Some(OsStr::new(locked)), Some(next), &[]).expect("argv");
-        assert_eq!(argv.program, next);
-        assert_ne!(argv.program, locked);
-
-        let macos = chosen_unix_shell_with(
-            HostOs::Macos,
-            Some(OsStr::new(locked)),
-            Some(locked),
-            |path| path == "/bin/zsh" || path == "/bin/sh",
-        );
-        assert_eq!(macos, "/bin/zsh");
-
-        let linux = chosen_unix_shell_with(
-            HostOs::Linux,
-            Some(OsStr::new("/no/such/shell")),
-            None,
-            |path| path == "/bin/sh",
-        );
-        assert_eq!(linux, "/bin/sh");
+        for (passwd, program) in [(next, next), (locked, FALLBACK)] {
+            let argv = shell_argv(Some(OsStr::new(locked)), Some(passwd), &[]);
+            assert_eq!(argv.program, program, "passwd shell {passwd}");
+        }
     }
 
     #[test]
@@ -2616,7 +2455,6 @@ END
         // "hi" is aGk= in standard base64.
         parser.advance(&mut term, b"\x1b]52;c;aGk=\x07");
         assert!(copies.lock().expect("clipboard").is_empty());
-        assert_eq!(term_config().osc52, Osc52::Disabled);
 
         let accepted = Arc::new(Mutex::new(Vec::new()));
         let mut copying = Term::new(
@@ -2634,103 +2472,353 @@ END
         assert_eq!(accepted.lock().expect("clipboard").as_slice(), ["hi"]);
     }
 
+    /// (case, new size, child exited, child alive, resize). Cell pixels are
+    /// rounded per scale, so a move from 1x to 2x is a new size. An unchanged
+    /// size never asks whether the child is alive: that reads `/proc`.
     #[test]
-    fn retina_cell_pixels_are_rounded_points() {
+    fn the_pty_takes_only_a_new_size_and_only_while_the_child_lives() {
         let metrics = grid_metrics(80, 24, 8.4, 16.0);
         let one = window_size(&metrics, 1.0);
         let two = window_size(&metrics, 2.0);
-        assert_eq!(two.cell_width, 17);
-        assert_eq!(two.num_cols, one.num_cols);
-        assert_ne!(two.cell_width, one.cell_width);
-        assert!(!same_window_size(one, two));
+        assert_eq!((two.num_cols, two.cell_width), (one.num_cols, 17));
+        let wider = WindowSize {
+            cell_width: 9,
+            ..one
+        };
+        for (case, size, exited, alive, resize) in [
+            ("same size", one, false, true, false),
+            ("2x", two, false, true, true),
+            ("wider cells", wider, false, true, true),
+            ("exited", two, true, true, false),
+            ("hung up", two, false, false, false),
+        ] {
+            let asked = std::cell::Cell::new(false);
+            let decided = should_resize(one, size, exited, || {
+                asked.set(true);
+                alive
+            });
+            assert_eq!(decided, resize, "{case}");
+            assert!(!(asked.get() && case == "same size"), "{case}");
+        }
+    }
+
+    /// Typing reaches the shell. Escape, Tab and the arrows belong to it too
+    /// (vim, completion, history), so they must not move focus out of the
+    /// terminal. Ctrl+Tab does, so the keyboard is never trapped.
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one live shell for every key; a shell per key would repeat its startup"
+    )]
+    fn focused_terminal_keeps_escape_tab_and_arrows_until_ctrl_tab() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let cwd = dir.path().to_owned();
+        let view_id = Id::unique("focus test");
+        // The user's prompt may use glyphs the test fonts lack.
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(Vec2::new(640.0, 320.0))
+            .with_step_dt(1.0 / 60.0)
+            .allow_missing_glyphs()
+            .build_ui_state(
+                move |ui, terminal: &mut Option<Terminal>| {
+                    let _ = ui.button("Above");
+                    let palette = super::super::theme::DEFAULT_THEME.palette;
+                    show(ui, terminal, &cwd, view_id, &palette);
+                },
+                None,
+            );
+        let started = std::time::Instant::now();
+        while !matches!(harness.state(), Some(Terminal::Live(_))) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "shell did not start"
+            );
+            harness.step();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let inside = Pos2::new(320.0, 200.0);
+        harness.hover_at(inside);
+        for pressed in [true, false] {
+            harness.event(Event::PointerButton {
+                pos: inside,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            });
+            harness.step();
+        }
+        harness.step();
+        let focused = |harness: &egui_kittest::Harness<'_, Option<Terminal>>| {
+            harness
+                .ctx
+                .memory(|memory| memory.has_focus(focus_id(view_id)))
+        };
+        assert!(focused(&harness), "a click focuses the terminal");
+        // Text and Enter reach the shell: only the command's output has 42.
+        harness.event(Event::Text("echo cthulhu-$((6 * 7))".to_owned()));
+        harness.key_press(Key::Enter);
+        let shown = |harness: &egui_kittest::Harness<'_, Option<Terminal>>| match harness.state() {
+            Some(Terminal::Live(session)) => {
+                let term = session.term.lock();
+                let cells = term.renderable_content().display_iter;
+                cells.map(|cell| cell.c).collect::<String>()
+            }
+            _ => String::new(),
+        };
+        while !shown(&harness).contains("cthulhu-42") {
+            let late = started.elapsed() > Duration::from_secs(10);
+            assert!(!late, "{}", shown(&harness));
+            harness.step();
+            thread::sleep(Duration::from_millis(10));
+        }
+        // A drag over the screen's top rows selects their text.
+        for (at, pressed) in [(Pos2::new(20.0, 40.0), true), (inside, false)] {
+            harness.hover_at(at);
+            harness.step();
+            harness.event(Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            });
+            harness.step();
+        }
+        let selected = match harness.state() {
+            Some(Terminal::Live(session)) => session.term.lock().selection_to_string(),
+            _ => None,
+        };
+        assert!(selected.is_some_and(|text| text.contains("cthulhu-42")));
+        for key in [Key::Escape, Key::Tab, Key::ArrowUp, Key::ArrowLeft] {
+            harness.key_press(key);
+            harness.step();
+            harness.step();
+            assert!(focused(&harness), "{key:?} moved focus out of the terminal");
+        }
+        for modifiers in [Modifiers::CTRL, Modifiers::CTRL | Modifiers::SHIFT] {
+            harness.key_press_modifiers(modifiers, Key::Tab);
+            harness.step();
+            harness.step();
+            assert!(
+                !focused(&harness),
+                "{modifiers:?}+Tab kept focus in the terminal"
+            );
+            assert!(
+                harness.ctx.memory(egui::Memory::focused).is_some(),
+                "{modifiers:?}+Tab dropped focus instead of moving it"
+            );
+            harness.hover_at(inside);
+            for pressed in [true, false] {
+                harness.event(Event::PointerButton {
+                    pos: inside,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                });
+                harness.step();
+            }
+            harness.step();
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn resize_after_shell_exit_does_not_kill_the_app() {
+    fn unset_names_ignore_values_and_names_that_are_not_unicode() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = |bytes: &[u8]| OsString::from_vec(bytes.to_vec());
+        let vars = [
+            (raw(b"GIT_DIR"), raw(b"\xff")),
+            (raw(b"LANG"), raw(b"\xff")),
+            (raw(b"GIT_\xff"), raw(b"x")),
+            (raw(b"GITHUB_TOKEN"), raw(b"\xff")),
+            (raw(b"GIT_SSH_COMMAND"), raw(b"ssh")),
+            // Another variable on Unix, which git and gh never read.
+            (raw(b"github_token"), raw(b"mine")),
+            (raw(b"git_prompt_style"), raw(b"short")),
+        ];
+        assert_eq!(vars_to_unset(vars), ["GITHUB_TOKEN", "GIT_DIR"]);
+    }
+
+    /// Colors the program did not set are this widget's. Programs such as vim
+    /// ask for the background (OSC 11) to pick light or dark colors, so an
+    /// unset color is answered with what is painted.
+    #[test]
+    fn unset_colors_paint_and_report_the_widgets_own() {
+        let palette = super::super::theme::DEFAULT_THEME.palette;
+        let unset = color::Colors::default();
+        for (color, expected) in [
+            (Color::Named(NamedColor::Foreground), palette.text),
+            (Color::Named(NamedColor::BrightForeground), palette.text),
+            (Color::Named(NamedColor::Cursor), palette.text),
+            (Color::Named(NamedColor::DimForeground), palette.text_muted),
+            (Color::Named(NamedColor::Background), palette.background),
+            (Color::Named(NamedColor::BrightWhite), ansi_color(15)),
+            (Color::Named(NamedColor::DimWhite), ansi_color(7)),
+            // The table, the corners of the 6x6x6 cube, one inner step on
+            // each axis (xterm's #5f87af), and the ends of the gray ramp.
+            (Color::Indexed(1), Color32::from_rgb(0xf7, 0x76, 0x8e)),
+            (Color::Indexed(16), Color32::from_rgb(0, 0, 0)),
+            (Color::Indexed(67), Color32::from_rgb(95, 135, 175)),
+            (Color::Indexed(231), Color32::from_rgb(255, 255, 255)),
+            (Color::Indexed(232), Color32::from_gray(8)),
+            (Color::Indexed(255), Color32::from_gray(238)),
+            (
+                Color::Spec(Rgb { r: 1, g: 2, b: 3 }),
+                Color32::from_rgb(1, 2, 3),
+            ),
+        ] {
+            assert_eq!(
+                resolve_color(color, &unset, &palette),
+                expected,
+                "{color:?}"
+            );
+        }
+
+        let rgb = |color: Color32| Rgb {
+            r: color.r(),
+            g: color.g(),
+            b: color.b(),
+        };
+        let set = Rgb { r: 1, g: 2, b: 3 };
+        let mut colors = color::Colors::default();
+        colors[NamedColor::Cursor] = Some(set);
+        colors[5] = Some(set);
+        for (index, expected) in [
+            (NamedColor::Foreground as usize, rgb(palette.text)),
+            (NamedColor::Background as usize, rgb(palette.background)),
+            (NamedColor::Cursor as usize, set),
+            (1, rgb(ansi_color(1))),
+            (5, set),
+        ] {
+            assert_eq!(
+                reported_color(&colors, index, &palette),
+                expected,
+                "{index}"
+            );
+        }
+    }
+
+    /// (column, row, wide, cell) for 8x16 cells from (100, 50). A wide
+    /// character takes two columns.
+    #[test]
+    fn cells_are_laid_out_from_the_origin() {
+        let metrics = grid_metrics(80, 24, 8.0, 16.0);
+        for (col, row, wide, [left, top, right]) in [
+            (0, 0, false, [100.0, 50.0, 108.0]),
+            (3, 2, false, [124.0, 82.0, 132.0]),
+            (3, 2, true, [124.0, 82.0, 140.0]),
+        ] {
+            let cell = cell_rect(Pos2::new(100.0, 50.0), &metrics, col, row, wide);
+            let expected = Rect::from_x_y_ranges(left..=right, top..=top + 16.0);
+            assert_eq!(cell, expected, "{col},{row} wide {wide}");
+        }
+    }
+
+    /// (pointer, row, column, grid line) on an 80x24 screen of 8x16 cells
+    /// at (100, 50), scrolled 2 lines back. Outside the screen the hit
+    /// clamps to the nearest cell.
+    #[test]
+    fn a_pointer_hits_the_cell_under_it() {
+        let metrics = grid_metrics(80, 24, 8.0, 16.0);
+        let rect = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(640.0, 390.0));
+        for (x, y, row, col, line) in [
+            (100.0, 50.0, 0, 0, -2),
+            (125.0, 90.0, 2, 3, 0),
+            (0.0, 0.0, 0, 0, -2),
+            (900.0, 437.0, 23, 79, 21),
+        ] {
+            let hit = hit_at(rect, Pos2::new(x, y), &metrics, 2);
+            let point = Point::new(alacritty_terminal::index::Line(line), Column(col));
+            assert_eq!((hit.row, hit.col, hit.point), (row, col, point), "{x},{y}");
+        }
+    }
+
+    /// (box height, prompt rows, top of the screen, repaint), with 16-point
+    /// rows in a box whose top is at 100. The block starts at the top of the
+    /// box; a box more than half a row off its height asks for a frame.
+    #[test]
+    fn the_preview_puts_the_prompt_block_at_the_top() {
+        for (height, span, top, repaint) in [
+            (32.0, 0..2, 100.0, false),
+            (32.0, 3..5, 52.0, false),
+            (40.0, 3..5, 52.0, false),
+            (48.0, 3..5, 52.0, true),
+            (16.0, 3..5, 52.0, true),
+        ] {
+            let visible = Rect::from_min_size(Pos2::new(10.0, 100.0), Vec2::new(200.0, height));
+            let placed = place_prompt(visible, &span, 16.0);
+            let case = format!("{height} {span:?}");
+            assert_eq!(placed, (Pos2::new(10.0, top), repaint), "{case}");
+        }
+    }
+
+    /// The Settings preview runs a real shell, on a screen taller than its
+    /// box so a long prompt is not scrolled away, and draws its prompt.
+    #[cfg(unix)]
+    #[test]
+    fn the_preview_draws_the_prompt_of_a_tall_shell() {
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let ctx = egui::Context::default();
-        let metrics = test_metrics();
-        let mut session = match ShellSession::spawn(dir.path(), &ctx, &metrics) {
-            Ok(session) => session,
-            Err(error) => panic!("{error}"),
-        };
-        session.write(b"exit\n");
+        let cwd = dir.path().to_owned();
+        // The user's prompt may use glyphs the test fonts lack.
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(Vec2::new(640.0, 120.0))
+            .with_step_dt(1.0 / 60.0)
+            .allow_missing_glyphs()
+            .build_ui_state(
+                move |ui, terminal: &mut Option<Terminal>| {
+                    let palette = super::super::theme::DEFAULT_THEME.palette;
+                    show_preview(ui, terminal, &cwd, &palette);
+                },
+                None,
+            );
         let started = std::time::Instant::now();
-        let mut saw_exit = false;
-        while started.elapsed() < Duration::from_secs(3) {
-            if session.poll(&ctx) || session.child_exited || !unix_child_is_alive(session.pid) {
-                saw_exit = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert!(saw_exit, "shell did not exit");
-        let pid = std::process::id();
-        let mut bigger = metrics.clone();
-        bigger.cols = 100;
-        bigger.rows = 40;
-        session.resize(&bigger, 2.0);
-        session.resize(&bigger, 1.0);
-        assert_eq!(std::process::id(), pid);
-        drop(session);
-    }
-
-    fn prompt_on_screen(columns: usize, screen_lines: usize, bytes: &[u8]) -> Range<usize> {
-        let grid = GridSize {
-            columns,
-            screen_lines,
+        let prompt = |harness: &egui_kittest::Harness<'_, Option<Terminal>>| {
+            let texts = crate::ui::test_support::painted_texts(harness);
+            texts
+                .iter()
+                .any(|(_, galley)| galley.text() != "Starting shell…")
         };
-        let mut term = Term::new(
-            term_config(),
-            &grid,
-            alacritty_terminal::event::VoidListener,
-        );
-        let mut parser = alacritty_terminal::vte::ansi::Processor::<
-            alacritty_terminal::vte::ansi::StdSyncHandler,
-        >::new();
-        parser.advance(&mut term, bytes);
-        prompt_span(&term)
-    }
-
-    #[test]
-    fn prompt_span_keeps_a_one_line_prompt() {
-        assert_eq!(prompt_on_screen(40, 16, b"$ "), 0..1);
-    }
-
-    #[test]
-    fn prompt_span_skips_the_blank_line_above_a_two_line_prompt() {
-        let bytes = b"\r\n~/repo on main\r\n> ";
-        assert_eq!(prompt_on_screen(40, 16, bytes), 1..3);
-    }
-
-    #[test]
-    fn prompt_span_counts_a_colored_space() {
-        let bytes = b"\x1b[41m \x1b[0m\r\n>";
-        assert_eq!(prompt_on_screen(40, 16, bytes), 0..2);
-    }
-
-    #[test]
-    fn prompt_span_counts_an_inverse_space() {
-        let bytes = b"\x1b[7m \x1b[0m\r\n>";
-        assert_eq!(prompt_on_screen(40, 16, bytes), 0..2);
-    }
-
-    #[test]
-    fn prompt_span_keeps_the_rows_nearest_the_cursor() {
-        let mut bytes = Vec::new();
-        for row in 0..10 {
-            if row > 0 {
-                bytes.extend_from_slice(b"\r\n");
-            }
-            bytes.push(b'x');
+        while !prompt(&harness) {
+            assert!(started.elapsed() < Duration::from_secs(5), "no prompt");
+            harness.step();
+            thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(prompt_on_screen(8, 16, &bytes), 2..10);
+        let Some(Terminal::Live(session)) = harness.state() else {
+            panic!("the preview has no live shell");
+        };
+        assert_eq!(session.term.lock().screen_lines(), PREVIEW_SCREEN_ROWS);
     }
 
+    /// (case, screen columns, bytes, prompt rows). A blank row ends the
+    /// prompt above the cursor; a colored or inverse space does not. A block
+    /// taller than the preview keeps the rows nearest the cursor.
     #[test]
-    fn prompt_span_stops_at_a_blank_line_above_the_prompt() {
-        let bytes = b"hello\r\n\r\n$ ";
-        assert_eq!(prompt_on_screen(40, 16, bytes), 2..3);
+    fn prompt_span_is_the_block_that_ends_at_the_cursor() {
+        #[rustfmt::skip]
+        let cases: [(&str, usize, &[u8], Range<usize>); 6] = [
+            ("one-line prompt", 40, b"$ ", 0..1),
+            ("blank line above", 40, b"\r\n~/repo on main\r\n> ", 1..3),
+            ("colored space", 40, b"\x1b[41m \x1b[0m\r\n>", 0..2),
+            ("inverse space", 40, b"\x1b[7m \x1b[0m\r\n>", 0..2),
+            ("ten rows", 8, b"x\r\nx\r\nx\r\nx\r\nx\r\nx\r\nx\r\nx\r\nx\r\nx", 2..10),
+            ("output, blank, prompt", 40, b"hello\r\n\r\n$ ", 2..3),
+        ];
+        for (case, columns, bytes, expected) in cases {
+            let grid = GridSize {
+                columns,
+                screen_lines: 16,
+            };
+            let mut term = Term::new(
+                term_config(),
+                &grid,
+                alacritty_terminal::event::VoidListener,
+            );
+            let mut parser = alacritty_terminal::vte::ansi::Processor::<
+                alacritty_terminal::vte::ansi::StdSyncHandler,
+            >::new();
+            parser.advance(&mut term, bytes);
+            assert_eq!(prompt_span(&term), expected, "{case}");
+        }
     }
 }

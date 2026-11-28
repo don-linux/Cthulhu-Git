@@ -6,115 +6,88 @@
 //! child is reparented to init and walking `PPid` no longer reaches the git
 //! process.
 
-#[cfg(unix)]
 use std::collections::HashMap;
 
+use rustix::process::{Pid, Signal};
+
 /// How far to walk `PPid` before giving up. A cycle must not spin.
-#[cfg(unix)]
 const MAX_PPID_STEPS: usize = 64;
 
-/// Kill `pid`'s descendants, then its process group.
+/// Kill `pid`'s descendants, then its process group, while `pid` has not been
+/// reaped yet, so the number still names that process.
 ///
 /// Descendants are signaled first, and twice: a child can fork in between the
 /// two snapshots. The parent is still alive for both, so a `setsid` grandchild
 /// is not reparented to init before its pid is recorded.
 pub fn reap_process_tree(pid: u32) {
-    #[cfg(unix)]
-    {
-        reap_unix(pid);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-    }
-}
-
-#[cfg(unix)]
-fn reap_unix(pid: u32) {
-    // pid 0, init, this process, and this process's group are never signaled.
-    let Some(leader) = group_leader(pid) else {
+    let Some(leader) = signalable(pid) else {
         return;
     };
-
     kill_descendants(pid);
     // A fork that lands after the first snapshot is still a child of `pid`.
     // Record it before the parent is killed, or that child is reparented to init.
     kill_descendants(pid);
+    kill_group_of(leader);
+}
 
-    // `group_leader` already rejected our group. Check again at the signal:
+/// Kill the process group that `pid` led, after `pid` has exited and been
+/// reaped. Walking `PPid` would no longer find its descendants, and could
+/// find those of an unrelated process that got the number, so only the group
+/// is signaled.
+pub(crate) fn kill_group(pid: u32) {
+    if let Some(leader) = signalable(pid) {
+        kill_group_of(leader);
+    }
+}
+
+fn kill_group_of(leader: Pid) {
+    // `signalable` already rejected our group. Check again at the signal:
     // this call must not kill the caller's group.
     if leader == rustix::process::getpgrp() {
         return;
     }
     // `getpgid` succeeds when this pid has been recycled and returns the new
     // process's group. That id is no longer the git group, so do not signal it.
-    // ESRCH is not that case: reap runs after the leader has exited, and
-    // grandchildren can still be in the group. A free pid makes `getpgid`
-    // return ESRCH; a recycled one makes it succeed.
+    // ESRCH is not that case: the leader may have exited while grandchildren
+    // are still in the group. A free pid makes `getpgid` return ESRCH; a
+    // recycled one makes it succeed.
     if let Ok(pgid) = rustix::process::getpgid(Some(leader))
         && pgid != leader
     {
         return;
     }
-    let _ = rustix::process::kill_process_group(leader, rustix::process::Signal::KILL);
+    let _ = rustix::process::kill_process_group(leader, Signal::KILL);
 }
 
-#[cfg(unix)]
-fn group_leader(pid: u32) -> Option<rustix::process::Pid> {
-    if pid == 0 || pid == 1 {
+/// `pid` when this process may signal it: never 0, init, this process, or
+/// this process's group.
+fn signalable(pid: u32) -> Option<Pid> {
+    if pid <= 1 {
         return None;
     }
-    let raw = i32::try_from(pid).ok()?;
-    let parsed = rustix::process::Pid::from_raw(raw)?;
-    if parsed == rustix::process::getpid() || parsed == rustix::process::getpgrp() {
-        return None;
-    }
-    Some(parsed)
+    let parsed = Pid::from_raw(i32::try_from(pid).ok()?)?;
+    (parsed != rustix::process::getpid() && parsed != rustix::process::getpgrp()).then_some(parsed)
 }
 
-#[cfg(unix)]
 fn kill_descendants(root: u32) {
-    let self_pid = rustix::process::getpid();
-    for pid in descendant_pids(root) {
-        if pid <= 1 {
-            continue;
-        }
-        let Ok(raw) = i32::try_from(pid) else {
-            continue;
-        };
-        let Some(parsed) = rustix::process::Pid::from_raw(raw) else {
-            continue;
-        };
-        if parsed == self_pid {
-            continue;
-        }
-        let _ = rustix::process::kill_process(parsed, rustix::process::Signal::KILL);
-    }
-}
-
-#[cfg(unix)]
-fn descendant_pids(root: u32) -> Vec<u32> {
     let ppids = snapshot_ppids();
-    let pids: Vec<u32> = ppids.keys().copied().collect();
-    pids.into_iter()
-        .filter(|&pid| is_descendant(pid, root, &ppids))
-        .collect()
+    for &pid in ppids.keys() {
+        if is_descendant(pid, root, &ppids)
+            && let Some(pid) = signalable(pid)
+        {
+            let _ = rustix::process::kill_process(pid, Signal::KILL);
+        }
+    }
 }
 
 /// `start` is a descendant of `root` when following `PPid` reaches `root` in
-/// at most [`MAX_PPID_STEPS`] hops. A repeated pid is a cycle and stops the walk.
-#[cfg(unix)]
+/// at most [`MAX_PPID_STEPS`] hops, which also ends a cycle.
 fn is_descendant(start: u32, root: u32, ppids: &HashMap<u32, u32>) -> bool {
     if start == root {
         return false;
     }
     let mut current = start;
-    let mut seen = Vec::with_capacity(MAX_PPID_STEPS);
     for _ in 0..MAX_PPID_STEPS {
-        if seen.contains(&current) {
-            return false;
-        }
-        seen.push(current);
         let Some(&parent) = ppids.get(&current) else {
             return false;
         };
@@ -141,10 +114,10 @@ fn snapshot_ppids() -> HashMap<u32, u32> {
         let Ok(pid) = name.parse::<u32>() else {
             continue;
         };
-        let Some(ppid) = ppid_from_status(pid) else {
+        let Some(parent) = ppid_from_status(pid) else {
             continue;
         };
-        ppids.insert(pid, ppid);
+        ppids.insert(pid, parent);
     }
     ppids
 }
@@ -162,6 +135,10 @@ fn ppid_from_status(pid: u32) -> Option<u32> {
 /// cannot take a new dependency to decode it. `/bin/ps` is absolute so `PATH`
 /// cannot select a different binary.
 #[cfg(target_os = "macos")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "`/bin/ps` by absolute path, not git"
+)]
 fn snapshot_ppids() -> HashMap<u32, u32> {
     let mut ppids = HashMap::new();
     let Ok(output) = std::process::Command::new("/bin/ps")
@@ -181,24 +158,28 @@ fn snapshot_ppids() -> HashMap<u32, u32> {
         let Some(pid) = parts.next().and_then(|part| part.parse::<u32>().ok()) else {
             continue;
         };
-        let Some(ppid) = parts.next().and_then(|part| part.parse::<u32>().ok()) else {
+        let Some(parent) = parts.next().and_then(|part| part.parse::<u32>().ok()) else {
             continue;
         };
-        ppids.insert(pid, ppid);
+        ppids.insert(pid, parent);
     }
     ppids
 }
 
-/// No portable snapshot. [`reap_unix`] still signals the process group.
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+/// No portable snapshot. [`reap_process_tree`] still signals the process group.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn snapshot_ppids() -> HashMap<u32, u32> {
     HashMap::new()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     #[test]
-    fn reap_returns_after_the_leader_has_exited() {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a short-lived process to reap, not git"
+    )]
+    fn killing_the_group_after_the_leader_has_exited_returns() {
         let mut child = std::process::Command::new("true")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -217,6 +198,6 @@ mod tests {
         // ESRCH must not skip the group signal: an exited leader can still
         // have grandchildren. `kill_process_group` is a no-op when the group
         // is already empty, which is this `true` process.
-        super::reap_process_tree(pid);
+        super::kill_group(pid);
     }
 }

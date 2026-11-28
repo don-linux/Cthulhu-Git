@@ -1,17 +1,17 @@
 //! The optional GitHub token: read-only, kept in the system keychain, never
 //! in `settings.json`, logs or the accessibility tree.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 const KEYRING_SERVICE: &str = "io.github.don-linux.cthulhu-git";
 const KEYRING_USER: &str = "github.com";
@@ -22,15 +22,12 @@ const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// chosen (GitHub's documented template parameters).
 pub const TOKEN_TEMPLATE_URL: &str = "https://github.com/settings/personal-access-tokens/new?name=Cthulhu+Git&description=Read-only+access+for+Cthulhu+Git&expires_in=90&contents=read";
 
-/// A GitHub token. `Debug` does not print it.
+/// A GitHub token. `Debug` does not print it, and its memory is wiped when
+/// it is dropped.
 #[derive(Clone, PartialEq, Eq)]
-pub struct Token(String);
+pub struct Token(Zeroizing<String>);
 
 impl Token {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
     /// Trims pasted text. Refuses anything that cannot be a token: too short
     /// or long, or with spaces, control or non-ASCII characters inside.
     pub fn parse(input: &str) -> Option<Self> {
@@ -39,7 +36,7 @@ impl Token {
             && value
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
-        plausible.then(|| Self(value.to_owned()))
+        plausible.then(|| Self(Zeroizing::new(value.to_owned())))
     }
 
     pub fn expose(&self) -> &str {
@@ -53,36 +50,21 @@ impl fmt::Debug for Token {
     }
 }
 
-impl Drop for Token {
-    fn drop(&mut self) {
-        self.0.zeroize();
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TokenStoreError {
     /// No keychain or Secret Service to talk to. The token can still be used
     /// for this session.
+    #[error("No system keychain is available ({0}).")]
     Unavailable(String),
     /// The keychain exists but did not answer: it is locked, or the call
     /// passed the deadline. A token already stored is left in place.
+    #[error("The system keychain did not answer ({0}).")]
     Locked(String),
+    #[error("The system keychain refused the request ({0}).")]
     Failed(String),
 }
 
-impl fmt::Display for TokenStoreError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unavailable(detail) => write!(f, "No system keychain is available ({detail})."),
-            Self::Locked(detail) => write!(f, "The system keychain did not answer ({detail})."),
-            Self::Failed(detail) => {
-                write!(f, "The system keychain refused the request ({detail}).")
-            }
-        }
-    }
-}
-
-fn store_error(error: keyring::Error) -> TokenStoreError {
+fn store_error(error: &keyring::Error) -> TokenStoreError {
     match error {
         keyring::Error::NoDefaultStore | keyring::Error::NotSupportedByStore(_) => {
             TokenStoreError::Unavailable(error.to_string())
@@ -94,592 +76,279 @@ fn store_error(error: keyring::Error) -> TokenStoreError {
     }
 }
 
-/// `true` for every `cargo test` build and when `CTHULHU_KEYRING=sample`.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The token's entry in a credential store, reached through one worker thread.
 ///
-/// `keyring` 4.2 exposes `use_sample_store` only behind the `cli` feature,
-/// which also links the native stores, and `Entry::new` installs the OS
-/// store on first use. This process-local store is installed instead, before
-/// any `Entry::new`, so tests never build the macOS keychain, Windows
-/// Credential Manager, or Linux Secret Service.
-fn sample_store_requested() -> bool {
-    #[cfg(test)]
-    {
-        true
-    }
-    #[cfg(not(test))]
-    {
-        std::env::var_os("CTHULHU_KEYRING").is_some_and(|value| value == "sample")
-    }
+/// Every call runs on that thread in the order it was made, so a save that
+/// wakes up late cannot land after a newer delete. A caller waits at most
+/// `timeout`, then the call is cancelled: a save not written yet is skipped,
+/// and one written late puts back the value it replaced, because its caller
+/// was told the token is not saved.
+pub struct Keychain {
+    jobs: Result<Sender<Job>, TokenStoreError>,
+    timeout: Duration,
 }
 
-fn install_sample_store() {
-    // The map is a static, so it exists before the flag. The flag is what a
-    // test observes: `load_token` must have chosen this store, not `Entry::new`.
-    SAMPLE_READY.store(true, Ordering::SeqCst);
-}
-
-fn native_entry() -> Result<keyring::Entry, TokenStoreError> {
-    #[cfg(test)]
-    {
-        NATIVE_ENTRY_BUILDS.fetch_add(1, Ordering::SeqCst);
+impl Keychain {
+    /// Starts the worker. `open` builds the entry on it, because opening a
+    /// native store can block (the Secret Service answers over D-Bus).
+    pub fn new(
+        open: impl FnOnce() -> Result<keyring::Entry, TokenStoreError> + Send + 'static,
+        timeout: Duration,
+    ) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let jobs = thread::Builder::new()
+            .name("keychain".to_owned())
+            .spawn(move || work(open().as_ref(), &receiver))
+            .map(|_| sender)
+            .map_err(|error| {
+                TokenStoreError::Unavailable(format!(
+                    "could not start the keychain worker: {error}"
+                ))
+            });
+        Self { jobs, timeout }
     }
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(store_error)
-}
 
-fn lock<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Blocks on the keychain; call it off the UI thread. `None` when nothing is stored.
-/// A stored value that is not a token is an error, not "nothing stored", so
-/// the settings keep pointing at the keychain.
-pub fn load_token() -> Result<Option<Token>, TokenStoreError> {
-    match dispatch(Kind::Load, keychain_timeout())? {
-        KeychainReply::Loaded(result) => result,
-        KeychainReply::Finished(_) => Err(TokenStoreError::Failed(
-            "the keychain worker returned the wrong result".to_owned(),
-        )),
+    /// Blocks; call it off the UI thread. `None` when nothing is stored. A
+    /// stored value that is not a token is an error, not "nothing stored", so
+    /// the settings keep pointing at the keychain.
+    pub fn load(&self) -> Result<Option<Token>, TokenStoreError> {
+        self.call(Job::Load)
     }
-}
 
-pub fn save_token(token: &Token) -> Result<(), TokenStoreError> {
-    match dispatch(Kind::Save(token.clone()), keychain_timeout())? {
-        KeychainReply::Finished(result) => result,
-        KeychainReply::Loaded(_) => Err(TokenStoreError::Failed(
-            "the keychain worker returned the wrong result".to_owned(),
-        )),
+    pub fn save(&self, token: &Token) -> Result<(), TokenStoreError> {
+        let token = token.clone();
+        self.call(|ticket| Job::Save(token, ticket)).map(|_| ())
     }
-}
 
-/// Removing a token that is not there succeeds.
-pub fn delete_token() -> Result<(), TokenStoreError> {
-    match dispatch(Kind::Delete, keychain_timeout())? {
-        KeychainReply::Finished(result) => result,
-        KeychainReply::Loaded(_) => Err(TokenStoreError::Failed(
-            "the keychain worker returned the wrong result".to_owned(),
-        )),
+    /// Removing a token that is not there succeeds.
+    pub fn delete(&self) -> Result<(), TokenStoreError> {
+        self.call(Job::Delete).map(|_| ())
     }
-}
 
-fn keychain_timeout() -> Duration {
-    #[cfg(test)]
-    {
-        if let Some(timeout) = *lock(&TIMEOUT_OVERRIDE) {
-            return timeout;
-        }
-    }
-    KEYCHAIN_TIMEOUT
-}
-
-/// One worker, one generation per call. A caller that hits the deadline marks
-/// its generation cancelled. The worker is the only thread that talks to the
-/// store, so a `set_password` that wakes up late cannot run after a newer
-/// delete, and a cancelled save puts back whatever was stored before it.
-fn dispatch(kind: Kind, timeout: Duration) -> Result<KeychainReply, TokenStoreError> {
-    if sample_store_requested() {
-        install_sample_store();
-    }
-    let generation = NEXT_GENERATION.fetch_add(1, Ordering::SeqCst);
-    let (sender, receiver) = mpsc::channel();
-    enqueue(Job {
-        generation,
-        kind,
-        reply: sender,
-    })?;
-    match receiver.recv_timeout(timeout) {
-        Ok(reply) => {
-            {
-                let mut book = lock(&COMMIT);
-                take_generation(&mut book.committed, generation);
-            }
-            Ok(reply)
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            let committed = {
-                let mut book = lock(&COMMIT);
-                if take_generation(&mut book.committed, generation) {
-                    true
-                } else {
-                    book.cancelled.push(generation);
-                    false
+    fn call(&self, job: impl FnOnce(Ticket) -> Job) -> Result<Option<Token>, TokenStoreError> {
+        let jobs = self.jobs.as_ref().map_err(Clone::clone)?;
+        let state = Arc::new(Mutex::new(State::Waiting));
+        let (reply, answer) = mpsc::channel();
+        jobs.send(job(Ticket {
+            state: Arc::clone(&state),
+            reply,
+        }))
+        .map_err(|_| worker_stopped())?;
+        match answer.recv_timeout(self.timeout) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                let mut state = lock(&state);
+                if *state == State::Answered {
+                    // Answered as the deadline passed; the reply is in the channel.
+                    drop(state);
+                    return answer.try_recv().map_err(|_| worker_stopped())?;
                 }
-            };
-            if committed {
-                receiver.recv_timeout(Duration::from_secs(1)).map_err(|_| {
-                    TokenStoreError::Unavailable("the keychain worker stopped".to_owned())
-                })
-            } else {
+                *state = State::Cancelled;
                 Err(TokenStoreError::Locked(
                     "the keychain did not answer in time".to_owned(),
                 ))
             }
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(TokenStoreError::Unavailable(
-            "the keychain worker stopped".to_owned(),
-        )),
-    }
-}
-
-fn enqueue(job: Job) -> Result<(), TokenStoreError> {
-    {
-        let mut status = lock(&WORKER_STATUS);
-        status.queued += 1;
-        WORKER_STATUS_CV.notify_all();
-    }
-    if worker_sender()?.send(job).is_err() {
-        let mut status = lock(&WORKER_STATUS);
-        status.queued = status.queued.saturating_sub(1);
-        return Err(TokenStoreError::Unavailable(
-            "the keychain worker stopped".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn worker_sender() -> Result<&'static Sender<Job>, TokenStoreError> {
-    static SENDER: OnceLock<Sender<Job>> = OnceLock::new();
-    if let Some(sender) = SENDER.get() {
-        return Ok(sender);
-    }
-    let (sender, receiver) = mpsc::channel();
-    thread::Builder::new()
-        .name("keychain".to_owned())
-        .spawn(move || worker_loop(receiver))
-        .map_err(|error| {
-            TokenStoreError::Unavailable(format!("could not start the keychain worker: {error}"))
-        })?;
-    match SENDER.set(sender) {
-        Ok(()) => SENDER.get().ok_or_else(|| {
-            TokenStoreError::Unavailable("the keychain worker is missing".to_owned())
-        }),
-        Err(extra) => {
-            // Another thread published the sender first. Dropping this one
-            // disconnects the spare worker so it exits.
-            drop(extra);
-            SENDER.get().ok_or_else(|| {
-                TokenStoreError::Unavailable("the keychain worker is missing".to_owned())
-            })
+            Err(RecvTimeoutError::Disconnected) => Err(worker_stopped()),
         }
     }
 }
 
-fn worker_loop(incoming: Receiver<Job>) {
-    while let Ok(job) = incoming.recv() {
-        {
-            let mut status = lock(&WORKER_STATUS);
-            status.queued = status.queued.saturating_sub(1);
-            status.running = true;
+fn worker_stopped() -> TokenStoreError {
+    TokenStoreError::Unavailable("the keychain worker stopped".to_owned())
+}
+
+type Reply = Result<Option<Token>, TokenStoreError>;
+
+enum Job {
+    Load(Ticket),
+    Save(Token, Ticket),
+    Delete(Ticket),
+}
+
+/// What the caller and the worker share for one call.
+struct Ticket {
+    state: Arc<Mutex<State>>,
+    reply: Sender<Reply>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+    Waiting,
+    Answered,
+    Cancelled,
+}
+
+impl Ticket {
+    fn cancelled(&self) -> bool {
+        *lock(&self.state) == State::Cancelled
+    }
+
+    /// Sends `result` unless the caller gave up. `false` when it did.
+    fn answer(&self, result: Reply) -> bool {
+        let mut state = lock(&self.state);
+        if *state == State::Cancelled {
+            return false;
         }
-        let Job {
-            generation,
-            kind,
-            reply,
-        } = job;
-        let performed = match &kind {
-            Kind::Load => Performed::Load(perform_load()),
-            Kind::Save(token) => perform_save(generation, token),
-            Kind::Delete => Performed::Delete(delete_secret()),
+        *state = State::Answered;
+        let _ = self.reply.send(result);
+        true
+    }
+}
+
+fn work(entry: Result<&keyring::Entry, &TokenStoreError>, jobs: &Receiver<Job>) {
+    for job in jobs {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                let (Job::Load(ticket) | Job::Save(_, ticket) | Job::Delete(ticket)) = job;
+                ticket.answer(Err(error.clone()));
+                continue;
+            }
         };
-        let answer = settle(generation, performed);
-        {
-            let mut status = lock(&WORKER_STATUS);
-            status.running = false;
-            WORKER_STATUS_CV.notify_all();
+        match job {
+            Job::Load(ticket) => {
+                ticket.answer(read(entry).and_then(|stored| {
+                    stored
+                        .map(|value| {
+                            Token::parse(&value).ok_or_else(|| {
+                                TokenStoreError::Failed("the saved value is not a token".to_owned())
+                            })
+                        })
+                        .transpose()
+                }));
+            }
+            Job::Save(token, ticket) => save(entry, &token, &ticket),
+            Job::Delete(ticket) => {
+                ticket.answer(delete(entry).map(|()| None));
+            }
         }
-        let _ = reply.send(answer);
     }
 }
 
-fn perform_load() -> Result<Option<Token>, TokenStoreError> {
-    match read_secret()? {
-        Some(value) => Token::parse(&value)
-            .map(Some)
-            .ok_or_else(|| TokenStoreError::Failed("the saved value is not a token".to_owned())),
-        None => Ok(None),
-    }
-}
-
-fn perform_save(generation: u64, token: &Token) -> Performed {
-    let previous = match read_secret() {
-        Ok(value) => value,
+fn save(entry: &keyring::Entry, token: &Token, ticket: &Ticket) {
+    let previous = match read(entry) {
+        Ok(previous) => previous,
         Err(error) => {
-            return Performed::Save {
-                result: Err(error),
-                previous: None,
-            };
-        }
-    };
-    // The deadline already fired and nothing has been written. Skipping the
-    // write leaves the previous secret where it was.
-    if !still_current(generation) {
-        return Performed::Save {
-            result: Err(discarded_error()),
-            previous: None,
-        };
-    }
-    Performed::Save {
-        result: write_secret(token.expose()),
-        previous,
-    }
-}
-
-fn still_current(generation: u64) -> bool {
-    !lock(&COMMIT).cancelled.contains(&generation)
-}
-
-fn settle(generation: u64, performed: Performed) -> KeychainReply {
-    let cancelled = {
-        let mut book = lock(&COMMIT);
-        if take_generation(&mut book.cancelled, generation) {
-            true
-        } else {
-            book.committed.push(generation);
-            false
-        }
-    };
-    match performed {
-        Performed::Load(result) => {
-            if cancelled {
-                KeychainReply::Loaded(Err(discarded_error()))
-            } else {
-                KeychainReply::Loaded(result)
-            }
-        }
-        Performed::Save { result, previous } => {
-            if cancelled {
-                // The password may already have been replaced while the
-                // prompt was up. Put the previous value back before any
-                // newer save or delete runs.
-                if result.is_ok() {
-                    revert_save(previous);
-                }
-                KeychainReply::Finished(Err(discarded_error()))
-            } else {
-                KeychainReply::Finished(result)
-            }
-        }
-        Performed::Delete(result) => {
-            if cancelled {
-                KeychainReply::Finished(Err(discarded_error()))
-            } else {
-                KeychainReply::Finished(result)
-            }
-        }
-    }
-}
-
-fn discarded_error() -> TokenStoreError {
-    TokenStoreError::Locked("the keychain result belonged to an older request".to_owned())
-}
-
-fn revert_save(previous: Option<Zeroizing<String>>) {
-    let reverted = match &previous {
-        Some(old) => write_secret(old),
-        None => delete_secret(),
-    };
-    // The caller has already moved on. A newer queued request still runs
-    // after this and is the value that sticks.
-    let _ = reverted;
-}
-
-fn read_secret() -> Result<Option<Zeroizing<String>>, TokenStoreError> {
-    if sample_store_requested() {
-        install_sample_store();
-        return sample_get();
-    }
-    match native_entry()?.get_password() {
-        Ok(value) => Ok(Some(Zeroizing::new(value))),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(store_error(error)),
-    }
-}
-
-fn write_secret(password: &str) -> Result<(), TokenStoreError> {
-    if sample_store_requested() {
-        install_sample_store();
-        #[cfg(test)]
-        wait_if_set_gate_closed();
-        sample_set(password);
-        return Ok(());
-    }
-    native_entry()?.set_password(password).map_err(store_error)
-}
-
-fn delete_secret() -> Result<(), TokenStoreError> {
-    if sample_store_requested() {
-        install_sample_store();
-        sample_delete();
-        return Ok(());
-    }
-    match native_entry()?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(store_error(error)),
-    }
-}
-
-fn sample_get() -> Result<Option<Zeroizing<String>>, TokenStoreError> {
-    let store = lock(&SAMPLE);
-    Ok(store.password.clone().map(Zeroizing::new))
-}
-
-fn sample_set(password: &str) {
-    let mut store = lock(&SAMPLE);
-    if let Some(mut old) = store.password.replace(password.to_owned()) {
-        old.zeroize();
-    }
-    #[cfg(test)]
-    store.mutations.push("set");
-}
-
-fn sample_delete() {
-    let mut store = lock(&SAMPLE);
-    if let Some(mut old) = store.password.take() {
-        old.zeroize();
-    }
-    #[cfg(test)]
-    store.mutations.push("delete");
-}
-
-struct SampleStore {
-    password: Option<String>,
-    #[cfg(test)]
-    mutations: Vec<&'static str>,
-}
-
-static SAMPLE_READY: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
-static NATIVE_ENTRY_BUILDS: AtomicU64 = AtomicU64::new(0);
-static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-static SAMPLE: Mutex<SampleStore> = Mutex::new(SampleStore {
-    password: None,
-    #[cfg(test)]
-    mutations: Vec::new(),
-});
-
-struct CommitBook {
-    // A handful of in-flight generations. `Vec::new` is const, so this can live
-    // in a static without a lazy initializer.
-    cancelled: Vec<u64>,
-    committed: Vec<u64>,
-}
-
-static COMMIT: Mutex<CommitBook> = Mutex::new(CommitBook {
-    cancelled: Vec::new(),
-    committed: Vec::new(),
-});
-
-fn take_generation(values: &mut Vec<u64>, generation: u64) -> bool {
-    let Some(index) = values.iter().position(|value| *value == generation) else {
-        return false;
-    };
-    values.swap_remove(index);
-    true
-}
-
-struct WorkerStatus {
-    queued: usize,
-    running: bool,
-}
-
-static WORKER_STATUS: Mutex<WorkerStatus> = Mutex::new(WorkerStatus {
-    queued: 0,
-    running: false,
-});
-static WORKER_STATUS_CV: Condvar = Condvar::new();
-
-#[cfg(test)]
-static TIMEOUT_OVERRIDE: Mutex<Option<Duration>> = Mutex::new(None);
-
-enum Kind {
-    Load,
-    Save(Token),
-    Delete,
-}
-
-struct Job {
-    generation: u64,
-    kind: Kind,
-    reply: Sender<KeychainReply>,
-}
-
-enum Performed {
-    Load(Result<Option<Token>, TokenStoreError>),
-    Save {
-        result: Result<(), TokenStoreError>,
-        previous: Option<Zeroizing<String>>,
-    },
-    Delete(Result<(), TokenStoreError>),
-}
-
-enum KeychainReply {
-    Loaded(Result<Option<Token>, TokenStoreError>),
-    Finished(Result<(), TokenStoreError>),
-}
-
-#[cfg(test)]
-struct SetGate {
-    closed: bool,
-    waiters: usize,
-}
-
-#[cfg(test)]
-static SET_GATE: Mutex<SetGate> = Mutex::new(SetGate {
-    closed: false,
-    waiters: 0,
-});
-#[cfg(test)]
-static SET_GATE_CV: Condvar = Condvar::new();
-
-#[cfg(test)]
-fn wait_if_set_gate_closed() {
-    let mut gate = lock(&SET_GATE);
-    if !gate.closed {
-        return;
-    }
-    gate.waiters += 1;
-    SET_GATE_CV.notify_all();
-    while gate.closed {
-        gate = SET_GATE_CV
-            .wait(gate)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-    }
-    gate.waiters -= 1;
-    SET_GATE_CV.notify_all();
-}
-
-/// Runs `work` on a side thread. The keychain calls do not accept a deadline,
-/// so a hung prompt must not pin the caller. Keychain mutations themselves go
-/// through [`dispatch`], which keeps one worker and drops stale generations.
-#[cfg(test)]
-fn close_set_gate() {
-    lock(&SET_GATE).closed = true;
-}
-
-#[cfg(test)]
-fn open_set_gate() {
-    let mut gate = lock(&SET_GATE);
-    gate.closed = false;
-    SET_GATE_CV.notify_all();
-}
-
-#[cfg(test)]
-fn set_keychain_timeout(timeout: Option<Duration>) {
-    *lock(&TIMEOUT_OVERRIDE) = timeout;
-}
-
-#[cfg(test)]
-fn clear_sample_store() {
-    let mut store = lock(&SAMPLE);
-    if let Some(mut old) = store.password.take() {
-        old.zeroize();
-    }
-    store.mutations.clear();
-}
-
-#[cfg(test)]
-fn seed_sample_store(password: &str) {
-    let mut store = lock(&SAMPLE);
-    if let Some(mut old) = store.password.replace(password.to_owned()) {
-        old.zeroize();
-    }
-    store.mutations.clear();
-}
-
-#[cfg(test)]
-fn sample_mutations() -> Vec<&'static str> {
-    lock(&SAMPLE).mutations.clone()
-}
-
-/// `queued`, `running`, and how many `set_password` calls are inside the gate.
-#[cfg(test)]
-fn wait_for_keychain(pred: impl Fn(usize, bool, usize) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut status = lock(&WORKER_STATUS);
-    loop {
-        let waiters = lock(&SET_GATE).waiters;
-        if pred(status.queued, status.running, waiters) {
+            ticket.answer(Err(error));
             return;
         }
-        if Instant::now() >= deadline {
-            panic!(
-                "timed out waiting for the keychain worker (queued={}, running={})",
-                status.queued, status.running
-            );
-        }
-        let (next, _) = WORKER_STATUS_CV
-            .wait_timeout(status, Duration::from_millis(50))
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        status = next;
+    };
+    // The deadline passed before anything was written: leave the entry as it is.
+    if ticket.cancelled() {
+        return;
+    }
+    let written = entry
+        .set_password(token.expose())
+        .map_err(|error| store_error(&error));
+    let landed = written.is_ok();
+    if !ticket.answer(written.map(|()| None)) && landed {
+        undo_save(entry, previous.as_deref().map(String::as_str));
     }
 }
 
-#[cfg(test)]
-fn wait_for<T: Send + 'static>(
-    work: impl FnOnce() -> T + Send + 'static,
-    timeout: Duration,
-) -> Result<T, TokenStoreError> {
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = sender.send(work());
-    });
-    receiver
-        .recv_timeout(timeout)
-        .map_err(|_| TokenStoreError::Locked("the keychain did not answer in time".to_owned()))
+/// Puts back what a cancelled save replaced. When that fails the new token is
+/// deleted rather than kept, since its caller was told it is not saved.
+fn undo_save(entry: &keyring::Entry, previous: Option<&str>) {
+    let restored = match previous {
+        Some(old) => entry.set_password(old).is_ok(),
+        None => delete(entry).is_ok(),
+    };
+    if !restored {
+        let _ = entry.delete_credential();
+    }
 }
 
-/// `GH_TOKEN`, then `GITHUB_TOKEN`, the names GitHub CLI reads.
-pub fn token_from_env() -> Option<(&'static str, Token)> {
-    ["GH_TOKEN", "GITHUB_TOKEN"].into_iter().find_map(|name| {
-        let Ok(raw) = std::env::var(name) else {
-            return None;
+fn read(entry: &keyring::Entry) -> Result<Option<Zeroizing<String>>, TokenStoreError> {
+    match entry.get_password() {
+        Ok(value) => Ok(Some(Zeroizing::new(value))),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(store_error(&error)),
+    }
+}
+
+fn delete(entry: &keyring::Entry) -> Result<(), TokenStoreError> {
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(store_error(&error)),
+    }
+}
+
+/// The system keychain, opened the first time a token is loaded, saved or
+/// removed.
+fn system_keychain() -> &'static Keychain {
+    static SYSTEM: OnceLock<Keychain> = OnceLock::new();
+    SYSTEM.get_or_init(|| {
+        // keyring opens the platform's store on the first entry: macOS
+        // Keychain, Windows Credential Manager or the Secret Service.
+        let open = || {
+            keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|error| store_error(&error))
         };
-        // `Zeroizing` clears the environment value on both the parse failure
-        // and the success path. `Token` keeps its own copy.
-        let value = Zeroizing::new(raw);
-        Token::parse(&value).map(|token| (name, token))
+        Keychain::new(open, KEYCHAIN_TIMEOUT)
+    })
+}
+
+/// [`Keychain::load`] on the system keychain.
+pub fn load_token() -> Result<Option<Token>, TokenStoreError> {
+    system_keychain().load()
+}
+
+/// [`Keychain::save`] on the system keychain.
+pub fn save_token(token: &Token) -> Result<(), TokenStoreError> {
+    system_keychain().save(token)
+}
+
+/// [`Keychain::delete`] on the system keychain.
+pub fn delete_token() -> Result<(), TokenStoreError> {
+    system_keychain().delete()
+}
+
+/// `GH_TOKEN`, then `GITHUB_TOKEN`, the names GitHub CLI reads, from the
+/// environment `var` reads.
+///
+/// The copy read here is not wiped: the environment holds the same value for
+/// the life of the process.
+pub fn token_from_env(var: impl Fn(&str) -> Option<OsString>) -> Option<(&'static str, Token)> {
+    ["GH_TOKEN", "GITHUB_TOKEN"].into_iter().find_map(|name| {
+        let value = var(name)?;
+        Token::parse(value.to_str()?).map(|token| (name, token))
     })
 }
 
 /// Asks GitHub CLI for its github.com token (`gh auth token`). Only absolute
-/// `PATH` entries and the usual install folders are searched.
-pub fn gh_cli_token() -> Result<Token, String> {
-    let path_var = std::env::var_os("PATH");
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+/// `PATH` entries and the usual install folders are searched, in the
+/// environment `var` reads.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "GitHub CLI, found by absolute path, not git"
+)]
+pub fn gh_cli_token(var: impl Fn(&str) -> Option<OsString>) -> Result<Token, String> {
+    let home = var("HOME")
+        .or_else(|| var("USERPROFILE"))
         .map(PathBuf::from);
-    let gh = find_gh(path_var.as_deref(), home.as_deref())
+    let fallbacks = gh_fallbacks(home.as_deref(), var("ProgramFiles"));
+    let gh = find_gh(var("PATH").as_deref(), fallbacks)
         .ok_or_else(|| "GitHub CLI (gh) was not found.".to_owned())?;
-    let output = run_with_timeout(
+    run_gh(
         Command::new(&gh)
             .args(["auth", "token", "--hostname", "github.com"])
             .env("GH_PROMPT_DISABLED", "1")
             .env("NO_COLOR", "1"),
         GH_TIMEOUT,
-    )?;
-    let mut bytes = output.1;
-    let signed_in = output.0;
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    let token = Token::parse(&text);
-    text.zeroize();
-    bytes.zeroize();
-    if !signed_in {
-        return Err("GitHub CLI is not signed in to github.com (run `gh auth login`).".to_owned());
-    }
-    token.ok_or_else(|| "GitHub CLI did not print a token.".to_owned())
+    )
 }
 
 fn gh_name() -> &'static str {
     if cfg!(windows) { "gh.exe" } else { "gh" }
 }
 
-fn gh_fallbacks(home: Option<&Path>) -> Vec<PathBuf> {
+fn gh_fallbacks(home: Option<&Path>, program_files: Option<OsString>) -> Vec<PathBuf> {
     let mut paths = if cfg!(windows) {
-        std::env::var_os("ProgramFiles")
-            .map(|dir| vec![PathBuf::from(dir).join("GitHub CLI").join("gh.exe")])
-            .unwrap_or_default()
+        program_files
+            .map_or_default(|dir| vec![PathBuf::from(dir).join("GitHub CLI").join("gh.exe")])
     } else {
         ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
             .into_iter()
@@ -696,13 +365,13 @@ fn gh_fallbacks(home: Option<&Path>) -> Vec<PathBuf> {
 /// repository could plant its own `gh`; they are skipped. A file without the
 /// execute bit is skipped too, so an earlier non-executable does not hide
 /// `/usr/bin/gh`.
-pub(crate) fn find_gh(path_var: Option<&std::ffi::OsStr>, home: Option<&Path>) -> Option<PathBuf> {
+fn find_gh(path_var: Option<&std::ffi::OsStr>, fallbacks: Vec<PathBuf>) -> Option<PathBuf> {
     path_var
         .into_iter()
         .flat_map(std::env::split_paths)
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(gh_name()))
-        .chain(gh_fallbacks(home))
+        .chain(fallbacks)
         .find(|path| is_executable_file(path))
 }
 
@@ -719,8 +388,10 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-/// `(success, stdout)`. The child is killed when it runs past `timeout`.
-fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<(bool, Vec<u8>), String> {
+/// Runs `gh auth token` and reads the token it prints. The child is killed
+/// when it runs past `timeout`. Its output may hold a token, so it is wiped
+/// wherever it is dropped.
+fn run_gh(command: &mut Command, timeout: Duration) -> Result<Token, String> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -738,9 +409,9 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<(bool, V
         .stdout
         .take()
         .ok_or_else(|| "GitHub CLI output was not captured.".to_owned())?;
-    // `Zeroizing` clears the buffer if the caller times out and drops the
-    // receiver, and if `send` fails because that receiver is already gone.
-    // Joining the reader would wait on a grandchild that still holds the pipe.
+    // A grandchild of gh may hold the pipe after gh exits, so the reader is
+    // waited for only as long as the budget lasts, never joined. A buffer
+    // sent after that is wiped with the channel.
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut bytes = Zeroizing::new(Vec::new());
@@ -761,45 +432,90 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<(bool, V
             Err(error) => return Err(format!("GitHub CLI failed: {error}")),
         }
     };
-    let mut stdout = receiver
-        .recv()
-        .unwrap_or_else(|_| Zeroizing::new(Vec::new()));
-    // Move the bytes out. `stdout`'s drop still wipes the wrapper; `gh_cli_token`
-    // wipes this copy after parsing.
-    Ok((success, std::mem::take(&mut *stdout)))
+    if !success {
+        return Err("GitHub CLI is not signed in to github.com (run `gh auth login`).".to_owned());
+    }
+    let stdout = match receiver.recv_timeout(timeout.saturating_sub(started.elapsed())) {
+        Ok(bytes) => bytes,
+        Err(RecvTimeoutError::Timeout) => {
+            return Err("GitHub CLI did not answer in time.".to_owned());
+        }
+        Err(RecvTimeoutError::Disconnected) => Zeroizing::default(),
+    };
+    // Parsed in place, without a copy: text that is not UTF-8 is no token.
+    std::str::from_utf8(&stdout)
+        .ok()
+        .and_then(Token::parse)
+        .ok_or_else(|| "GitHub CLI did not print a token.".to_owned())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, MutexGuard};
-
     use super::*;
 
     #[test]
     fn debug_never_prints_the_token() {
-        let token = Token::new("ghp_supersecretvalue1234567890");
+        let token = parsed_token("ghp_supersecretvalue1234567890");
         assert_eq!(format!("{token:?}"), "Token(…)");
         assert!(!format!("{:?}", Some(token)).contains("supersecret"));
     }
 
+    /// An interior newline is refused: the token becomes a header value.
     #[test]
     fn parse_trims_and_refuses_what_cannot_be_a_token() {
-        assert_eq!(
-            Token::parse("  github_pat_11ABCDEFG0123456789_abcdef \n")
-                .map(|token| token.expose().to_owned())
-                .as_deref(),
-            Some("github_pat_11ABCDEFG0123456789_abcdef")
-        );
-        for refused in [
-            "",
-            "short",
-            "has space inside the token value",
-            "ghp_\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
-            "ghp_line\nbreak_inside_the_value",
+        let shortest = "a".repeat(20);
+        let longest = "a".repeat(255);
+        for (input, expected) in [
+            (
+                "  github_pat_11ABCDEFG0123456789_abcdef \n".to_owned(),
+                Some("github_pat_11ABCDEFG0123456789_abcdef"),
+            ),
+            (format!(" \t{shortest}\n"), Some(shortest.as_str())),
+            (
+                "ghs_dash-and_underscore-01".to_owned(),
+                Some("ghs_dash-and_underscore-01"),
+            ),
+            (longest.clone(), Some(longest.as_str())),
+            ("a".repeat(19), None),
+            ("a".repeat(256), None),
+            (String::new(), None),
+            ("short".to_owned(), None),
+            ("has space inside the token value".to_owned(), None),
+            ("ghp_line\nbreak_inside_the_value".to_owned(), None),
+            (format!("ghp_{}", "\u{e9}".repeat(10)), None),
         ] {
-            assert!(Token::parse(refused).is_none(), "{refused:?}");
+            let parsed = Token::parse(&input);
+            assert_eq!(parsed.as_ref().map(Token::expose), expected, "{input:?}");
         }
-        assert!(Token::parse(&"a".repeat(256)).is_none());
+    }
+
+    /// `GH_TOKEN` wins, as in GitHub CLI; a value that cannot be a token is
+    /// passed over.
+    #[test]
+    fn the_environment_token_is_gh_token_then_github_token() {
+        const CLASSIC: &str = "ghp_abcdefghijklmnopqrstuvwxyz";
+        const FINE: &str = "github_pat_11ABCDEFG0123456789_abcdef";
+        // (GH_TOKEN, GITHUB_TOKEN, the variable used and its token)
+        let cases = [
+            (Some(CLASSIC), Some(FINE), Some(("GH_TOKEN", CLASSIC))),
+            (None, Some(FINE), Some(("GITHUB_TOKEN", FINE))),
+            (
+                Some("not a token"),
+                Some(FINE),
+                Some(("GITHUB_TOKEN", FINE)),
+            ),
+            (None, None, None),
+        ];
+        for (gh_token, github_token, expected) in cases {
+            let var = |name: &str| match name {
+                "GH_TOKEN" => gh_token.map(OsString::from),
+                "GITHUB_TOKEN" => github_token.map(OsString::from),
+                _ => None,
+            };
+            let found = token_from_env(var);
+            let found = found.as_ref().map(|(name, token)| (*name, token.expose()));
+            assert_eq!(found, expected, "{gh_token:?}, {github_token:?}");
+        }
     }
 
     #[test]
@@ -823,7 +539,7 @@ mod tests {
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let path = std::env::join_paths([PathBuf::from("relative/bin"), dir.path().to_path_buf()])
             .expect("join");
-        assert_eq!(find_gh(Some(&path), None), Some(gh.clone()));
+        assert_eq!(find_gh(Some(&path), Vec::new()), Some(gh.clone()));
 
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         let later = dir.path().join("later");
@@ -837,7 +553,7 @@ mod tests {
             later,
         ])
         .expect("join");
-        assert_eq!(find_gh(Some(&path), None), Some(next));
+        assert_eq!(find_gh(Some(&path), Vec::new()), Some(next));
 
         let home = tempfile::TempDir::new().expect("home");
         let local = home.path().join(".local").join("bin").join("gh");
@@ -845,65 +561,34 @@ mod tests {
         std::fs::write(&local, "#!/bin/sh\n").expect("write");
         std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         assert!(
-            gh_fallbacks(Some(home.path()))
+            gh_fallbacks(Some(home.path()), None)
                 .iter()
                 .any(|path| path == &local),
             "the user-local gh install must be on the fallback list"
         );
     }
 
-    #[test]
-    fn a_hung_keychain_call_returns_before_it_finishes() {
-        let started = Instant::now();
-        let result = wait_for(
-            || {
-                thread::sleep(Duration::from_secs(5));
-                1
-            },
-            Duration::from_millis(100),
-        );
-        assert!(matches!(result, Err(TokenStoreError::Locked(_))));
-        assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
     #[cfg(unix)]
     #[test]
-    fn a_hung_child_is_killed_after_the_timeout() {
+    #[expect(clippy::disallowed_methods, reason = "`/bin/sh` stands in for gh")]
+    fn run_gh_kills_a_hung_child_and_reads_only_a_signed_in_token() {
         let started = Instant::now();
-        let result = run_with_timeout(
+        let result = run_gh(
             Command::new("/bin/sh").args(["-c", "sleep 5"]),
             Duration::from_millis(100),
         );
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(3));
 
-        let (ok, out) = run_with_timeout(
-            Command::new("/bin/sh").args(["-c", "printf ghp_abcdefghijklmnopqrstuvwxyz"]),
-            Duration::from_secs(5),
-        )
-        .expect("ran");
-        assert!(ok);
-        assert_eq!(out, b"ghp_abcdefghijklmnopqrstuvwxyz");
-    }
-
-    struct KeychainGuard {
-        _lock: MutexGuard<'static, ()>,
-    }
-
-    fn keychain_guard() -> KeychainGuard {
-        static LOCK: Mutex<()> = Mutex::new(());
-        let guard = KeychainGuard { _lock: lock(&LOCK) };
-        open_set_gate();
-        set_keychain_timeout(None);
-        clear_sample_store();
-        guard
-    }
-
-    impl Drop for KeychainGuard {
-        fn drop(&mut self) {
-            open_set_gate();
-            set_keychain_timeout(None);
-            wait_for_keychain(|queued, running, _| queued == 0 && !running);
+        // Only a gh that exits signed in hands over the token it printed.
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz";
+        for (exit, expected) in [(0, Some(token)), (1, None)] {
+            let script = format!("printf {token}; exit {exit}");
+            let got = run_gh(
+                Command::new("/bin/sh").args(["-c", &script]),
+                Duration::from_secs(5),
+            );
+            assert_eq!(got.as_ref().ok().map(Token::expose), expected, "{script}");
         }
     }
 
@@ -911,103 +596,221 @@ mod tests {
         Token::parse(value).expect("plausible token")
     }
 
-    #[test]
-    fn load_token_reads_the_sample_store_without_a_keychain() {
-        let _guard = keychain_guard();
-        let loaded = load_token().expect("sample store answers");
-        assert!(
-            loaded.is_none(),
-            "an empty sample store is not-found, not a keychain error"
-        );
-        assert!(
-            SAMPLE_READY.load(Ordering::SeqCst),
-            "the sample store must be installed before any credential read"
-        );
-        assert_eq!(
-            NATIVE_ENTRY_BUILDS.load(Ordering::SeqCst),
-            0,
-            "cargo test must not construct the OS keychain entry"
-        );
+    /// The token's entry in a fresh in-memory store. Entries built from one
+    /// mock store share the credential, so a test can reach the worker's.
+    fn mock_entry() -> (keyring::Entry, keyring_core::Entry) {
+        let store: Arc<keyring_core::CredentialStore> =
+            keyring_core::mock::Store::new().expect("mock store");
+        let entry = || keyring_core::Entry::new_in_store(&store, KEYRING_SERVICE, KEYRING_USER);
+        let worker = keyring::Entry {
+            inner: entry().expect("entry"),
+        };
+        (worker, entry().expect("entry"))
+    }
 
+    fn mock_keychain() -> (Keychain, keyring_core::Entry) {
+        let (worker, test) = mock_entry();
+        (
+            Keychain::new(move || Ok(worker), Duration::from_secs(5)),
+            test,
+        )
+    }
+
+    #[test]
+    fn keychain_saves_loads_and_deletes_in_its_store() {
+        let (keychain, shared) = mock_keychain();
+        assert!(keychain.load().expect("empty store").is_none());
         let token = parsed_token("ghp_abcdefghijklmnopqrstuvwxyz");
-        save_token(&token).expect("save");
-        let stored = load_token().expect("load").expect("stored");
+        keychain.save(&token).expect("save");
+        let stored = keychain.load().expect("load").expect("stored");
         assert_eq!(stored.expose(), token.expose());
-        delete_token().expect("delete");
-        assert!(load_token().expect("load after delete").is_none());
-        assert_eq!(NATIVE_ENTRY_BUILDS.load(Ordering::SeqCst), 0);
+        keychain.delete().expect("delete");
+        assert!(keychain.load().expect("load after delete").is_none());
+        keychain.delete().expect("deleting nothing succeeds");
+
+        shared
+            .set_password("not a token")
+            .expect("plant a bad value");
+        assert!(matches!(keychain.load(), Err(TokenStoreError::Failed(_))));
     }
 
     #[test]
-    fn a_timed_out_save_discards_the_late_write() {
-        let _guard = keychain_guard();
-        let previous = parsed_token("ghp_oldtokenvalue_abcdefghij");
-        seed_sample_store(previous.expose());
-        load_token().expect("start the keychain worker");
-        close_set_gate();
-        set_keychain_timeout(Some(Duration::from_millis(500)));
-        let late = parsed_token("ghp_newtokenvalue_abcdefghij");
-        let started = Instant::now();
-        let save = thread::spawn(move || save_token(&late));
-        wait_for_keychain(|_, _, waiters| waiters >= 1);
-        let result = save.join().expect("save thread");
+    fn store_errors_say_whether_the_keychain_is_missing_locked_or_refusing() {
+        let (keychain, shared) = mock_keychain();
+        let cred: &keyring_core::mock::Cred = shared.as_any().downcast_ref().expect("mock cred");
+        let failure = || -> keyring_core::error::PlatformError { "denied".into() };
+        for (error, expected) in [
+            (keyring_core::Error::NoStorageAccess(failure()), "Locked"),
+            (keyring_core::Error::PlatformFailure(failure()), "Locked"),
+            (
+                keyring_core::Error::NotSupportedByStore("x".to_owned()),
+                "Unavailable",
+            ),
+            (
+                keyring_core::Error::Invalid("a".to_owned(), "b".to_owned()),
+                "Failed",
+            ),
+        ] {
+            let case = format!("{error:?}");
+            cred.set_error(error);
+            let got = match keychain.load() {
+                Err(TokenStoreError::Locked(_)) => "Locked",
+                Err(TokenStoreError::Unavailable(_)) => "Unavailable",
+                Err(TokenStoreError::Failed(_)) => "Failed",
+                Ok(_) => "Ok",
+            };
+            assert_eq!(got, expected, "{case}");
+        }
+    }
+
+    /// Blocks writes while closed, and reads too with `holds_reads`, and
+    /// records every write, so a test can hold a save past its deadline at
+    /// either step and then see what landed. With `refuse_rewrite`, every
+    /// write after the first fails.
+    #[derive(Default)]
+    struct Gate {
+        closed: Mutex<bool>,
+        opened: std::sync::Condvar,
+        writes: Mutex<Vec<String>>,
+        holds_reads: bool,
+        refuse_rewrite: bool,
+    }
+
+    impl Gate {
+        fn set_closed(&self, closed: bool) {
+            *lock(&self.closed) = closed;
+            self.opened.notify_all();
+        }
+
+        fn pass(&self) {
+            let mut closed = lock(&self.closed);
+            while *closed {
+                closed = self
+                    .opened
+                    .wait(closed)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+    }
+
+    struct GatedCred {
+        inner: keyring_core::Entry,
+        gate: Arc<Gate>,
+    }
+
+    impl keyring_core::api::CredentialApi for GatedCred {
+        fn set_secret(&self, secret: &[u8]) -> keyring_core::Result<()> {
+            self.gate.pass();
+            let mut writes = lock(&self.gate.writes);
+            if self.gate.refuse_rewrite && !writes.is_empty() {
+                return Err(keyring_core::Error::PlatformFailure("refused".into()));
+            }
+            writes.push(String::from_utf8_lossy(secret).into_owned());
+            drop(writes);
+            self.inner.set_secret(secret)
+        }
+
+        fn get_secret(&self) -> keyring_core::Result<Vec<u8>> {
+            if self.gate.holds_reads {
+                self.gate.pass();
+            }
+            self.inner.get_secret()
+        }
+
+        fn delete_credential(&self) -> keyring_core::Result<()> {
+            lock(&self.gate.writes).push("delete".to_owned());
+            self.inner.delete_credential()
+        }
+
+        fn get_credential(&self) -> keyring_core::Result<Option<Arc<keyring_core::Credential>>> {
+            Ok(None)
+        }
+
+        fn get_specifiers(&self) -> Option<(String, String)> {
+            self.inner.get_specifiers()
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A keychain whose saves block while the gate is closed, holding `old`.
+    fn gated_keychain(
+        old: &Token,
+        holds_reads: bool,
+        refuse_rewrite: bool,
+    ) -> (Keychain, Arc<Gate>) {
+        let gate = Arc::new(Gate {
+            holds_reads,
+            refuse_rewrite,
+            ..Gate::default()
+        });
+        let (_, inner) = mock_entry();
+        inner.set_password(old.expose()).expect("seed");
+        let cred = GatedCred {
+            inner,
+            gate: Arc::clone(&gate),
+        };
+        let worker = keyring::Entry {
+            inner: keyring_core::Entry::new_with_credential(Arc::new(cred)),
+        };
+        let keychain = Keychain::new(move || Ok(worker), Duration::from_millis(500));
+        (keychain, gate)
+    }
+
+    /// Its caller was told the token is not saved, so the new token never
+    /// stays: a save still reading is never written, a late write is replaced
+    /// by the old value, or the entry is emptied when that is refused.
+    #[test]
+    fn a_save_past_its_deadline_never_stays() {
+        let old = parsed_token("ghp_oldtokenvalue_abcdefghij");
+        let new = parsed_token("ghp_newtokenvalue_abcdefghij");
+        for (holds_reads, refuse_rewrite, kept, writes) in [
+            (true, false, Some(old.expose()), vec![]),
+            (
+                false,
+                false,
+                Some(old.expose()),
+                vec![new.expose(), old.expose()],
+            ),
+            (false, true, None, vec![new.expose(), "delete"]),
+        ] {
+            let case = (holds_reads, refuse_rewrite);
+            let (keychain, gate) = gated_keychain(&old, holds_reads, refuse_rewrite);
+            gate.set_closed(true);
+            assert!(
+                matches!(keychain.save(&new), Err(TokenStoreError::Locked(_))),
+                "a save held past its deadline must report the keychain as not answering"
+            );
+            gate.set_closed(false);
+            // Calls run in order, so this load waits for the late write and its undo.
+            let stored = keychain.load().expect("load");
+            assert_eq!(stored.as_ref().map(Token::expose), kept, "{case:?}");
+            assert_eq!(*lock(&gate.writes), writes, "{case:?}");
+        }
+    }
+
+    #[test]
+    fn a_late_save_does_not_come_back_after_a_newer_delete() {
+        let old = parsed_token("ghp_oldtokenvalue_abcdefghij");
+        let new = parsed_token("ghp_newtokenvalue_abcdefghij");
+        let (keychain, gate) = gated_keychain(&old, false, false);
+        gate.set_closed(true);
+        assert!(matches!(
+            keychain.save(&new),
+            Err(TokenStoreError::Locked(_))
+        ));
+        // Queued behind the held save before the gate opens.
+        assert!(matches!(keychain.delete(), Err(TokenStoreError::Locked(_))));
+        gate.set_closed(false);
         assert!(
-            matches!(result, Err(TokenStoreError::Locked(_))),
-            "a blocked set_password must surface the locked timeout, got {result:?}"
+            keychain.load().expect("load").is_none(),
+            "the delete must run after the late save, not before it"
         );
-        assert!(started.elapsed() < Duration::from_secs(2));
-        open_set_gate();
-        set_keychain_timeout(None);
-        wait_for_keychain(|queued, running, _| queued == 0 && !running);
-        let sets = sample_mutations().iter().filter(|op| **op == "set").count();
-        assert!(
-            sets >= 2,
-            "the late set_password must run and then be reverted, mutations={:?}",
-            sample_mutations()
-        );
-        let stored = load_token().expect("load");
         assert_eq!(
-            stored.as_ref().map(Token::expose),
-            Some(previous.expose()),
-            "the generation that timed out must not keep the password it wrote late"
-        );
-    }
-
-    #[test]
-    fn a_late_save_does_not_overwrite_a_newer_delete() {
-        let _guard = keychain_guard();
-        load_token().expect("start the keychain worker");
-        close_set_gate();
-        set_keychain_timeout(Some(Duration::from_millis(500)));
-        let late = parsed_token("ghp_newtokenvalue_abcdefghij");
-        let save = thread::spawn(move || save_token(&late));
-        wait_for_keychain(|_, _, waiters| waiters >= 1);
-        let save_result = save.join().expect("save thread");
-        assert!(
-            matches!(save_result, Err(TokenStoreError::Locked(_))),
-            "got {save_result:?}"
-        );
-
-        set_keychain_timeout(Some(Duration::from_secs(3)));
-        let delete = thread::spawn(delete_token);
-        wait_for_keychain(|queued, _, waiters| queued >= 1 && waiters >= 1);
-        open_set_gate();
-        let delete_result = delete.join().expect("delete thread");
-        assert!(
-            delete_result.is_ok(),
-            "the delete queued behind the blocked save should finish, got {delete_result:?}"
-        );
-        wait_for_keychain(|queued, running, _| queued == 0 && !running);
-        assert!(
-            load_token().expect("load").is_none(),
-            "the late set_password must not resurrect the token after delete"
-        );
-        let log = sample_mutations();
-        let last_set = log.iter().rposition(|op| *op == "set");
-        let last_delete = log.iter().rposition(|op| *op == "delete");
-        assert!(
-            last_set.is_some_and(|set| last_delete.is_some_and(|delete| delete > set)),
-            "a set that lands after the delete would resurrect the secret, log={log:?}"
+            lock(&gate.writes).last().map(String::as_str),
+            Some("delete")
         );
     }
 }

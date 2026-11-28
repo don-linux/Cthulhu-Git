@@ -5,132 +5,34 @@
 //! The details come from one `git show` per commit, run on a worker thread
 //! the first time that commit's card opens.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
-use cthulhu_git::git::{self, CommitHover, CommitStats, Git, GraphBranch, GraphRow, Person};
-use cthulhu_git::github::{GitHubRepo, RepoContext};
-use eframe::egui::{
-    self, Context, CursorIcon, FontSelection, Label, RichText, Sense, Ui, Vec2, WidgetText,
+use cthulhu_git::git::{
+    self, CommitHover, CommitStats, Git, GitError, GraphBranch, GraphRow, Person,
 };
+use cthulhu_git::github::{GitHubRepo, RepoContext};
+use eframe::egui::{self, CursorIcon, Label, RichText, Sense, Ui, Vec2};
 
+use super::async_cache::{AsyncCache, Cached, GitRead};
 use super::avatars::{self, AvatarService};
 use super::theme::Palette;
-use super::widgets;
+use super::{clock, text, widgets};
 
 const CARD_WIDTH: f32 = 440.0;
 const AUTHOR_AVATAR: f32 = 40.0;
 const CO_AUTHOR_AVATAR: f32 = 22.0;
-/// Hovered commits whose details are kept, so the cache cannot grow without bound.
-const MAX_ENTRIES: usize = 256;
 
-enum State {
-    Loading,
-    Ready(Box<CommitHover>),
-    Failed(String),
-}
+/// Details already read, by commit hash, and the one `git show` in flight.
+pub type HoverCache = AsyncCache<String, CommitHover>;
 
 /// What [`HoverCache::cached`] found for one commit.
-pub(super) enum CachedCommit<'a> {
-    Pending,
-    Ready(&'a CommitHover),
-    Failed(&'a str),
-}
+pub(super) type CachedCommit<'a> = Cached<'a, CommitHover>;
 
-/// Details already read, and the one `git show` in flight.
-#[derive(Default)]
-pub struct HoverCache {
-    entries: HashMap<String, State>,
-    order: Vec<String>,
-    inflight: Option<(String, Receiver<Result<CommitHover, String>>)>,
-    /// Asked for while another read was running. Only the newest is kept.
-    wanted: Option<String>,
-}
+impl GitRead<CommitHover> for String {
+    const LOST: &'static str = "The commit details stopped unexpectedly.";
 
-impl HoverCache {
-    /// Collects a finished read and starts the next one.
-    pub fn poll(&mut self, ctx: &Context, root: &Path) {
-        if let Some((oid, receiver)) = &self.inflight {
-            let result = match receiver.try_recv() {
-                Ok(result) => Some(result),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => {
-                    Some(Err("The commit details stopped unexpectedly.".to_owned()))
-                }
-            };
-            if let Some(result) = result {
-                let state = match result {
-                    Ok(hover) => State::Ready(Box::new(hover)),
-                    Err(message) => State::Failed(message),
-                };
-                let oid = oid.clone();
-                self.inflight = None;
-                self.insert(oid, state);
-            }
-        }
-        if self.inflight.is_none()
-            && let Some(oid) = self.wanted.take()
-        {
-            self.start(ctx, root, oid);
-        }
-    }
-
-    fn insert(&mut self, oid: String, state: State) {
-        if !self.entries.contains_key(&oid) {
-            self.order.push(oid.clone());
-        }
-        self.entries.insert(oid, state);
-        while self.order.len() > MAX_ENTRIES {
-            let old = self.order.remove(0);
-            self.entries.remove(&old);
-        }
-    }
-
-    /// Starts a read unless this commit is already stored or in flight.
-    pub(super) fn request(&mut self, oid: &str) {
-        let busy_with_it = self
-            .inflight
-            .as_ref()
-            .is_some_and(|(inflight, _)| inflight == oid);
-        if self.entries.contains_key(oid) || busy_with_it {
-            return;
-        }
-        self.wanted = Some(oid.to_owned());
-    }
-
-    fn start(&mut self, ctx: &Context, root: &Path, oid: String) {
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
-        let root: PathBuf = root.to_path_buf();
-        let worker_oid = oid.clone();
-        thread::spawn(move || {
-            let result = Git::discover()
-                .and_then(|git| git::commit_hover(&git, &root, &worker_oid))
-                .map_err(|error| error.to_string());
-            let _ = sender.send(result);
-            ctx.request_repaint();
-        });
-        self.entries.insert(oid.clone(), State::Loading);
-        self.inflight = Some((oid, receiver));
-    }
-
-    /// The read for `oid`, when one has been asked for.
-    pub(super) fn cached(&self, oid: &str) -> Option<CachedCommit<'_>> {
-        self.entries.get(oid).map(|state| match state {
-            State::Loading => CachedCommit::Pending,
-            State::Ready(hover) => CachedCommit::Ready(hover),
-            State::Failed(message) => CachedCommit::Failed(message),
-        })
-    }
-
-    /// Stores a finished read so a test can draw the sidebar without `git show`.
-    #[cfg(test)]
-    pub(super) fn store_ready(&mut self, hover: CommitHover) {
-        let oid = hover.oid.clone();
-        self.insert(oid, State::Ready(Box::new(hover)));
+    fn read(&self, git: &Git, root: &Path) -> Result<CommitHover, GitError> {
+        git::commit_hover(git, root, self)
     }
 }
 
@@ -190,13 +92,14 @@ fn card(
     avatars: &mut AvatarService,
     context: &CardContext<'_>,
 ) {
-    cache.request(&row.oid);
+    cache.request(row.oid.as_str());
     let palette = context.palette;
     ui.set_max_width(CARD_WIDTH);
     ui.spacing_mut().item_spacing.y = 6.0;
-    let detail = match cache.entries.get(&row.oid) {
-        Some(State::Ready(hover)) => Some(hover.as_ref()),
-        _ => None,
+    let (detail, failed) = match cache.cached(row.oid.as_str()) {
+        Some(CachedCommit::Ready(hover)) => (Some(hover), None),
+        Some(CachedCommit::Failed(message)) => (None, Some(message)),
+        Some(CachedCommit::Pending) | None => (None, None),
     };
     let author = detail.map_or(&row.author, |hover| &hover.author);
     let co_authors = detail.map_or(row.co_authors.as_slice(), |hover| &hover.co_authors);
@@ -206,22 +109,19 @@ fn card(
         ui.vertical(|ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                ui.label(RichText::new(&author.name).strong().color(palette.text));
+                ui.label(RichText::new(&author.name).strong());
                 email_link(ui, &author.email, palette);
             });
-            match (detail, cache.entries.get(&row.oid)) {
+            match (detail, failed) {
                 (Some(hover), _) => {
-                    let when = relative_time(now_unix(), hover.authored_unix);
-                    ui.label(
-                        RichText::new(format!("{when} · {}", hover.authored_at))
-                            .color(palette.text_muted),
-                    );
+                    let when = relative_time(clock::now_unix(), hover.authored_unix);
+                    ui.label(RichText::new(format!("{when} · {}", hover.authored_at)).weak());
                 }
-                (None, Some(State::Failed(message))) => {
+                (None, Some(message)) => {
                     ui.label(RichText::new(message).color(palette.error));
                 }
                 _ => {
-                    ui.label(RichText::new("Loading…").color(palette.text_muted));
+                    ui.label(RichText::new("Loading…").weak());
                 }
             }
         });
@@ -231,13 +131,9 @@ fn card(
         ui.horizontal(|ui| {
             ui.add_space((AUTHOR_AVATAR - CO_AUTHOR_AVATAR) / 2.0);
             avatar(ui, avatars, person, CO_AUTHOR_AVATAR, context, None);
-            ui.label(RichText::new(&person.name).strong().color(palette.text));
+            ui.label(RichText::new(&person.name).strong());
             email_link(ui, &person.email, palette);
-            ui.label(
-                RichText::new("Co-author")
-                    .italics()
-                    .color(palette.text_muted),
-            );
+            ui.label(RichText::new("Co-author").italics().weak());
         });
     }
 
@@ -268,9 +164,11 @@ fn card(
         let hash = ui
             .add(
                 Label::new(
+                    // `small()` replaces the text style, so the family is set
+                    // after it: small size, monospace face.
                     RichText::new(&row.oid)
-                        .monospace()
                         .small()
+                        .family(egui::FontFamily::Monospace)
                         .color(palette.hash),
                 )
                 .sense(Sense::click())
@@ -317,34 +215,19 @@ pub(super) fn email_link(ui: &mut Ui, email: &str, palette: &Palette) {
     }
     let text = format!("<{email}>");
     match mailto_url(email) {
-        Some(url) => fitting_link(ui, RichText::new(text).color(palette.accent), &url),
-        None => fitting_label(ui, RichText::new(text).color(palette.text_muted)),
+        Some(url) => {
+            ui.hyperlink_to(
+                text::wrapped(ui, RichText::new(text).color(palette.accent)),
+                url,
+            );
+        }
+        None => fitting_label(ui, RichText::new(text).weak()),
     }
 }
 
 /// One line, broken anywhere inside `ui`'s width.
 fn fitting_label(ui: &mut Ui, text: RichText) {
-    let galley = fitting_galley(ui, text);
-    ui.add(Label::new(galley));
-}
-
-fn fitting_link(ui: &mut Ui, text: RichText, url: &str) {
-    let galley = fitting_galley(ui, text);
-    ui.hyperlink_to(galley, url);
-}
-
-fn fitting_galley(ui: &mut Ui, text: RichText) -> std::sync::Arc<egui::Galley> {
-    let width = ui.available_width().max(0.0);
-    let mut job = std::sync::Arc::unwrap_or_clone(WidgetText::from(text).into_layout_job(
-        ui.style(),
-        FontSelection::Default,
-        ui.text_valign(),
-    ));
-    job.wrap.max_width = width;
-    job.wrap.break_anywhere = true;
-    job.wrap.max_rows = usize::MAX;
-    job.wrap.overflow_character = None;
-    ui.fonts_mut(|fonts| fonts.layout_job(job))
+    ui.add(Label::new(text::wrapped(ui, text)));
 }
 
 /// Branch names that point at one commit, in the graph's colors.
@@ -389,16 +272,16 @@ pub(super) fn commit_stats_line(ui: &mut Ui, stats: CommitStats, palette: &Palet
         } else {
             format!("{} files changed", stats.files)
         };
-        ui.label(RichText::new(files).color(palette.text));
+        ui.label(RichText::new(files));
         if stats.insertions > 0 {
-            ui.label(RichText::new(", ").color(palette.text_muted));
+            ui.label(RichText::new(", ").weak());
             ui.label(
                 RichText::new(plural(stats.insertions, "insertion", "(+)"))
                     .color(palette.diff_added),
             );
         }
         if stats.deletions > 0 {
-            ui.label(RichText::new(", ").color(palette.text_muted));
+            ui.label(RichText::new(", ").weak());
             ui.label(
                 RichText::new(plural(stats.deletions, "deletion", "(-)"))
                     .color(palette.diff_removed),
@@ -540,7 +423,7 @@ fn line_with_links(
     strong: bool,
 ) {
     let text = |content: &str| {
-        let rich = RichText::new(content).color(palette.text);
+        let rich = RichText::new(content);
         if strong { rich.strong() } else { rich }
     };
     let Some(github) = github else {
@@ -575,16 +458,11 @@ fn line_with_links(
     });
 }
 
-pub(super) fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// "just now", "5 minutes ago", "3 days ago", "2 years ago". A time in the
-/// future (clock skew) reads as "just now".
-pub(crate) fn relative_time(now: i64, then: i64) -> String {
+/// future (clock skew) reads as "just now". `now` is [`clock::now_unix`];
+/// `then` is signed, as git stores commit times.
+pub(crate) fn relative_time(now: u64, then: i64) -> String {
+    let now = i64::try_from(now).unwrap_or(i64::MAX);
     let seconds = now.saturating_sub(then).max(0);
     let units = [
         (365 * 24 * 60 * 60, "year"),
@@ -609,77 +487,194 @@ pub(crate) fn relative_time(now: i64, then: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    use cthulhu_git::settings::HistoryColumns;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    use proptest::prelude::*;
+
     use super::*;
+    use crate::ui::async_cache::MAX_ENTRIES;
+    use crate::ui::repo_view::{self, Panels, ViewState};
+    use crate::ui::test_support::{
+        absent_git, commit, opened, painted_texts, proptest_config, tree_text,
+    };
+    use crate::ui::theme;
 
     #[test]
     fn relative_times_read_naturally() {
-        let now = 1_800_000_000;
-        assert_eq!(relative_time(now, now), "just now");
-        assert_eq!(relative_time(now, now + 500), "just now");
-        assert_eq!(relative_time(now, now - 59), "just now");
-        assert_eq!(relative_time(now, now - 60), "1 minute ago");
-        assert_eq!(relative_time(now, now - 5 * 60), "5 minutes ago");
-        assert_eq!(relative_time(now, now - 3 * 3600), "3 hours ago");
-        assert_eq!(relative_time(now, now - 86_400), "1 day ago");
-        assert_eq!(relative_time(now, now - 15 * 86_400), "2 weeks ago");
-        assert_eq!(relative_time(now, now - 70 * 86_400), "2 months ago");
-        assert_eq!(relative_time(now, now - 800 * 86_400), "2 years ago");
+        const NOW: i64 = 1_800_000_000;
+        const HOUR: i64 = 60 * 60;
+        const DAY: i64 = 24 * HOUR;
+        // (seconds ago, text). Each unit starts with a second either side.
+        const CASES: [(i64, &str); 22] = [
+            // A time in the future is clock skew.
+            (-500, "just now"),
+            (0, "just now"),
+            (59, "just now"),
+            (60, "1 minute ago"),
+            (5 * 60, "5 minutes ago"),
+            (HOUR - 1, "59 minutes ago"),
+            (HOUR, "1 hour ago"),
+            (HOUR + 1, "1 hour ago"),
+            (3 * HOUR, "3 hours ago"),
+            (DAY, "1 day ago"),
+            (7 * DAY - 1, "6 days ago"),
+            (7 * DAY, "1 week ago"),
+            (7 * DAY + 1, "1 week ago"),
+            (15 * DAY, "2 weeks ago"),
+            (30 * DAY - 1, "4 weeks ago"),
+            (30 * DAY, "1 month ago"),
+            (30 * DAY + 1, "1 month ago"),
+            (70 * DAY, "2 months ago"),
+            (365 * DAY - 1, "12 months ago"),
+            (365 * DAY, "1 year ago"),
+            (365 * DAY + 1, "1 year ago"),
+            (800 * DAY, "2 years ago"),
+        ];
+        let now = NOW.cast_unsigned();
+        for (ago, text) in CASES {
+            assert_eq!(relative_time(now, NOW - ago), text, "{ago}s ago");
+        }
+        // A clock past `i64::MAX` reads as it; the difference saturates.
+        for (now, then, text) in [
+            (u64::MAX, 0, "292471208677 years ago"),
+            (u64::MAX, i64::MIN, "292471208677 years ago"),
+            (0, i64::MAX, "just now"),
+        ] {
+            assert_eq!(relative_time(now, then), text, "{now} after {then}");
+        }
+    }
+
+    /// "just now", then minutes, hours and so on to years; within a unit, the count.
+    fn rank(text: &str) -> (usize, u64) {
+        const UNITS: [&str; 6] = ["minute", "hour", "day", "week", "month", "year"];
+        let Some((count, unit)) = text
+            .strip_suffix(" ago")
+            .and_then(|text| text.split_once(' '))
+        else {
+            assert_eq!(text, "just now");
+            return (0, 0);
+        };
+        let unit = UNITS
+            .iter()
+            .position(|name| unit.trim_end_matches('s') == *name)
+            .expect(text);
+        (unit + 1, count.parse().expect(text))
+    }
+
+    /// An issue reference: its label, number, and owner and repository.
+    type Issue<'a> = (&'a str, u64, Option<(&'a str, &'a str)>);
+
+    /// The issues in `text`, once the segments are checked to rebuild `text`
+    /// and each label to be `owner/repo`, the marker and the number.
+    fn issues(text: &str) -> Vec<Issue<'_>> {
+        let is_name = |name: &str| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+        };
+        let mut rebuilt = String::new();
+        let mut found = Vec::new();
+        for segment in issue_segments(text) {
+            match segment {
+                Segment::Text(part) => rebuilt.push_str(part),
+                Segment::Issue {
+                    label,
+                    owner,
+                    repo,
+                    number,
+                } => {
+                    rebuilt.push_str(label);
+                    assert_eq!(owner.is_some(), repo.is_some(), "{text:?}");
+                    let pair = owner.zip(repo);
+                    let prefix = pair.map_or(String::new(), |(owner, repo)| {
+                        assert!(is_name(owner) && is_name(repo), "{text:?}: {label:?}");
+                        format!("{owner}/{repo}")
+                    });
+                    assert!(
+                        number >= 1
+                            && (label == format!("{prefix}#{number}")
+                                || label == format!("{prefix}GH-{number}")),
+                        "{text:?}: {label:?} is not issue {number}"
+                    );
+                    found.push((label, number, pair));
+                }
+            }
+        }
+        assert_eq!(rebuilt, text);
+        found
+    }
+
+    proptest! {
+        #![proptest_config(proptest_config())]
+
+        #[test]
+        fn a_longer_gap_never_reads_shorter(
+            now in 0..=i64::MAX,
+            left in 0..=i64::MAX,
+            right in 0..=i64::MAX,
+        ) {
+            let (short, long) = (left.min(right), left.max(right));
+            let earlier = relative_time(now.cast_unsigned(), now.saturating_sub(short));
+            let later = relative_time(now.cast_unsigned(), now.saturating_sub(long));
+            prop_assert!(
+                rank(&earlier) <= rank(&later),
+                "now {now}: {short}s is {earlier}, {long}s is {later}"
+            );
+        }
+
+        #[test]
+        fn issue_segments_rebuild_any_text(
+            text in prop_oneof!["\\PC{0,36}", "(GH-|#|[A-Za-z0-9_.]|ünïcode|✓| |/){0,20}"],
+        ) {
+            issues(&text);
+        }
     }
 
     #[test]
     fn issue_references_follow_the_vs_code_rule() {
-        assert_eq!(
-            issue_segments("Fix #12 and GH-7, see octo/repo#3."),
-            [
-                Segment::Text("Fix "),
-                Segment::Issue {
-                    label: "#12",
-                    owner: None,
-                    repo: None,
-                    number: 12,
-                },
-                Segment::Text(" and "),
-                Segment::Issue {
-                    label: "GH-7",
-                    owner: None,
-                    repo: None,
-                    number: 7,
-                },
-                Segment::Text(", see "),
-                Segment::Issue {
-                    label: "octo/repo#3",
-                    owner: Some("octo"),
-                    repo: Some("repo"),
-                    number: 3,
-                },
-                Segment::Text("."),
-            ]
-        );
-        for plain in ["#0", "#012", "#12abc", "issue #", "C#", "##", ""] {
-            assert!(
-                issue_segments(plain)
-                    .iter()
-                    .all(|segment| matches!(segment, Segment::Text(_))),
-                "{plain}"
-            );
+        // (text, each issue: label, number, owner and repo)
+        #[rustfmt::skip]
+        const CASES: &[(&str, &[Issue<'static>])] = &[
+            ("", &[]),
+            ("#", &[]),
+            ("GH-", &[]),
+            ("#0", &[]),
+            ("#012", &[]),
+            ("GH-0", &[]),
+            ("C#", &[]),
+            ("##", &[]),
+            ("issue #", &[]),
+            ("#12abc", &[]),
+            ("foo#12bar", &[]),
+            ("#12_3", &[]),
+            // Too large for the number.
+            ("#99999999999999999999999", &[]),
+            ("#1", &[("#1", 1, None)]),
+            ("GH-2", &[("GH-2", 2, None)]),
+            ("GH-GH-1", &[("GH-1", 1, None)]),
+            ("end #8", &[("#8", 8, None)]),
+            ("/#4", &[("#4", 4, None)]),
+            // An empty owner is no owner.
+            ("/repo#3", &[("#3", 3, None)]),
+            // A multibyte letter right before the marker.
+            ("ü#9", &[("#9", 9, None)]),
+            ("ünïcode #5 ✓", &[("#5", 5, None)]),
+            ("Fix #12 and GH-7, see octo/repo#3.", &[
+                ("#12", 12, None),
+                ("GH-7", 7, None),
+                ("octo/repo#3", 3, Some(("octo", "repo"))),
+            ]),
+            ("a/b/c#1", &[("b/c#1", 1, Some(("b", "c")))]),
+            ("owner_name/repo.name#10", &[("owner_name/repo.name#10", 10, Some(("owner_name", "repo.name")))]),
+            ("octo/repoGH-3", &[("octo/repoGH-3", 3, Some(("octo", "repo")))]),
+        ];
+        for (text, expected) in CASES {
+            assert_eq!(issues(text), *expected, "{text:?}");
         }
-        assert_eq!(
-            issue_segments("#99999999999999999999999"),
-            [Segment::Text("#99999999999999999999999")]
-        );
-        assert_eq!(
-            issue_segments("ünïcode #5 ✓"),
-            [
-                Segment::Text("ünïcode "),
-                Segment::Issue {
-                    label: "#5",
-                    owner: None,
-                    repo: None,
-                    number: 5,
-                },
-                Segment::Text(" ✓"),
-            ]
-        );
     }
 
     #[test]
@@ -706,30 +701,110 @@ mod tests {
         }
     }
 
+    /// Every read goes through a worker; git is installed nowhere, so each
+    /// one fails at once. A commit asked for again, as the one on screen is
+    /// every frame, stays; the one asked for longest ago leaves.
     #[test]
-    fn the_cache_forgets_the_oldest_commits() {
+    fn the_cache_forgets_the_commit_asked_for_longest_ago() {
+        let ctx = egui::Context::default();
+        let git = absent_git();
         let mut cache = HoverCache::default();
-        for index in 0..MAX_ENTRIES + 10 {
-            cache.insert(format!("{index:040x}"), State::Failed(String::new()));
+        let oid = |index: usize| format!("{index:040x}");
+        for index in 0..=MAX_ENTRIES {
+            let wanted = oid(index);
+            cache.request(wanted.as_str());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while matches!(cache.cached(&wanted), None | Some(CachedCommit::Pending)) {
+                assert!(Instant::now() < deadline, "{wanted} never read");
+                cache.poll(&ctx, &git, Path::new("/repos"));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            cache.request(oid(0).as_str());
         }
-        assert_eq!(cache.entries.len(), MAX_ENTRIES);
-        assert!(!cache.entries.contains_key(&format!("{:040x}", 0)));
-        assert!(
-            cache
-                .entries
-                .contains_key(&format!("{:040x}", MAX_ENTRIES + 9))
-        );
+        let kept: Vec<usize> = (0..=MAX_ENTRIES)
+            .filter(|index| cache.cached(&oid(*index)).is_some())
+            .collect();
+        assert_eq!(kept.len(), MAX_ENTRIES, "{kept:?}");
+        assert!(!kept.contains(&1), "the oldest read is still kept");
+        assert!(kept.contains(&0), "the commit on screen was dropped");
     }
 
+    /// The message cell opens no card. The author cell opens one with the
+    /// row's co-author, addresses and message, and the error of the read:
+    /// the fixture's git is installed nowhere.
     #[test]
-    fn only_the_newest_request_waits_while_one_is_running() {
-        let mut cache = HoverCache::default();
-        let (_sender, receiver) = mpsc::channel();
-        cache.inflight = Some(("a".repeat(40), receiver));
-        cache.request(&"a".repeat(40));
-        assert_eq!(cache.wanted, None);
-        cache.request(&"b".repeat(40));
-        cache.request(&"c".repeat(40));
-        assert_eq!(cache.wanted, Some("c".repeat(40)));
+    fn history_hover_card_names_the_author_and_coauthor() {
+        const SUMMARY: &str = "Lanterns for the night expedition";
+        let hash = "ab".repeat(20);
+        let mut row = commit(SUMMARY);
+        row.oid.clone_from(&hash);
+        row.author = Person::new("Ada Voss", "ada@miskatonic.test");
+        row.co_authors = vec![Person::new("Herbert West", "west@arkham.test")];
+        let mut repo = opened("missing-repo", row);
+        let mut avatars = AvatarService::disabled();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1500.0, 640.0))
+            .with_step_dt(1.0 / 60.0)
+            .build_ui(move |ui| {
+                theme::apply(ui.ctx(), theme::DEFAULT_THEME);
+                let view = ViewState {
+                    error: None,
+                    panels: Panels::default(),
+                    syncing: None,
+                    columns: HistoryColumns::default(),
+                    history_loading: false,
+                    busy: false,
+                };
+                let _ = repo_view::show(ui, &mut repo, &view, &mut avatars);
+            });
+
+        for (cell, opens) in [(SUMMARY, false), ("Ada Voss, Herbert West", true)] {
+            harness
+                .query_all_by_label(cell)
+                .min_by(|left, right| left.rect().left().total_cmp(&right.rect().left()))
+                .unwrap_or_else(|| panic!("no {cell:?} cell\n{}", tree_text(&harness)))
+                .hover();
+            harness.run_steps(60);
+            // The read fails at once, and the card says so where the date goes.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while opens && !tree_text(&harness).contains("Could not run git") {
+                assert!(Instant::now() < deadline, "{}", tree_text(&harness));
+                std::thread::sleep(Duration::from_millis(10));
+                harness.step();
+            }
+            let text = tree_text(&harness);
+            let card = if opens {
+                text.contains("Co-author")
+                    && text.contains("Herbert West")
+                    && text.contains("<west@arkham.test>")
+                    && text.matches(SUMMARY).count() == 2
+            } else {
+                text.contains("Co-author") || text.contains("Loading…")
+            };
+            assert_eq!(card, opens, "{cell}\n{text}");
+        }
+        let painted = painted_texts(&harness);
+        // Avatars are off in tests, so each person is drawn as initials.
+        for initials in ["AV", "HW"] {
+            let drawn = painted.iter().any(|(_, galley)| galley.text() == initials);
+            assert!(drawn, "no {initials} avatar");
+        }
+        let fonts: Vec<_> = painted
+            .into_iter()
+            .filter(|(_, galley)| galley.text() == hash)
+            .flat_map(|(_, galley)| {
+                let sections = galley.job.sections.clone();
+                sections
+                    .into_iter()
+                    .map(|section| section.format.font_id.family)
+            })
+            .collect();
+        assert!(
+            !fonts.is_empty()
+                && fonts
+                    .iter()
+                    .all(|family| *family == egui::FontFamily::Monospace),
+            "the card's hash is not monospace: {fonts:?}"
+        );
     }
 }

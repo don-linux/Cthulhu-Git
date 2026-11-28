@@ -7,31 +7,35 @@ Map of the theme logic. Update this file when you change it.
 ```text
 settings.json "theme": "dark"
   -> theme::resolve(id)          unknown or missing id -> DEFAULT_THEME
-  -> theme::apply(ctx, theme)    palette -> egui Visuals; theme stored in the egui context
+  -> theme::apply(ctx, theme)    palette -> egui Visuals, plus the shared spacing and
+                                 corner radii; theme stored in the egui context
   -> views: theme::current(ui.ctx()).palette.<role>
 ```
 
 A theme is only data: a `Palette` of named color roles. `apply` is the only
-code that touches `egui::Visuals`. Views do not pick theme colors with
-`Color32` literals; `Color32::PLACEHOLDER`, `Color32::TRANSPARENT`, the white
-tint of an avatar texture and the terminal's ANSI colors are the exceptions.
+code that touches `egui::Visuals` and egui's spacing. Views do not pick theme
+colors with `Color32` literals; `Color32::PLACEHOLDER`, `Color32::TRANSPARENT`,
+the white tint of an avatar texture and the terminal's ANSI colors are the
+exceptions.
 
 ## Where things are
 
 | File | Symbol | What it controls |
 | ---- | ------ | ---------------- |
 | `src/ui/theme/mod.rs` | `Palette` | The color roles every theme must fill in |
-| `src/ui/theme/mod.rs` | `Theme` | `id` (saved in settings, never rename), `name`, `dark` (egui base style), `palette` |
+| `src/ui/theme/mod.rs` | `Theme` | `id` (saved in settings, never rename), `dark` (egui base style), `palette` |
 | `src/ui/theme/mod.rs` | `THEMES` | Registry of every theme |
 | `src/ui/theme/mod.rs` | `DEFAULT_THEME` | Used when settings have no theme or an unknown id |
 | `src/ui/theme/mod.rs` | `by_id`, `resolve` | Id lookup, with fallback to the default |
 | `src/ui/theme/mod.rs` | `apply` | Activates a theme; pins egui to the theme's dark/light base (ignores the OS preference) |
-| `src/ui/theme/mod.rs` | `visuals` | The palette-to-egui mapping (widgets, panels, selection, strokes) |
+| `src/ui/theme/mod.rs` | `BUTTON_PADDING`, `INTERACT_SIZE` | Spacing every theme shares, set by `apply`: icon buttons and the bars size themselves from the padding, checkbox and list rows from the interact height |
+| `src/ui/theme/mod.rs` | `visuals` | The palette-to-egui mapping (widgets, panels, selection, strokes), and the small corner radii of egui's own widgets (checkboxes, text fields, hover frames) |
 | `src/ui/theme/mod.rs` | `current` | The active theme, for views |
 | `src/ui/theme/dark.rs` | `THEME` | The dark theme (the only one today) |
 | `src/ui/mod.rs` | `CthulhuApp::new` | Applies the saved theme at startup |
 | `src/ui/widgets.rs`, `home.rs`, `repo_view.rs`, `settings.rs` | `theme::current(..).palette` | Where views read colors |
-| `src/ui/history.rs`, `hover.rs`, `avatars.rs`, `terminal.rs` | `&Palette` | Read the palette their callers pass |
+| `src/ui/terminal.rs` | `theme::current(..).palette` | Answers the shell's color queries with the colors it paints |
+| `src/ui/history.rs`, `hover.rs`, `changes.rs`, `avatars.rs`, `terminal.rs` | `&Palette` | Read the palette their callers pass |
 
 ## Palette roles
 
@@ -47,11 +51,11 @@ tint of an avatar texture and the terminal's ANSI colors are the exceptions.
 | `text_muted` | Field labels, paths, hints, history column titles |
 | `accent` | Primary button, hover and focus outlines, links |
 | `on_accent` | Text on `accent` |
-| `selection` | Selected text background |
+| `selection` | Selected text background, the chosen history row, and the terminal's selection |
 | `hash` | Commit hashes |
 | `graph` | Commit-graph lanes. Index 0 is the principal branch (`#3794FF` in the dark theme); the rest cycle when there are more lanes than colors. The same hues, faded, fill the branch-name labels, and a translucent stroke of the same hue joins a label to its commit. Author initials (when there is no avatar) use one of these hues, chosen from the address |
 | `warning` | Detached HEAD, a rejected GitHub token, the rate-limit pause on GitHub Auth, and tag chips on a commit |
-| `error` | Error banner |
+| `error` | Error banner, an unreadable recent card, a commit read that failed, a GitHub Auth error |
 | `diff_added` | Insertions in the commit hover's short stat, the `+` on an added diff line, and the "Connected as …" line on GitHub Auth |
 | `diff_removed` | Deletions in the commit hover's short stat, and the `-` on a removed diff line |
 | `diff_added_fill` | Background of an added line in the commit diff |
@@ -59,7 +63,7 @@ tint of an avatar texture and the terminal's ANSI colors are the exceptions.
 
 ## Add a theme
 
-1. Copy `src/ui/theme/dark.rs` to `src/ui/theme/<name>.rs` and change `id`, `name`, `dark` and the colors.
+1. Copy `src/ui/theme/dark.rs` to `src/ui/theme/<name>.rs` and change `id`, `dark` and the colors.
 2. Declare it in `src/ui/theme/mod.rs` (`mod <name>;`) and add `<name>::THEME` to `THEMES`.
 3. `cargo test` checks that ids are unique and the default is registered.
 

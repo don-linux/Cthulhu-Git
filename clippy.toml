@@ -1,0 +1,19 @@
+# Tests may panic on a broken fixture: `unwrap_used` and `expect_used` stay
+# for production code. This covers `#[test]` functions, `#[cfg(test)]`
+# modules and, since Rust 1.100, every file of the `tests/` crate.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# The library's only user is this package's binary, so a lint may suggest
+# changing a public signature.
+avoid-breaking-exported-api = false
+
+# Every git child is built by `git::exec`: it scrubs inherited `GIT_*`
+# variables, keeps only absolute PATH entries and puts the hardening options
+# first. Other programs and test fixtures say why at the call.
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "build git commands with `git::exec`, which scrubs `GIT_*` and hardens the call" },
+]
+
+# Product names written in prose, not code.
+doc-valid-idents = ["ConPTY", "MacPorts", "GIF89a", ".."]

@@ -2,10 +2,16 @@
 
 Map of the bundled faces. Update this file when you change them.
 
-The app does not read fonts from the operating system. Each face below is
-compiled into the binary from `assets/fonts/`. A license file sits next to
-every face and has to stay there: the licenses require the notice to travel
-with the font.
+Each face below is compiled into the binary from `assets/fonts/`, and so are
+egui's own fonts (see the last table). A license file sits next to every face
+and has to stay there: the licenses require the notice to travel with the
+font.
+
+The operating system's fonts are used only for a character no bundled face
+has, such as Chinese, Japanese or Korean text. eframe looks them up through
+its default `system_fonts` feature. Emoji never get that far: egui's
+monochrome emoji fonts sit at the end of every chain, so they look the same
+on every system.
 
 ## How it works
 
@@ -17,7 +23,7 @@ settings.json "ui_font": "inter"
 settings.json "terminal_font": null
   -> fonts::resolve_terminal      unknown or missing id -> meslo-lgs-nf
                                   "builtin" -> built-in monospace
-  -> FontService::sync            egui family "terminal", measured one pass later
+  -> FontService::sync            egui family "terminal", measured once egui has it
 ```
 
 Hashes and diffs stay on the built-in monospace. Choosing Obel Mono for the
@@ -36,9 +42,10 @@ the Regular cut of each family is bundled.
 | `src/ui/fonts.rs` | `DEFAULT_UI_ID` | Ubuntu |
 | `src/ui/fonts.rs` | `DEFAULT_TERMINAL_ID` | Meslo LGS NF |
 | `src/ui/fonts.rs` | `BUILTIN_TERMINAL_ID` | `builtin`, the monospace shipped with egui |
-| `src/ui/fonts.rs` | `FontService::sync` | Installs both choices with one `set_fonts` |
+| `src/ui/fonts.rs` | `FontService::sync` | Installs both choices with one `set_fonts`, only when either changed |
+| `src/ui/fonts.rs` | `terminal_font_id`, `preview_font` | Read the faces egui has loaded, so the terminal grid and the specimens never draw a family that is not there yet |
 | `src/ui/settings.rs` | Appearance page | Interface choice |
-| `src/ui/settings.rs` | Terminal page | Terminal choice, plus the one-line preview |
+| `src/ui/settings.rs` | Terminal page | Terminal choice, plus a preview of the shell prompt in that face |
 | `src/settings.rs` | `ui_font`, `terminal_font` | Saved ids |
 
 ## Interface
@@ -66,6 +73,27 @@ the Regular cut of each family is bundled.
 `null` uses `meslo-lgs-nf`. `builtin` keeps the monospace shipped with the
 app. Departure Mono is drawn at 11 pt so its pixels sit on the grid. Meslo
 LGS NF is the face that includes prompt icons.
+
+## Faces egui ships
+
+egui's default fonts (crate `epaint_default_fonts`) are compiled in as well.
+eframe enables `default_fonts`; the emoji fonts need egui's
+`monochrome_emoji_fonts` feature, which eframe does not forward, so
+`Cargo.toml` turns it on with a direct `egui` dependency. Their license texts
+are copied unchanged into `assets/fonts/egui/`; update them when egui is
+upgraded.
+
+| Face | Used for | License file |
+| ---- | -------- | ------------ |
+| Hack | hashes, diffs, the `builtin` terminal face | `Hack-Regular.txt` (MIT, Bitstream Vera) |
+| Noto Emoji | emoji fallback | `OFL.txt` (SIL OFL 1.1) |
+| emoji-icon-font | symbol fallback | `emoji-icon-font-mit-license.txt` (MIT) |
+| egui-icons | the logos in `egui::special_emojis`, a subset of emoji-icon-font | `emoji-icon-font-mit-license.txt` (MIT) |
+| Ubuntu Light | fallback after Hack for symbols such as `√` | `UFL.txt` (Ubuntu Font Licence 1.0) |
+
+The interface icons in `assets/icons/` (Lucide, ISC; some derived from
+Feather, MIT) are compiled in too; `assets/icons/LICENSE` ships beside the
+font notices.
 
 ## Add a face
 

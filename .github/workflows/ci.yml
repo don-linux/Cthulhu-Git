@@ -19,16 +19,16 @@ env:
 
 jobs:
   checks:
-    name: fmt, clippy, and tests
+    name: fmt, dependencies, clippy, and tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
         with:
-          tool: zizmor@1.30.1
+          tool: zizmor@1.33.1,cargo-nextest@0.9.152,cargo-deny@0.22.1,cargo-shear@1.14.1
       - name: actionlint and zizmor
         shell: bash
         env:
@@ -56,8 +56,13 @@ jobs:
           /usr/bin/git --version || true
           rustc --version
       - run: cargo fmt --check
+      # Advisories change without a commit here; advisories.yml checks them weekly.
+      - run: cargo deny --locked check licenses bans sources
+      - run: cargo shear --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo nextest run --locked --profile ci
+      # nextest does not run doctests.
+      - run: cargo test --locked --doc
 
   test:
     name: cargo test (${{ matrix.os }})
@@ -66,7 +71,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-26]
+        os: [windows-2025, macos-26]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

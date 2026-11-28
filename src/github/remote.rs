@@ -50,7 +50,7 @@ pub fn github_repo(remotes: &[Remote]) -> Option<GitHubRepo> {
 /// `https://github.com/o/r(.git)`, `git@github.com:o/r(.git)` and
 /// `ssh://git@github.com/o/r(.git)`. A user name, the default port, `www.`
 /// and a trailing slash are accepted.
-pub fn parse_github_url(url: &str) -> Option<GitHubRepo> {
+fn parse_github_url(url: &str) -> Option<GitHubRepo> {
     let url = url.trim();
     let path = if let Some(rest) = strip_prefix_ignore_case(url, "https://") {
         let (authority, path) = rest.split_once('/')?;
@@ -64,7 +64,7 @@ pub fn parse_github_url(url: &str) -> Option<GitHubRepo> {
         is_github_host(host).then_some(path)?
     };
     let path = path.trim_end_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
+    let path = path.trim_suffix(".git");
     let (owner, name) = path.split_once('/')?;
     (valid_owner(owner) && valid_name(name)).then(|| GitHubRepo {
         owner: owner.to_owned(),
@@ -83,7 +83,7 @@ fn github_authority(authority: &str, default_port: &str) -> bool {
         return false;
     }
     let host = authority.rsplit('@').next().unwrap_or(authority);
-    let host = host.strip_suffix(default_port).unwrap_or(host);
+    let host = host.trim_suffix(default_port);
     is_github_host(host)
 }
 
@@ -132,49 +132,42 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parses_the_github_url_forms() {
-        for url in [
-            "https://github.com/don-linux/Cthulhu-Git",
-            "https://github.com/don-linux/Cthulhu-Git.git",
-            "https://github.com/don-linux/Cthulhu-Git/",
-            "HTTPS://GitHub.com/don-linux/Cthulhu-Git.git",
-            "https://token@github.com/don-linux/Cthulhu-Git.git",
-            "git@github.com:don-linux/Cthulhu-Git.git",
-            "git@github.com:don-linux/Cthulhu-Git",
-            "ssh://git@github.com/don-linux/Cthulhu-Git.git",
-            "ssh://git@github.com:22/don-linux/Cthulhu-Git.git",
-            "https://www.github.com/don-linux/Cthulhu-Git",
-            "https://github.com:443/don-linux/Cthulhu-Git.git",
-        ] {
-            assert_eq!(
-                parse_github_url(url),
-                Some(repo("don-linux", "Cthulhu-Git")),
-                "{url}"
-            );
-        }
-    }
+    /// A remote URL, and whether it names `don-linux/Cthulhu-Git` on GitHub.
+    const URLS: &[(&str, bool)] = &[
+        ("https://github.com/don-linux/Cthulhu-Git", true),
+        ("https://github.com/don-linux/Cthulhu-Git.git", true),
+        ("https://github.com/don-linux/Cthulhu-Git/", true),
+        ("HTTPS://GitHub.com/don-linux/Cthulhu-Git.git", true),
+        ("https://token@github.com/don-linux/Cthulhu-Git.git", true),
+        ("git@github.com:don-linux/Cthulhu-Git.git", true),
+        ("git@github.com:don-linux/Cthulhu-Git", true),
+        ("ssh://git@github.com/don-linux/Cthulhu-Git.git", true),
+        ("ssh://git@github.com:22/don-linux/Cthulhu-Git.git", true),
+        ("https://www.github.com/don-linux/Cthulhu-Git", true),
+        ("https://github.com:443/don-linux/Cthulhu-Git.git", true),
+        // Another host, another shape, or a path that could escape.
+        ("https://gitlab.com/don-linux/Cthulhu-Git.git", false),
+        ("https://github.com.evil.example/a/b", false),
+        ("http://github.com/a/b", false),
+        ("git@gitlab.com:a/b.git", false),
+        ("https://github.com/a", false),
+        ("https://github.com/a/b/c", false),
+        ("https://github.com/a/..", false),
+        ("https://github.com/a%2f/b", false),
+        ("https://github.com/a/b?x=1", false),
+        ("https://evil.example#@github.com/o/r", false),
+        ("https://evil.example?@github.com/o/r", false),
+        ("https://evil.example\\@github.com/o/r", false),
+        ("https://github.com:8443/o/r", false),
+        ("/srv/git/repo.git", false),
+        ("", false),
+    ];
 
     #[test]
-    fn rejects_other_hosts_and_unsafe_paths() {
-        for url in [
-            "https://gitlab.com/don-linux/Cthulhu-Git.git",
-            "https://github.com.evil.example/a/b",
-            "http://github.com/a/b",
-            "git@gitlab.com:a/b.git",
-            "https://github.com/a",
-            "https://github.com/a/b/c",
-            "https://github.com/a/..",
-            "https://github.com/a%2f/b",
-            "https://github.com/a/b?x=1",
-            "https://evil.example#@github.com/o/r",
-            "https://evil.example?@github.com/o/r",
-            "https://evil.example\\@github.com/o/r",
-            "https://github.com:8443/o/r",
-            "/srv/git/repo.git",
-            "",
-        ] {
-            assert_eq!(parse_github_url(url), None, "{url}");
+    fn parse_github_url_table() {
+        for &(url, found) in URLS {
+            let expected = found.then(|| repo("don-linux", "Cthulhu-Git"));
+            assert_eq!(parse_github_url(url), expected, "{url}");
         }
     }
 

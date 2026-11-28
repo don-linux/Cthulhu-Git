@@ -1,1 +1,4 @@
 /target
+
+# Worktrees Claude Code creates for subagents.
+/.claude/worktrees/

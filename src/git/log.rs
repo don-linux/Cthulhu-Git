@@ -1,6 +1,7 @@
+use std::collections::HashSet;
 use std::path::Path;
 
-use super::exec::{Git, GitError};
+use super::exec::{Cr, Git, GitError, trim_eol};
 use super::repo::Head;
 
 /// Hash prefix length shown everywhere in the UI. Twelve hex digits is the
@@ -12,43 +13,19 @@ pub const SHORT_OID_LEN: usize = 12;
 /// own way: the graph subject is before the trailers, the message is after.
 pub(crate) const FIELD_SEPARATOR: u8 = 0x1f;
 
-/// The first `count` fields of `record`, split on [`FIELD_SEPARATOR`].
+/// The first `N` fields of `record`, split on [`FIELD_SEPARATOR`].
 /// The last field keeps any further separators, which is where a subject or
 /// a message is allowed to contain `0x1f`.
-pub(crate) fn split_fields(record: &[u8], count: usize) -> Option<Vec<&[u8]>> {
-    let mut parts = record.splitn(count, |byte| *byte == FIELD_SEPARATOR);
-    let mut fields = Vec::with_capacity(count);
-    for _ in 0..count {
-        fields.push(parts.next()?);
-    }
-    Some(fields)
+pub(crate) fn split_fields<const N: usize>(record: &[u8]) -> Option<[&[u8]; N]> {
+    let fields: Vec<&[u8]> = record.splitn(N, |byte| *byte == FIELD_SEPARATOR).collect();
+    fields.try_into().ok()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Commit {
-    pub oid: String,
-    /// First line of the commit message.
-    pub summary: String,
-}
-
-/// The newest commits reachable from HEAD, newest first.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct History {
-    pub commits: Vec<Commit>,
-    /// More commits exist beyond the requested limit.
-    pub truncated: bool,
-}
-
-impl Commit {
-    pub fn short_oid(&self) -> &str {
-        short_oid(&self.oid)
-    }
-}
-
-impl History {
-    pub fn latest(&self) -> Option<&Commit> {
-        self.commits.first()
-    }
+/// A full or abbreviated object name: hex digits, at least one. A name that
+/// passes cannot start with `-`, so git never reads it as an option.
+pub(crate) fn is_oid(oid: impl AsRef<[u8]>) -> bool {
+    let oid = oid.as_ref();
+    !oid.is_empty() && oid.iter().all(u8::is_ascii_hexdigit)
 }
 
 /// Someone named on a commit: its author, or a `Co-authored-by` trailer.
@@ -100,6 +77,7 @@ pub fn email_key(email: &str) -> String {
 pub fn parse_co_authors(text: &str) -> Vec<Person> {
     const KEY: &str = "co-authored-by:";
     let mut found: Vec<Person> = Vec::new();
+    let mut seen = HashSet::new();
     // A bare CR and the Unicode separators end a line too, as they do for
     // the `m` flag of VS Code's regular expression.
     for line in text.split(['\n', '\r', '\u{2028}', '\u{2029}']) {
@@ -112,8 +90,7 @@ pub fn parse_co_authors(text: &str) -> Vec<Person> {
         let Some(person) = parse_name_and_email(&line[KEY.len()..]) else {
             continue;
         };
-        let key = person.email_key();
-        if !found.iter().any(|known| known.email_key() == key) {
+        if seen.insert(person.email_key()) {
             found.push(person);
         }
     }
@@ -124,11 +101,10 @@ pub fn parse_co_authors(text: &str) -> Vec<Person> {
 fn parse_name_and_email(value: &str) -> Option<Person> {
     let value = value.trim();
     let inner = value.strip_suffix('>')?;
-    let open = inner
-        .char_indices()
-        .filter(|(_, c)| *c == '<')
-        .map(|(index, _)| index)
-        .find(|&index| !inner[index + 1..].contains('>'))?;
+    // The first `<` after the last `>`. One pass each way: the trailer comes
+    // from the repository, so it can be megabytes of brackets.
+    let from = inner.rfind('>').map_or(0, |index| index + 1);
+    let open = from + inner[from..].find('<')?;
     let name = inner[..open].trim();
     let email = inner[open + 1..].trim();
     if name.is_empty() || email.is_empty() {
@@ -140,14 +116,10 @@ fn parse_name_and_email(value: &str) -> Option<Person> {
 /// Co-authors that are not the author. A trailer with one of the author's
 /// addresses is dropped; one with the author's name but another address adds
 /// that address to `author.aliases`.
-pub fn fold_co_authors(author: &mut Person, co_authors: Vec<Person>) -> Vec<Person> {
-    let recorded = author.clone();
-    fold_with_recorded(author, &recorded, co_authors)
-}
-
-/// [`fold_co_authors`] when `.mailmap` may have rewritten the author:
-/// `recorded` is the identity written in the commit (`%an <%ae>`). Its address
-/// becomes an alias, and a trailer naming it is the author too.
+///
+/// `.mailmap` may have rewritten the author: `recorded` is the identity written
+/// in the commit (`%an <%ae>`). Its address becomes an alias, and a trailer
+/// naming it is the author too.
 pub(crate) fn fold_with_recorded(
     author: &mut Person,
     recorded: &Person,
@@ -216,77 +188,106 @@ pub struct CommitDetail {
     pub message: String,
 }
 
-const DETAIL_FORMAT: &str =
-    "--format=%H%x1f%aN%x1f%aE%x1f%an%x1f%ae%x1f%ad%x1f%(trailers:only,unfold)%x1e%B";
+/// Oid, author after and before `.mailmap`, author time in Unix seconds and
+/// in the local zone, the trailer block, then the message. The detail and the
+/// hover both read it with [`parse_commit`].
+const COMMIT_FORMAT: &str =
+    "--format=%H%x1f%aN%x1f%aE%x1f%an%x1f%ae%x1f%at%x1f%ad%x1f%(trailers:only,unfold)%x1e%B";
+
+/// One [`COMMIT_FORMAT`] record, before a view applies its own rules.
+struct CommitRecord<'a> {
+    oid: String,
+    author: Person,
+    co_authors: Vec<Person>,
+    unix: &'a [u8],
+    authored_at: &'a [u8],
+    message: &'a [u8],
+}
+
+/// The first seven unit separators split the fixed fields, the first record
+/// separator ends the trailer block, and the rest is the message, so
+/// separators inside the message are kept.
+fn parse_commit(record: &[u8]) -> Option<CommitRecord<'_>> {
+    let [
+        oid,
+        mapped_name,
+        mapped_email,
+        name,
+        email,
+        unix,
+        authored_at,
+        rest,
+    ] = split_fields(record)?;
+    let (trailers, message) = split_trailers(rest)?;
+    if !is_oid(oid) {
+        return None;
+    }
+    let (author, co_authors) =
+        author_and_co_authors([mapped_name, mapped_email, name, email], &trailers);
+    Some(CommitRecord {
+        oid: String::from_utf8_lossy(oid).into_owned(),
+        author,
+        co_authors,
+        unix,
+        authored_at,
+        message,
+    })
+}
+
+/// Author time in the local zone as `YYYY-MM-DD HH:MM`, the stamp every view shows.
+pub(crate) const LOCAL_DATE: &str = "--date=format-local:%Y-%m-%d %H:%M";
 
 /// Reads `HEAD`'s newest commit. An unborn branch has none, so git is not asked.
 ///
 /// The record is not NUL-terminated. A NUL inside the message stays in
 /// `message` instead of cutting the record short.
-///
-/// `--no-textconv` and `--no-ext-diff` are set so a repository diff driver
-/// cannot run while the commit is only being displayed.
 pub fn latest_commit(
     git: &Git,
     root: &Path,
     head: &Head,
 ) -> Result<Option<CommitDetail>, GitError> {
+    head_commit(git, root, head, COMMIT_FORMAT, parse_commit_detail)
+}
+
+/// `git log -1` of `HEAD` in `format`, read by `parse`. An unborn branch has
+/// no commit, so git is not asked. `--no-textconv` and `--no-ext-diff` keep
+/// a repository diff driver from running while a commit is only displayed.
+pub(crate) fn head_commit<T>(
+    git: &Git,
+    root: &Path,
+    head: &Head,
+    format: &str,
+    parse: impl FnOnce(&[u8]) -> Option<T>,
+) -> Result<Option<T>, GitError> {
     if matches!(head, Head::Unborn(_)) {
         return Ok(None);
     }
-
     let args = [
         "log",
         "-1",
-        "--date=format-local:%Y-%m-%d %H:%M",
-        DETAIL_FORMAT,
+        LOCAL_DATE,
+        format,
         "--no-textconv",
         "--no-ext-diff",
         "HEAD",
         "--",
     ];
-    let output = git.require_ok(root, &args)?;
-    parse_commit_detail(&output.stdout)
-        .ok_or_else(|| {
-            super::exec::rejected(
-                &format!("git {}", args.join(" ")),
-                "unrecognized log output",
-            )
-        })
-        .map(Some)
+    git.read(root, &args, "log", parse).map(Some)
 }
 
-/// Parses one [`DETAIL_FORMAT`] record. The first six unit separators split
-/// the fixed fields, the first record separator ends the trailer block, and
-/// the rest is the message, so separators inside the message are kept.
+/// Parses `git log -1` with [`COMMIT_FORMAT`]. Only git's record newline
+/// leaves the message, and the date must be there.
 pub(crate) fn parse_commit_detail(stdout: &[u8]) -> Option<CommitDetail> {
-    if stdout.is_empty() {
+    let commit = parse_commit(trim_eol(stdout, Cr::AfterLf))?;
+    if commit.authored_at.is_empty() {
         return None;
     }
-    let mut record = stdout.to_vec();
-    if record.last() == Some(&b'\n') {
-        record.pop();
-        if record.last() == Some(&b'\r') {
-            record.pop();
-        }
-    }
-
-    let parts = split_fields(&record, 7)?;
-    let oid = parts[0];
-    let identity = [parts[1], parts[2], parts[3], parts[4]];
-    let authored_at = parts[5];
-    let (trailers, message) = split_trailers(parts[6])?;
-    if oid.is_empty() || !oid.iter().all(u8::is_ascii_hexdigit) || authored_at.is_empty() {
-        return None;
-    }
-    let message = String::from_utf8_lossy(message).into_owned();
-    let (author, co_authors) = author_and_co_authors(identity, &trailers);
     Some(CommitDetail {
-        oid: String::from_utf8_lossy(oid).into_owned(),
-        author,
-        co_authors,
-        authored_at: String::from_utf8_lossy(authored_at).into_owned(),
-        message,
+        oid: commit.oid,
+        author: commit.author,
+        co_authors: commit.co_authors,
+        authored_at: String::from_utf8_lossy(commit.authored_at).into_owned(),
+        message: String::from_utf8_lossy(commit.message).into_owned(),
     })
 }
 
@@ -345,11 +346,8 @@ pub struct CommitHover {
     pub tags: Vec<String>,
 }
 
-/// Ends the message; the short stat follows it.
+/// Ends the hover's message; the numstat follows it.
 const RECORD_END: u8 = 0x1d;
-
-const HOVER_FORMAT: &str =
-    "--format=%H%x1f%aN%x1f%aE%x1f%an%x1f%ae%x1f%at%x1f%ad%x1f%(trailers:only,unfold)%x1e%B%x1d";
 
 /// Reads one commit for the hover: author, dates, full message, the files it
 /// changes and the tags that point at it. Asked only when the hover opens,
@@ -362,12 +360,13 @@ const HOVER_FORMAT: &str =
 /// `--no-textconv` and `--no-ext-diff` keep a repo-local `diff.<driver>`
 /// from executing when the hover opens.
 pub fn commit_hover(git: &Git, root: &Path, oid: &str) -> Result<CommitHover, GitError> {
-    if !is_commit_oid(oid) {
+    if !is_oid(oid) {
         return Err(super::exec::rejected(
             "git show",
             format!("{oid} is not a commit hash"),
         ));
     }
+    let format = format!("{COMMIT_FORMAT}%x1d");
     let args = [
         "show",
         "--no-color",
@@ -377,24 +376,14 @@ pub fn commit_hover(git: &Git, root: &Path, oid: &str) -> Result<CommitHover, Gi
         "--first-parent",
         "--numstat",
         "-z",
-        "--date=format-local:%Y-%m-%d %H:%M",
-        HOVER_FORMAT,
+        LOCAL_DATE,
+        format.as_str(),
         oid,
         "--",
     ];
-    let output = git.require_ok(root, &args)?;
-    let mut hover = parse_commit_hover(&output.stdout).ok_or_else(|| {
-        super::exec::rejected(
-            &format!("git {}", args.join(" ")),
-            "unrecognized show output",
-        )
-    })?;
+    let mut hover = git.read(root, &args, "show", parse_commit_hover)?;
     hover.tags = commit_tags(git, root, &hover.oid);
     Ok(hover)
-}
-
-fn is_commit_oid(oid: &str) -> bool {
-    !oid.is_empty() && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Tags that point at `oid`. A failure becomes an empty list.
@@ -407,7 +396,8 @@ fn commit_tags(git: &Git, root: &Path, oid: &str) -> Vec<String> {
     let args = [
         "for-each-ref",
         points_at.as_str(),
-        "--format=%(refname:short)",
+        // Not `short`, which prints `tags/v1` when a branch is also named v1.
+        "--format=%(refname:lstrip=2)",
         "refs/tags",
     ];
     match git.require_ok(root, &args) {
@@ -422,47 +412,35 @@ pub(crate) fn parse_tag_names(stdout: &[u8]) -> Vec<String> {
     stdout
         .split(|byte| matches!(byte, 0 | b'\n'))
         .map(|name| {
-            let name = name.strip_suffix(b"\r").unwrap_or(name);
+            let name = name.trim_suffix(b"\r");
             String::from_utf8_lossy(name).trim().to_owned()
         })
         .filter(|name| !name.is_empty())
         .collect()
 }
 
-/// Fixed fields split by the first seven unit separators, the trailer block
-/// up to the first record separator, the message up to the last group
-/// separator, and the numstat after it.
+/// A [`COMMIT_FORMAT`] record up to the last group separator, and the
+/// numstat after it. The Unix time must parse, and the message loses every
+/// trailing line ending.
 ///
 /// The group separator ends the message. Numstat paths are not expected to
 /// contain that byte; one that does is rejected with the rest of the record.
 pub(crate) fn parse_commit_hover(stdout: &[u8]) -> Option<CommitHover> {
     let end = stdout.iter().rposition(|byte| *byte == RECORD_END)?;
-    let (record, stat) = (&stdout[..end], &stdout[end + 1..]);
-    let parts = split_fields(record, 8)?;
-    let oid = parts[0];
-    let identity = [parts[1], parts[2], parts[3], parts[4]];
-    let unix = parts[5];
-    let authored_at = parts[6];
-    let (trailers, message) = split_trailers(parts[7])?;
-    if oid.is_empty() || !oid.iter().all(u8::is_ascii_hexdigit) {
-        return None;
-    }
-    let authored_unix = std::str::from_utf8(unix).ok()?.trim().parse().ok()?;
-    let message = String::from_utf8_lossy(message)
-        .trim_end_matches(['\n', '\r'])
-        .to_owned();
-    let (author, co_authors) = author_and_co_authors(identity, &trailers);
-    let files = parse_numstat(stat)?;
-    let stats = stats_from_files(&files);
+    let commit = parse_commit(&stdout[..end])?;
+    let authored_unix = std::str::from_utf8(commit.unix).ok()?.trim().parse().ok()?;
+    let files = parse_numstat(&stdout[end + 1..])?;
     Some(CommitHover {
-        oid: String::from_utf8_lossy(oid).into_owned(),
-        author,
-        co_authors,
+        oid: commit.oid,
+        author: commit.author,
+        co_authors: commit.co_authors,
         authored_unix,
-        authored_at: String::from_utf8_lossy(authored_at).into_owned(),
-        message,
+        authored_at: String::from_utf8_lossy(commit.authored_at).into_owned(),
+        message: String::from_utf8_lossy(commit.message)
+            .trim_end_matches(['\n', '\r'])
+            .to_owned(),
+        stats: stats_from_files(&files),
         files,
-        stats,
         tags: Vec::new(),
     })
 }
@@ -471,29 +449,32 @@ pub(crate) fn parse_commit_hover(stdout: &[u8]) -> Option<CommitHover> {
 ///
 /// `git show -z` puts a NUL, then a newline, between the format and this
 /// list. Both are skipped. `-` is a binary file. An empty slice is an empty list.
-pub(crate) fn parse_numstat(mut bytes: &[u8]) -> Option<Vec<CommitFile>> {
-    while bytes
-        .first()
-        .is_some_and(|byte| matches!(byte, b'\n' | b'\r' | 0))
-    {
-        bytes = &bytes[1..];
-    }
+pub(crate) fn parse_numstat(bytes: &[u8]) -> Option<Vec<CommitFile>> {
+    let start = bytes
+        .iter()
+        .position(|byte| !matches!(byte, b'\n' | b'\r' | 0))
+        .unwrap_or(bytes.len());
+    // A rename's two paths are the next two pieces, so the split carries on
+    // from inside an entry.
+    let mut pieces = bytes[start..].split(|byte| *byte == 0);
     let mut files = Vec::new();
-    while !bytes.is_empty() {
-        let (insertions, rest) = take_count(bytes)?;
-        let rest = rest.strip_prefix(b"\t")?;
-        let (deletions, rest) = take_count(rest)?;
-        let rest = rest.strip_prefix(b"\t")?;
-        let (path, rest) = split_nul(rest)?;
-        let (path, previous, rest) = if path.is_empty() {
-            let (old, rest) = split_nul(rest)?;
-            let (new, rest) = split_nul(rest)?;
+    while let Some(entry) = pieces.next() {
+        if entry.is_empty() {
+            // Every entry ends with NUL, so only the last piece is empty.
+            return pieces.next().is_none().then_some(files);
+        }
+        let mut columns = entry.splitn(3, |byte| *byte == b'\t');
+        let insertions = count(columns.next()?)?;
+        let deletions = count(columns.next()?)?;
+        let path = columns.next()?;
+        let (path, previous) = if path.is_empty() {
+            let (old, new) = (pieces.next()?, pieces.next()?);
             if old.is_empty() || new.is_empty() {
                 return None;
             }
-            (new, Some(old), rest)
+            (new, Some(old))
         } else {
-            (path, None, rest)
+            (path, None)
         };
         files.push(CommitFile {
             path: String::from_utf8_lossy(path).into_owned(),
@@ -501,27 +482,23 @@ pub(crate) fn parse_numstat(mut bytes: &[u8]) -> Option<Vec<CommitFile>> {
             insertions,
             deletions,
         });
-        bytes = rest;
     }
-    Some(files)
+    None
 }
 
-/// A run of digits, or a single `-` for a binary file.
-fn take_count(bytes: &[u8]) -> Option<(Option<u64>, &[u8])> {
-    if bytes.first() == Some(&b'-') {
-        return Some((None, &bytes[1..]));
+/// Digits only (`u64::from_str` alone takes `+5`), or `-` for a binary file.
+#[expect(
+    clippy::option_option,
+    reason = "the outer `None` rejects the record, as in every parser here; the inner one is the field"
+)]
+fn count(field: &[u8]) -> Option<Option<u64>> {
+    if field == b"-" {
+        return Some(None);
     }
-    let end = bytes.iter().position(|byte| !byte.is_ascii_digit())?;
-    if end == 0 {
+    if field.is_empty() || !field.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    let number = std::str::from_utf8(&bytes[..end]).ok()?.parse().ok()?;
-    Some((Some(number), &bytes[end..]))
-}
-
-fn split_nul(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
-    let end = bytes.iter().position(|byte| *byte == 0)?;
-    Some((&bytes[..end], &bytes[end + 1..]))
+    std::str::from_utf8(field).ok()?.parse().ok().map(Some)
 }
 
 fn stats_from_files(files: &[CommitFile]) -> Option<CommitStats> {
@@ -582,7 +559,7 @@ const NOTICE_EMPTY: &str = "No line changes.";
 /// `--no-textconv` and `--no-ext-diff` are required here: `git show -p`
 /// otherwise runs the repository's textconv and external diff commands.
 pub fn file_diff(git: &Git, root: &Path, oid: &str, path: &str) -> Result<FileDiff, GitError> {
-    if !is_commit_oid(oid) {
+    if !is_oid(oid) {
         return Err(super::exec::rejected(
             "git show",
             format!("{oid} is not a commit hash"),
@@ -612,83 +589,54 @@ pub fn file_diff(git: &Git, root: &Path, oid: &str, path: &str) -> Result<FileDi
 /// Turns one `git show -p` into lines. The `diff --git` preamble is dropped.
 /// A binary file, a submodule, or a mode-only change becomes `notice` and no lines.
 pub(crate) fn parse_file_diff(text: &str) -> FileDiff {
-    if text
-        .lines()
+    let header: Vec<&str> = header_lines(text).collect();
+    if header
+        .iter()
         .any(|line| line.starts_with("Binary files ") || line.starts_with("GIT binary patch"))
     {
         return noticed(NOTICE_BINARY);
     }
-    if text
-        .lines()
-        .any(|line| line.contains("Subproject commit") || line.contains(" 160000"))
-    {
+    if header.iter().copied().any(is_gitlink_header) {
         return noticed(NOTICE_SUBMODULE);
     }
+    let saw_mode = header
+        .iter()
+        .any(|line| line.starts_with("old mode ") || line.starts_with("new mode "));
 
-    let mut saw_mode = false;
     let mut lines = Vec::new();
     let mut old_no = 0u32;
     let mut new_no = 0u32;
     let mut in_hunk = false;
     for line in text.lines() {
-        if line.starts_with("old mode ") || line.starts_with("new mode ") {
-            saw_mode = true;
+        if line.starts_with("diff --git ") {
+            in_hunk = false;
+            continue;
         }
-        if let Some((old, new)) = hunk_starts(line) {
+        let (kind, text) = if let Some(starts) = hunk_starts(line) {
             in_hunk = true;
-            old_no = old;
-            new_no = new;
-            lines.push(DiffLine {
-                kind: DiffKind::Hunk,
-                old: None,
-                new: None,
-                text: line.to_owned(),
-            });
+            (old_no, new_no) = starts;
+            (DiffKind::Hunk, line)
+        } else if !in_hunk {
             continue;
-        }
-        if !in_hunk {
-            continue;
-        }
-        let Some(prefix) = line.chars().next() else {
-            continue;
+        } else {
+            match line.as_bytes().first() {
+                Some(b'+') => (DiffKind::Added, &line[1..]),
+                Some(b'-') => (DiffKind::Removed, &line[1..]),
+                Some(b' ') => (DiffKind::Context, &line[1..]),
+                Some(b'\\') => (DiffKind::Meta, "No newline at end of file"),
+                _ => continue,
+            }
         };
-        match prefix {
-            '+' => {
-                lines.push(DiffLine {
-                    kind: DiffKind::Added,
-                    old: None,
-                    new: (new_no > 0).then_some(new_no),
-                    text: line[1..].to_owned(),
-                });
-                new_no = new_no.saturating_add(1);
-            }
-            '-' => {
-                lines.push(DiffLine {
-                    kind: DiffKind::Removed,
-                    old: (old_no > 0).then_some(old_no),
-                    new: None,
-                    text: line[1..].to_owned(),
-                });
-                old_no = old_no.saturating_add(1);
-            }
-            ' ' => {
-                lines.push(DiffLine {
-                    kind: DiffKind::Context,
-                    old: (old_no > 0).then_some(old_no),
-                    new: (new_no > 0).then_some(new_no),
-                    text: line[1..].to_owned(),
-                });
-                old_no = old_no.saturating_add(1);
-                new_no = new_no.saturating_add(1);
-            }
-            '\\' => lines.push(DiffLine {
-                kind: DiffKind::Meta,
-                old: None,
-                new: None,
-                text: "No newline at end of file".to_owned(),
-            }),
-            _ => {}
-        }
+        let on_old = matches!(kind, DiffKind::Removed | DiffKind::Context);
+        let on_new = matches!(kind, DiffKind::Added | DiffKind::Context);
+        lines.push(DiffLine {
+            kind,
+            old: (on_old && old_no > 0).then_some(old_no),
+            new: (on_new && new_no > 0).then_some(new_no),
+            text: text.to_owned(),
+        });
+        old_no = old_no.saturating_add(u32::from(on_old));
+        new_no = new_no.saturating_add(u32::from(on_new));
     }
 
     if lines.is_empty() {
@@ -711,6 +659,36 @@ pub(crate) fn parse_file_diff(text: &str) -> FileDiff {
     }
 }
 
+/// The header of every `diff --git` section: its lines before the first hunk.
+/// `git show` prints a type change as two sections. Hunk lines are file
+/// content and can contain anything, so they are left out.
+fn header_lines(text: &str) -> impl Iterator<Item = &str> {
+    let mut in_hunk = false;
+    text.lines().filter(move |line| {
+        if line.starts_with("diff --git ") {
+            in_hunk = false;
+        } else if hunk_starts(line).is_some() {
+            in_hunk = true;
+        }
+        !in_hunk
+    })
+}
+
+/// `index a..b 160000`, `new file mode 160000`, and the other mode lines of a
+/// submodule (gitlink) entry.
+fn is_gitlink_header(line: &str) -> bool {
+    [
+        "index ",
+        "new file mode ",
+        "deleted file mode ",
+        "old mode ",
+        "new mode ",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+        && line.ends_with(" 160000")
+}
+
 fn noticed(notice: &str) -> FileDiff {
     FileDiff {
         notice: Some(notice.to_owned()),
@@ -730,8 +708,7 @@ fn hunk_starts(line: &str) -> Option<(u32, u32)> {
 
 fn spec_start(spec: &str) -> Option<u32> {
     spec.split_once(',')
-        .map(|(start, _)| start)
-        .unwrap_or(spec)
+        .map_or(spec, |(start, _)| start)
         .parse()
         .ok()
 }
@@ -740,163 +717,208 @@ pub fn short_oid(oid: &str) -> &str {
     oid.get(..SHORT_OID_LEN).unwrap_or(oid)
 }
 
-/// Reads up to `limit` commits reachable from HEAD in the repository at `root`.
-///
-/// `head` comes from [`super::inspect`]; an unborn branch has no commits, so
-/// git is not asked at all (it would fail instead of printing nothing).
-///
-/// `--no-textconv` and `--no-ext-diff` are set so a repository diff driver
-/// cannot run while the history list is displayed.
-pub fn history(git: &Git, root: &Path, head: &Head, limit: usize) -> Result<History, GitError> {
-    if matches!(head, Head::Unborn(_)) || limit == 0 {
-        return Ok(History::default());
-    }
-
-    // Git 2.55 parses --max-count as a 32-bit signed integer. A larger value
-    // is rejected ("not an integer") instead of listing the commits.
-    let max_count = format!(
-        "--max-count={}",
-        limit.saturating_add(1).min(i32::MAX as usize)
-    );
-    let args = [
-        "log",
-        &max_count,
-        "-z",
-        "--format=%H%x1f%s",
-        "--no-color",
-        "--no-textconv",
-        "--no-ext-diff",
-        "HEAD",
-        "--",
-    ];
-    let output = git.require_ok(root, &args)?;
-    let mut commits = parse_log(&output.stdout).ok_or_else(|| {
-        super::exec::rejected(
-            &format!("git {}", args.join(" ")),
-            "unrecognized log output",
-        )
-    })?;
-
-    let truncated = commits.len() > limit;
-    commits.truncate(limit);
-    Ok(History { commits, truncated })
-}
-
-/// Parses `git log -z --format=%H%x1f%s`: NUL-terminated records of
-/// `<oid> 0x1f <subject>`.
-///
-/// `-z` ends a record on NUL, so a NUL inside the subject ends that subject.
-/// Bytes after it are another commit only when they contain a field
-/// separator. A tail with none is discarded; otherwise that one subject
-/// would reject every commit already parsed. A record that fails validation
-/// still rejects the whole log.
-pub(crate) fn parse_log(stdout: &[u8]) -> Option<Vec<Commit>> {
-    let mut commits = Vec::new();
-    for record in stdout
-        .split(|byte| *byte == 0)
-        .filter(|record| !record.is_empty())
-    {
-        match parse_log_record(record) {
-            Some(commit) => commits.push(commit),
-            None if commits.is_empty() || record.contains(&FIELD_SEPARATOR) => return None,
-            None => {}
-        }
-    }
-    Some(commits)
-}
-
-fn parse_log_record(record: &[u8]) -> Option<Commit> {
-    let separator = record.iter().position(|byte| *byte == FIELD_SEPARATOR)?;
-    let (oid, summary) = (&record[..separator], &record[separator + 1..]);
-    if oid.is_empty() || !oid.iter().all(u8::is_ascii_hexdigit) {
-        return None;
-    }
-    Some(Commit {
-        oid: String::from_utf8_lossy(oid).into_owned(),
-        summary: String::from_utf8_lossy(summary).into_owned(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
+    use proptest::prelude::*;
+
     use super::*;
+    use crate::test_support::OID_A;
 
-    const OID_A: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-    const OID_B: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+    #[test]
+    fn short_oid_is_twelve_characters() {
+        let long = OID_A.to_owned();
+        for (oid, short) in [
+            ("", ""),
+            ("abc", "abc"),
+            ("0123456789ab", "0123456789ab"),
+            ("0123456789abc", "0123456789ab"),
+            (long.as_str(), "4b825dc642cb"),
+        ] {
+            assert_eq!(short_oid(oid), short, "{oid:?}");
+        }
+    }
 
-    fn record(oid: &str, summary: &[u8]) -> Vec<u8> {
-        let mut out = oid.as_bytes().to_vec();
-        out.push(FIELD_SEPARATOR);
-        out.extend_from_slice(summary);
-        out.push(0);
-        out
+    const ADA_AND_GRACE: &[(&str, &str)] =
+        &[("Ada", "ada@example.com"), ("Grace", "grace@example.com")];
+
+    /// Trailer text, and the `(name, email)` pairs read from it in order.
+    const CO_AUTHORS: &[(&str, &[(&str, &str)])] = &[
+        ("", &[]),
+        ("Co-authored", &[]),
+        // `concat!` keeps the leading spaces; a `\` line continuation would strip them.
+        (
+            concat!(
+                "Co-authored-by: Ada Voss <ada@miskatonic.test>\r\n",
+                "CO-AUTHORED-BY:\tHerb\tWest\t<west@arkham.test>\t\r\n",
+                "Co-authored-by: Ada Voss <ADA@miskatonic.test>\n",
+                "Co-authored-by: First <Dup@Example.com>\n",
+                "co-authored-by: Second <dup@example.com>\n",
+                "Co-authored-by: <nameless@arkham.test>\n",
+                "Co-authored-by: <>\n",
+                "Co-authored-by: Nobody <>\n",
+                "Co-authored-by: Nobody < >\n",
+                "Co-authored-by: No Address\n",
+                "Reviewed-by: Someone <someone@arkham.test>\n",
+                "Co-authored-by: Odd <Name> <odd@arkham.test>\n",
+                "Co-authored-by: Tagged <user<host@example.com>\n",
+                "  Co-authored-by: Indented <in@example.com>\n",
+                "Co-authored-by: Ünïcödé Ñame <unicode@arkham.test>",
+            ),
+            &[
+                ("Ada Voss", "ada@miskatonic.test"),
+                ("Herb\tWest", "west@arkham.test"),
+                ("First", "Dup@Example.com"),
+                ("Odd <Name>", "odd@arkham.test"),
+                ("Tagged", "user<host@example.com"),
+                ("Ünïcödé Ñame", "unicode@arkham.test"),
+            ],
+        ),
+        // The key starts the line, in any case. Whitespace may follow the
+        // address; text may not.
+        ("  Co-authored-by: A <a@b.co>", &[]),
+        ("prefix Co-authored-by: Name <a@b.co>", &[]),
+        ("Co-authored-by: Name <a@b.co> trailing", &[]),
+        (
+            "cO-AuThOrEd-By:Herbert West   <west@arkham.test> \t ",
+            &[("Herbert West", "west@arkham.test")],
+        ),
+        // A bare CR and the Unicode separators end a line, as in VS Code.
+        (
+            "Co-authored-by: Ada <ada@example.com>\rCo-authored-by: Grace <grace@example.com>",
+            ADA_AND_GRACE,
+        ),
+        (
+            "Co-authored-by: Ada <ada@example.com>\n\rCo-authored-by: Grace <grace@example.com>",
+            ADA_AND_GRACE,
+        ),
+        (
+            "Co-authored-by: Ada <ada@example.com>\u{2028}Co-authored-by: Grace <grace@example.com>",
+            ADA_AND_GRACE,
+        ),
+        (
+            "Co-authored-by: Ada <ada@example.com>\u{2029}Co-authored-by: Grace <grace@example.com>",
+            ADA_AND_GRACE,
+        ),
+    ];
+
+    fn people(pairs: &[(&str, &str)]) -> Vec<Person> {
+        pairs
+            .iter()
+            .map(|(name, email)| Person::new(*name, *email))
+            .collect()
     }
 
     #[test]
-    fn parses_records_in_order() {
-        let mut stdout = record(OID_A, b"Awaken the Old Ones");
-        stdout.extend(record(OID_B, b"Initial commit"));
-        assert_eq!(
-            parse_log(&stdout),
-            Some(vec![
-                Commit {
-                    oid: OID_A.to_owned(),
-                    summary: "Awaken the Old Ones".to_owned()
-                },
-                Commit {
-                    oid: OID_B.to_owned(),
-                    summary: "Initial commit".to_owned()
-                },
-            ])
-        );
+    fn parse_co_authors_table() {
+        for (text, expected) in CO_AUTHORS {
+            assert_eq!(parse_co_authors(text), people(expected), "{text:?}");
+        }
     }
 
     #[test]
-    fn empty_output_is_an_empty_history() {
-        assert_eq!(parse_log(b""), Some(Vec::new()));
+    fn parse_co_authors_stays_linear_on_huge_trailers() {
+        let name = "N".repeat(60_000);
+        let email = format!("{}@x.test", "e".repeat(20_000));
+        let line = format!("Co-authored-by: {name} <{email}>");
+        assert_eq!(parse_co_authors(&line), [Person::new(name, email)]);
+        assert_eq!(parse_co_authors(&"a".repeat(100_000)), []);
+
+        // A megabyte of `<` before the closing `>`, and thousands of distinct
+        // co-authors, come from a repository and must parse in linear time.
+        let brackets = format!("Co-authored-by: a {}>b>", "<".repeat(1 << 20));
+        assert_eq!(parse_co_authors(&brackets), []);
+        let many = (0..20_000).fold(String::new(), |mut many, n| {
+            let _ = writeln!(many, "Co-authored-by: N{n} <n{n}@x.test>");
+            many
+        });
+        assert_eq!(parse_co_authors(&many).len(), 20_000);
     }
 
-    #[test]
-    fn missing_trailing_nul_is_accepted() {
-        let mut stdout = record(OID_A, b"Last");
-        stdout.pop();
-        assert_eq!(parse_log(&stdout).map(|commits| commits.len()), Some(1));
+    proptest! {
+        #![proptest_config(crate::test_support::proptest_config())]
+
+        #[test]
+        fn parse_co_authors_never_panics(text in "(?s).{0,200}") {
+            let _ = parse_co_authors(&text);
+        }
     }
 
-    #[test]
-    fn empty_subject_is_kept() {
-        let commits = parse_log(&record(OID_A, b"")).expect("parsable");
-        assert_eq!(commits[0].summary, "");
-    }
+    /// The author as recorded (no `.mailmap`), the co-author trailers, and
+    /// the author's aliases and the co-authors kept after folding.
+    type Fold = (
+        (&'static str, &'static str),
+        &'static [(&'static str, &'static str)],
+        &'static [&'static str],
+        &'static [(&'static str, &'static str)],
+    );
+
+    const FOLDS: &[Fold] = &[
+        // The author's address in any case or padding is the author. The
+        // author's name with another address is an alias, once.
+        (
+            ("Ada Lovelace", "Ada@Example.com"),
+            &[
+                ("Someone", "ada@example.com"),
+                ("Other Name", "  ADA@example.com  "),
+                ("ada lovelace", "Alt@Example.com"),
+                ("ADA LOVELACE", "alt@example.com"),
+                ("Ada Lovelace", "second@example.com"),
+                ("Grace Hopper", "grace@example.com"),
+            ],
+            &["Alt@Example.com", "second@example.com"],
+            &[("Grace Hopper", "grace@example.com")],
+        ),
+        // An empty or blank name is no alias key.
+        (
+            ("", "author@example.com"),
+            &[
+                ("", "other@example.com"),
+                ("   ", "space@example.com"),
+                ("Author", "author@example.com"),
+            ],
+            &[],
+            &[("", "other@example.com"), ("   ", "space@example.com")],
+        ),
+        (
+            ("   ", "ada@example.com"),
+            &[("Ada", "alt@example.com")],
+            &[],
+            &[("Ada", "alt@example.com")],
+        ),
+        // Names match trimmed, and the author keeps the name as written.
+        (
+            ("Ada ", "ada@example.com"),
+            &[("ada", "alt@example.com")],
+            &["alt@example.com"],
+            &[],
+        ),
+        // Without an address, a blank trailer address is the author's.
+        (
+            ("Ada", ""),
+            &[
+                ("Grace", "grace@example.com"),
+                ("Blank", "  "),
+                ("ada", "alt@example.com"),
+            ],
+            &["alt@example.com"],
+            &[("Grace", "grace@example.com")],
+        ),
+    ];
 
     #[test]
-    fn subject_may_contain_the_separator() {
-        let commits = parse_log(&record(OID_A, b"a\x1fb")).expect("parsable");
-        assert_eq!(commits[0].summary, "a\u{1f}b");
-    }
-
-    #[test]
-    fn nul_in_subject_keeps_the_prefix_and_the_commit() {
-        let mut stdout = OID_A.as_bytes().to_vec();
-        stdout.push(FIELD_SEPARATOR);
-        stdout.extend_from_slice(b"subject with NUL\0 and more\0");
-        let commits = parse_log(&stdout).expect("a NUL in the subject must not drop the history");
-        assert_eq!(commits.len(), 1);
-        assert_eq!(commits[0].oid, OID_A);
-        assert_eq!(commits[0].summary, "subject with NUL");
-    }
-
-    #[test]
-    fn non_utf8_subject_is_replaced_not_rejected() {
-        let commits = parse_log(&record(OID_A, b"caf\xe9")).expect("parsable");
-        assert_eq!(commits[0].summary, "caf\u{fffd}");
-    }
-
-    #[test]
-    fn malformed_records_are_rejected() {
-        assert_eq!(parse_log(b"no separator\0"), None);
-        assert_eq!(parse_log(b"\x1fsubject without oid\0"), None);
-        assert_eq!(parse_log(b"not-hex\x1fsubject\0"), None);
+    fn fold_with_recorded_table() {
+        for &((name, email), co_authors, aliases, kept) in FOLDS {
+            let mut author = Person::new(name, email);
+            let recorded = author.clone();
+            let got = fold_with_recorded(&mut author, &recorded, people(co_authors));
+            let expected = Person {
+                aliases: aliases.iter().map(|alias| (*alias).to_owned()).collect(),
+                ..recorded
+            };
+            assert_eq!((author, got), (expected, people(kept)), "{name:?}");
+        }
     }
 
     /// What `%(trailers:only)` prints for these test messages: their
@@ -916,6 +938,7 @@ mod tests {
             email.as_bytes(),
             name.as_bytes(),
             email.as_bytes(),
+            b"1792598400",
             date.as_bytes(),
         ] {
             out.push(FIELD_SEPARATOR);
@@ -930,13 +953,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_commit_detail_and_keeps_a_separator_in_the_message() {
+    fn parses_commit_detail_and_keeps_separators_and_nul_in_the_message() {
         let stdout = detail_record(
             OID_A,
             "cthulhu",
             "cthulhu@example.invalid",
             "2026-10-07 18:43",
-            b"Second\n\nThe body\x1f stays.",
+            b"Second\n\nThe body\x1f stays.\x00 and more",
         );
         assert_eq!(
             parse_commit_detail(&stdout),
@@ -945,7 +968,7 @@ mod tests {
                 author: Person::new("cthulhu", "cthulhu@example.invalid"),
                 co_authors: Vec::new(),
                 authored_at: "2026-10-07 18:43".to_owned(),
-                message: "Second\n\nThe body\u{1f} stays.".to_owned(),
+                message: "Second\n\nThe body\u{1f} stays.\u{0} and more".to_owned(),
             })
         );
     }
@@ -980,50 +1003,6 @@ mod tests {
     }
 
     #[test]
-    fn co_author_lines_follow_the_vs_code_rule() {
-        let text = "Co-authored-by: Ada Voss <ada@miskatonic.test>\n\
-                    CO-AUTHORED-BY:Herbert West   <west@arkham.test>   \n\
-                    Co-authored-by: Ada Voss <ADA@miskatonic.test>\n\
-                    Co-authored-by: <nameless@arkham.test>\n\
-                    Co-authored-by: No Address\n\
-                    Co-authored-by: Empty <>\n\
-                    Reviewed-by: Someone <someone@arkham.test>\n\
-                    Co-authored-by: Odd <Name> <odd@arkham.test>\n\
-                    Co-authored-by: Ünïcödé Ñame <unicode@arkham.test>";
-        let people = parse_co_authors(text);
-        assert_eq!(
-            people,
-            [
-                Person::new("Ada Voss", "ada@miskatonic.test"),
-                Person::new("Herbert West", "west@arkham.test"),
-                Person::new("Odd <Name>", "odd@arkham.test"),
-                Person::new("Ünïcödé Ñame", "unicode@arkham.test"),
-            ]
-        );
-    }
-
-    #[test]
-    fn co_author_key_must_start_the_line() {
-        assert!(parse_co_authors("  Co-authored-by: A <a@b>").is_empty());
-        assert!(parse_co_authors("Co-authored").is_empty());
-        assert!(parse_co_authors("").is_empty());
-    }
-
-    #[test]
-    fn commit_detail_keeps_a_nul_inside_the_message() {
-        let stdout = detail_record(
-            OID_A,
-            "cthulhu",
-            "cthulhu@example.invalid",
-            "2026-10-07 18:43",
-            b"subject with NUL\x00 and more",
-        );
-        let detail = parse_commit_detail(&stdout).expect("parsable");
-        assert!(detail.message.contains('\u{0}'));
-        assert!(detail.message.contains("and more"));
-    }
-
-    #[test]
     fn malformed_commit_detail_is_rejected() {
         assert_eq!(parse_commit_detail(b""), None);
         assert_eq!(parse_commit_detail(b"no separators\n"), None);
@@ -1050,22 +1029,14 @@ mod tests {
     }
 
     fn hover_record(message: &[u8], numstat: &[u8]) -> Vec<u8> {
-        let mut out = OID_A.as_bytes().to_vec();
-        for field in [
-            b"Ada Voss".as_slice(),
-            b"ada@miskatonic.test",
-            b"Ada Voss",
-            b"ada@miskatonic.test",
-            b"1792598400",
-            b"2026-10-21 11:10",
-        ] {
-            out.push(FIELD_SEPARATOR);
-            out.extend_from_slice(field);
-        }
-        out.push(FIELD_SEPARATOR);
-        out.extend_from_slice(&trailer_lines(message));
-        out.push(TRAILERS_END);
-        out.extend_from_slice(message);
+        let mut out = detail_record(
+            OID_A,
+            "Ada Voss",
+            "ada@miskatonic.test",
+            "2026-10-21 11:10",
+            message,
+        );
+        out.pop();
         out.push(RECORD_END);
         out.extend_from_slice(numstat);
         out
@@ -1123,7 +1094,7 @@ mod tests {
                 deletions: 7,
             })
         );
-        assert!(hover.tags.is_empty());
+        assert_eq!(hover.tags, [] as [String; 0]);
     }
 
     #[test]
@@ -1159,26 +1130,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_numstat_is_an_empty_file_list() {
-        assert_eq!(parse_numstat(b""), Some(Vec::new()));
-        assert_eq!(parse_numstat(b"\n"), Some(Vec::new()));
-        let empty = hover_record(b"Merge branch 'topic'\n", b"\n");
-        let hover = parse_commit_hover(&empty).expect("empty");
-        assert!(hover.files.is_empty());
-        assert_eq!(hover.stats, None);
-    }
-
-    #[test]
-    fn malformed_numstat_is_rejected() {
-        assert_eq!(parse_numstat(b"\nno tabs"), None);
-        assert_eq!(parse_numstat(b"\n1\t0\t\0only-old\0"), None);
-        assert_eq!(
-            parse_commit_hover(&hover_record(b"m", b"\nnot-numstat")),
-            None
-        );
-    }
-
-    #[test]
     fn tag_names_keep_a_comma_and_skip_empty_records() {
         assert_eq!(
             parse_tag_names(b"v1,0\nv0.0.1\n"),
@@ -1188,8 +1139,8 @@ mod tests {
             parse_tag_names(b"v1,0\0\nv0.0.1\r\n"),
             ["v1,0".to_owned(), "v0.0.1".to_owned()]
         );
-        assert!(parse_tag_names(b"").is_empty());
-        assert!(parse_tag_names(b"\n").is_empty());
+        assert_eq!(parse_tag_names(b""), [] as [String; 0]);
+        assert_eq!(parse_tag_names(b"\n"), [] as [String; 0]);
     }
 
     #[test]
@@ -1233,46 +1184,104 @@ mod tests {
                 },
             ]
         );
+        // A side that starts at 0 is empty, so a stray line there has no number.
+        let stray = parse_file_diff("@@ -0,0 +0,0 @@\n x\n");
+        assert_eq!((stray.lines[1].old, stray.lines[1].new), (None, None));
     }
 
     #[test]
     fn unified_diff_notices_replace_lines_that_are_not_a_text_hunk() {
-        assert_eq!(
-            parse_file_diff("Binary files a/bin.dat and b/bin.dat differ\n")
-                .notice
-                .as_deref(),
-            Some("Binary file.")
+        for (diff, notice) in [
+            (
+                "Binary files a/bin.dat and b/bin.dat differ\n",
+                "Binary file.",
+            ),
+            ("GIT binary patch\ndelta 1\n", "Binary file."),
+            (
+                "index abc..def 160000\n@@ -1 +1 @@\n-Subproject commit abc\n+Subproject commit def\n",
+                "Submodule update.",
+            ),
+            ("old mode 100644\nnew mode 100755\n", "File mode changed."),
+            ("diff --git a/x b/x\n", "No line changes."),
+            (
+                "new file mode 160000\nindex 0000000..abc\n@@ -0,0 +1 @@\n+Subproject commit abc\n",
+                "Submodule update.",
+            ),
+            // A type change is two sections, and the second header counts too.
+            (
+                concat!(
+                    "diff --git a/x b/x\ndeleted file mode 120000\nindex 1de5659..0000000\n",
+                    "--- a/x\n+++ /dev/null\n@@ -1 +0,0 @@\n-target\n\\ No newline at end of file\n",
+                    "diff --git a/x b/x\nnew file mode 100644\nindex 0000000..8352675\n",
+                    "Binary files /dev/null and b/x differ\n",
+                ),
+                "Binary file.",
+            ),
+            (
+                concat!(
+                    "diff --git a/x b/x\ndeleted file mode 100644\nindex 1de5659..0000000\n",
+                    "--- a/x\n+++ /dev/null\n@@ -1 +0,0 @@\n-text\n",
+                    "diff --git a/x b/x\nnew file mode 160000\nindex 0000000..abc\n",
+                    "--- /dev/null\n+++ b/x\n@@ -0,0 +1 @@\n+Subproject commit abc\n",
+                ),
+                "Submodule update.",
+            ),
+        ] {
+            assert_eq!(
+                parse_file_diff(diff).notice.as_deref(),
+                Some(notice),
+                "{diff:?}"
+            );
+        }
+        // The markers inside a text file's hunks are content, not a header.
+        let text = parse_file_diff(
+            "diff --git a/price.txt b/price.txt\nindex abc..def 100644\n@@ -1,2 +1,2 @@\n-price 150000\n+price 160000\n Subproject commit is just text here\n",
         );
+        assert_eq!(text.notice, None);
+        assert_eq!(text.lines.len(), 4, "hunk header and three lines: {text:?}");
+        // The second section's `---`/`+++` header is not a hunk line.
+        let type_change = parse_file_diff(concat!(
+            "diff --git a/x b/x\ndeleted file mode 120000\n--- a/x\n+++ /dev/null\n",
+            "@@ -1 +0,0 @@\n-target\n",
+            "diff --git a/x b/x\nnew file mode 100644\n--- /dev/null\n+++ b/x\n",
+            "@@ -0,0 +1 @@\n+hello\n",
+        ));
+        let texts: Vec<&str> = type_change
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
         assert_eq!(
-            parse_file_diff("GIT binary patch\ndelta 1\n")
-                .notice
-                .as_deref(),
-            Some("Binary file.")
-        );
-        assert_eq!(
-            parse_file_diff(
-                "index abc..def 160000\n@@ -1 +1 @@\n-Subproject commit abc\n+Subproject commit def\n"
-            )
-            .notice
-            .as_deref(),
-            Some("Submodule update.")
-        );
-        assert_eq!(
-            parse_file_diff("old mode 100644\nnew mode 100755\n")
-                .notice
-                .as_deref(),
-            Some("File mode changed.")
-        );
-        assert_eq!(
-            parse_file_diff("diff --git a/x b/x\n").notice.as_deref(),
-            Some("No line changes.")
+            texts,
+            ["@@ -1 +0,0 @@", "target", "@@ -0,0 +1 @@", "hello"],
+            "{type_change:?}"
         );
     }
 
     #[test]
-    fn malformed_hover_records_are_rejected() {
+    fn empty_and_malformed_hover_records() {
+        for (numstat, files) in [
+            (&b""[..], Some(0)),
+            (b"\n", Some(0)),
+            (b"\nno tabs", None),
+            (b"\n1\t0\t\0only-old\0", None),
+            // Digits only: `u64::from_str` alone would take the sign.
+            (b"\n+1\t0\ta\0", None),
+        ] {
+            let parsed = parse_numstat(numstat).map(|files| files.len());
+            assert_eq!(parsed, files, "{numstat:?}");
+        }
+        let merge = parse_commit_hover(&hover_record(b"Merge branch 'topic'\n", b"\n"))
+            .expect("a merge with no changes");
+        assert_eq!(merge.files, []);
+        assert_eq!(merge.stats, None);
+
         assert_eq!(parse_commit_hover(b""), None);
         assert_eq!(parse_commit_hover(b"no record end"), None);
+        assert_eq!(
+            parse_commit_hover(&hover_record(b"m", b"\nnot-numstat")),
+            None
+        );
         let mut bad_time = hover_record(b"m", b"");
         let at = bad_time
             .windows(10)
@@ -1280,15 +1289,5 @@ mod tests {
             .expect("time");
         bad_time[at] = b'x';
         assert_eq!(parse_commit_hover(&bad_time), None);
-    }
-
-    #[test]
-    fn short_oid_is_twelve_characters() {
-        let commit = Commit {
-            oid: OID_A.to_owned(),
-            summary: String::new(),
-        };
-        assert_eq!(commit.short_oid(), "4b825dc642cb");
-        assert_eq!(short_oid("abc"), "abc");
     }
 }

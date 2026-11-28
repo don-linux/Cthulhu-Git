@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use super::exec::{Git, GitError};
+use super::exec::{Cr, Git, GitError, trim_eol};
 use super::log::short_oid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,10 +39,10 @@ impl fmt::Display for Head {
 pub fn inspect(git: &Git, path: &Path) -> Result<RepoInfo, GitError> {
     let dir = require_directory(path)?;
     let root = repository_root(git, &dir)?;
-    let name = root
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.display().to_string());
+    let name = root.file_name().map_or_else(
+        || root.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
     let head = read_head(git, &root)?;
     Ok(RepoInfo { root, name, head })
 }
@@ -67,7 +67,7 @@ fn repository_root(git: &Git, dir: &Path) -> Result<PathBuf, GitError> {
 
     if stdout_text(&bare.stdout) == "true" {
         let git_dir = git.require_ok(dir, &["rev-parse", "--absolute-git-dir"])?;
-        return git_path(git_dir.stdout);
+        return git_path(&git_dir.stdout);
     }
 
     show_toplevel(git, dir)
@@ -75,20 +75,15 @@ fn repository_root(git: &Git, dir: &Path) -> Result<PathBuf, GitError> {
 
 fn show_toplevel(git: &Git, dir: &Path) -> Result<PathBuf, GitError> {
     let output = git.require_ok(dir, &["rev-parse", "--show-toplevel"])?;
-    git_path(output.stdout)
+    git_path(&output.stdout)
 }
 
-fn git_path(stdout: Vec<u8>) -> Result<PathBuf, GitError> {
-    let mut stdout = stdout;
-    // Git adds one trailing newline (`\n` on Unix, `\r\n` on Windows). A
-    // directory whose name itself ends in CR or LF must keep that byte.
-    if stdout.last() == Some(&b'\n') {
-        stdout.pop();
-    }
-    #[cfg(windows)]
-    if stdout.last() == Some(&b'\r') {
-        stdout.pop();
-    }
+/// Git ends a line with `\n` on Unix and `\r\n` on Windows. A directory whose
+/// name itself ends in CR or LF must keep that byte.
+const LINE_CR: Cr = if cfg!(windows) { Cr::Any } else { Cr::Kept };
+
+fn git_path(stdout: &[u8]) -> Result<PathBuf, GitError> {
+    let stdout = trim_eol(stdout, LINE_CR);
     if stdout.is_empty() {
         return Err(super::exec::rejected("git rev-parse", "empty output"));
     }
@@ -125,7 +120,7 @@ fn read_head(git: &Git, root: &Path) -> Result<Head, GitError> {
 
 fn branch_name(stdout: &[u8]) -> String {
     let full = stdout_text(stdout);
-    full.strip_prefix("refs/heads/").unwrap_or(&full).to_owned()
+    full.trim_prefix("refs/heads/").to_owned()
 }
 
 fn detached_head(git: &Git, root: &Path) -> Result<Head, GitError> {
@@ -143,114 +138,23 @@ fn detached_head(git: &Git, root: &Path) -> Result<Head, GitError> {
 }
 
 fn stdout_text(stdout: &[u8]) -> String {
-    let mut bytes = stdout.to_vec();
-    if bytes.last() == Some(&b'\n') {
-        bytes.pop();
-    }
-    #[cfg(windows)]
-    if bytes.last() == Some(&b'\r') {
-        bytes.pop();
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
+    String::from_utf8_lossy(trim_eol(stdout, LINE_CR)).into_owned()
 }
 
 #[cfg(unix)]
-fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
-    use std::os::unix::ffi::OsStringExt;
-    PathBuf::from(std::ffi::OsString::from_vec(bytes))
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
 }
 
 #[cfg(not(unix))]
-fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-/// Reads `# branch.oid` / `# branch.head` from `git status --porcelain=v2 --branch -z`.
-///
-/// Production code reads HEAD with `symbolic-ref` instead, so this parser is
-/// exercised by the unit and property tests only.
-#[cfg(test)]
-pub(crate) fn parse_head(stdout: &[u8]) -> Option<Head> {
-    let mut oid = None;
-    let mut head = None;
-
-    for record in stdout.split(|byte| *byte == 0) {
-        let Some(header) = record.strip_prefix(b"# ") else {
-            continue;
-        };
-        let header = String::from_utf8_lossy(header);
-        if let Some(value) = header.strip_prefix("branch.oid ") {
-            oid = Some(value.to_owned());
-        } else if let Some(value) = header.strip_prefix("branch.head ") {
-            head = Some(value.to_owned());
-        }
-    }
-
-    let head = head?;
-    let oid = oid?;
-    Some(match (head.as_str(), oid.as_str()) {
-        ("(detached)", "(initial)") => return None,
-        ("(detached)", oid) => Head::Detached {
-            short_oid: short_oid(oid).to_owned(),
-        },
-        (_, "(initial)") => Head::Unborn(head),
-        _ => Head::Branch(head),
-    })
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-
-    fn status(records: &[&str]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for record in records {
-            out.extend_from_slice(record.as_bytes());
-            out.push(0);
-        }
-        out
-    }
-
-    #[test]
-    fn branch_header() {
-        let stdout = status(&[
-            &format!("# branch.oid {OID}"),
-            "# branch.head feature/necronomicon",
-            "# branch.upstream origin/feature/necronomicon",
-            "# branch.ab +1 -2",
-            "1 .M N... 100644 100644 100644 aaaa bbbb README.md",
-        ]);
-        assert_eq!(
-            parse_head(&stdout),
-            Some(Head::Branch("feature/necronomicon".to_owned()))
-        );
-    }
-
-    #[test]
-    fn detached_header_uses_short_oid() {
-        let stdout = status(&[&format!("# branch.oid {OID}"), "# branch.head (detached)"]);
-        assert_eq!(
-            parse_head(&stdout),
-            Some(Head::Detached {
-                short_oid: "4b825dc642cb".to_owned()
-            })
-        );
-    }
-
-    #[test]
-    fn unborn_header() {
-        let stdout = status(&["# branch.oid (initial)", "# branch.head main"]);
-        assert_eq!(parse_head(&stdout), Some(Head::Unborn("main".to_owned())));
-    }
-
-    #[test]
-    fn missing_headers_are_rejected() {
-        assert_eq!(parse_head(b""), None);
-        assert_eq!(parse_head(&status(&["# branch.head main"])), None);
-        assert_eq!(parse_head(&status(&[&format!("# branch.oid {OID}")])), None);
-    }
 
     #[test]
     fn head_display_matches_ui_wording() {

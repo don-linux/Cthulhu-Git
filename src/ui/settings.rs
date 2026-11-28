@@ -13,16 +13,16 @@
 //! holds the optional read-only token.
 
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use cthulhu_git::github::{ApiStatus, TOKEN_TEMPLATE_URL};
 use cthulhu_git::settings::{HistoryColumns, sanitize_font_name};
 use eframe::egui::{
-    self, Align, Button, Color32, CursorIcon, FontId, Frame, Id, Key, Label, Layout, Margin,
-    RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, Vec2,
+    self, Align, Button, CursorIcon, FontId, Frame, Id, Key, Label, Layout, Margin, RichText,
+    ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, UiBuilder, Vec2,
 };
 
 use super::Action;
+use super::clock;
 use super::fonts::{self, Face};
 use super::github_auth::{GitHubAuth, Notice, Stored, token_field_id};
 use super::icons::{self, Icon};
@@ -44,9 +44,10 @@ const COLUMN_SPACING: f32 = 8.0;
 /// Extra gap before a section or the About card, on top of `COLUMN_SPACING`.
 const BETWEEN_CARDS: f32 = 12.0;
 const TITLE_SIZE: f32 = 24.0;
-const SUBTITLE_SIZE: f32 = 16.0;
 const SECTION_SIZE: f32 = 18.0;
+/// Body text, buttons and fields on a page; subtitles too.
 const BODY_SIZE: f32 = 16.0;
+/// Small text on a page: hints and labels.
 const HELP_SIZE: f32 = 15.0;
 const NAV_LABEL_SIZE: f32 = 16.0;
 const BAR_TITLE_SIZE: f32 = 18.0;
@@ -61,6 +62,15 @@ enum Page {
     GitHubAuth,
     About,
 }
+
+/// The navigation, top to bottom.
+const PAGES: [(Page, &str, Icon); 5] = [
+    (Page::Appearance, "Appearance", Icon::Type),
+    (Page::Terminal, "Terminal", Icon::Terminal),
+    (Page::History, "History", Icon::CircleUserRound),
+    (Page::GitHubAuth, "GitHub Auth", Icon::KeyRound),
+    (Page::About, "About", Icon::Info),
+];
 
 /// What the History, GitHub Auth, and About pages read.
 pub struct SettingsView {
@@ -131,40 +141,15 @@ pub fn show(
         .unwrap_or(Page::Appearance);
 
     egui::Panel::top("settings-top-bar")
-        .frame(bar_frame(&palette))
+        .frame(widgets::bar_frame(&palette))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 if icons::icon_button(ui, Icon::ArrowLeft, palette.text, "Back").clicked() {
                     actions.push(Action::CloseSettings);
                 }
-                if icons::icon_button(ui, Icon::House, palette.text, "Open another repository")
-                    .clicked()
-                {
-                    actions.push(Action::Home);
-                }
-                let folder_tint = if view_state.busy {
-                    palette.text_muted
-                } else {
-                    palette.text
-                };
-                if icons::icon_button_enabled(
-                    ui,
-                    Icon::Folder,
-                    folder_tint,
-                    "Open a folder",
-                    !view_state.busy,
-                )
-                .clicked()
-                {
-                    actions.push(Action::Browse);
-                }
+                widgets::home_and_folder(ui, view_state.busy, &mut actions);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new("Settings")
-                            .size(BAR_TITLE_SIZE)
-                            .strong()
-                            .color(palette.text),
-                    );
+                    ui.label(RichText::new("Settings").size(BAR_TITLE_SIZE).strong());
                 });
             });
         });
@@ -180,26 +165,10 @@ pub fn show(
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = NAV_ITEM_GAP;
-                    if nav_button(ui, "Appearance", Icon::Type, page == Page::Appearance).clicked()
-                    {
-                        page = Page::Appearance;
-                    }
-                    if nav_button(ui, "Terminal", Icon::Terminal, page == Page::Terminal).clicked()
-                    {
-                        page = Page::Terminal;
-                    }
-                    if nav_button(ui, "History", Icon::CircleUserRound, page == Page::History)
-                        .clicked()
-                    {
-                        page = Page::History;
-                    }
-                    if nav_button(ui, "GitHub Auth", Icon::KeyRound, page == Page::GitHubAuth)
-                        .clicked()
-                    {
-                        page = Page::GitHubAuth;
-                    }
-                    if nav_button(ui, "About", Icon::Info, page == Page::About).clicked() {
-                        page = Page::About;
+                    for (entry, label, icon) in PAGES {
+                        if nav_button(ui, label, icon, page == entry).clicked() {
+                            page = entry;
+                        }
                     }
                 });
         });
@@ -210,26 +179,17 @@ pub fn show(
             .auto_shrink(false)
             .show(ui, |ui| {
                 page_column(ui, |ui| match page {
-                    Page::Appearance => {
-                        appearance_page(ui, &palette, ui_font, &mut actions);
-                    }
+                    Page::Appearance => appearance_page(ui, ui_font, &mut actions),
                     Page::Terminal => {
-                        terminal_page(ui, &palette, terminal_font, &mut actions);
+                        terminal_page(ui, terminal_font, &mut actions);
                         if let Some(cwd) = cwd {
                             section(ui, |ui| {
-                                centered_text(
-                                    ui,
-                                    RichText::new("Terminal Live Preview")
-                                        .size(SUBTITLE_SIZE)
-                                        .color(palette.text_muted),
-                                );
+                                centered_text(ui, RichText::new("Terminal Live Preview").weak());
                                 shell_preview(ui, &palette, preview, cwd);
                             });
                         }
                     }
-                    Page::History => {
-                        history_page(ui, &palette, view_state.author_avatars, &mut actions);
-                    }
+                    Page::History => history_page(ui, view_state.author_avatars, &mut actions),
                     Page::GitHubAuth => {
                         github_page(ui, &palette, github, &view_state.api_status);
                     }
@@ -244,10 +204,9 @@ pub fn show(
     actions
 }
 
-fn appearance_page(ui: &mut Ui, palette: &Palette, saved: Option<&str>, actions: &mut Vec<Action>) {
+fn appearance_page(ui: &mut Ui, saved: Option<&str>, actions: &mut Vec<Action>) {
     page_header(
         ui,
-        palette,
         "Appearance",
         "Typeface for the interface. Every face here is bundled with the app.",
     );
@@ -255,13 +214,12 @@ fn appearance_page(ui: &mut Ui, palette: &Palette, saved: Option<&str>, actions:
         if let Some(text) = stale_font(saved, fonts::UI_FACES) {
             help(
                 ui,
-                palette,
                 &format!("\"{text}\" is not bundled. The interface is using Ubuntu."),
             );
         }
         for face in fonts::UI_FACES {
             let selected = fonts::resolve_ui(saved) == face.id;
-            if choice_row(ui, palette, face, UI_SAMPLE, selected).clicked() {
+            if choice_row(ui, face, UI_SAMPLE, selected).clicked() {
                 let next = if face.id == fonts::DEFAULT_UI_ID {
                     None
                 } else {
@@ -270,14 +228,13 @@ fn appearance_page(ui: &mut Ui, palette: &Palette, saved: Option<&str>, actions:
                 store_font(saved, next, actions, Action::SetUiFont);
             }
         }
-        help(ui, palette, "Commit hashes keep the built-in monospace.");
+        help(ui, "Commit hashes keep the built-in monospace.");
     });
 }
 
-fn terminal_page(ui: &mut Ui, palette: &Palette, saved: Option<&str>, actions: &mut Vec<Action>) {
+fn terminal_page(ui: &mut Ui, saved: Option<&str>, actions: &mut Vec<Action>) {
     page_header(
         ui,
-        palette,
         "Terminal Font",
         "Typeface for the terminal only. Meslo LGS NF is the default.",
     );
@@ -285,12 +242,11 @@ fn terminal_page(ui: &mut Ui, palette: &Palette, saved: Option<&str>, actions: &
         if let Some(text) = stale_terminal(saved) {
             help(
                 ui,
-                palette,
                 &format!("\"{text}\" is not bundled. The terminal is using Meslo LGS NF."),
             );
         }
         let builtin = saved.is_some_and(fonts::is_builtin_terminal);
-        if choice_builtin(ui, palette, builtin).clicked() {
+        if choice_builtin(ui, builtin).clicked() {
             store_font(
                 saved,
                 Some(fonts::BUILTIN_TERMINAL_ID),
@@ -300,7 +256,7 @@ fn terminal_page(ui: &mut Ui, palette: &Palette, saved: Option<&str>, actions: &
         }
         for face in fonts::TERMINAL_FACES {
             let selected = !builtin && fonts::resolve_terminal(saved) == Some(face.id);
-            if choice_row(ui, palette, face, TERMINAL_SAMPLE, selected).clicked() {
+            if choice_row(ui, face, TERMINAL_SAMPLE, selected).clicked() {
                 let next = if face.id == fonts::DEFAULT_TERMINAL_ID {
                     None
                 } else {
@@ -311,7 +267,6 @@ fn terminal_page(ui: &mut Ui, palette: &Palette, saved: Option<&str>, actions: &
         }
         help(
             ui,
-            palette,
             "Prompt icons are in Meslo LGS NF. The other faces do not include them.",
         );
     });
@@ -363,16 +318,9 @@ struct Specimen<'a> {
     sample_font: egui::FontId,
 }
 
-fn choice_row(
-    ui: &mut Ui,
-    palette: &Palette,
-    face: &Face,
-    sample: &str,
-    selected: bool,
-) -> egui::Response {
+fn choice_row(ui: &mut Ui, face: &Face, sample: &str, selected: bool) -> egui::Response {
     specimen_row(
         ui,
-        palette,
         Specimen {
             id: face.id,
             title: face.name,
@@ -385,14 +333,13 @@ fn choice_row(
     )
 }
 
-fn choice_builtin(ui: &mut Ui, palette: &Palette, selected: bool) -> egui::Response {
-    let mut title = egui::TextStyle::Monospace.resolve(ui.style());
+fn choice_builtin(ui: &mut Ui, selected: bool) -> egui::Response {
+    let mut title = TextStyle::Monospace.resolve(ui.style());
     title.size = BODY_SIZE;
     let mut sample = title.clone();
     sample.size = HELP_SIZE;
     specimen_row(
         ui,
-        palette,
         Specimen {
             id: "builtin",
             title: "Built-in",
@@ -405,12 +352,7 @@ fn choice_builtin(ui: &mut Ui, palette: &Palette, selected: bool) -> egui::Respo
     )
 }
 
-fn specimen_row(
-    ui: &mut Ui,
-    palette: &Palette,
-    row: Specimen<'_>,
-    selected: bool,
-) -> egui::Response {
+fn specimen_row(ui: &mut Ui, row: Specimen<'_>, selected: bool) -> egui::Response {
     let Specimen {
         id,
         title,
@@ -419,81 +361,37 @@ fn specimen_row(
         title_font,
         sample_font,
     } = row;
-    let response = ui
-        .scope_builder(UiBuilder::new().id_salt(id).sense(Sense::click()), |ui| {
-            let hovered = ui.response().hovered();
-            let fill = if selected {
-                palette.surface_active
-            } else if hovered {
-                palette.surface_hover
-            } else {
-                Color32::TRANSPARENT
-            };
-            Frame::new()
-                .fill(fill)
-                .corner_radius(widgets::CORNER_RADIUS)
-                .inner_margin(Margin::symmetric(12, 10))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            Label::new(RichText::new(title).font(title_font).color(palette.text))
-                                .selectable(false),
-                        );
-                        ui.add(
-                            Label::new(
-                                RichText::new(note)
-                                    .size(HELP_SIZE)
-                                    .color(palette.text_muted),
-                            )
-                            .selectable(false),
-                        );
-                    });
-                    ui.add(
-                        Label::new(
-                            RichText::new(sample)
-                                .font(sample_font)
-                                .color(palette.text_muted),
-                        )
-                        .selectable(false),
-                    );
-                });
-        })
-        .response;
-    response.on_hover_cursor(CursorIcon::PointingHand)
+    widgets::selectable_row(ui, id, selected, Margin::symmetric(12, 10), |ui| {
+        let name = ui
+            .horizontal(|ui| {
+                let name =
+                    ui.add(Label::new(RichText::new(title).font(title_font)).selectable(false));
+                ui.add(Label::new(RichText::new(note).small().weak()).selectable(false));
+                name
+            })
+            .inner;
+        ui.add(Label::new(RichText::new(sample).font(sample_font).weak()).selectable(false));
+        name
+    })
 }
 
 fn about_page(ui: &mut Ui, palette: &Palette, about: &AboutInfo) {
     ui.add_space(PAGE_TOP);
-    centered_text(
-        ui,
-        RichText::new("Cthulhu-Git")
-            .size(TITLE_SIZE)
-            .strong()
-            .color(palette.text),
-    );
+    centered_text(ui, RichText::new("Cthulhu-Git").size(TITLE_SIZE).strong());
     about_logo(ui);
-    centered_text(
-        ui,
-        RichText::new(&about.description)
-            .size(SUBTITLE_SIZE)
-            .color(palette.text_muted),
-    );
+    centered_text(ui, RichText::new(&about.description).weak());
     card(ui, palette, |ui| {
         about_row(ui, palette, "Version", &about.version, false);
         about_row(ui, palette, "Version date", &about.version_date, false);
         about_row(ui, palette, "Commit", &about.commit, true);
         about_row(ui, palette, "License", &about.license, false);
         about_row(ui, palette, "Git", &about.git_version, false);
-        ui.horizontal(|ui| {
-            icons::icon(ui, Icon::GitHub, palette.text);
-            link(ui, palette, &about.repository, &about.repository);
-        });
-        let releases = about.releases_url();
-        ui.horizontal(|ui| {
-            icons::icon(ui, Icon::GitHub, palette.text);
-            link(ui, palette, &releases, &releases);
-        });
+        for url in [about.repository.clone(), about.releases_url()] {
+            ui.horizontal(|ui| {
+                icons::icon(ui, Icon::GitHub, palette.text);
+                ui.hyperlink_to(&url, &url);
+            });
+        }
         // `horizontal` keeps this row at the button's height. A bare right-to-left
         // layout would claim the rest of the page and stretch the card.
         ui.horizontal(|ui| {
@@ -501,7 +399,7 @@ fn about_page(ui: &mut Ui, palette: &Palette, about: &AboutInfo) {
                 let copy = text_button(ui, "Copy version info", true);
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.set_min_width(ui.available_width());
-                    help(ui, palette, "© 2026 Don Linux");
+                    help(ui, "© 2026 Don Linux");
                 });
                 if copy.clicked() {
                     ui.ctx().copy_text(about.copy_text());
@@ -523,46 +421,28 @@ fn about_logo(ui: &mut Ui) {
 fn about_row(ui: &mut Ui, palette: &Palette, label: &str, value: &str, monospace: bool) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
-        ui.label(
-            RichText::new(label)
-                .size(HELP_SIZE)
-                .color(palette.text_muted),
-        );
-        let mut text = RichText::new(value).size(BODY_SIZE).color(if monospace {
-            palette.hash
-        } else {
-            palette.text
-        });
+        ui.label(RichText::new(label).small().weak());
+        let mut text = RichText::new(value);
         if monospace {
-            text = text.monospace();
+            text = text.monospace().size(BODY_SIZE).color(palette.hash);
         }
         ui.label(text);
     });
 }
 
-fn history_page(ui: &mut Ui, palette: &Palette, avatars_on: bool, actions: &mut Vec<Action>) {
+fn history_page(ui: &mut Ui, avatars_on: bool, actions: &mut Vec<Action>) {
     page_header(
         ui,
-        palette,
         "Commit History",
         "Author pictures and the width of the history columns.",
     );
     section(ui, |ui| {
         let mut on = avatars_on;
-        if ui
-            .checkbox(
-                &mut on,
-                RichText::new("Show author avatars")
-                    .size(BODY_SIZE)
-                    .color(palette.text),
-            )
-            .changed()
-        {
+        if ui.checkbox(&mut on, "Show author avatars").changed() {
             actions.push(Action::SetAuthorAvatars(on));
         }
         help(
             ui,
-            palette,
             "Pictures come from GitHub (no-reply addresses, and the GitHub API for repositories \
              hosted there) and from Gravatar, which receives a SHA-256 hash of the address, never \
              the address itself. They are kept for a week in the user cache folder. Off draws \
@@ -570,10 +450,9 @@ fn history_page(ui: &mut Ui, palette: &Palette, avatars_on: bool, actions: &mut 
         );
     });
     section(ui, |ui| {
-        section_title(ui, palette, "Columns");
+        section_title(ui, "Columns");
         help(
             ui,
-            palette,
             "Drag a divider in the history header to resize that column only. Double-click a \
              divider to restore that column. Widths follow the window and the open sidebars.",
         );
@@ -608,30 +487,24 @@ const POSSIBLE_LATER: [(&str, &str); 5] = [
 fn github_page(ui: &mut Ui, palette: &Palette, github: &mut GitHubAuth, api: &ApiStatus) {
     page_header(
         ui,
-        palette,
         "GitHub Auth",
         "Optional. Without a token, public repositories still show avatars.",
     );
     section(ui, |ui| {
-        body(
-            ui,
-            palette,
+        ui.label(
             "A GitHub token lets Cthulhu Git read the authors and avatars of your private \
              repositories, and raises GitHub's limit from 60 to 5,000 requests an hour. It is only \
              used to read: Cthulhu Git never writes to GitHub with it.",
         );
     });
     section(ui, |ui| {
-        section_title(ui, palette, "1. Create a read-only token");
-        link(
-            ui,
-            palette,
+        section_title(ui, "1. Create a read-only token");
+        ui.hyperlink_to(
             "Open GitHub's token form, already set to read-only",
             TOKEN_TEMPLATE_URL,
         );
         help(
             ui,
-            palette,
             "The form asks for Contents: read-only and Metadata: read-only. For an organization's \
              private repositories, choose that organization as the Resource owner.",
         );
@@ -639,7 +512,7 @@ fn github_page(ui: &mut Ui, palette: &Palette, github: &mut GitHubAuth, api: &Ap
 
     let busy = github.busy();
     section(ui, |ui| {
-        section_title(ui, palette, "2. Paste it here");
+        section_title(ui, "2. Paste it here");
         ui.horizontal(|ui| {
             // The button is placed first so the field takes whatever width remains.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -650,7 +523,6 @@ fn github_page(ui: &mut Ui, palette: &Palette, github: &mut GitHubAuth, api: &Ap
                         .id(token_field_id())
                         .password(true)
                         .hint_text("github_pat_…")
-                        .font(field_font())
                         .desired_width(ui.available_width()),
                 );
                 let enter = field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
@@ -666,7 +538,7 @@ fn github_page(ui: &mut Ui, palette: &Palette, github: &mut GitHubAuth, api: &Ap
             {
                 github.import_gh(ui.ctx());
             }
-            if cthulhu_git::github::token_from_env().is_some()
+            if cthulhu_git::github::token_from_env(|name| std::env::var_os(name)).is_some()
                 && text_button(ui, "Use GH_TOKEN", !busy)
                     .on_hover_text("Fills the field from GH_TOKEN or GITHUB_TOKEN.")
                     .clicked()
@@ -676,100 +548,92 @@ fn github_page(ui: &mut Ui, palette: &Palette, github: &mut GitHubAuth, api: &Ap
         });
     });
 
-    section(ui, |ui| {
-        section_title(ui, palette, "Status");
-        let stored = match github.stored() {
-            Stored::None => "No token. Public repositories only.",
-            Stored::Keychain => "Token saved in the system keychain.",
-            Stored::Session => "Token used for this session only; it is not saved.",
-        };
-        body(ui, palette, stored);
-        if let Some(login) = github.user() {
-            let limit = github
-                .rate()
-                .and_then(|rate| Some((rate.remaining?, rate.limit?)))
-                .map(|(remaining, limit)| format!(" · {remaining}/{limit} requests left this hour"))
-                .unwrap_or_default();
-            colored(
-                ui,
-                &format!("Connected as {login}{limit}"),
-                palette.diff_added,
-            );
-        }
-        if api.token_rejected {
-            colored(
-                ui,
-                "GitHub rejected the token; requests continue without it.",
-                palette.warning,
-            );
-        }
-        if let Some(until) = api.paused_until {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_secs())
-                .unwrap_or(0);
-            if until > now {
-                let minutes = (until - now).div_ceil(60);
-                colored(
-                    ui,
-                    &format!(
-                        "GitHub's rate limit was reached. The API is asked again in {minutes} min."
-                    ),
-                    palette.warning,
-                );
-            }
-        }
-        match github.notice() {
-            Some(Notice::Info(text)) => help(ui, palette, text),
-            Some(Notice::Error(text)) => colored(ui, text, palette.error),
-            None => {}
-        }
-        if busy {
-            ui.spinner();
-        }
-        ui.horizontal(|ui| {
-            if text_button(ui, "Verify", !busy && github.has_token())
-                .on_hover_text("Asks GitHub who the token belongs to.")
-                .clicked()
-            {
-                github.verify(ui.ctx());
-            }
-            if text_button(ui, "Remove token", !busy && github.has_token()).clicked() {
-                github.remove(ui.ctx());
-            }
-        });
-        help(
-            ui,
-            palette,
-            "Stored in Keychain on macOS, Credential Manager on Windows, or the Secret Service \
-             (GNOME Keyring, KWallet) on Linux. Never in settings.json. It is sent only to \
-             api.github.com, never to avatar hosts.",
-        );
-    });
+    section(ui, |ui| token_status(ui, palette, github, api, busy));
 
     section(ui, |ui| {
-        section_title(ui, palette, "Possible later with this token");
+        section_title(ui, "Possible later with this token");
         for (feature, permission) in POSSIBLE_LATER {
             ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(format!("• {feature}"))
-                        .size(BODY_SIZE)
-                        .color(palette.text),
-                );
-                ui.label(
-                    RichText::new(format!("({permission})"))
-                        .size(HELP_SIZE)
-                        .color(palette.text_muted),
-                );
+                ui.label(format!("• {feature}"));
+                help(ui, &format!("({permission})"));
             });
         }
         help(
             ui,
-            palette,
             "Writing to GitHub (pushing over HTTPS, opening pull requests) would need a different \
              token with write access, and is not part of this page.",
         );
     });
+}
+
+/// What is stored, whose token it is, GitHub's limits, and the token actions.
+fn token_status(
+    ui: &mut Ui,
+    palette: &Palette,
+    github: &mut GitHubAuth,
+    api: &ApiStatus,
+    busy: bool,
+) {
+    section_title(ui, "Status");
+    ui.label(match github.stored() {
+        Stored::None => "No token. Public repositories only.",
+        Stored::Keychain => "Token saved in the system keychain.",
+        Stored::Session => "Token used for this session only; it is not saved.",
+    });
+    if let Some(login) = github.user() {
+        let limit = github
+            .rate()
+            .and_then(|rate| Some((rate.remaining?, rate.limit?)))
+            .map_or_default(|(remaining, limit)| {
+                format!(" · {remaining}/{limit} requests left this hour")
+            });
+        ui.colored_label(palette.diff_added, format!("Connected as {login}{limit}"));
+    }
+    if api.token_rejected {
+        ui.colored_label(
+            palette.warning,
+            "GitHub rejected the token; requests continue without it.",
+        );
+    }
+    if let Some(until) = api.paused_until {
+        let now = clock::now_unix();
+        if until > now {
+            let minutes = (until - now).div_ceil(60);
+            ui.colored_label(
+                palette.warning,
+                format!(
+                    "GitHub's rate limit was reached. The API is asked again in {minutes} min."
+                ),
+            );
+        }
+    }
+    match github.notice() {
+        Some(Notice::Info(text)) => help(ui, text),
+        Some(Notice::Error(text)) => {
+            ui.colored_label(palette.error, text);
+        }
+        None => {}
+    }
+    if busy {
+        ui.spinner();
+    }
+    ui.horizontal(|ui| {
+        if text_button(ui, "Verify", !busy && github.has_token())
+            .on_hover_text("Asks GitHub who the token belongs to.")
+            .clicked()
+        {
+            github.verify(ui.ctx());
+        }
+        if text_button(ui, "Remove token", !busy && github.has_token()).clicked() {
+            github.remove(ui.ctx());
+        }
+    });
+    help(
+        ui,
+        "Stored in Keychain on macOS, Credential Manager on Windows, or the Secret Service \
+         (GNOME Keyring, KWallet) on Linux. Never in settings.json. It is sent only to \
+         api.github.com, never to avatar hosts.",
+    );
 }
 
 /// The prompt block, clipped out of a wide shell. The PTY is many rows tall
@@ -779,7 +643,7 @@ fn github_page(ui: &mut Ui, palette: &Palette, github: &mut GitHubAuth, api: &Ap
 /// Pointer and keyboard are ignored.
 fn shell_preview(ui: &mut Ui, palette: &Palette, preview: &mut Option<Terminal>, cwd: &Path) {
     let row = terminal_row_height(ui);
-    let lines = terminal::preview_line_count(preview) as f32;
+    let lines = terminal::preview_line_count(preview.as_ref()) as f32;
     let size = Vec2::new(ui.available_width(), row * lines + PREVIEW_PAD * 2.0);
     let drawn = ui.allocate_ui(size, |ui| {
         ui.set_min_size(size);
@@ -788,7 +652,9 @@ fn shell_preview(ui: &mut Ui, palette: &Palette, preview: &mut Option<Terminal>,
         let content = outer.shrink2(Vec2::new(0.0, PREVIEW_PAD));
         ui.scope_builder(UiBuilder::new().max_rect(content), |ui| {
             ui.shrink_clip_rect(content);
-            terminal::show(ui, preview, cwd, preview_view_id(), palette, false);
+            // The page's larger text is not the terminal's.
+            ui.style_mut().text_styles = ui.ctx().global_style().text_styles.clone();
+            terminal::show_preview(ui, preview, cwd, palette);
         });
         // Clicks land here, including the padding, and do nothing.
         let _ = ui.interact(outer, preview_hit_id(), Sense::CLICK | Sense::DRAG);
@@ -811,67 +677,31 @@ fn preview_hit_id() -> Id {
 }
 
 fn preview_view_id() -> Id {
-    Id::new("settings-font-preview")
+    Id::unique("settings-font-preview")
 }
 
 fn nav_button(ui: &mut Ui, label: &str, icon: Icon, selected: bool) -> egui::Response {
     let palette = theme::current(ui.ctx()).palette;
-    let response = ui
-        .scope_builder(
-            UiBuilder::new().id_salt(label).sense(Sense::click()),
-            |ui| {
-                let hovered = ui.response().hovered();
-                let fill = if selected {
-                    palette.surface_active
-                } else if hovered {
-                    palette.surface_hover
-                } else {
-                    Color32::TRANSPARENT
-                };
-                Frame::new()
-                    .fill(fill)
-                    .corner_radius(widgets::CORNER_RADIUS)
-                    .inner_margin(Margin::symmetric(14, 12))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            let tint = if selected {
-                                palette.accent
-                            } else {
-                                palette.text
-                            };
-                            icons::icon(ui, icon, tint);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(label)
-                                        .size(NAV_LABEL_SIZE)
-                                        .color(palette.text),
-                                )
-                                .selectable(false)
-                                .truncate(),
-                            );
-                        });
-                    });
-            },
-        )
-        .response;
-    response.on_hover_cursor(CursorIcon::PointingHand)
-}
-
-fn note(ui: &mut Ui, text: &str, color: Color32) {
-    ui.label(RichText::new(text).size(HELP_SIZE).color(color));
+    widgets::selectable_row(ui, label, selected, Margin::symmetric(14, 12), |ui| {
+        ui.horizontal(|ui| {
+            let tint = if selected {
+                palette.accent
+            } else {
+                palette.text
+            };
+            icons::icon(ui, icon, tint);
+            ui.add(
+                Label::new(RichText::new(label).size(NAV_LABEL_SIZE))
+                    .selectable(false)
+                    .truncate(),
+            )
+        })
+        .inner
+    })
 }
 
 fn page_id() -> Id {
-    Id::new("settings-page")
-}
-
-/// Same chrome as the repository bars.
-fn bar_frame(palette: &Palette) -> Frame {
-    Frame::new()
-        .fill(palette.surface)
-        .stroke(Stroke::new(1.0, palette.border))
-        .inner_margin(Margin::symmetric(12, 6))
+    Id::unique("settings-page")
 }
 
 fn nav_frame(palette: &Palette) -> Frame {
@@ -880,29 +710,26 @@ fn nav_frame(palette: &Palette) -> Frame {
         .inner_margin(Margin::symmetric(10, 12))
 }
 
+/// The page's text sizes and spacing, which every block in it inherits.
 fn page_column(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     widgets::centered_column(ui, PAGE_WIDTH, |ui| {
-        ui.spacing_mut().item_spacing.y = COLUMN_SPACING;
+        let style = ui.style_mut();
+        style.spacing.item_spacing.y = COLUMN_SPACING;
+        // Buttons, checkboxes, links and fields draw their text in `Body`.
+        for (text_style, size) in [(TextStyle::Body, BODY_SIZE), (TextStyle::Small, HELP_SIZE)] {
+            style
+                .text_styles
+                .insert(text_style, FontId::proportional(size));
+        }
         add(ui);
         ui.add_space(PAGE_END);
     });
 }
 
-fn page_header(ui: &mut Ui, palette: &Palette, title: &str, subtitle: &str) {
+fn page_header(ui: &mut Ui, title: &str, subtitle: &str) {
     ui.add_space(PAGE_TOP);
-    centered_text(
-        ui,
-        RichText::new(title)
-            .size(TITLE_SIZE)
-            .strong()
-            .color(palette.text),
-    );
-    centered_text(
-        ui,
-        RichText::new(subtitle)
-            .size(SUBTITLE_SIZE)
-            .color(palette.text_muted),
-    );
+    centered_text(ui, RichText::new(title).size(TITLE_SIZE).strong());
+    centered_text(ui, RichText::new(subtitle).weak());
 }
 
 /// Centers each line in the column, including a subtitle that wraps.
@@ -912,44 +739,17 @@ fn centered_text(ui: &mut Ui, text: RichText) {
     });
 }
 
-fn section_title(ui: &mut Ui, palette: &Palette, title: &str) {
-    ui.label(
-        RichText::new(title)
-            .size(SECTION_SIZE)
-            .strong()
-            .color(palette.text),
-    );
+fn section_title(ui: &mut Ui, title: &str) {
+    ui.label(RichText::new(title).size(SECTION_SIZE).strong());
 }
 
-fn body(ui: &mut Ui, palette: &Palette, text: &str) {
-    colored(ui, text, palette.text);
-}
-
-fn help(ui: &mut Ui, palette: &Palette, text: &str) {
-    note(ui, text, palette.text_muted);
-}
-
-fn colored(ui: &mut Ui, text: &str, color: Color32) {
-    ui.label(RichText::new(text).size(BODY_SIZE).color(color));
-}
-
-fn link(ui: &mut Ui, palette: &Palette, label: &str, url: &str) {
-    ui.hyperlink_to(
-        RichText::new(label).size(BODY_SIZE).color(palette.accent),
-        url,
-    );
+fn help(ui: &mut Ui, text: &str) {
+    ui.label(RichText::new(text).small().weak());
 }
 
 fn text_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
-    ui.add_enabled(
-        enabled,
-        Button::new(RichText::new(label).size(BODY_SIZE)).min_size(BUTTON_MIN),
-    )
-    .on_hover_cursor(CursorIcon::PointingHand)
-}
-
-fn field_font() -> FontId {
-    FontId::proportional(BODY_SIZE)
+    ui.add_enabled(enabled, Button::new(label).min_size(BUTTON_MIN))
+        .on_hover_cursor(CursorIcon::PointingHand)
 }
 
 /// A block of the page with the gap of a card, and no fill or border.
@@ -957,7 +757,6 @@ fn section(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     ui.add_space(BETWEEN_CARDS);
     ui.vertical(|ui| {
         ui.set_width(ui.available_width());
-        ui.spacing_mut().item_spacing.y = COLUMN_SPACING;
         add(ui);
     });
 }
@@ -971,31 +770,315 @@ fn card(ui: &mut Ui, palette: &Palette, add: impl FnOnce(&mut Ui)) {
         .inner_margin(Margin::same(20))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = COLUMN_SPACING;
             add(ui);
         });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{fonts, stale_font, stale_terminal};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use eframe::egui::accesskit::{Role, Toggled};
+    use eframe::egui::output::OutputCommand;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::{NodeT, Queryable};
+
+    use super::*;
+    use crate::ui::test_support::{painted_texts, tree_text};
+
+    type Shared<T> = Rc<RefCell<T>>;
+
+    /// Settings with `ui_font` and `terminal_font` saved and installed the way
+    /// the app installs them, keeping the last frame's actions.
+    fn settings(
+        ui_font: Option<&'static str>,
+        terminal_font: Option<&'static str>,
+        about: AboutInfo,
+    ) -> (Harness<'static>, Shared<GitHubAuth>, Shared<Vec<Action>>) {
+        let github = Shared::<GitHubAuth>::default();
+        let actions = Shared::<Vec<Action>>::default();
+        let (github_ui, actions_ui) = (Rc::clone(&github), Rc::clone(&actions));
+        let mut faces = fonts::FontService::default();
+        let mut preview = None;
+        let view = SettingsView {
+            author_avatars: true,
+            api_status: ApiStatus::default(),
+            busy: false,
+            about,
+        };
+        let harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 1600.0))
+            .with_step_dt(1.0 / 60.0)
+            .build_ui(move |ui| {
+                theme::apply(ui.ctx(), theme::DEFAULT_THEME);
+                faces.sync(ui.ctx(), ui_font, terminal_font);
+                let mut github = github_ui.borrow_mut();
+                let shown = show(
+                    ui,
+                    ui_font,
+                    terminal_font,
+                    &mut preview,
+                    None,
+                    &view,
+                    &mut github,
+                );
+                *actions_ui.borrow_mut() = shown;
+            });
+        (harness, github, actions)
+    }
+
+    fn click(harness: &mut Harness<'_>, label: &str) {
+        harness.get_by_label(label).click();
+        harness.step();
+    }
+
+    #[test]
+    fn each_page_lists_its_own_faces_and_asks_only_on_a_click() {
+        const INTERFACE: &[&str] = &[
+            "Ubuntu",
+            "Ubuntu Mono",
+            "Ubuntu Sans",
+            "IBM Plex Sans",
+            "Obel Mono",
+            "Aspekta",
+            "Inter",
+        ];
+        const TERMINAL: &[&str] = &["Built-in", "Obel Mono", "Meslo LGS NF", "Departure Mono"];
+        const NONE: &[&str] = &[];
+        let unknown = (Some("JetBrains Mono"), Some("Fira Code"));
+        let ui_font = |id: &str| Action::SetUiFont(Some(id.to_owned()));
+        let terminal_font = |id: &str| Action::SetTerminalFont(Some(id.to_owned()));
+        // (saved faces, page, faces listed, a face not listed, warning, shown as
+        // selected, clicked, asked for)
+        #[rustfmt::skip]
+        let cases = [
+            ((None, None), "Appearance", INTERFACE, "Meslo LGS NF", None, ["Appearance", "Ubuntu"], "Inter", ui_font("inter")),
+            ((None, None), "Terminal", TERMINAL, "Ubuntu Sans", None, ["Terminal", "Meslo LGS NF"], "Departure Mono", terminal_font("departure-mono")),
+            // Obel Mono is on both pages, and each sets only its own surface.
+            ((Some("ubuntu-sans"), Some("builtin")), "Appearance", INTERFACE, "Meslo LGS NF", None, ["Appearance", "Ubuntu Sans"], "Obel Mono", ui_font("obel-mono")),
+            ((Some("obel-mono"), Some("builtin")), "Terminal", TERMINAL, "Ubuntu Sans", None, ["Terminal", "Built-in"], "Obel Mono", terminal_font("obel-mono")),
+            // A face that is not bundled is reported, not rewritten.
+            (unknown, "Appearance", INTERFACE, "Meslo LGS NF", Some("\"JetBrains Mono\" is not bundled. The interface is using Ubuntu."), ["Appearance", "Ubuntu"], "Inter", ui_font("inter")),
+            (unknown, "Terminal", TERMINAL, "Ubuntu Sans", Some("\"Fira Code\" is not bundled. The terminal is using Meslo LGS NF."), ["Terminal", "Meslo LGS NF"], "Departure Mono", terminal_font("departure-mono")),
+            ((None, None), "History", NONE, "Inter", None, ["History", "Show author avatars"], "Show author avatars", Action::SetAuthorAvatars(false)),
+        ];
+        for ((ui, terminal), page, listed, absent, warning, selected, clicked, asked) in cases {
+            let case = format!("{page} with {ui:?} and {terminal:?}");
+            let (mut harness, _github, actions) =
+                settings(ui, terminal, AboutInfo::current("2.43.0"));
+            if page != "Appearance" {
+                click(&mut harness, page);
+                // The list was drawn before the click; the next frame shows it.
+                harness.step();
+            }
+            assert!(
+                actions.borrow().is_empty(),
+                "{case}: {:?}",
+                actions.borrow()
+            );
+            let shown: Vec<String> = harness
+                .query_all_by(|node| node.toggled() == Some(Toggled::True))
+                .filter_map(|node| node.accesskit_node().label())
+                .collect();
+            assert_eq!(shown, selected, "{case}: selected rows");
+            for face in listed.iter().chain(warning.as_ref()) {
+                harness.get_by_label(face);
+            }
+            assert!(
+                harness.query_by_label(absent).is_none(),
+                "{case}: lists {absent}"
+            );
+            click(&mut harness, clicked);
+            assert_eq!(*actions.borrow(), [asked], "{case}");
+        }
+    }
+
+    /// `ghp_` and 36 characters: the shape of a classic personal access token.
+    const FAKE_TOKEN: &str = "ghp_agentnetworktesttokenvalueXXXXXXXXXX";
+
+    fn assert_no_token_material(text: &str) {
+        for needle in ["?", "@", "ghp_", "github_pat_", FAKE_TOKEN] {
+            assert!(!text.contains(needle), "{text:?} contains {needle}");
+        }
+    }
+
+    /// egui appends output commands across passes. A click's commands are the
+    /// suffix while the earlier ones are still in front.
+    fn commands_since<'a>(
+        previous: &[OutputCommand],
+        harness: &'a Harness<'_>,
+    ) -> &'a [OutputCommand] {
+        let commands = &harness.output().platform_output.commands;
+        commands.trim_prefix(previous)
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one typed token, then every place it could leak through"
+    )]
+    fn a_typed_token_stays_masked_and_out_of_links_and_copied_text() {
+        const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+        const DATE: &str = "2026-10-24";
+        let version = env!("CARGO_PKG_VERSION");
+        let license = env!("CARGO_PKG_LICENSE");
+        let repository = env!("CARGO_PKG_REPOSITORY");
+        let releases = format!("{repository}/releases");
+        assert_no_token_material(repository);
+        let about = AboutInfo {
+            version: version.to_owned(),
+            version_date: DATE.to_owned(),
+            commit: COMMIT.to_owned(),
+            license: license.to_owned(),
+            description: env!("CARGO_PKG_DESCRIPTION").to_owned(),
+            repository: repository.to_owned(),
+            git_version: "2.43.0".to_owned(),
+        };
+        let (mut harness, github, _actions) = settings(None, None, about);
+
+        // Save, Verify, Remove, Import and Use GH_TOKEN all leave the process.
+        // This test only types into the masked field.
+        click(&mut harness, "GitHub Auth");
+        // The link's readable name is the requirement; egui exposes it as a label.
+        harness.get_by_label("Open GitHub's token form, already set to read-only");
+        harness.get_by_role(Role::PasswordInput).click();
+        harness.step();
+        harness
+            .get_by_role(Role::PasswordInput)
+            .type_text(FAKE_TOKEN);
+        // The first keystroke into an empty field is painted a frame later.
+        harness.step();
+        harness.step();
+        {
+            let auth = github.borrow();
+            assert_eq!(auth.draft, FAKE_TOKEN, "the field did not take the token");
+            assert!(!auth.busy(), "typing started a keychain or network task");
+            assert!(!auth.has_token(), "typing stored a token");
+            assert_eq!(auth.stored(), Stored::None);
+            assert!(auth.notice().is_none(), "typing produced a notice");
+        }
+        let field = harness.get_by_role(Role::PasswordInput);
+        let mut shown = field.value().unwrap_or_default();
+        if shown.is_empty() {
+            shown = field.children().filter_map(|child| child.value()).collect();
+        }
+        let masked = "\u{2022}".repeat(FAKE_TOKEN.len());
+        assert_eq!(shown, masked, "password display");
+        // (page, a section title or subtitle it shows)
+        for (page, shown) in [
+            ("GitHub Auth", "2. Paste it here"),
+            ("GitHub Auth", "No token. Public repositories only."),
+            (
+                "History",
+                "Author pictures and the width of the history columns.",
+            ),
+            ("About", "Copy version info"),
+        ] {
+            if page != "GitHub Auth" {
+                click(&mut harness, page);
+            }
+            let tree = tree_text(&harness);
+            assert!(tree.contains(shown), "{page}: no {shown:?}");
+            assert!(
+                !tree.contains(FAKE_TOKEN),
+                "{page}: token in the accessibility tree"
+            );
+            // Painted text that no widget reports never reaches the tree.
+            let painted: Vec<_> = painted_texts(&harness)
+                .iter()
+                .map(|(_, galley)| galley.text().to_owned())
+                .collect();
+            assert!(
+                painted.iter().all(|text| !text.contains(FAKE_TOKEN)),
+                "{page}: token painted"
+            );
+            assert_eq!(
+                painted.contains(&masked),
+                page == "GitHub Auth",
+                "{page}: masked field"
+            );
+        }
+        assert_eq!(
+            github.borrow().draft,
+            FAKE_TOKEN,
+            "leaving GitHub Auth dropped the typed token"
+        );
+
+        let tops = ["Terminal", "History", "GitHub Auth", "About"]
+            .map(|label| harness.get_by_label(label).rect().top());
+        assert!(
+            tops[..3].iter().all(|top| tops[3] > *top),
+            "About is not last in the navigation: {tops:?}"
+        );
+        let about_labels = [version, DATE, COMMIT, license, "2.43.0", repository];
+        for label in about_labels
+            .into_iter()
+            .chain(["© 2026 Don Linux", "Cthulhu-Git logo"])
+        {
+            harness.get_by_label(label);
+        }
+        for node in harness.root().children_recursive() {
+            if let Some(url) = node.accesskit_node().url() {
+                assert!(url == repository || url == releases, "link to {url:?}");
+            }
+        }
+        for url in [repository, releases.as_str()] {
+            let previous = harness.output().platform_output.commands.clone();
+            click(&mut harness, url);
+            let fresh = commands_since(&previous, &harness);
+            assert!(
+                fresh.iter().any(
+                    |command| matches!(command, OutputCommand::OpenUrl(open) if open.url == url)
+                ),
+                "no OpenUrl for {url}: {fresh:?}"
+            );
+        }
+        let previous = harness.output().platform_output.commands.clone();
+        click(&mut harness, "Copy version info");
+        let copied = commands_since(&previous, &harness)
+            .iter()
+            .find_map(|command| match command {
+                OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .expect("Copy version info copies text");
+        for part in [version, COMMIT, repository] {
+            assert!(copied.contains(part), "{copied:?} lacks {part}");
+        }
+        assert_no_token_material(&copied);
+    }
 
     #[test]
     fn font_warning_does_not_interpolate_unsanitized_text() {
-        let bidi = "\u{202E}JetBrains Mono";
-        let warning = stale_font(Some(bidi), fonts::UI_FACES).expect("warning");
-        assert_eq!(warning, "JetBrains Mono");
-        assert!(!warning.contains('\u{202E}'));
-
         let huge = "x".repeat(100_000);
-        let warning = stale_font(Some(&huge), fonts::UI_FACES).expect("warning");
-        assert_eq!(warning, "x".repeat(128));
-        assert!(!warning.contains(&huge));
-
-        assert!(stale_font(Some("obel\nmono"), fonts::UI_FACES).is_none());
-        assert!(stale_terminal(Some("fira\ncode")).is_none());
-        let terminal = stale_terminal(Some("\u{202E}Fira Code")).expect("warning");
-        assert_eq!(terminal, "Fira Code");
-        assert!(!terminal.contains('\u{202E}'));
+        let name = |text: &str| Some(text.to_owned());
+        // (case, warning, the name it shows)
+        let cases = [
+            (
+                "bidi interface",
+                stale_font(Some("\u{202E}JetBrains Mono"), fonts::UI_FACES),
+                name("JetBrains Mono"),
+            ),
+            (
+                "huge interface",
+                stale_font(Some(&huge), fonts::UI_FACES),
+                Some("x".repeat(128)),
+            ),
+            (
+                "newline interface",
+                stale_font(Some("obel\nmono"), fonts::UI_FACES),
+                None,
+            ),
+            ("newline terminal", stale_terminal(Some("fira\ncode")), None),
+            (
+                "bidi terminal",
+                stale_terminal(Some("\u{202E}Fira Code")),
+                name("Fira Code"),
+            ),
+        ];
+        for (case, warning, shown) in cases {
+            assert_eq!(warning, shown, "{case}");
+        }
     }
 }

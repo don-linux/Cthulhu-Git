@@ -1,17 +1,23 @@
 //! Bundled faces for the interface and the terminal.
 //!
-//! Nothing is read from the operating system. Each face is compiled into the
-//! binary. egui installs `set_fonts` on the following pass, so a named family
-//! is not measured on the pass that first queues it. The terminal point
-//! size changes on that same pass, with the face egui has actually loaded.
+//! Each face is compiled into the binary. Behind it in every chain come
+//! egui's bundled icon and monochrome emoji fonts, so emoji look the same on
+//! every system. Only a character none of them has, such as CJK, comes from
+//! the system fonts eframe looks up (its `system_fonts` feature).
+//!
+//! egui loads `set_fonts` at once when no text has been laid out yet in the
+//! pass, otherwise on the next pass. A named family egui has not loaded draws
+//! boxes, so the specimens and the terminal grid read the fonts egui has
+//! loaded, never the ones last asked for. The terminal point size belongs to
+//! the face loaded in the same font map.
 //!
 //! The interface replaces egui's proportional face. The terminal uses the
-//! named family `"terminal"` and, until that face is ready, the built-in
+//! named family `"terminal"` and, until that face is loaded, the built-in
 //! monospace. Hashes and diffs stay on that built-in monospace either way.
 
 use std::sync::Arc;
 
-use eframe::egui::{self, FontData, FontDefinitions, FontFamily, FontId, Id, TextStyle};
+use eframe::egui::{self, FontData, FontDefinitions, FontFamily, FontId, TextStyle};
 
 /// egui family that holds only the terminal face.
 pub const TERMINAL_FAMILY: &str = "terminal";
@@ -133,8 +139,7 @@ pub fn face_by_id<'a>(faces: &'a [Face], name: &str) -> Option<&'a Face> {
 pub fn resolve_ui(saved: Option<&str>) -> &'static str {
     saved
         .and_then(|name| face_by_id(UI_FACES, name))
-        .map(|face| face.id)
-        .unwrap_or(DEFAULT_UI_ID)
+        .map_or(DEFAULT_UI_ID, |face| face.id)
 }
 
 /// `true` when `name` asks for egui's built-in monospace.
@@ -152,33 +157,24 @@ pub fn resolve_terminal(saved: Option<&str>) -> Option<&'static str> {
     if is_builtin_terminal(name) {
         return None;
     }
-    Some(
-        face_by_id(TERMINAL_FACES, name)
-            .map(|face| face.id)
-            .unwrap_or(DEFAULT_TERMINAL_ID),
-    )
+    Some(face_by_id(TERMINAL_FACES, name).map_or(DEFAULT_TERMINAL_ID, |face| face.id))
 }
 
 /// The specimen font for a bundled face. Proportional until egui has loaded
-/// the named families, which is the pass after they are first queued.
+/// the named family.
 pub fn preview_font(ui: &egui::Ui, id: &str, size: f32) -> FontId {
-    if faces_ready(ui.ctx()) {
-        FontId::new(size, FontFamily::Name(id.into()))
+    let family = FontFamily::Name(id.into());
+    if ui.fonts(|fonts| fonts.definitions().families.contains_key(&family)) {
+        FontId::new(size, family)
     } else {
         FontId::proportional(size)
     }
 }
 
-/// The faces currently handed to egui.
+/// The faces last handed to egui.
 #[derive(Default)]
 pub struct FontService {
-    applied_ui: String,
-    applied_terminal: Option<String>,
-    queued: bool,
-    /// Named preview families are bound on the next pass.
-    activate_faces_next_pass: bool,
-    /// The terminal family is bound on the next pass.
-    activate_terminal_next_pass: bool,
+    requested: Option<(&'static str, Option<&'static str>)>,
 }
 
 impl FontService {
@@ -193,122 +189,37 @@ impl FontService {
         ui_font: Option<&str>,
         terminal_font: Option<&str>,
     ) {
-        // Fonts queued last pass are loaded before this call.
-        if self.activate_faces_next_pass {
-            set_faces_ready(ctx, true);
-            self.activate_faces_next_pass = false;
-        }
-        if self.activate_terminal_next_pass {
-            let active = self.applied_terminal.is_some();
-            set_terminal_active(ctx, active);
-            // Same pass that the queued face becomes measurable.
-            store_terminal_size(ctx, self.applied_terminal.as_deref().and_then(point_size));
-            self.activate_terminal_next_pass = false;
-        }
-
-        let ui_id = resolve_ui(ui_font);
-        let terminal_id = resolve_terminal(terminal_font);
-        if self.queued
-            && self.applied_ui == ui_id
-            && self.applied_terminal.as_deref() == terminal_id
-        {
-            return;
-        }
-
-        let had_terminal = self.queued && self.applied_terminal.is_some();
-        let terminal_changed = self.applied_terminal.as_deref() != terminal_id;
-        ctx.set_fonts(definitions(ui_id, terminal_id));
-        ctx.request_repaint();
-        self.applied_ui = ui_id.to_owned();
-        self.applied_terminal = terminal_id.map(str::to_owned);
-        let first = !self.queued;
-        self.queued = true;
-
-        if first || !faces_ready(ctx) {
-            self.activate_faces_next_pass = true;
-        }
-        match terminal_id {
-            // egui swaps the font map on the next pass. Until then the grid
-            // keeps the previous point size; publishing the new one resizes
-            // the PTY against the face that is still on screen.
-            Some(_) if terminal_changed => {
-                if !had_terminal {
-                    set_terminal_active(ctx, false);
-                }
-                self.activate_terminal_next_pass = true;
-            }
-            Some(_) => set_terminal_active(ctx, true),
-            None => {
-                set_terminal_active(ctx, false);
-                self.activate_terminal_next_pass = false;
-                store_terminal_size(ctx, None);
-            }
+        let wanted = (resolve_ui(ui_font), resolve_terminal(terminal_font));
+        if self.requested != Some(wanted) {
+            ctx.set_fonts(definitions(wanted.0, wanted.1));
+            // Text already laid out on this pass leaves the change to the next.
+            ctx.request_repaint();
+            self.requested = Some(wanted);
         }
     }
 }
 
-fn point_size(id: &str) -> Option<f32> {
-    face_by_id(TERMINAL_FACES, id).and_then(|face| face.terminal_size)
-}
-
-/// The font the terminal grid measures. The named family is used only on a
-/// pass where egui has already loaded it.
+/// The font the terminal grid measures: the terminal face egui has loaded, at
+/// that face's point size, or else the monospace text style.
 pub fn terminal_font_id(ui: &egui::Ui) -> FontId {
     let mut font = TextStyle::Monospace.resolve(ui.style());
-    if terminal_active(ui.ctx()) {
-        font.family = FontFamily::Name(TERMINAL_FAMILY.into());
-        if let Some(size) = terminal_size(ui.ctx()) {
+    let family = FontFamily::Name(TERMINAL_FAMILY.into());
+    let loaded = ui.fonts(|fonts| {
+        let chain = fonts.definitions().families.get(&family)?;
+        face_by_id(TERMINAL_FACES, chain.first()?)
+    });
+    if let Some(face) = loaded {
+        font.family = family;
+        if let Some(size) = face.terminal_size {
             font.size = size;
         }
     }
     font
 }
 
-fn faces_ready(ctx: &egui::Context) -> bool {
-    ctx.data(|data| data.get_temp(faces_ready_id()).unwrap_or(false))
-}
-
-fn set_faces_ready(ctx: &egui::Context, ready: bool) {
-    ctx.data_mut(|data| data.insert_temp(faces_ready_id(), ready));
-}
-
-fn faces_ready_id() -> Id {
-    Id::new("cthulhu-git-bundled-faces")
-}
-
-fn terminal_active(ctx: &egui::Context) -> bool {
-    ctx.data(|data| data.get_temp(terminal_active_id()).unwrap_or(false))
-}
-
-fn set_terminal_active(ctx: &egui::Context, active: bool) {
-    ctx.data_mut(|data| data.insert_temp(terminal_active_id(), active));
-}
-
-fn terminal_active_id() -> Id {
-    Id::new("cthulhu-git-terminal-font")
-}
-
-fn terminal_size(ctx: &egui::Context) -> Option<f32> {
-    ctx.data(|data| data.get_temp(terminal_size_id()))
-}
-
-fn store_terminal_size(ctx: &egui::Context, size: Option<f32>) {
-    ctx.data_mut(|data| {
-        if let Some(size) = size {
-            data.insert_temp(terminal_size_id(), size);
-        } else {
-            data.remove::<f32>(terminal_size_id());
-        }
-    });
-}
-
-fn terminal_size_id() -> Id {
-    Id::new("cthulhu-git-terminal-font-size")
-}
-
 /// Proportional becomes `ui_id`. Every bundled face is also registered under
 /// its own name so a row can draw a specimen before it is the one in use.
-/// Emoji fallbacks stay at the end of each chain.
+/// egui's icon and emoji fallbacks stay at the end of each chain.
 fn definitions(ui_id: &str, terminal_id: Option<&str>) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let fallbacks = proportional_fallbacks(&fonts);
@@ -350,562 +261,225 @@ fn definitions(ui_id: &str, terminal_id: Option<&str>) -> FontDefinitions {
     fonts
 }
 
-/// egui's proportional list starts with Ubuntu Light. The rest are emoji.
+/// egui's proportional list starts with Ubuntu Light. The rest are its icon
+/// and monochrome emoji fonts.
 fn proportional_fallbacks(fonts: &FontDefinitions) -> Vec<String> {
     fonts
         .families
         .get(&FontFamily::Proportional)
-        .map(|names| {
+        .map_or_default(|names| {
             names
                 .iter()
                 .filter(|name| name.as_str() != "Ubuntu-Light")
                 .cloned()
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
-
-    #[test]
-    fn obel_mono_is_shared_and_other_faces_stay_in_one_catalog() {
-        assert!(face_by_id(UI_FACES, DEFAULT_UI_ID).is_some());
-        let interface = face_by_id(UI_FACES, "obel-mono").expect("interface");
-        let terminal = face_by_id(TERMINAL_FACES, "obel-mono").expect("terminal");
-        assert_eq!(interface.bytes.as_ptr(), terminal.bytes.as_ptr());
-        for face in UI_FACES {
-            assert!(face.bytes.len() > 4, "{}", face.id);
-            if face.id == "obel-mono" {
-                continue;
-            }
-            assert!(face_by_id(TERMINAL_FACES, face.id).is_none(), "{}", face.id);
-        }
-        for face in TERMINAL_FACES {
-            if face.id != "obel-mono" {
-                assert!(face_by_id(UI_FACES, face.id).is_none(), "{}", face.id);
-            }
-            let tag = &face.bytes[..4];
-            assert!(
-                tag == b"\0\x01\0\0" || tag == b"OTTO" || tag == b"true",
-                "{}",
-                face.id
-            );
-        }
-    }
-
-    #[test]
-    fn resolve_falls_back_when_the_saved_id_is_not_bundled() {
-        assert_eq!(resolve_ui(None), DEFAULT_UI_ID);
-        assert_eq!(resolve_ui(Some("  ")), DEFAULT_UI_ID);
-        assert_eq!(resolve_ui(Some("Comic Sans")), DEFAULT_UI_ID);
-        assert_eq!(resolve_ui(Some(" INTER ")), "inter");
-        assert_eq!(resolve_terminal(None), Some(DEFAULT_TERMINAL_ID));
-        assert_eq!(
-            resolve_terminal(Some("Fira Code")),
-            Some(DEFAULT_TERMINAL_ID)
-        );
-        assert_eq!(resolve_terminal(Some("builtin")), None);
-        assert_eq!(resolve_terminal(Some(" BUILTIN ")), None);
-        assert_eq!(resolve_terminal(Some("meslo-lgs-nf")), Some("meslo-lgs-nf"));
-        assert_eq!(
-            resolve_terminal(Some("Departure-Mono")),
-            Some("departure-mono")
-        );
-    }
-
-    /// egui binds `set_fonts` at the start of the next pass. Measuring a named
-    /// family on the install pass is the panic this guards.
-    #[test]
-    fn named_faces_are_measured_on_the_pass_after_they_are_queued() {
-        let ctx = egui::Context::default();
-        let mut service = FontService::default();
-
-        ctx.begin_pass(egui::RawInput::default());
-        service.sync(&ctx, Some("inter"), Some("meslo-lgs-nf"));
-        assert!(!faces_ready(&ctx));
-        assert!(!terminal_active(&ctx));
-        finish_pass(&ctx);
-
-        ctx.begin_pass(egui::RawInput::default());
-        service.sync(&ctx, Some("inter"), Some("meslo-lgs-nf"));
-        assert!(faces_ready(&ctx));
-        assert!(terminal_active(&ctx));
-        assert!(terminal_size(&ctx).is_none());
-        ctx.fonts_mut(|fonts| {
-            for face in UI_FACES.iter().chain(TERMINAL_FACES) {
-                let id = FontId::new(16.0, FontFamily::Name(face.id.into()));
-                assert!(fonts.glyph_width(&id, 'M') > 0.0, "{}", face.id);
-            }
-        });
-        finish_pass(&ctx);
-
-        ctx.begin_pass(egui::RawInput::default());
-        service.sync(&ctx, Some("obel-mono"), Some("departure-mono"));
-        assert!(faces_ready(&ctx));
-        assert!(terminal_active(&ctx));
-        // Meslo is still loaded. Its size (none) stays until the next pass.
-        assert!(terminal_size(&ctx).is_none());
-        ctx.fonts(|fonts| {
-            let chain = fonts
-                .definitions()
-                .families
-                .get(&FontFamily::Name(TERMINAL_FAMILY.into()))
-                .expect("terminal family");
-            assert_eq!(chain.first().map(String::as_str), Some("meslo-lgs-nf"));
-        });
-        finish_pass(&ctx);
-
-        ctx.begin_pass(egui::RawInput::default());
-        service.sync(&ctx, Some("obel-mono"), Some("departure-mono"));
-        assert!(faces_ready(&ctx));
-        assert!(terminal_active(&ctx));
-        assert_eq!(terminal_size(&ctx), Some(DEPARTURE_SIZE));
-        let named = FontId::new(DEPARTURE_SIZE, FontFamily::Name(TERMINAL_FAMILY.into()));
-        ctx.fonts_mut(|fonts| {
-            let chain = fonts
-                .definitions()
-                .families
-                .get(&FontFamily::Name(TERMINAL_FAMILY.into()))
-                .expect("terminal family");
-            assert_eq!(chain.first().map(String::as_str), Some("departure-mono"));
-            assert!(fonts.glyph_width(&named, 'M') > 0.0);
-        });
-        finish_pass(&ctx);
-
-        // A blank setting is Meslo. The face egui has loaded is still Departure
-        // until the next pass, so the 11 pt size stays on this one.
-        ctx.begin_pass(egui::RawInput::default());
-        service.sync(&ctx, None, None);
-        assert!(faces_ready(&ctx));
-        assert!(terminal_active(&ctx));
-        assert_eq!(terminal_size(&ctx), Some(DEPARTURE_SIZE));
-        let named = FontId::new(DEPARTURE_SIZE, FontFamily::Name(TERMINAL_FAMILY.into()));
-        ctx.fonts_mut(|fonts| {
-            assert!(fonts.glyph_width(&named, 'M') > 0.0);
-            let chain = fonts
-                .definitions()
-                .families
-                .get(&FontFamily::Name(TERMINAL_FAMILY.into()))
-                .expect("terminal family");
-            assert_eq!(chain.first().map(String::as_str), Some("departure-mono"));
-        });
-        finish_pass(&ctx);
-
-        ctx.begin_pass(egui::RawInput::default());
-        service.sync(&ctx, None, None);
-        assert_loaded(&ctx, DEFAULT_UI_ID, Some(DEFAULT_TERMINAL_ID));
-        finish_pass(&ctx);
-
-        // `builtin` is the choice that drops the named family, on this pass.
-        ctx.begin_pass(egui::RawInput::default());
-        service.sync(&ctx, None, Some("builtin"));
-        assert!(faces_ready(&ctx));
-        assert!(!terminal_active(&ctx));
-        assert!(terminal_size(&ctx).is_none());
-        finish_pass(&ctx);
-    }
-
-    /// Switching Meslo to Departure must not publish 11 pt while Meslo is
-    /// still the face egui has loaded.
-    #[test]
-    fn departure_install_pass_keeps_the_meslo_chain_and_previous_size() {
-        let ctx = egui::Context::default();
-        let mut service = FontService::default();
-        settle(&ctx, &mut service, None, Some("meslo-lgs-nf"));
-        assert!(terminal_active(&ctx));
-        assert!(terminal_size(&ctx).is_none());
-        let previous = terminal_font_size(&ctx);
-        finish_pass(&ctx);
-
-        ctx.begin_pass(egui::RawInput::default());
-        service.sync(&ctx, None, Some("departure-mono"));
-        assert!(terminal_active(&ctx));
-        assert_eq!(terminal_size(&ctx), None);
-        assert_eq!(terminal_chain(&ctx).as_deref(), Some("meslo-lgs-nf"));
-        assert_eq!(terminal_font_size(&ctx), previous);
-        finish_pass(&ctx);
-
-        ctx.begin_pass(egui::RawInput::default());
-        service.sync(&ctx, None, Some("departure-mono"));
-        assert_eq!(terminal_size(&ctx), Some(DEPARTURE_SIZE));
-        assert_eq!(terminal_chain(&ctx).as_deref(), Some("departure-mono"));
-        assert_eq!(terminal_font_size(&ctx), DEPARTURE_SIZE);
-        let named = FontId::new(DEPARTURE_SIZE, FontFamily::Name(TERMINAL_FAMILY.into()));
-        ctx.fonts_mut(|fonts| {
-            assert!(fonts.glyph_width(&named, 'M') > 0.0);
-        });
-        finish_pass(&ctx);
-    }
-
-    #[test]
-    fn departure_size_follows_the_loaded_face_at_one_and_two_pixels_per_point() {
-        for pixels in [1.0_f32, 2.0] {
-            let mut harness = egui_kittest::Harness::builder()
-                .with_size(egui::vec2(480.0, 200.0))
-                .with_pixels_per_point(pixels)
-                .build_ui_state(
-                    |ui, probe: &mut ScaleProbe| {
-                        probe.fonts.sync(ui.ctx(), None, probe.terminal);
-                        let font = terminal_font_id(ui);
-                        probe.reported_size = font.size;
-                        probe.named = font.family == FontFamily::Name(TERMINAL_FAMILY.into());
-                        probe.pixels_per_point = ui.pixels_per_point();
-                    },
-                    ScaleProbe {
-                        fonts: FontService::default(),
-                        terminal: Some(DEFAULT_TERMINAL_ID),
-                        reported_size: 0.0,
-                        named: false,
-                        pixels_per_point: 0.0,
-                    },
-                );
-            // The builder runs until the queued face has loaded, so Meslo is
-            // already the active family when the harness is returned.
-            assert!(
-                (harness.state().pixels_per_point - pixels).abs() < 0.01,
-                "pixels_per_point {}",
-                harness.state().pixels_per_point
-            );
-            assert!(harness.state().named);
-            let previous = harness.state().reported_size;
-            assert!(
-                (previous - DEPARTURE_SIZE).abs() > 0.5,
-                "meslo reported {previous} at {pixels} px/pt"
-            );
-
-            harness.state_mut().terminal = Some("departure-mono");
-            harness.step();
-            assert!(harness.state().named);
-            assert_eq!(harness.state().reported_size, previous);
-
-            harness.step();
-            assert!(harness.state().named);
-            assert_eq!(harness.state().reported_size, DEPARTURE_SIZE);
-        }
-    }
-
-    struct ScaleProbe {
-        fonts: FontService,
-        terminal: Option<&'static str>,
-        reported_size: f32,
-        named: bool,
-        pixels_per_point: f32,
-    }
-
-    fn terminal_chain(ctx: &egui::Context) -> Option<String> {
-        ctx.fonts(|fonts| {
-            fonts
-                .definitions()
-                .families
-                .get(&FontFamily::Name(TERMINAL_FAMILY.into()))
-                .and_then(|chain| chain.first().cloned())
-        })
-    }
-
-    fn terminal_font_size(ctx: &egui::Context) -> f32 {
-        let mut size = 0.0;
-        let mut ran = false;
-        egui::Area::new(Id::new("cthulhu-terminal-size-probe")).show(ctx, |ui| {
-            size = terminal_font_id(ui).size;
-            ran = true;
-        });
-        assert!(ran, "terminal size probe did not run");
-        size
-    }
 
     /// nf-oct-terminal. Meslo LGS NF has it; Obel Mono does not.
     const PROMPT_ICON: char = '\u{f120}';
 
     #[test]
-    fn hostile_ids_stay_inside_the_bundled_catalog_and_off_disk() {
-        let missing =
-            std::env::temp_dir().join(format!("cthulhu-font-probe-{}", std::process::id()));
-        let _ = std::fs::remove_file(&missing);
-        let path = missing.to_string_lossy().into_owned();
-        let huge = "x".repeat(100_000);
-        let samples = [
-            "",
-            " ",
-            " \n\t ",
-            "UBUNTU-SANS",
-            " Obel-Mono ",
-            "inter\n",
-            "obel\nmono",
-            "JetBrains Mono",
-            "Fira Code",
-            "\u{202e}obel-mono",
-            path.as_str(),
-            huge.as_str(),
-        ];
-        for name in samples {
-            let ui = resolve_ui(Some(name));
-            assert!(
-                UI_FACES.iter().any(|face| face.id == ui),
-                "{name:?} resolved to {ui}"
-            );
-            if let Some(terminal) = resolve_terminal(Some(name)) {
-                assert!(
-                    TERMINAL_FACES.iter().any(|face| face.id == terminal),
-                    "{name:?} resolved to {terminal}"
-                );
-            }
-        }
-        assert_eq!(resolve_ui(Some("JetBrains Mono")), DEFAULT_UI_ID);
-        assert_eq!(resolve_ui(Some(&path)), DEFAULT_UI_ID);
-        assert_eq!(resolve_ui(Some("\u{202e}obel-mono")), DEFAULT_UI_ID);
-        assert_eq!(
-            resolve_terminal(Some("Fira Code")),
-            Some(DEFAULT_TERMINAL_ID)
-        );
-        assert_eq!(resolve_terminal(Some(&path)), Some(DEFAULT_TERMINAL_ID));
-        assert_eq!(resolve_terminal(Some("builtin")), None);
-        assert_eq!(resolve_terminal(Some(" Obel-Mono ")), Some("obel-mono"));
-        assert!(
-            !missing.exists(),
-            "font lookup created {}",
-            missing.display()
-        );
-
-        let ctx = egui::Context::default();
-        let mut service = FontService::default();
-        settle(&ctx, &mut service, Some(&huge), Some(path.as_str()));
-        assert_loaded(&ctx, DEFAULT_UI_ID, Some(DEFAULT_TERMINAL_ID));
-        assert!(!missing.exists(), "sync created {}", missing.display());
-        finish_pass(&ctx);
+    fn only_obel_mono_is_in_both_catalogs() {
+        let shared: Vec<_> = UI_FACES
+            .iter()
+            .filter(|face| face_by_id(TERMINAL_FACES, face.id).is_some())
+            .map(|face| face.id)
+            .collect();
+        assert_eq!(shared, ["obel-mono"]);
     }
 
-    /// Measuring `terminal` on the pass that first installs it panics. Blank
-    /// and unknown names stay on Meslo. Only `builtin` turns that family off,
-    /// and it turns off before the next pass drops it from the font map.
+    /// (saved id, interface face, terminal face). Case and the whitespace
+    /// around an id do not matter; anything else that is not a bundled id is
+    /// the default. Only `builtin` turns the terminal face off.
     #[test]
-    fn hostile_terminal_names_wait_one_pass_and_only_builtin_turns_the_face_off() {
-        let missing =
-            std::env::temp_dir().join(format!("cthulhu-font-delay-probe-{}", std::process::id()));
-        let _ = std::fs::remove_file(&missing);
-        let path = missing.to_string_lossy().into_owned();
-        let ctx = egui::Context::default();
-        let mut service = FontService::default();
-
-        for spelling in [" BUILTIN ", "Builtin"] {
-            settle(&ctx, &mut service, None, Some("departure-mono"));
-            finish_pass(&ctx);
-            ctx.begin_pass(egui::RawInput::default());
-            service.sync(&ctx, None, Some(spelling));
-            assert!(!terminal_active(&ctx), "{spelling}");
-            assert!(terminal_size(&ctx).is_none(), "{spelling}");
-            assert_terminal_grid(&ctx, false);
-            finish_pass(&ctx);
-            ctx.begin_pass(egui::RawInput::default());
-            service.sync(&ctx, None, Some(spelling));
-            assert_loaded(&ctx, DEFAULT_UI_ID, None);
-            assert_terminal_grid(&ctx, false);
-            finish_pass(&ctx);
-        }
-
-        let lookalikes = [
-            None,
-            Some(""),
-            Some(" \n\t "),
-            Some("Fira Code"),
-            Some("\u{202e}builtin"),
-            Some("builtin.ttf"),
-            Some("built-in"),
-            Some(path.as_str()),
-        ];
-        for name in lookalikes {
-            settle(&ctx, &mut service, None, Some("departure-mono"));
-            finish_pass(&ctx);
-            ctx.begin_pass(egui::RawInput::default());
-            service.sync(&ctx, None, name);
-            assert!(terminal_active(&ctx), "{name:?}");
-            assert_eq!(terminal_size(&ctx), Some(DEPARTURE_SIZE), "{name:?}");
-            assert_terminal_grid(&ctx, true);
-            let named = FontId::new(16.0, FontFamily::Name(TERMINAL_FAMILY.into()));
-            ctx.fonts_mut(|fonts| {
-                assert!(fonts.glyph_width(&named, 'M') > 0.0, "{name:?}");
-                let chain = fonts
-                    .definitions()
-                    .families
-                    .get(&FontFamily::Name(TERMINAL_FAMILY.into()))
-                    .expect("terminal family");
-                assert_eq!(
-                    chain.first().map(String::as_str),
-                    Some("departure-mono"),
-                    "{name:?}"
-                );
-            });
-            finish_pass(&ctx);
-            ctx.begin_pass(egui::RawInput::default());
-            service.sync(&ctx, None, name);
-            assert_loaded(&ctx, DEFAULT_UI_ID, Some(DEFAULT_TERMINAL_ID));
-            assert_terminal_grid(&ctx, true);
-            finish_pass(&ctx);
-            assert!(!missing.exists(), "sync created {}", missing.display());
-        }
-
-        // From the built-in face, Departure's 11 pt arrives with the face.
-        // The grid keeps the style monospace until that pass.
-        settle(&ctx, &mut service, None, Some("builtin"));
-        finish_pass(&ctx);
-        ctx.begin_pass(egui::RawInput::default());
-        service.sync(&ctx, None, Some("departure-mono"));
-        assert!(!terminal_active(&ctx));
-        assert!(terminal_size(&ctx).is_none());
-        assert_terminal_grid(&ctx, false);
-        finish_pass(&ctx);
-        ctx.begin_pass(egui::RawInput::default());
-        service.sync(&ctx, None, Some("departure-mono"));
-        assert!(terminal_active(&ctx));
-        assert_eq!(terminal_size(&ctx), Some(DEPARTURE_SIZE));
-        assert_terminal_grid(&ctx, true);
-        let named = FontId::new(DEPARTURE_SIZE, FontFamily::Name(TERMINAL_FAMILY.into()));
-        ctx.fonts_mut(|fonts| {
-            assert!(fonts.glyph_width(&named, 'M') > 0.0);
-        });
-        finish_pass(&ctx);
-
-        for blank in [None, Some(""), Some(" \n\t ")] {
-            settle(&ctx, &mut service, None, Some("builtin"));
-            finish_pass(&ctx);
-            ctx.begin_pass(egui::RawInput::default());
-            service.sync(&ctx, None, blank);
-            assert!(!terminal_active(&ctx), "{blank:?}");
-            assert!(terminal_size(&ctx).is_none(), "{blank:?}");
-            assert_terminal_grid(&ctx, false);
-            finish_pass(&ctx);
-            ctx.begin_pass(egui::RawInput::default());
-            service.sync(&ctx, None, blank);
-            assert_loaded(&ctx, DEFAULT_UI_ID, Some(DEFAULT_TERMINAL_ID));
-            assert_terminal_grid(&ctx, true);
-            let named = FontId::new(16.0, FontFamily::Name(TERMINAL_FAMILY.into()));
-            ctx.fonts_mut(|fonts| {
-                assert!(fonts.glyph_width(&named, 'M') > 0.0, "{blank:?}");
-            });
-            finish_pass(&ctx);
-        }
-    }
-
-    #[test]
-    fn every_face_pair_applies_without_clobbering_the_other() {
-        let ctx = egui::Context::default();
-        let mut service = FontService::default();
-        let terminals = [
-            None,
-            Some("builtin"),
-            Some("obel-mono"),
-            Some("meslo-lgs-nf"),
-            Some("departure-mono"),
-        ];
-        for ui in [
-            "ubuntu",
-            "ubuntu-mono",
-            "ubuntu-sans",
-            "ibm-plex-sans",
-            "obel-mono",
-            "aspekta",
-            "inter",
+    fn saved_ids_resolve_to_a_bundled_face() {
+        const UI: &str = "ubuntu";
+        const TERMINAL: Option<&str> = Some("meslo-lgs-nf");
+        for (saved, ui, terminal) in [
+            (None, UI, TERMINAL),
+            (Some(""), UI, TERMINAL),
+            (Some(" \n\t "), UI, TERMINAL),
+            (Some("Comic Sans"), UI, TERMINAL),
+            (Some("Fira Code"), UI, TERMINAL),
+            (Some("obel\nmono"), UI, TERMINAL),
+            (Some("\u{202e}obel-mono"), UI, TERMINAL),
+            (Some("/tmp/cthulhu-font-probe.ttf"), UI, TERMINAL),
+            (Some(" INTER "), "inter", TERMINAL),
+            (Some("inter\n"), "inter", TERMINAL),
+            (Some("UBUNTU-SANS"), "ubuntu-sans", TERMINAL),
+            (Some(" Obel-Mono "), "obel-mono", Some("obel-mono")),
+            (Some("meslo-lgs-nf"), UI, Some("meslo-lgs-nf")),
+            (Some("Departure-Mono"), UI, Some("departure-mono")),
+            (Some("builtin"), UI, None),
+            (Some(" BUILTIN "), UI, None),
+            (Some("\u{202e}builtin"), UI, TERMINAL),
+            (Some("builtin.ttf"), UI, TERMINAL),
+            (Some("built-in"), UI, TERMINAL),
         ] {
-            for terminal in terminals {
-                // The choice queued on the first pass is what the next pass loads.
-                settle(&ctx, &mut service, Some(ui), terminal);
-                assert_loaded(&ctx, ui, resolve_terminal(terminal));
-                if ui == "ubuntu-sans" && terminal == Some("meslo-lgs-nf") {
-                    ctx.fonts_mut(|fonts| {
-                        let meslo = FontId::new(14.0, FontFamily::Name("meslo-lgs-nf".into()));
-                        let obel = FontId::new(14.0, FontFamily::Name("obel-mono".into()));
-                        assert!(fonts.glyph_width(&meslo, 'M') > 0.0);
-                        assert!(fonts.glyph_width(&obel, 'M') > 0.0);
-                        // A missing glyph is zero wide. Meslo's notdef is not used here:
-                        // the same code point on Obel Mono measures zero.
-                        assert!(fonts.glyph_width(&meslo, PROMPT_ICON) > 0.0);
-                        assert_eq!(fonts.glyph_width(&obel, PROMPT_ICON), 0.0);
-                    });
-                }
-                finish_pass(&ctx);
-            }
+            assert_eq!(
+                (resolve_ui(saved), resolve_terminal(saved)),
+                (ui, terminal),
+                "{saved:?}"
+            );
         }
     }
 
-    /// One pass queues the faces. The next pass is the one egui has loaded,
-    /// and it is left open so the caller can measure.
-    fn settle(
-        ctx: &egui::Context,
-        service: &mut FontService,
-        ui: Option<&str>,
-        terminal: Option<&str>,
-    ) {
-        ctx.begin_pass(egui::RawInput::default());
-        service.sync(ctx, ui, terminal);
-        finish_pass(ctx);
-        ctx.begin_pass(egui::RawInput::default());
-        service.sync(ctx, ui, terminal);
-    }
+    proptest! {
+        #![proptest_config(crate::ui::test_support::proptest_config())]
 
-    fn assert_loaded(ctx: &egui::Context, ui: &str, terminal: Option<&str>) {
-        assert!(faces_ready(ctx));
-        match terminal {
-            Some("departure-mono") => {
-                assert!(terminal_active(ctx));
-                assert_eq!(terminal_size(ctx), Some(DEPARTURE_SIZE));
-            }
-            Some(_) => {
-                assert!(terminal_active(ctx));
-                assert!(terminal_size(ctx).is_none());
-            }
-            None => {
-                assert!(!terminal_active(ctx));
-                assert!(terminal_size(ctx).is_none());
-            }
-        }
-        ctx.fonts(|fonts| {
-            let definitions = fonts.definitions();
-            let proportional = definitions
-                .families
-                .get(&FontFamily::Proportional)
-                .expect("proportional");
-            assert_eq!(proportional.first().map(String::as_str), Some(ui));
-            let terminal_family = FontFamily::Name(TERMINAL_FAMILY.into());
-            match terminal {
+        /// Whatever the settings file holds, both faces come from the catalog.
+        #[test]
+        fn every_saved_id_resolves_inside_the_catalog(
+            saved in prop_oneof![
+                any::<String>(),
+                "[ \t\n]{0,2}(INTER|ubuntu-mono|Obel-Mono|meslo-lgs-nf|DEPARTURE-mono)[ \t\n]{0,2}",
+                "[ \t\n]{0,2}(Builtin|built-in|BUILTIN)[ \t\n]{0,2}",
+            ],
+        ) {
+            let ui = resolve_ui(Some(saved.as_str()));
+            prop_assert!(UI_FACES.iter().any(|face| face.id == ui), "{saved:?} drew {ui}");
+            match resolve_terminal(Some(saved.as_str())) {
                 Some(id) => {
-                    let chain = definitions
-                        .families
-                        .get(&terminal_family)
-                        .expect("terminal family");
-                    assert_eq!(chain.first().map(String::as_str), Some(id));
-                    assert!(chain.len() > 1, "monospace fallback was dropped");
+                    let bundled = TERMINAL_FACES.iter().any(|face| face.id == id);
+                    prop_assert!(bundled, "{saved:?} drew {id}");
                 }
-                None => assert!(
-                    !definitions.families.contains_key(&terminal_family),
-                    "built-in terminal still installed a named face"
-                ),
+                None => {
+                    prop_assert!(is_builtin_terminal(&saved), "{saved:?} turned the face off");
+                }
             }
+        }
+    }
+
+    /// egui loads `set_fonts` on the same pass when no text has been laid out
+    /// yet, otherwise on the next. A named family is only measured once it is
+    /// loaded, and the terminal size belongs to the loaded face.
+    #[test]
+    fn faces_are_measured_only_once_egui_has_loaded_them() {
+        const MESLO: Option<&str> = Some(DEFAULT_TERMINAL_ID);
+        const DEPARTURE: Option<&str> = Some("departure-mono");
+        let ctx = egui::Context::default();
+        let mut service = FontService::default();
+        // (case, interface, terminal, text laid out first, loaded proportional, loaded terminal)
+        #[rustfmt::skip]
+        let passes = [
+            ("first faces after text", Some("inter"), MESLO, true, "Ubuntu-Light", None),
+            ("next pass", Some("inter"), MESLO, false, "inter", MESLO),
+            ("Departure after text keeps Meslo", Some("obel-mono"), DEPARTURE, true, "inter", MESLO),
+            ("Departure at 11 pt", Some("obel-mono"), DEPARTURE, false, "obel-mono", DEPARTURE),
+            ("blank before text", None, None, false, DEFAULT_UI_ID, MESLO),
+            ("builtin after text keeps Meslo", None, Some("builtin"), true, DEFAULT_UI_ID, MESLO),
+            ("builtin drops the family", None, Some("builtin"), false, DEFAULT_UI_ID, None),
+            ("Departure from builtin", None, DEPARTURE, false, DEFAULT_UI_ID, DEPARTURE),
+        ];
+        for (case, ui_font, terminal_font, text_first, proportional, terminal) in passes {
+            ctx.begin_pass(egui::RawInput::default());
+            if text_first {
+                ctx.fonts_mut(|fonts| {
+                    fonts.layout_no_wrap("x".into(), FontId::default(), egui::Color32::WHITE)
+                });
+            }
+            service.sync(&ctx, ui_font, terminal_font);
+            let loaded = ctx.fonts(|fonts| {
+                let chain = |family| fonts.definitions().families.get(&family)?.first().cloned();
+                let terminal = chain(FontFamily::Name(TERMINAL_FAMILY.into()));
+                (chain(FontFamily::Proportional), terminal)
+            });
+            assert_eq!(loaded.0.as_deref(), Some(proportional), "{case}");
+            assert_eq!(loaded.1.as_deref(), terminal, "{case}");
+            let bundled = face_by_id(UI_FACES, proportional).is_some();
+            let mut ran = false;
+            egui::Area::new(egui::Id::unique("cthulhu-font-probe")).show(&ctx, |ui| {
+                for face in UI_FACES {
+                    let font = preview_font(ui, face.id, 16.0);
+                    let named = font.family != FontFamily::Proportional;
+                    assert_eq!(named, bundled, "{case}: {}", face.id);
+                    assert!(
+                        ui.fonts_mut(|fonts| fonts.glyph_width(&font, 'M')) > 0.0,
+                        "{case}"
+                    );
+                }
+                let monospace = TextStyle::Monospace.resolve(ui.style());
+                let grid = match terminal.and_then(|id| face_by_id(TERMINAL_FACES, id)) {
+                    Some(face) => FontId::new(
+                        face.terminal_size.unwrap_or(monospace.size),
+                        FontFamily::Name(TERMINAL_FAMILY.into()),
+                    ),
+                    None => monospace,
+                };
+                assert_eq!(terminal_font_id(ui), grid, "{case}");
+                assert!(
+                    ui.fonts_mut(|fonts| fonts.glyph_width(&grid, 'M')) > 0.0,
+                    "{case}"
+                );
+                ran = true;
+            });
+            assert!(ran, "{case}: the probe did not run");
+            finish_pass(&ctx);
+        }
+    }
+
+    /// Each pair puts its interface face first in the proportional chain and
+    /// its terminal face first in the terminal chain, with egui's monospace
+    /// behind it; no terminal face installs no terminal family. Every bundled
+    /// face stays registered under its own name.
+    #[test]
+    fn every_face_pair_builds_both_chains_without_clobbering_the_other() {
+        let terminal_family = FontFamily::Name(TERMINAL_FAMILY.into());
+        let terminals =
+            std::iter::once(None).chain(TERMINAL_FACES.iter().map(|face| Some(face.id)));
+        for ui in UI_FACES {
+            for terminal in terminals.clone() {
+                let case = format!("{} with {terminal:?}", ui.id);
+                let fonts = definitions(ui.id, terminal);
+                let first = |family: &FontFamily| {
+                    fonts
+                        .families
+                        .get(family)
+                        .and_then(|chain| chain.first())
+                        .map(String::as_str)
+                };
+                assert_eq!(first(&FontFamily::Proportional), Some(ui.id), "{case}");
+                assert_eq!(first(&terminal_family), terminal, "{case}");
+                if terminal.is_some() {
+                    assert!(
+                        fonts.families[&terminal_family].len() > 1,
+                        "{case}: monospace fallback was dropped"
+                    );
+                }
+                for face in UI_FACES.iter().chain(TERMINAL_FACES) {
+                    let named = FontFamily::Name(face.id.into());
+                    assert_eq!(first(&named), Some(face.id), "{case}: {}", face.id);
+                    assert!(fonts.font_data.contains_key(face.id), "{case}: {}", face.id);
+                }
+            }
+        }
+
+        // One real load. A missing glyph measures zero wide, so Meslo's prompt
+        // icon is its own glyph, not a fallback's, and the emoji is egui's.
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput::default());
+        FontService::default().sync(&ctx, None, Some(DEFAULT_TERMINAL_ID));
+        ctx.fonts_mut(|fonts| {
+            let meslo = FontId::new(14.0, FontFamily::Name(DEFAULT_TERMINAL_ID.into()));
+            let obel = FontId::new(14.0, FontFamily::Name("obel-mono".into()));
+            assert!(fonts.glyph_width(&obel, 'M') > 0.0);
+            assert!(fonts.glyph_width(&meslo, PROMPT_ICON) > 0.0);
+            assert_eq!(fonts.glyph_width(&obel, PROMPT_ICON), 0.0);
+            assert!(fonts.glyph_width(&FontId::proportional(14.0), '\u{1f419}') > 0.0);
         });
+        finish_pass(&ctx);
     }
 
     fn finish_pass(ctx: &egui::Context) {
         // Dropping an unapplied texture delta panics. This test has no renderer.
         let mut output = ctx.end_pass();
         output.textures_delta.clear();
-    }
-
-    /// `named` is the terminal family. Otherwise the grid stays on egui's
-    /// monospace, including its size, even when a custom size is already stored.
-    fn assert_terminal_grid(ctx: &egui::Context, named: bool) {
-        let mut ran = false;
-        egui::Area::new(Id::new("cthulhu-terminal-grid-probe")).show(ctx, |ui| {
-            let font = terminal_font_id(ui);
-            let monospace = TextStyle::Monospace.resolve(ui.style());
-            if named {
-                assert_eq!(font.family, FontFamily::Name(TERMINAL_FAMILY.into()));
-                assert_eq!(font.size, terminal_size(ui.ctx()).unwrap_or(monospace.size));
-            } else {
-                assert_eq!(font.family, FontFamily::Monospace);
-                assert_eq!(font.size, monospace.size);
-            }
-            ran = true;
-        });
-        assert!(ran, "terminal grid probe did not run");
     }
 }
