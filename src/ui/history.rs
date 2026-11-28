@@ -952,8 +952,9 @@ fn lane_glow(
     let (mut halo, mut crest) = (Mesh::default(), Mesh::default());
     for trace in row.traces.iter().filter(|trace| trace.color == glow.color) {
         let (start, end) = trace_ends(graph, trace.from_lane, trace.to_lane, dot, lane_width);
-        add_glow_segment(&mut halo, start, end, color, glow);
-        add_crest_segment(&mut crest, start, end, color, glow);
+        let on_edge = [trace.from_lane.is_some(), trace.to_lane.is_some()];
+        add_glow_segment(&mut halo, [start, end], on_edge, color, glow);
+        add_crest_segment(&mut crest, [start, end], on_edge, color, glow);
     }
     if row.commit_color == glow.color {
         // The commit circle is opaque, so the aura is the band outside it.
@@ -1046,8 +1047,8 @@ fn glow_share(alpha: u8, share: f32) -> u8 {
 /// no sample that `shows`, adds nothing.
 fn ribbon<T: Copy>(
     mesh: &mut Mesh,
-    start: Pos2,
-    end: Pos2,
+    [start, end]: [Pos2; 2],
+    on_edge: [bool; 2],
     stops: &[(f32, f32)],
     light: impl Fn(Pos2) -> T,
     shows: impl Fn(T) -> bool,
@@ -1072,9 +1073,19 @@ fn ribbon<T: Copy>(
         return;
     }
     let first = mesh.vertices.len() as u32;
-    for (point, light) in samples {
+    for (step, (point, light)) in samples.into_iter().enumerate() {
+        // An end on the row's top or bottom edge is cut along that edge, where
+        // the next row's ribbon starts square to its own lane. A cut square to
+        // a lane change would leave a notch without light at the joint. Such
+        // a segment always runs down the row, so `normal.x` is never zero.
+        let along_edge = (step == 0 && on_edge[0]) || (step == steps && on_edge[1]);
         for &(offset, share) in stops {
-            mesh.colored_vertex(point + normal * offset, shade(light, share));
+            let across = if along_edge {
+                Vec2::new(offset / normal.x, 0.0)
+            } else {
+                normal * offset
+            };
+            mesh.colored_vertex(point + across, shade(light, share));
         }
     }
     stitch(mesh, first, steps as u32, stops.len() as u32, false);
@@ -1118,7 +1129,13 @@ fn stitch(mesh: &mut Mesh, first: u32, bands: u32, width: u32, closed: bool) {
 /// The halo along `start`→`end`. Full alpha out to the stroke edge, since the
 /// stroke is painted on top of the center, then a falloff that clears before
 /// the next lane.
-fn add_glow_segment(mesh: &mut Mesh, start: Pos2, end: Pos2, color: Color32, glow: LaneGlow) {
+fn add_glow_segment(
+    mesh: &mut Mesh,
+    ends: [Pos2; 2],
+    on_edge: [bool; 2],
+    color: Color32,
+    glow: LaneGlow,
+) {
     // Offset from the stroke center, and the share of this sample's alpha.
     const STOPS: [(f32, f32); 6] = [
         (-GLOW_RADIUS, 0.0),
@@ -1130,8 +1147,8 @@ fn add_glow_segment(mesh: &mut Mesh, start: Pos2, end: Pos2, color: Color32, glo
     ];
     ribbon(
         mesh,
-        start,
-        end,
+        ends,
+        on_edge,
         &STOPS,
         |point| glow_alpha(glow.time, glow.origin + point.y),
         |_| true,
@@ -1182,7 +1199,13 @@ fn crest_color(lane: Color32, lobe: f32, share: f32) -> Color32 {
 
 /// A short light along `start`→`end`. A segment the spark does not reach
 /// adds nothing.
-fn add_crest_segment(mesh: &mut Mesh, start: Pos2, end: Pos2, color: Color32, glow: LaneGlow) {
+fn add_crest_segment(
+    mesh: &mut Mesh,
+    ends: [Pos2; 2],
+    on_edge: [bool; 2],
+    color: Color32,
+    glow: LaneGlow,
+) {
     // Offset from the stroke center, and the share of this sample's alpha.
     const STOPS: [(f32, f32); 5] = [
         (-GLOW_CREST_RADIUS, 0.0),
@@ -1193,8 +1216,8 @@ fn add_crest_segment(mesh: &mut Mesh, start: Pos2, end: Pos2, color: Color32, gl
     ];
     ribbon(
         mesh,
-        start,
-        end,
+        ends,
+        on_edge,
         &STOPS,
         |point| crest_lobe(glow.time, glow.origin + point.y),
         |lobe| lobe > 0.02,
@@ -1717,8 +1740,8 @@ mod tests {
     #[rustfmt::skip]
     const GOLDEN: [([[usize; 2]; 2], [u64; 2]); 8] = [
         ([[30, 120], [25, 96]], [0xd7e20f28027a9a35, 0x43f38e51d12d739a]), // straight
-        ([[36, 150], [30, 120]], [0x75fbc29c0416f8ec, 0xb0711276fd7cd83d]), // lane change
-        ([[108, 402], [86, 312]], [0x7db8a48a103b3ea8, 0x2fa896d0a854ad9f]), // merge
+        ([[36, 150], [30, 120]], [0x96903933ab41dd26, 0x3de8a17a1344d847]), // lane change
+        ([[108, 402], [86, 312]], [0xe4bc37ab4ec5b458, 0x3b0028a3706a8351]), // merge
         ([[84, 312], [66, 240]], [0x1aaa1a4a360d428d, 0xa97ffe770013a1c9]), // dot
         ([[36, 120], [66, 240]], [0x11281c45b3196845, 0xf7cad7d9de74f997]), // narrow
         ([[84, 312], [15, 48]], [0xb61e34c53fef13b9, 0x239961336da8b433]), // crest edge
