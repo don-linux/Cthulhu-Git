@@ -1396,6 +1396,11 @@ fn clicking_a_branch_tag_lights_only_that_lanes_halo() {
     let feature = palette.graph_color(3);
 
     assert_no_glow(&harness);
+    // The checked-out branch's tag at rest, and with 40 more alpha when lit.
+    let rest = palette.graph_chip(0, true);
+    let tag_lit =
+        egui::Color32::from_rgba_unmultiplied(main.r(), main.g(), main.b(), rest.a() + 40);
+    assert_eq!(rects_filled(&harness, rest).len(), 1, "main's tag at rest");
 
     // A third of the way into the fade the light is there, but weaker than
     // the floor it reaches when fully lit.
@@ -1405,6 +1410,7 @@ fn clicking_a_branch_tag_lights_only_that_lanes_halo() {
     let fading_in = brightest_glow(&harness);
     harness.run_steps(fade_frames());
     assert_glow_is(&harness, main);
+    assert_eq!(rects_filled(&harness, tag_lit).len(), 1, "main's lit tag");
     let lit = brightest_glow(&harness);
     assert!(
         0 < fading_in && fading_in < lit,
@@ -1427,7 +1433,9 @@ fn clicking_a_branch_tag_lights_only_that_lanes_halo() {
 
 /// The crest asks for its next frame only while a painted row glows and the
 /// window has focus: (lit branch, window focused, frame requested). Forty
-/// commits of `main` keep `feature`'s rows below the window.
+/// commits of `main` keep `feature`'s rows below the window. At 34.1 s the
+/// crest's head is 420 points down the branch, below the rows on screen, and
+/// the lit lane still asks: its halo glows there.
 #[test]
 fn the_glow_asks_for_frames_only_while_seen() {
     for (lit, focused, requested) in [
@@ -1439,10 +1447,11 @@ fn the_glow_asks_for_frames_only_while_seen() {
         let mut repo = opened_graph("glow-frames", fork_graph(40));
         repo.lit_branch = lit.map(str::to_owned);
         let mut harness = harness(
-            egui::vec2(1400.0, HEIGHT),
+            egui::vec2(1400.0, 400.0),
             screen(repo, HistoryColumns::default(), false, false),
         );
         harness.input_mut().focused = focused;
+        harness.input_mut().time = Some(34.1);
         harness.step();
         let delay = harness.output().viewport_output[&egui::ViewportId::ROOT].repaint_delay;
         assert_eq!(

@@ -660,9 +660,7 @@ fn history_row(
             .map(|&(color, fade)| LaneGlow {
                 time: cx.time,
                 color,
-                // `origin + screen_y` is the content Y, so the crest stays on
-                // the same commits when the table scrolls.
-                origin: row_index as f32 * row_height - rect.top(),
+                origin: glow_origin(row_index, row_height, rect.top()),
                 fade,
             })
             .collect();
@@ -883,6 +881,13 @@ struct LaneGlow {
     origin: f32,
     /// How far the lane has lit up, from 0 (out) to 1. Every alpha scales by it.
     fade: f32,
+}
+
+/// [`LaneGlow::origin`] of the row `row_index` drawn at `row_top`: plus a
+/// screen Y, it gives the content Y, so the crest stays on the same commits
+/// when the table scrolls.
+fn glow_origin(row_index: usize, row_height: f32, row_top: f32) -> f32 {
+    row_index as f32 * row_height - row_top
 }
 
 /// The commit dot's center, the radius of the background ring it sits in,
@@ -1764,9 +1769,9 @@ mod tests {
             })
     }
 
-    /// The graph cell of a row lit on lane color 0 at `time` and `fade`, whose
-    /// dot sits 140 points down the branch, and the row with that dot and
-    /// `traces`.
+    /// The graph cell of a row lit on lane color 0 at `time` and `fade`, and
+    /// the row with that dot and `traces`. It is the fourth row of 40 points,
+    /// drawn at y 50, so its dot sits 140 points down the branch.
     fn lit_row(
         [lane, color]: [usize; 2],
         traces: &[Trace],
@@ -1790,13 +1795,13 @@ mod tests {
             commit_color: color,
             traces: traces.collect(),
         };
+        let graph = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(150.0, 40.0));
         let glow = LaneGlow {
             time,
             color: 0,
-            origin: 70.0,
+            origin: glow_origin(3, graph.height(), graph.top()),
             fade,
         };
-        let graph = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(150.0, 40.0));
         (graph, row, glow)
     }
 
