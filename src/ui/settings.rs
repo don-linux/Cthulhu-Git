@@ -968,6 +968,7 @@ mod tests {
         // (page, a section title or subtitle it shows)
         for (page, shown) in [
             ("GitHub Auth", "2. Paste it here"),
+            ("GitHub Auth", "No token. Public repositories only."),
             (
                 "History",
                 "Author pictures and the width of the history columns.",
