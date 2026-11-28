@@ -1711,45 +1711,50 @@ mod tests {
             })
     }
 
+    /// The graph cell of a row lit on lane color 0 at `time`, whose dot sits
+    /// 140 points down the branch, and the row with that dot and `traces`.
+    fn lit_row(
+        [lane, color]: [usize; 2],
+        traces: &[Trace],
+        time: f64,
+    ) -> (Rect, GraphRow, LaneGlow) {
+        let traces = traces
+            .iter()
+            .map(|&(from_lane, to_lane, color)| GraphTrace {
+                from_lane,
+                to_lane,
+                color,
+            });
+        let row = GraphRow {
+            oid: String::new(),
+            summary: String::new(),
+            author: Person::default(),
+            co_authors: Vec::new(),
+            branches: Vec::new(),
+            commit_lane: lane,
+            commit_color: color,
+            traces: traces.collect(),
+        };
+        let glow = LaneGlow {
+            time,
+            color: 0,
+            origin: 70.0,
+        };
+        let graph = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(150.0, 40.0));
+        (graph, row, glow)
+    }
+
     /// Every vertex, color and index of the lit lane's light at fixed times.
     /// The digests hold the exact bits of glibc's `expf` and `sinf`; another
     /// libm may round a last bit differently, so other systems check counts.
     #[test]
     fn lane_glow_meshes_match_the_golden() {
         let exact = cfg!(all(target_os = "linux", target_env = "gnu"));
-        let graph = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(150.0, 40.0));
         let (mut now, mut changed) = (String::new(), String::new());
-        for ((case, lane_width, time, [lane, color], traces), golden) in
-            GLOW_ROWS.into_iter().zip(GOLDEN)
-        {
-            let row = GraphRow {
-                oid: String::new(),
-                summary: String::new(),
-                author: Person::default(),
-                co_authors: Vec::new(),
-                branches: Vec::new(),
-                commit_lane: lane,
-                commit_color: color,
-                traces: (traces.iter())
-                    .map(|&(from_lane, to_lane, color)| GraphTrace {
-                        from_lane,
-                        to_lane,
-                        color,
-                    })
-                    .collect(),
-            };
-            let glow = LaneGlow {
-                time,
-                color: 0,
-                origin: 70.0,
-            };
-            let meshes = lane_glow(
-                graph,
-                &row,
-                lane_width,
-                glow,
-                Color32::from_rgb(64, 160, 224),
-            );
+        for ((case, lane_width, time, dot, traces), golden) in GLOW_ROWS.into_iter().zip(GOLDEN) {
+            let (graph, row, glow) = lit_row(dot, traces, time);
+            let color = Color32::from_rgb(64, 160, 224);
+            let meshes = lane_glow(graph, &row, lane_width, glow, color);
             let meshes = [("halo", meshes.0), ("crest", meshes.1)];
             let counts = meshes
                 .each_ref()
@@ -1773,5 +1778,32 @@ mod tests {
             changed.is_empty(),
             "the glow changed:{changed}\nGOLDEN is now:\n{now}"
         );
+    }
+
+    /// The halo goes under the strokes and the dots, the crest over them. A
+    /// trace with no length paints no stroke.
+    #[test]
+    fn paint_lanes_puts_the_halo_under_the_strokes_and_the_crest_on_top() {
+        let palette = &crate::ui::theme::DEFAULT_THEME.palette;
+        let (graph, row, glow) = lit_row([0, 0], MERGE, 0.7);
+        let (halo, crest) = lane_glow(graph, &row, 20.0, glow, palette.graph_color(0));
+        let mut output = egui::Context::default().run_ui(egui::RawInput::default(), |ui| {
+            let fill = Color32::BLACK;
+            paint_lanes(ui.painter(), graph, &row, palette, 20.0, fill, Some(glow));
+        });
+        output.textures_delta.clear();
+        let painted: Vec<&str> = (output.shapes.iter())
+            .map(|clipped| match &clipped.shape {
+                egui::Shape::Mesh(mesh) if **mesh == halo => "halo",
+                egui::Shape::Mesh(mesh) if **mesh == crest => "crest",
+                egui::Shape::LineSegment { .. } => "stroke",
+                egui::Shape::Circle(_) => "dot",
+                _ => "other",
+            })
+            .collect();
+        let order = [
+            "halo", "stroke", "stroke", "stroke", "stroke", "dot", "dot", "crest",
+        ];
+        assert_eq!(painted, order);
     }
 }
