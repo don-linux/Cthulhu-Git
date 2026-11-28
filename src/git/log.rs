@@ -412,7 +412,7 @@ pub(crate) fn parse_tag_names(stdout: &[u8]) -> Vec<String> {
     stdout
         .split(|byte| matches!(byte, 0 | b'\n'))
         .map(|name| {
-            let name = name.strip_suffix(b"\r").unwrap_or(name);
+            let name = name.trim_suffix(b"\r");
             String::from_utf8_lossy(name).trim().to_owned()
         })
         .filter(|name| !name.is_empty())

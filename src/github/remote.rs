@@ -64,7 +64,7 @@ fn parse_github_url(url: &str) -> Option<GitHubRepo> {
         is_github_host(host).then_some(path)?
     };
     let path = path.trim_end_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
+    let path = path.trim_suffix(".git");
     let (owner, name) = path.split_once('/')?;
     (valid_owner(owner) && valid_name(name)).then(|| GitHubRepo {
         owner: owner.to_owned(),
@@ -83,7 +83,7 @@ fn github_authority(authority: &str, default_port: &str) -> bool {
         return false;
     }
     let host = authority.rsplit('@').next().unwrap_or(authority);
-    let host = host.strip_suffix(default_port).unwrap_or(host);
+    let host = host.trim_suffix(default_port);
     is_github_host(host)
 }
 

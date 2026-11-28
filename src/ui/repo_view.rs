@@ -269,7 +269,7 @@ fn bottom_bar(
             })
             .inner;
         if terminal_toggle.clicked() {
-            panels.terminal = !panels.terminal;
+            panels.terminal.toggle();
             // The strip lives in the right sidebar, so showing it opens that too.
             if panels.terminal {
                 panels.detail = true;
@@ -308,7 +308,7 @@ fn top_bar(ui: &mut Ui, repo: &OpenedRepo, palette: &Palette, panels: &mut Panel
         let branches_toggle =
             icons::icon_button(ui, Icon::PanelLeft, branches_tint, branches_hover);
         if branches_toggle.clicked() {
-            panels.branches = !panels.branches;
+            panels.branches.toggle();
         }
 
         let (detail_tint, detail_hover) = if panels.detail {
@@ -322,7 +322,7 @@ fn top_bar(ui: &mut Ui, repo: &OpenedRepo, palette: &Palette, panels: &mut Panel
             })
             .inner;
         if detail_toggle.clicked() {
-            panels.detail = !panels.detail;
+            panels.detail.toggle();
         }
 
         let row = ui.max_rect();
@@ -405,7 +405,7 @@ fn branch_row(ui: &mut Ui, listed: &mut ListedBranch, lane: Option<usize>, palet
                 node.push_labelled_by(response.id.accesskit_id());
             });
             if response.clicked() {
-                listed.checked = !listed.checked;
+                listed.checked.toggle();
             }
         });
 

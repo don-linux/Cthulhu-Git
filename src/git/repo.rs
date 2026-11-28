@@ -120,7 +120,7 @@ fn read_head(git: &Git, root: &Path) -> Result<Head, GitError> {
 
 fn branch_name(stdout: &[u8]) -> String {
     let full = stdout_text(stdout);
-    full.strip_prefix("refs/heads/").unwrap_or(&full).to_owned()
+    full.trim_prefix("refs/heads/").to_owned()
 }
 
 fn detached_head(git: &Git, root: &Path) -> Result<Head, GitError> {

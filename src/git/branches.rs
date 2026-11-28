@@ -162,7 +162,7 @@ fn parse_committer_time(bytes: &[u8]) -> Option<Option<i64>> {
         return Some(None);
     }
     let text = std::str::from_utf8(bytes).ok()?;
-    let digits = text.strip_prefix('-').unwrap_or(text);
+    let digits = text.trim_prefix('-');
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }

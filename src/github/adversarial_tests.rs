@@ -102,9 +102,7 @@ fn errors_never_show_the_token() {
 
 fn arb_urlish() -> impl Strategy<Value = String> {
     prop_oneof![
-        3 => prop::collection::vec(any::<u8>(), 0..512).prop_map(|bytes| {
-            String::from_utf8_lossy(&bytes).into_owned()
-        }),
+        3 => prop::collection::vec(any::<u8>(), 0..512).prop_map(String::from_utf8_lossy_owned),
         1 => string_regex("https://[A-Za-z0-9.-]{1,40}/[A-Za-z0-9._~-]{0,20}").unwrap(),
     ]
 }

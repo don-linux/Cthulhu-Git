@@ -225,7 +225,7 @@ impl Settings {
     /// capped, and font ids sanitized, because the file may be hand-edited.
     pub fn from_json(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         // Notepad on Windows writes a UTF-8 BOM in front of otherwise valid JSON.
-        let json = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+        let json = bytes.trim_prefix(b"\xEF\xBB\xBF");
         let mut settings: Self = serde_json::from_slice(json)?;
         settings.normalize_recent();
         settings.normalize_fonts();

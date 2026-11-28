@@ -910,7 +910,7 @@ mod tests {
         harness: &'a Harness<'_>,
     ) -> &'a [OutputCommand] {
         let commands = &harness.output().platform_output.commands;
-        commands.strip_prefix(previous).unwrap_or(commands)
+        commands.trim_prefix(previous)
     }
 
     #[test]

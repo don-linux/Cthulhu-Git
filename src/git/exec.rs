@@ -272,7 +272,7 @@ pub(crate) fn trim_eol(bytes: &[u8], cr: Cr) -> &[u8] {
         Cr::Kept => false,
     };
     if strip_cr {
-        rest.strip_suffix(b"\r").unwrap_or(rest)
+        rest.trim_suffix(b"\r")
     } else {
         rest
     }
