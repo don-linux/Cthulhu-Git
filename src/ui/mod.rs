@@ -255,8 +255,8 @@ impl GitFinder {
     }
 
     /// The text the UI shows for `error`.
-    fn describe(&self, error: GitError) -> String {
-        self.forget_if_gone(&error);
+    fn describe(&self, error: &GitError) -> String {
+        self.forget_if_gone(error);
         error.to_string()
     }
 
@@ -268,7 +268,7 @@ impl GitFinder {
         stopped: &str,
     ) -> Result<T, String> {
         match done {
-            Ok(result) => result.map_err(|error| self.describe(error)),
+            Ok(result) => result.map_err(|error| self.describe(&error)),
             Err(Stopped) => Err(stopped.to_owned()),
         }
     }
@@ -335,8 +335,8 @@ impl CthulhuApp {
             // The window stays hidden until its first frame is painted, so
             // opening here makes that frame the repository or the home
             // screen with the error, never a home screen that then flips.
-            let result = load(&app.find_git, &path).map_err(|error| app.find_git.describe(error));
-            app.finish_open(ctx, path, result);
+            let result = load(&app.find_git, &path).map_err(|error| app.find_git.describe(&error));
+            app.finish_open(ctx, &path, result);
         }
         // Home, with no first open or a failed one, scans from the start.
         if let Screen::Home(scan) = &mut app.screen {
@@ -409,17 +409,12 @@ impl CthulhuApp {
         let result = self
             .find_git
             .outcome(done, "Opening stopped unexpectedly. Try again.");
-        self.finish_open(ctx, opening.path, result);
+        self.finish_open(ctx, &opening.path, result);
     }
 
     /// Installs the repository and starts reading its history graph, or goes
     /// Home when opening failed.
-    fn finish_open(
-        &mut self,
-        ctx: &egui::Context,
-        path: PathBuf,
-        result: Result<Refreshed, String>,
-    ) {
+    fn finish_open(&mut self, ctx: &egui::Context, path: &Path, result: Result<Refreshed, String>) {
         match result {
             Ok(refreshed) => {
                 self.error = None;
@@ -469,7 +464,7 @@ impl CthulhuApp {
             }
             Err(message) => {
                 self.error = Some(message);
-                if self.settings.last_repository.as_deref() == Some(path.as_path()) {
+                if self.settings.last_repository.as_deref() == Some(path) {
                     self.settings.forget_last_repository();
                     self.save_settings();
                 }
@@ -782,8 +777,8 @@ struct SyncJob {
     task: Task<Result<Refreshed, GitError>>,
 }
 
-fn run_sync(git: &Git, root: &Path, command: SyncCommand) -> Result<Refreshed, GitError> {
-    match &command {
+fn run_sync(git: &Git, root: &Path, command: &SyncCommand) -> Result<Refreshed, GitError> {
+    match command {
         SyncCommand::Fetch(branch) => git::fetch(git, root, branch)?,
         SyncCommand::Pull => git::pull_ff_only(git, root)?,
         SyncCommand::Checkout(name) => git::switch_branch(git, root, name)?,
@@ -806,8 +801,7 @@ fn apply_refresh(repo: &mut OpenedRepo, refreshed: Refreshed) {
             let checked = previous
                 .iter()
                 .find(|listed| listed.branch.name == branch.name)
-                .map(|listed| listed.checked)
-                .unwrap_or(false);
+                .is_some_and(|listed| listed.checked);
             ListedBranch { branch, checked }
         })
         .collect();
@@ -879,7 +873,7 @@ impl CthulhuApp {
             SyncCommand::Pull => SyncKind::Pull,
             SyncCommand::Checkout(_) => SyncKind::Checkout,
         };
-        let task = Task::spawn(ctx, move || run_sync(&git, &root, command));
+        let task = Task::spawn(ctx, move || run_sync(&git, &root, &command));
         *sync = Some(SyncJob { kind, task });
         self.error = None;
     }
@@ -940,7 +934,7 @@ impl CthulhuApp {
         {
             Ok(graph) => {
                 repo.graph = graph;
-                repo.graph_selection = load.selection.clone();
+                repo.graph_selection.clone_from(&load.selection);
                 repo.graph_requested = load.selection;
                 self.error = None;
             }
@@ -985,7 +979,7 @@ impl CthulhuApp {
 mod tests {
     use std::fs;
     use std::io;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
@@ -1024,6 +1018,10 @@ mod tests {
     #[test]
     fn git_is_searched_again_only_once_it_cannot_start() {
         static SEARCHES: AtomicUsize = AtomicUsize::new(0);
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "`GitFinder::new` takes a search with the signature of `Git::discover`"
+        )]
         fn search() -> Result<Git, GitError> {
             SEARCHES.fetch_add(1, Ordering::SeqCst);
             Ok(absent_git())
@@ -1037,7 +1035,7 @@ mod tests {
         let finder = GitFinder::new(search);
         for (step, (error, searches)) in cases.into_iter().enumerate() {
             if let Some(error) = error {
-                finder.describe(error);
+                finder.describe(&error);
             }
             assert!(finder.git().is_ok(), "step {step}");
             assert_eq!(SEARCHES.load(Ordering::SeqCst), searches, "step {step}");
@@ -1264,7 +1262,7 @@ mod tests {
         let mut views = Vec::new();
         for (kind, answer, error, checked) in CASES {
             let case = format!("{kind:?} that {answer:?}");
-            app.finish_open(&ctx, PathBuf::from("/repos/sync"), Ok(refreshed("main")));
+            app.finish_open(&ctx, Path::new("/repos/sync"), Ok(refreshed("main")));
             assert!(app.history_loading(), "{case}: no history read at first");
             app.apply_action(&ctx, Action::Checkout("feature".to_owned()));
             app.apply_action(&ctx, Action::Pull);
@@ -1351,6 +1349,10 @@ mod tests {
     /// The repository shows the graph of `main`; the user has just checked
     /// `feature`, and the worker is reading `main` and `feature`.
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one table of what happens meanwhile and how the worker answers"
+    )]
     fn a_graph_result_lands_only_on_the_selection_that_asked() {
         #[rustfmt::skip]
         const CASES: [GraphCase; 9] = [

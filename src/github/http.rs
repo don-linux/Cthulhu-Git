@@ -79,7 +79,7 @@ fn classify_ureq(error: ureq::Error) -> HttpError {
 }
 
 /// The body reader reports ureq's own errors (body limit, timeouts,
-/// decompression) wrapped in an io::Error; ureq's `From` unwraps them so they
+/// decompression) wrapped in an `io::Error`; ureq's `From` unwraps them so they
 /// are classified like errors from the request itself.
 fn classify_io(error: std::io::Error) -> HttpError {
     classify_ureq(ureq::Error::from(error))

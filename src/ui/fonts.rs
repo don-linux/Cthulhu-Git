@@ -139,8 +139,7 @@ pub fn face_by_id<'a>(faces: &'a [Face], name: &str) -> Option<&'a Face> {
 pub fn resolve_ui(saved: Option<&str>) -> &'static str {
     saved
         .and_then(|name| face_by_id(UI_FACES, name))
-        .map(|face| face.id)
-        .unwrap_or(DEFAULT_UI_ID)
+        .map_or(DEFAULT_UI_ID, |face| face.id)
 }
 
 /// `true` when `name` asks for egui's built-in monospace.
@@ -158,11 +157,7 @@ pub fn resolve_terminal(saved: Option<&str>) -> Option<&'static str> {
     if is_builtin_terminal(name) {
         return None;
     }
-    Some(
-        face_by_id(TERMINAL_FACES, name)
-            .map(|face| face.id)
-            .unwrap_or(DEFAULT_TERMINAL_ID),
-    )
+    Some(face_by_id(TERMINAL_FACES, name).map_or(DEFAULT_TERMINAL_ID, |face| face.id))
 }
 
 /// The specimen font for a bundled face. Proportional until egui has loaded
@@ -272,14 +267,13 @@ fn proportional_fallbacks(fonts: &FontDefinitions) -> Vec<String> {
     fonts
         .families
         .get(&FontFamily::Proportional)
-        .map(|names| {
+        .map_or_default(|names| {
             names
                 .iter()
                 .filter(|name| name.as_str() != "Ubuntu-Light")
                 .cloned()
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

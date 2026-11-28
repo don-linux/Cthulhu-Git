@@ -1,6 +1,6 @@
 //! Lucide interface icons (`assets/icons/`, ISC license). Each SVG is drawn
 //! white; drawing tints it with a palette color, so the icons follow the
-//! theme. egui_extras renders an SVG at the size and pixel density it is drawn
+//! theme. `egui_extras` renders an SVG at the size and pixel density it is drawn
 //! at, so the icons stay sharp at any display scale.
 //!
 //! [`app_logo`] is the application mark (`assets/icon.svg`), in color. It is
@@ -69,7 +69,7 @@ impl Icon {
     }
 }
 
-/// Every drawing path installs egui_extras' SVG loader, so a `Ui` that did
+/// Every drawing path installs `egui_extras`' SVG loader, so a `Ui` that did
 /// not come through `CthulhuApp::new`, such as a test harness's, draws the
 /// icons too.
 fn install_svg_loader(ctx: &Context) {

@@ -527,7 +527,7 @@ mod tests {
         );
         let (accounts, limit) =
             commit_accounts(&fake, None, &repo, Some("f605456"), 500, NOW).expect("listed");
-        assert!(accounts.authors.is_empty());
+        assert_eq!(accounts.authors, []);
         assert_eq!(limit.remaining, Some(58));
         assert_eq!(
             commit_accounts(&fake, None, &repo, Some("main&x=1"), 1, NOW),
@@ -552,7 +552,7 @@ mod tests {
         };
         let (accounts, limit) =
             commit_accounts(&transport, None, &repo, None, 5, NOW).expect("listing");
-        assert!(!accounts.authors.is_empty());
+        assert_ne!(accounts.authors, []);
         assert!(limit.limit.is_some());
         let image = fetch_image(&transport, "https://github.com/cursoragent.png?size=96")
             .expect("redirected avatar");

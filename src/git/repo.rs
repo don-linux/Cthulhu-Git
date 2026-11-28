@@ -39,10 +39,10 @@ impl fmt::Display for Head {
 pub fn inspect(git: &Git, path: &Path) -> Result<RepoInfo, GitError> {
     let dir = require_directory(path)?;
     let root = repository_root(git, &dir)?;
-    let name = root
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.display().to_string());
+    let name = root.file_name().map_or_else(
+        || root.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
     let head = read_head(git, &root)?;
     Ok(RepoInfo { root, name, head })
 }

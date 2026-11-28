@@ -237,7 +237,7 @@ fn linux_fallback_paths() -> Vec<PathBuf> {
 /// one run on all.
 fn platform_fallbacks() -> Vec<PathBuf> {
     if cfg!(target_os = "macos") {
-        macos_fallback_paths(|path| path.is_file())
+        macos_fallback_paths(Path::is_file)
     } else if cfg!(windows) {
         windows_fallback_paths(|name| env::var_os(name))
     } else if cfg!(unix) {
@@ -288,6 +288,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the rows pass it as `path_var`; a `Some` per row pushes the table past 100 lines"
+    )]
     fn joined(dirs: &[PathBuf]) -> Option<OsString> {
         Some(env::join_paths(dirs).expect("joinable PATH"))
     }
@@ -508,7 +512,7 @@ mod tests {
         let expected = if cfg!(target_os = "macos") {
             (
                 vec![PathBuf::from(MACOS_SHIM_GIT)],
-                macos_fallback_paths(|path| path.is_file()),
+                macos_fallback_paths(Path::is_file),
             )
         } else if cfg!(windows) {
             (Vec::new(), windows_fallback_paths(|name| env::var_os(name)))

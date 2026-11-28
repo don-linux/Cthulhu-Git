@@ -7,7 +7,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -76,10 +76,8 @@ fn store_error(error: &keyring::Error) -> TokenStoreError {
     }
 }
 
-fn lock<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The token's entry in a credential store, reached through one worker thread.
@@ -104,7 +102,7 @@ impl Keychain {
         let (sender, receiver) = mpsc::channel();
         let jobs = thread::Builder::new()
             .name("keychain".to_owned())
-            .spawn(move || work(open(), &receiver))
+            .spawn(move || work(open().as_ref(), &receiver))
             .map(|_| sender)
             .map_err(|error| {
                 TokenStoreError::Unavailable(format!(
@@ -201,9 +199,9 @@ impl Ticket {
     }
 }
 
-fn work(entry: Result<keyring::Entry, TokenStoreError>, jobs: &Receiver<Job>) {
+fn work(entry: Result<&keyring::Entry, &TokenStoreError>, jobs: &Receiver<Job>) {
     for job in jobs {
-        let entry = match &entry {
+        let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
                 let (Job::Load(ticket) | Job::Save(_, ticket) | Job::Delete(ticket)) = job;
@@ -346,8 +344,7 @@ fn gh_name() -> &'static str {
 fn gh_fallbacks(home: Option<&Path>, program_files: Option<OsString>) -> Vec<PathBuf> {
     let mut paths = if cfg!(windows) {
         program_files
-            .map(|dir| vec![PathBuf::from(dir).join("GitHub CLI").join("gh.exe")])
-            .unwrap_or_default()
+            .map_or_default(|dir| vec![PathBuf::from(dir).join("GitHub CLI").join("gh.exe")])
     } else {
         ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
             .into_iter()
@@ -488,7 +485,7 @@ mod tests {
         }
     }
 
-    /// GH_TOKEN wins, as in GitHub CLI; a value that cannot be a token is
+    /// `GH_TOKEN` wins, as in GitHub CLI; a value that cannot be a token is
     /// passed over.
     #[test]
     fn the_environment_token_is_gh_token_then_github_token() {
@@ -686,7 +683,7 @@ mod tests {
                 closed = self
                     .opened
                     .wait(closed)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    .unwrap_or_else(PoisonError::into_inner);
             }
         }
     }

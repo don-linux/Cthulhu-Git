@@ -152,7 +152,7 @@ impl GitHubAuth {
     /// user's choice.
     pub fn use_env(&mut self) {
         if let Some((name, token)) = github::token_from_env(|name| std::env::var_os(name)) {
-            self.draft = token.expose().to_owned();
+            token.expose().clone_into(&mut self.draft);
             self.notice = Some(Notice::Info(format!(
                 "Filled from {name}. Press Save to keep it."
             )));
@@ -247,7 +247,7 @@ impl GitHubAuth {
                 }));
             }
             Outcome::Imported(Ok(token)) => {
-                self.draft = token.expose().to_owned();
+                token.expose().clone_into(&mut self.draft);
                 self.notice = Some(Notice::Info(
                     "Filled from GitHub CLI. Press Save to keep it.".to_owned(),
                 ));

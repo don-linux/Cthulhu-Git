@@ -35,6 +35,10 @@ fn plant(dir: &Path, name: &str, log: &Path) -> String {
 /// them through `include.path`), a textconv and an external diff, a
 /// signature program, fsmonitor, and a hook.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one hostile repository read by every command that could run its config"
+)]
 fn hostile_repository_config_never_runs_on_reads() {
     let repo = Repo::init("hostile");
     for name in ["a.txt", "b.txt", "c.txt"] {
@@ -96,7 +100,7 @@ fn hostile_repository_config_never_runs_on_reads() {
             .write(true)
             .open(repo.root.join(name))
             .expect(name);
-        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(86_400))
+        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_hours(24))
             .expect("mtime");
     }
 
@@ -116,7 +120,7 @@ fn hostile_repository_config_never_runs_on_reads() {
     assert_eq!(latest.map(|detail| detail.oid), Some(signed.clone()));
     assert_eq!(head_commit_oid(git, root).expect("head oid"), signed);
     quiet("head_commit_oid");
-    assert!(remotes(git, root).expect("remotes").is_empty());
+    assert_eq!(remotes(git, root).expect("remotes"), []);
     quiet("remotes");
     let glanced = glance(git, root).expect("glance");
     quiet("glance");
@@ -380,8 +384,8 @@ fn dubious_ownership_suggestion_is_shell_quoted() {
             !marker.exists(),
             "{path:?}: {suggestion} ran another command"
         );
-        let argv = fs::read(sidecar(&recorder, ".argv")).expect("git ran");
-        let args: Vec<&[u8]> = argv
+        let received = fs::read(sidecar(&recorder, ".argv")).expect("git ran");
+        let args: Vec<&[u8]> = received
             .split(|byte| *byte == 0)
             .filter(|arg| !arg.is_empty())
             .collect();

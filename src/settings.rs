@@ -17,6 +17,10 @@ const MAX_FONT_NAME_BYTES: usize = 128;
 /// its value from [`Settings::default`] and unknown ones are ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is its own key in settings.json; grouping them would change the file"
+)]
 pub struct Settings {
     /// Id of the active theme. `None` or an unknown id means the default theme.
     pub theme: Option<String>,
@@ -86,6 +90,7 @@ impl HistoryColumns {
     pub const RANGE: std::ops::RangeInclusive<u16> = 20..=1000;
 
     /// Puts each field outside [`Self::RANGE`] back to its own default.
+    #[must_use]
     pub fn normalized(self) -> Self {
         let defaults = Self::default();
         let keep = |value: u16, default: u16| {
@@ -458,6 +463,10 @@ mod tests {
 
     /// Every way a file is read. `None` is a parse error.
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one table of settings files and what each loads as"
+    )]
     fn from_json_fills_defaults_and_normalizes() {
         let defaults = HistoryColumns::default();
         let mut recents: Vec<String> = (0..20).map(|index| format!("/repo-{index}")).collect();
@@ -615,6 +624,10 @@ mod tests {
     /// What `save_to` writes reads back as `expected` (`None`: as saved),
     /// holds exactly the known keys, and so never a token.
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one table of saved settings and what each reads back as"
+    )]
     fn to_json_normalizes_and_round_trips() {
         const KEYS: [&str; 11] = [
             "author_avatars",

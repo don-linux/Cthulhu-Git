@@ -9,7 +9,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -29,9 +29,9 @@ use super::clock::now_unix;
 use super::theme::Palette;
 
 const WORKERS: usize = 4;
-const IMAGE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const IMAGE_TTL: Duration = Duration::from_hours(7 * 24);
 /// Short, so a token added later or a new Gravatar shows up within a day.
-const MISS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MISS_TTL: Duration = Duration::from_hours(24);
 /// Decoder limits: avatars are 96 px, nothing legitimate is near these.
 const MAX_SIDE: u32 = 1024;
 const MAX_DECODE_BYTES: u64 = 16 * 1024 * 1024;
@@ -239,9 +239,8 @@ impl AvatarService {
                     .name(format!("avatar-{index}"))
                     .spawn(move || {
                         loop {
-                            let job = match lock(&receiver).recv() {
-                                Ok(job) => job,
-                                Err(_) => return,
+                            let Ok(job) = lock(&receiver).recv() else {
+                                return;
                             };
                             let loaded = load(&job, &resolver, &status, cache.as_ref());
                             if done
@@ -270,9 +269,7 @@ impl AvatarService {
 /// A poisoned lock only means a worker panicked mid-request; the state is
 /// still usable.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn load(
@@ -326,8 +323,9 @@ fn load(
         // The API may still find this person: do not remember a miss.
         let wait = answer
             .retry_at
-            .map(|at| Duration::from_secs(at.saturating_sub(now)))
-            .unwrap_or(RETRY_AFTER)
+            .map_or(RETRY_AFTER, |at| {
+                Duration::from_secs(at.saturating_sub(now))
+            })
             .max(Duration::from_secs(1));
         return Loaded::RetryAt(Instant::now() + wait);
     }

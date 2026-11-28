@@ -129,7 +129,8 @@ fn format_not_found(tried: &[PathBuf]) -> String {
             .iter()
             .map(|path| path.display().to_string())
             .collect();
-        message.push_str(&format!(" Searched: {}", tried.join(", ")));
+        message.push_str(" Searched: ");
+        message.push_str(&tried.join(", "));
     }
     message
 }
@@ -387,7 +388,7 @@ fn command(program: &Path) -> Command {
     // helpers such as `git-credential-manager` and a Homebrew `ssh`. Append
     // those directories on macOS only, after the user's entries.
     let path_extras = if cfg!(target_os = "macos") {
-        macos_gui_path_dirs(|dir| dir.is_dir())
+        macos_gui_path_dirs(Path::is_dir)
     } else {
         Vec::new()
     };
@@ -550,9 +551,16 @@ fn capture(
     };
     let pid = child.id();
     let (tx, rx) = mpsc::channel();
-    // `command` pipes both streams, so neither `take` can come back empty.
-    drain(0, child.stdout.take().expect("git stdout is piped"), &tx);
-    drain(1, child.stderr.take().expect("git stderr is piped"), &tx);
+    #[expect(
+        clippy::expect_used,
+        reason = "`command` pipes both streams, so neither `take` can come back empty"
+    )]
+    let (stdout, stderr) = (
+        child.stdout.take().expect("git stdout is piped"),
+        child.stderr.take().expect("git stderr is piped"),
+    );
+    drain(0, stdout, &tx);
+    drain(1, stderr, &tx);
     let mut slots: [Option<Drained>; 2] = [None, None];
     let past_cap =
         |slots: &[Option<Drained>; 2]| slots.iter().any(|slot| matches!(slot, Some(Ok(None))));
@@ -1084,6 +1092,10 @@ mod tests {
     const INHERITED: EnvChange = None;
     const REMOVED: EnvChange = Some(None);
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "builds the set state of `EnvChange`, beside `INHERITED` and `REMOVED`"
+    )]
     fn set(value: impl Into<OsString>) -> EnvChange {
         Some(Some(value.into()))
     }
@@ -1118,6 +1130,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one table of inherited environments and what each command must see"
+    )]
     fn git_env_drops_inherited_git_vars_and_relative_path_entries() {
         let other_case = if cfg!(windows) { REMOVED } else { INHERITED };
         // Every case inherits all of these, each set to a hostile value.

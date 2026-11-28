@@ -172,6 +172,15 @@ fn unwritable_parent_directory_is_a_write_error() {
 /// JSON that does not parse, or more recents than the cap, is not.
 #[test]
 fn concurrent_saves_leave_valid_json() {
+    // Counts a writer as done even when it panics, so the reader stops and
+    // the panic fails the test instead of a reader that spins forever.
+    struct Finish<'a>(&'a AtomicUsize);
+    impl Drop for Finish<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
+
     // One burst often ends on a clean rename, which would hide an earlier
     // torn publish, so each writer runs two.
     const BURSTS: usize = 2;
@@ -203,14 +212,6 @@ fn concurrent_saves_leave_valid_json() {
             torn.lock().expect("torn lock").get_or_insert(problem);
         }
     };
-    // Counts a writer as done even when it panics, so the reader stops and
-    // the panic fails the test instead of a reader that spins forever.
-    struct Finish<'a>(&'a AtomicUsize);
-    impl Drop for Finish<'_> {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::Release);
-        }
-    }
     let writer = |name: &str, recents: usize, padding: usize| {
         let _finish = Finish(&finished);
         start.wait();

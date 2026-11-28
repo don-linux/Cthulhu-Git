@@ -50,6 +50,10 @@ fn file_url(path: &Path) -> String {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one table of repositories and what opening each finds"
+)]
 fn opening_a_path_finds_its_repository_head_and_graph() {
     #[cfg_attr(not(unix), expect(unused_mut, reason = "only Unix adds rows below"))]
     let mut cases: Vec<Case> = vec![

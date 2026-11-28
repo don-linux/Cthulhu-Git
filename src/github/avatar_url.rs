@@ -1,6 +1,8 @@
 //! Avatar URLs that need no API call: GitHub no-reply addresses, a few
 //! known agents, and Gravatar.
 
+use std::fmt::Write as _;
+
 use sha2::{Digest, Sha256};
 
 /// Pixels asked for. Twice the 40-point hover avatar, so it stays sharp at 2x.
@@ -16,8 +18,10 @@ const KNOWN_ACCOUNTS: [(&str, &str); 1] = [("cursoragent@cursor.com", "199161495
 pub fn sha256_hex(text: &str) -> String {
     Sha256::digest(text.as_bytes())
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 /// `{id}+{login}@users.noreply.github.com`, the form GitHub has used since

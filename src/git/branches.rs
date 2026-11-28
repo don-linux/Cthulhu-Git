@@ -153,6 +153,10 @@ fn parse_ref_line(line: &[u8]) -> Option<ParsedRef> {
 
 /// Empty when the branch has no commit. Anything that is not an integer rejects
 /// the whole record.
+#[expect(
+    clippy::option_option,
+    reason = "the outer `None` rejects the record, as in every parser here; the inner one is the field"
+)]
 fn parse_committer_time(bytes: &[u8]) -> Option<Option<i64>> {
     if bytes.is_empty() {
         return Some(None);

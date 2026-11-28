@@ -548,67 +548,7 @@ fn github_page(ui: &mut Ui, palette: &Palette, github: &mut GitHubAuth, api: &Ap
         });
     });
 
-    section(ui, |ui| {
-        section_title(ui, "Status");
-        ui.label(match github.stored() {
-            Stored::None => "No token. Public repositories only.",
-            Stored::Keychain => "Token saved in the system keychain.",
-            Stored::Session => "Token used for this session only; it is not saved.",
-        });
-        if let Some(login) = github.user() {
-            let limit = github
-                .rate()
-                .and_then(|rate| Some((rate.remaining?, rate.limit?)))
-                .map(|(remaining, limit)| format!(" · {remaining}/{limit} requests left this hour"))
-                .unwrap_or_default();
-            ui.colored_label(palette.diff_added, format!("Connected as {login}{limit}"));
-        }
-        if api.token_rejected {
-            ui.colored_label(
-                palette.warning,
-                "GitHub rejected the token; requests continue without it.",
-            );
-        }
-        if let Some(until) = api.paused_until {
-            let now = clock::now_unix();
-            if until > now {
-                let minutes = (until - now).div_ceil(60);
-                ui.colored_label(
-                    palette.warning,
-                    format!(
-                        "GitHub's rate limit was reached. The API is asked again in {minutes} min."
-                    ),
-                );
-            }
-        }
-        match github.notice() {
-            Some(Notice::Info(text)) => help(ui, text),
-            Some(Notice::Error(text)) => {
-                ui.colored_label(palette.error, text);
-            }
-            None => {}
-        }
-        if busy {
-            ui.spinner();
-        }
-        ui.horizontal(|ui| {
-            if text_button(ui, "Verify", !busy && github.has_token())
-                .on_hover_text("Asks GitHub who the token belongs to.")
-                .clicked()
-            {
-                github.verify(ui.ctx());
-            }
-            if text_button(ui, "Remove token", !busy && github.has_token()).clicked() {
-                github.remove(ui.ctx());
-            }
-        });
-        help(
-            ui,
-            "Stored in Keychain on macOS, Credential Manager on Windows, or the Secret Service \
-             (GNOME Keyring, KWallet) on Linux. Never in settings.json. It is sent only to \
-             api.github.com, never to avatar hosts.",
-        );
-    });
+    section(ui, |ui| token_status(ui, palette, github, api, busy));
 
     section(ui, |ui| {
         section_title(ui, "Possible later with this token");
@@ -626,6 +566,76 @@ fn github_page(ui: &mut Ui, palette: &Palette, github: &mut GitHubAuth, api: &Ap
     });
 }
 
+/// What is stored, whose token it is, GitHub's limits, and the token actions.
+fn token_status(
+    ui: &mut Ui,
+    palette: &Palette,
+    github: &mut GitHubAuth,
+    api: &ApiStatus,
+    busy: bool,
+) {
+    section_title(ui, "Status");
+    ui.label(match github.stored() {
+        Stored::None => "No token. Public repositories only.",
+        Stored::Keychain => "Token saved in the system keychain.",
+        Stored::Session => "Token used for this session only; it is not saved.",
+    });
+    if let Some(login) = github.user() {
+        let limit = github
+            .rate()
+            .and_then(|rate| Some((rate.remaining?, rate.limit?)))
+            .map_or_default(|(remaining, limit)| {
+                format!(" · {remaining}/{limit} requests left this hour")
+            });
+        ui.colored_label(palette.diff_added, format!("Connected as {login}{limit}"));
+    }
+    if api.token_rejected {
+        ui.colored_label(
+            palette.warning,
+            "GitHub rejected the token; requests continue without it.",
+        );
+    }
+    if let Some(until) = api.paused_until {
+        let now = clock::now_unix();
+        if until > now {
+            let minutes = (until - now).div_ceil(60);
+            ui.colored_label(
+                palette.warning,
+                format!(
+                    "GitHub's rate limit was reached. The API is asked again in {minutes} min."
+                ),
+            );
+        }
+    }
+    match github.notice() {
+        Some(Notice::Info(text)) => help(ui, text),
+        Some(Notice::Error(text)) => {
+            ui.colored_label(palette.error, text);
+        }
+        None => {}
+    }
+    if busy {
+        ui.spinner();
+    }
+    ui.horizontal(|ui| {
+        if text_button(ui, "Verify", !busy && github.has_token())
+            .on_hover_text("Asks GitHub who the token belongs to.")
+            .clicked()
+        {
+            github.verify(ui.ctx());
+        }
+        if text_button(ui, "Remove token", !busy && github.has_token()).clicked() {
+            github.remove(ui.ctx());
+        }
+    });
+    help(
+        ui,
+        "Stored in Keychain on macOS, Credential Manager on Windows, or the Secret Service \
+         (GNOME Keyring, KWallet) on Linux. Never in settings.json. It is sent only to \
+         api.github.com, never to avatar hosts.",
+    );
+}
+
 /// The prompt block, clipped out of a wide shell. The PTY is many rows tall
 /// so a multi-line prompt is not scrolled away; the box grows to the block
 /// that ends at the cursor. The shell measures the terminal font each frame,
@@ -633,7 +643,7 @@ fn github_page(ui: &mut Ui, palette: &Palette, github: &mut GitHubAuth, api: &Ap
 /// Pointer and keyboard are ignored.
 fn shell_preview(ui: &mut Ui, palette: &Palette, preview: &mut Option<Terminal>, cwd: &Path) {
     let row = terminal_row_height(ui);
-    let lines = terminal::preview_line_count(preview) as f32;
+    let lines = terminal::preview_line_count(preview.as_ref()) as f32;
     let size = Vec2::new(ui.available_width(), row * lines + PREVIEW_PAD * 2.0);
     let drawn = ui.allocate_ui(size, |ui| {
         ui.set_min_size(size);
@@ -904,6 +914,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one typed token, then every place it could leak through"
+    )]
     fn a_typed_token_stays_masked_and_out_of_links_and_copied_text() {
         const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
         const DATE: &str = "2026-10-24";

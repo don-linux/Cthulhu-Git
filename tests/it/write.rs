@@ -154,7 +154,14 @@ fn switch_attaches_head_to_the_named_branch() {
 /// Every refusal leaves HEAD and the files where they were. Git's own refusal
 /// is a `Command` error naming the branch, never a forced switch.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one table of refused switches and what each must leave in place"
+)]
 fn switch_refuses_and_leaves_the_repository_unchanged() {
+    type Setup = fn(&Repo) -> PathBuf;
+    type Check = fn(&str, &Repo, &Path);
+
     // Refused before git runs: this git does not exist, so running it would
     // be a spawn error instead.
     let nowhere = git_at(PathBuf::from("/nonexistent/git"));
@@ -167,8 +174,6 @@ fn switch_refuses_and_leaves_the_repository_unchanged() {
     }
 
     // (case, branch, setup returning where to switch, expected stderr, extra check)
-    type Setup = fn(&Repo) -> PathBuf;
-    type Check = fn(&str, &Repo, &Path);
     let cases: [(&str, &str, Setup, Option<&str>, Check); 4] = [
         (
             "a dirty file the switch would overwrite",
@@ -394,14 +399,14 @@ fn pull_ff_only_never_rebases() {
 
         let recorder = fake_git(&origin.tmp.path().join("bin/git"), "2.33.0", "argv");
         pull_ff_only(&git_at(recorder.clone()), &clone).expect("the recorder succeeds");
-        let argv = fs::read(sidecar(&recorder, ".argv")).expect("git ran");
-        let argv = String::from_utf8(argv).expect("utf-8 argv");
-        let args: Vec<&str> = argv.split('\0').collect();
+        let received = fs::read(sidecar(&recorder, ".argv")).expect("git ran");
+        let received = String::from_utf8(received).expect("utf-8 argv");
+        let args: Vec<&str> = received.split('\0').collect();
         let pull = args.iter().position(|arg| *arg == "pull").expect("a pull");
         assert_eq!(
             args[pull..],
             ["pull", "--ff-only", "--no-rebase", ""],
-            "{argv:?}"
+            "{received:?}"
         );
     }
 }

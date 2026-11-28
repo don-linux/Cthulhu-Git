@@ -114,10 +114,10 @@ fn snapshot_ppids() -> HashMap<u32, u32> {
         let Ok(pid) = name.parse::<u32>() else {
             continue;
         };
-        let Some(ppid) = ppid_from_status(pid) else {
+        let Some(parent) = ppid_from_status(pid) else {
             continue;
         };
-        ppids.insert(pid, ppid);
+        ppids.insert(pid, parent);
     }
     ppids
 }
@@ -154,10 +154,10 @@ fn snapshot_ppids() -> HashMap<u32, u32> {
         let Some(pid) = parts.next().and_then(|part| part.parse::<u32>().ok()) else {
             continue;
         };
-        let Some(ppid) = parts.next().and_then(|part| part.parse::<u32>().ok()) else {
+        let Some(parent) = parts.next().and_then(|part| part.parse::<u32>().ok()) else {
             continue;
         };
-        ppids.insert(pid, ppid);
+        ppids.insert(pid, parent);
     }
     ppids
 }

@@ -467,6 +467,10 @@ impl<'a> Layout<'a> {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one pass over the lanes; its steps share `lanes`, `traces` and `top_to_bottom`"
+    )]
     fn row(&self, row: usize, commit: &GraphCommit, lanes: &mut Vec<Lane>) -> GraphRow {
         let on_trunk = self.trunk[row];
         let commit_color = self.colors[row];

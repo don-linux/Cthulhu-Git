@@ -60,6 +60,10 @@ fn startup_folder(arg: Option<std::ffi::OsString>) -> Option<PathBuf> {
 /// Without an explicit icon, eframe shows the egui logo in the title bar,
 /// taskbar and Dock.
 #[cfg(not(target_os = "macos"))]
+#[expect(
+    clippy::expect_used,
+    reason = "build.rs encodes this PNG at compile time, so it always decodes"
+)]
 fn window_icon() -> egui::IconData {
     eframe::icon_data::from_png_bytes(include_bytes!(concat!(env!("OUT_DIR"), "/icon-256.png")))
         .expect("icon-256.png rendered by build.rs")

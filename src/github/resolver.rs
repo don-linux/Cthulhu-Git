@@ -235,6 +235,10 @@ impl AvatarResolver {
 
     /// `Some(Some(url))` when an address has an avatar, `Some(None)` when
     /// GitHub already said none of them has one, `None` when unknown.
+    #[expect(
+        clippy::option_option,
+        reason = "mirrors `known`, whose `None` value records that GitHub has no avatar"
+    )]
     fn lookup(&mut self, repo: &GitHubRepo, emails: &[String]) -> Option<Option<String>> {
         let state = self.state(repo);
         let mut all_unlinked = !emails.is_empty();
@@ -356,7 +360,7 @@ mod tests {
                 "{email}"
             );
         }
-        assert!(fake.urls().is_empty());
+        assert_eq!(fake.urls(), [] as [String; 0]);
 
         let warm = list_url(100, Some("aaa111"));
         fake.reply(&warm, 200, &[], b"[]");

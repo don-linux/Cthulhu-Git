@@ -531,14 +531,13 @@ fn paint_latest(
         .rows
         .iter()
         .find(|row| row.oid == commit.oid)
-        .map(|row| row.branches.as_slice())
-        .unwrap_or(&[]);
+        .map_or_default(|row| row.branches.as_slice());
     paint_commit(
         ui,
         repo.github.as_ref(),
         palette,
         avatars,
-        CommitBody {
+        &CommitBody {
             oid: &commit.oid,
             author: Some(&commit.author),
             co_authors: &commit.co_authors,
@@ -592,15 +591,15 @@ fn paint_selected(
         DetailDate::Pending
     };
     let stats = ready.and_then(|hover| hover.stats);
-    let tags = ready.map(|hover| hover.tags.as_slice()).unwrap_or(&[]);
-    let files = ready.map(|hover| hover.files.as_slice()).unwrap_or(&[]);
-    let branches = row.map(|row| row.branches.as_slice()).unwrap_or(&[]);
+    let tags = ready.map_or_default(|hover| hover.tags.as_slice());
+    let files = ready.map_or_default(|hover| hover.files.as_slice());
+    let branches = row.map_or_default(|row| row.branches.as_slice());
     paint_commit(
         ui,
         repo.github.as_ref(),
         palette,
         avatars,
-        CommitBody {
+        &CommitBody {
             oid,
             author,
             co_authors,
@@ -661,7 +660,7 @@ fn paint_commit(
     github: Option<&GitHubRepo>,
     palette: &Palette,
     avatars: &mut AvatarService,
-    body: CommitBody<'_>,
+    body: &CommitBody<'_>,
 ) -> bool {
     let context = github.map(|github| RepoContext {
         repo: github.clone(),

@@ -192,7 +192,7 @@ fn branches_report_commit_counts_and_ahead_behind() {
     assert_eq!(detail.oid, repo.git(&["rev-parse", "HEAD"]));
     assert_eq!(detail.author.name, "cthulhu");
     assert_eq!(detail.author.email, "cthulhu@example.invalid");
-    assert!(detail.co_authors.is_empty());
+    assert_eq!(detail.co_authors, []);
     assert!(
         detail
             .message
@@ -237,8 +237,8 @@ fn graph_and_latest_commit_read_co_author_trailers() {
         .iter()
         .find(|row| row.summary == "Awaken")
         .expect("awaken row");
-    assert!(awakened.co_authors.is_empty());
-    assert!(awakened.author.aliases.is_empty());
+    assert_eq!(awakened.co_authors, []);
+    assert_eq!(awakened.author.aliases, [] as [String; 0]);
 
     let info = repo.info();
     let detail = latest_commit(&repo.git, &info.root, &info.head)
@@ -353,7 +353,7 @@ fn commit_hover_reads_a_root_commit_a_merge_and_an_annotated_tag() {
         merged.files
     );
     assert!(merged.stats.is_some_and(|stats| stats.files >= 1));
-    assert!(merged.tags.is_empty());
+    assert_eq!(merged.tags, [] as [String; 0]);
     let diff = file_diff(&repo.git, &info.root, &merge, listed).expect("NFD patch");
     assert!(
         diff.lines
@@ -367,7 +367,7 @@ fn commit_hover_reads_a_root_commit_a_merge_and_an_annotated_tag() {
 fn remotes_are_listed_in_config_order() {
     let repo = awaken();
     let info = repo.info();
-    assert!(remotes(&repo.git, &info.root).expect("none").is_empty());
+    assert_eq!(remotes(&repo.git, &info.root).expect("none"), []);
 
     repo.git(&[
         "remote",
@@ -464,7 +464,7 @@ fn graph_shows_where_a_branch_leaves_main() {
         .expect("feature row");
     assert_eq!(graph.rows[feature_at + 1].summary, "Awaken");
     assert_eq!(graph.rows[feature_at + 1].commit_lane, 0);
-    assert!(graph.rows[feature_at + 1].branches.is_empty());
+    assert_eq!(graph.rows[feature_at + 1].branches, []);
 }
 
 /// A detached HEAD keeps its commit on the graph, labelled `HEAD`, beside

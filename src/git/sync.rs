@@ -12,7 +12,7 @@ use std::time::Duration;
 use super::exec::{Git, GitError, classify_failure, rejected};
 
 /// Fetch and pull talk to a network. A local read stays on the shorter limit.
-const NETWORK_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+const NETWORK_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// `git pull --ff-only --no-rebase`, with no remote and no branch: git uses
 /// the upstream. `--no-rebase` skips `pull.rebase` and `branch.<name>.rebase`
@@ -195,6 +195,10 @@ pub fn switch_branch(git: &Git, root: &Path, name: &str) -> Result<(), GitError>
 ///
 /// `check-ref-format --branch` rejects that dash. A name such as `-switch` is
 /// still a legal ref, and `git switch --` can take it.
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "git rejects only a lowercase `.lock` component; `a.LOCK` is a legal ref"
+)]
 fn branch_name_is_switchable(name: &str) -> bool {
     if name.is_empty() || name == "@" {
         return false;

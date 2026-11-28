@@ -6,6 +6,11 @@
 //! - Windows targets: a multi-size `.ico` plus `VERSIONINFO`, compiled into the
 //!   executable so Explorer, the taskbar and Task Manager show the icon and name.
 
+#![expect(
+    clippy::expect_used,
+    reason = "a build script reports failure by panicking; cargo stops the build and shows the message"
+)]
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -104,7 +109,7 @@ fn embed_windows_resources(tree: &usvg::Tree, out_dir: &Path) {
     }
 }
 
-/// embed_resource puts `OUT_DIR` on the resource compiler's include path, so
+/// `embed_resource` puts `OUT_DIR` on the resource compiler's include path, so
 /// the icon beside the script is found by its bare name.
 fn resource_script() -> String {
     let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");

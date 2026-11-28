@@ -487,6 +487,10 @@ pub(crate) fn parse_numstat(bytes: &[u8]) -> Option<Vec<CommitFile>> {
 }
 
 /// Digits only (`u64::from_str` alone takes `+5`), or `-` for a binary file.
+#[expect(
+    clippy::option_option,
+    reason = "the outer `None` rejects the record, as in every parser here; the inner one is the field"
+)]
 fn count(field: &[u8]) -> Option<Option<u64>> {
     if field == b"-" {
         return Some(None);
@@ -704,8 +708,7 @@ fn hunk_starts(line: &str) -> Option<(u32, u32)> {
 
 fn spec_start(spec: &str) -> Option<u32> {
     spec.split_once(',')
-        .map(|(start, _)| start)
-        .unwrap_or(spec)
+        .map_or(spec, |(start, _)| start)
         .parse()
         .ok()
 }
@@ -716,6 +719,8 @@ pub fn short_oid(oid: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use proptest::prelude::*;
 
     use super::*;
@@ -818,15 +823,16 @@ mod tests {
         let email = format!("{}@x.test", "e".repeat(20_000));
         let line = format!("Co-authored-by: {name} <{email}>");
         assert_eq!(parse_co_authors(&line), [Person::new(name, email)]);
-        assert!(parse_co_authors(&"a".repeat(100_000)).is_empty());
+        assert_eq!(parse_co_authors(&"a".repeat(100_000)), []);
 
         // A megabyte of `<` before the closing `>`, and thousands of distinct
         // co-authors, come from a repository and must parse in linear time.
         let brackets = format!("Co-authored-by: a {}>b>", "<".repeat(1 << 20));
-        assert!(parse_co_authors(&brackets).is_empty());
-        let many: String = (0..20_000)
-            .map(|n| format!("Co-authored-by: N{n} <n{n}@x.test>\n"))
-            .collect();
+        assert_eq!(parse_co_authors(&brackets), []);
+        let many = (0..20_000).fold(String::new(), |mut many, n| {
+            let _ = writeln!(many, "Co-authored-by: N{n} <n{n}@x.test>");
+            many
+        });
         assert_eq!(parse_co_authors(&many).len(), 20_000);
     }
 
@@ -1088,7 +1094,7 @@ mod tests {
                 deletions: 7,
             })
         );
-        assert!(hover.tags.is_empty());
+        assert_eq!(hover.tags, [] as [String; 0]);
     }
 
     #[test]
@@ -1133,8 +1139,8 @@ mod tests {
             parse_tag_names(b"v1,0\0\nv0.0.1\r\n"),
             ["v1,0".to_owned(), "v0.0.1".to_owned()]
         );
-        assert!(parse_tag_names(b"").is_empty());
-        assert!(parse_tag_names(b"\n").is_empty());
+        assert_eq!(parse_tag_names(b""), [] as [String; 0]);
+        assert_eq!(parse_tag_names(b"\n"), [] as [String; 0]);
     }
 
     #[test]
@@ -1267,7 +1273,7 @@ mod tests {
         }
         let merge = parse_commit_hover(&hover_record(b"Merge branch 'topic'\n", b"\n"))
             .expect("a merge with no changes");
-        assert!(merge.files.is_empty());
+        assert_eq!(merge.files, []);
         assert_eq!(merge.stats, None);
 
         assert_eq!(parse_commit_hover(b""), None);

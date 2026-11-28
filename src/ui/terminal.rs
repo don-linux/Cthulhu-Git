@@ -55,6 +55,10 @@ struct ShellArgv {
 
 /// The shell for the PTY, from this process's environment.
 #[cfg(unix)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "one signature with the Windows `shell`, which fails without PowerShell"
+)]
 fn shell() -> Result<ShellArgv, String> {
     let unset = vars_to_unset(std::env::vars_os());
     let unset: Vec<&str> = unset.iter().map(String::as_str).collect();
@@ -614,8 +618,7 @@ fn pty_pid(pty: &Pty) -> u32 {
     {
         pty.child_watcher()
             .pid()
-            .map(std::num::NonZeroU32::get)
-            .unwrap_or(0)
+            .map_or(0, std::num::NonZeroU32::get)
     }
 }
 
@@ -626,7 +629,10 @@ fn should_signal(pid: u32) -> bool {
     if pid <= 1 {
         return false;
     }
-    let Some(parsed) = rustix::process::Pid::from_raw(pid as i32) else {
+    let Some(parsed) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
         return false;
     };
     if parsed == rustix::process::getpid() || parsed == rustix::process::getpgrp() {
@@ -674,7 +680,10 @@ fn signal_pid(pid: u32, signal: rustix::process::Signal) {
     if !should_signal(pid) {
         return;
     }
-    let Some(pid) = rustix::process::Pid::from_raw(pid as i32) else {
+    let Some(pid) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
         return;
     };
     let _ = rustix::process::kill_process(pid, signal);
@@ -773,6 +782,8 @@ fn processes_in_session(_session: i32) -> Vec<u32> {
 
 #[cfg(windows)]
 fn kill_process_tree(pid: u32) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     if pid <= 1 {
         return Ok(());
     }
@@ -780,8 +791,6 @@ fn kill_process_tree(pid: u32) -> Result<(), String> {
     let program = windows_taskkill_path(std::env::var("SystemRoot").ok().as_deref(), |path| {
         Path::new(path).is_file()
     })?;
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let status = std::process::Command::new(&program)
         .args(["/F", "/T", "/PID", &pid.to_string()])
         .stdin(std::process::Stdio::null())
@@ -849,7 +858,7 @@ const PREVIEW_MAX_LINES: usize = 8;
 ///
 /// One row until the shell is on screen. A live shell reports the prompt
 /// block that ends at the cursor.
-pub fn preview_line_count(terminal: &Option<Terminal>) -> usize {
+pub fn preview_line_count(terminal: Option<&Terminal>) -> usize {
     let Some(Terminal::Live(session)) = terminal else {
         return 1;
     };
@@ -1349,7 +1358,7 @@ fn handle_pointer(
             session.anchor = None;
         }
     } else if over {
-        report_buttons(session, hit.col, hit.row, &pressed, &released, modifiers);
+        report_buttons(session, hit.col, hit.row, pressed, released, modifiers);
         if response.dragged() && down {
             session.write(&sgr(
                 button_code(0, modifiers) + 32,
@@ -1378,8 +1387,8 @@ fn report_buttons(
     session: &ShellSession,
     col: usize,
     row: usize,
-    pressed: &[bool; 3],
-    released: &[bool; 3],
+    pressed: [bool; 3],
+    released: [bool; 3],
     modifiers: Modifiers,
 ) {
     for (index, code) in [0_u8, 1, 2].into_iter().enumerate() {
@@ -2079,13 +2088,12 @@ END
             {
                 return pid;
             }
-            if started.elapsed() > Duration::from_secs(2) {
-                panic!(
-                    "pid file {} was not written\n{}",
-                    path.display(),
-                    screen_text(session)
-                );
-            }
+            assert!(
+                started.elapsed() <= Duration::from_secs(2),
+                "pid file {} was not written\n{}",
+                path.display(),
+                screen_text(session)
+            );
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -2137,9 +2145,11 @@ END
             {
                 return pid;
             }
-            if started.elapsed() > Duration::from_secs(2) {
-                panic!("pid file {} was not written", path.display());
-            }
+            assert!(
+                started.elapsed() <= Duration::from_secs(2),
+                "pid file {} was not written",
+                path.display()
+            );
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -2151,7 +2161,7 @@ END
         assert!(error.contains("Cannot enter"), "{error}");
     }
 
-    /// (LANG, LC_ALL, LC_CTYPE, LANG for the shell). A Dock launch has no
+    /// (`LANG`, `LC_ALL`, `LC_CTYPE`, `LANG` for the shell). A Dock launch has no
     /// locale, so the shell gets UTF-8; a locale that is set is inherited.
     #[test]
     fn shell_env_names_the_terminal_and_fills_a_missing_locale() {
@@ -2265,7 +2275,7 @@ END
     #[test]
     fn window_size_never_reports_a_zero_grid() {
         let fits = |cells: u16, px: u16| {
-            cells >= 1 && px >= 1 && u32::from(cells) * u32::from(px) <= u32::from(u16::MAX)
+            cells >= 1 && px >= 1 && u16::try_from(u32::from(cells) * u32::from(px)).is_ok()
         };
         let small = grid_metrics(80, 24, 8.0, 16.0);
         let huge = grid_metrics(1_000, 400, 1_000.0, 1_000.0);
@@ -2477,6 +2487,10 @@ END
     /// terminal. Ctrl+Tab does, so the keyboard is never trapped.
     #[cfg(unix)]
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one live shell for every key; a shell per key would repeat its startup"
+    )]
     fn focused_terminal_keeps_escape_tab_and_arrows_until_ctrl_tab() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let cwd = dir.path().to_owned();
@@ -2570,7 +2584,7 @@ END
                 "{modifiers:?}+Tab kept focus in the terminal"
             );
             assert!(
-                harness.ctx.memory(|memory| memory.focused()).is_some(),
+                harness.ctx.memory(egui::Memory::focused).is_some(),
                 "{modifiers:?}+Tab dropped focus instead of moving it"
             );
             harness.hover_at(inside);
