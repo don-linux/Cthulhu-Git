@@ -149,8 +149,7 @@ fn opened(name: &str, commits: &[(String, String)], truncated: bool) -> OpenedRe
             summary: summary.clone(),
             parents: commits
                 .get(index + 1)
-                .map(|(parent, _)| vec![parent.clone()])
-                .unwrap_or_default(),
+                .map_or_default(|(parent, _)| vec![parent.clone()]),
             author: author.clone(),
             co_authors: Vec::new(),
         })
@@ -393,9 +392,9 @@ fn aligned_edges(
         labels(harness)
     );
     let names: Vec<_> = headers.iter().map(|(name, _)| *name).collect();
-    let mut previous = -1isize;
+    let mut previous = None;
     for name in &names {
-        let index = TITLES.iter().position(|title| title == name).unwrap() as isize;
+        let index = TITLES.iter().position(|title| title == name);
         assert!(
             index > previous,
             "{case}: titles out of order: {}",
@@ -484,10 +483,9 @@ fn aligned_edges(
 
 fn pointer_over_history(harness: &Harness<'_, Screen>, height: f32) -> Pos2 {
     let headers = header_row(harness);
-    let title = headers
+    let (_, title) = headers
         .iter()
         .find(|(name, _)| *name == "Commit Hash" || *name == "Branch" || *name == "Graph")
-        .map(|(_, rect)| *rect)
         .unwrap_or_else(|| panic!("no visible column\n{}", labels(harness)));
     // A few points into the title keeps the pointer over the history body
     // and off the sidebars, below the single commit row.
@@ -739,6 +737,10 @@ fn titles_follow_their_cells_through_a_sideways_scroll() {
 /// The message divider, dragged wider, reset by a double click, then dragged
 /// past its minimum. The other columns keep their shares throughout.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one divider dragged, reset and dragged again; each step starts from the table the last one left"
+)]
 fn the_message_divider_resizes_and_resets_only_its_column() {
     let start = HistoryColumns {
         branch: 160,
@@ -889,6 +891,10 @@ fn a_thousand_commits_stay_virtualized() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one row with every cell too long, checked column by column"
+)]
 fn long_cells_stay_inside_their_columns() {
     let oid = "abcdef0123456789abcdef0123456789abcdef01";
     let summary = format!("{}{}", "字".repeat(80), "W".repeat(400));
@@ -1343,7 +1349,7 @@ fn lane_glow_near(harness: &Harness<'_, Screen>, lane: egui::Color32) -> usize {
 
 fn brightest_glow(harness: &Harness<'_, Screen>) -> u8 {
     let colors = glow_colors(harness);
-    colors.iter().map(|color| color.a()).max().unwrap_or(0)
+    colors.iter().map(egui::Color32::a).max().unwrap_or(0)
 }
 
 fn assert_no_glow(harness: &Harness<'_, Screen>) {
@@ -1519,7 +1525,7 @@ fn graph_point(harness: &Harness<'_, Screen>, row_y: f32) -> Pos2 {
     let hash = header_title(harness, "Commit Hash");
     let left = graph.left() - super::history::CELL_PAD;
     let right = hash.left() - super::history::CELL_PAD;
-    Pos2::new((left + right) / 2.0, row_y)
+    Pos2::new(f32::midpoint(left, right), row_y)
 }
 
 fn selection_rows(harness: &Harness<'_, Screen>) -> Vec<egui::Rect> {
@@ -1856,6 +1862,10 @@ fn clicking_the_author_card_hash_copies_it() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one commit followed from its row to its colored diff"
+)]
 fn view_changes_shows_tags_and_a_colored_diff() {
     let mut repo = one_commit("field notes from the estuary");
     let oid = repo.latest.as_ref().expect("commit").oid.clone();
@@ -1998,10 +2008,7 @@ fn panel_toggle_rects(harness: &Harness<'_, Screen>) -> Vec<egui::Rect> {
         .query_all_by_role(Role::Button)
         .map(|node| node.rect())
         .collect();
-    let top = buttons
-        .iter()
-        .map(|rect| rect.top())
-        .fold(f32::MAX, f32::min);
+    let top = buttons.iter().map(egui::Rect::top).fold(f32::MAX, f32::min);
     buttons
         .into_iter()
         .filter(|rect| rect.top() < top + 4.0)

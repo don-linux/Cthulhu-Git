@@ -237,6 +237,10 @@ pub struct HistoryOutput {
 /// When `loading` is set and there are no rows yet, the muted line says the
 /// history is still opening. A finished load with no commits keeps
 /// "No commits yet."
+#[expect(
+    clippy::too_many_lines,
+    reason = "one frame of the table in order: the divider drag is read before the layout is used, and the rows, fades and header share that layout"
+)]
 pub fn show(
     ui: &mut Ui,
     repo: &mut OpenedRepo,
@@ -292,8 +296,8 @@ pub fn show(
         .ctx()
         .data(|data| data.get_temp(live_id))
         .unwrap_or(saved);
-    let text_font = scaled(ui, TextStyle::Body);
-    let mono_font = scaled(ui, TextStyle::Monospace);
+    let text_font = scaled(ui, &TextStyle::Body);
+    let mono_font = scaled(ui, &TextStyle::Monospace);
     let hash_width = ui
         .painter()
         .layout_no_wrap(
@@ -334,11 +338,11 @@ pub fn show(
         }
         layout = layout_columns(panel, &live, mins, graph.columns);
     }
-    let line = ui
+    let line_height = ui
         .text_style_height(&TextStyle::Monospace)
         .max(ui.text_style_height(&TextStyle::Body))
         * TEXT_SCALE;
-    let row_height = (line + ROW_PAD).max(ROW_MIN);
+    let row_height = (line_height + ROW_PAD).max(ROW_MIN);
     let context = github.as_ref().map(|repo| RepoContext {
         repo: repo.clone(),
         head: rows[0].oid.clone(),
@@ -458,7 +462,7 @@ fn reset_column(mut columns: HistoryColumns, column: Column) -> HistoryColumns {
     columns
 }
 
-fn scaled(ui: &Ui, style: TextStyle) -> FontId {
+fn scaled(ui: &Ui, style: &TextStyle) -> FontId {
     let mut font = style.resolve(ui.style());
     font.size *= TEXT_SCALE;
     font
@@ -607,6 +611,10 @@ fn content(cell: Rect) -> Rect {
     )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one row in paint order: fill, connector, lanes and chip, then each cell and the sensors on top"
+)]
 fn history_row(
     ui: &mut Ui,
     row: &GraphRow,
@@ -1064,12 +1072,12 @@ fn ribbon<T: Copy>(
     if length < 0.5 {
         return;
     }
-    let steps = (length / GLOW_SAMPLE).ceil().max(1.0) as usize;
+    let intervals = (length / GLOW_SAMPLE).ceil().max(1.0) as usize;
     let tangent = delta / length;
     let normal = Vec2::new(-tangent.y, tangent.x);
-    let samples: Vec<(Pos2, T)> = (0..=steps)
+    let samples: Vec<(Pos2, T)> = (0..=intervals)
         .map(|step| {
-            let point = start + delta * (step as f32 / steps as f32);
+            let point = start + delta * (step as f32 / intervals as f32);
             (point, light(point))
         })
         .collect();
@@ -1083,7 +1091,7 @@ fn ribbon<T: Copy>(
         // the next row's ribbon starts square to its own lane. A cut square to
         // a lane change would leave a notch without light at the joint. Such
         // a segment always runs down the row, so `normal.x` is never zero.
-        let along_edge = (step == 0 && on_edge[0]) || (step == steps && on_edge[1]);
+        let along_edge = (step == 0 && on_edge[0]) || (step == intervals && on_edge[1]);
         for &(offset, share) in stops {
             let across = if along_edge {
                 Vec2::new(offset / normal.x, 0.0)
@@ -1093,7 +1101,7 @@ fn ribbon<T: Copy>(
             mesh.colored_vertex(point + across, shade(light, share));
         }
     }
-    stitch(mesh, first, steps as u32, stops.len() as u32, false);
+    stitch(mesh, first, intervals as u32, stops.len() as u32, false);
 }
 
 /// Rings of `steps` vertices around `center`, each `base * scale` from it in
@@ -1178,7 +1186,7 @@ fn add_glow_disc(
     let tint = |share| glow_color(color, glow_share(peak, share * fade));
     let aura = [
         (inner, tint(1.0)),
-        ((inner + outer) * 0.5, tint(GLOW_EDGE_SHARE)),
+        (f32::midpoint(inner, outer), tint(GLOW_EDGE_SHARE)),
         (outer, tint(0.0)),
     ];
     // On a base of 1, each scale is exactly the radius it names.
@@ -1462,6 +1470,8 @@ fn chip_fill(palette: &Palette, color: usize, current: bool, lit: f32) -> Color3
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use cthulhu_git::git::GraphTrace;
     use proptest::prelude::*;
 
@@ -1487,6 +1497,10 @@ mod tests {
         /// larger, laid end to end. The lanes fit in the graph column, and
         /// changing one share never moves another column.
         #[test]
+        #[expect(
+            clippy::float_cmp,
+            reason = "the layout returns one of these values, computed the same way, so they are equal to the bit"
+        )]
         fn each_column_is_its_share_or_its_minimum(
             panel in -10.0_f32..4000.0,
             shares in proptest::array::uniform5(HistoryColumns::RANGE),
@@ -1743,6 +1757,10 @@ mod tests {
     /// then a digest of each mesh's exact bits. One row per line, as the
     /// test prints them.
     #[rustfmt::skip]
+    #[expect(
+        clippy::unreadable_literal,
+        reason = "the digests are pasted as the test prints them, with `{:#018x}`"
+    )]
     const GOLDEN: [([[usize; 2]; 2], [u64; 2]); 8] = [
         ([[30, 120], [25, 96]], [0xd7e20f28027a9a35, 0x43f38e51d12d739a]), // straight
         ([[36, 150], [30, 120]], [0x96903933ab41dd26, 0x3de8a17a1344d847]), // lane change
@@ -1824,17 +1842,20 @@ mod tests {
                 .map(|(_, mesh)| [mesh.vertices.len(), mesh.indices.len()]);
             let digests = meshes.each_ref().map(|(_, mesh)| mesh_digest(mesh));
             let [halo, crest] = digests;
-            now += &format!("({counts:?}, [{halo:#018x}, {crest:#018x}]), // {case}\n");
+            let _ = writeln!(
+                now,
+                "({counts:?}, [{halo:#018x}, {crest:#018x}]), // {case}"
+            );
             if counts == golden.0 && (!exact || digests == golden.1) {
                 continue;
             }
-            changed += &format!("\n{case}: counts {:?}, now {counts:?}\n", golden.0);
+            let _ = writeln!(changed, "\n{case}: counts {:?}, now {counts:?}", golden.0);
             for (name, mesh) in &meshes {
                 for (index, vertex) in mesh.vertices.iter().enumerate() {
                     let (x, y, color) = (vertex.pos.x, vertex.pos.y, vertex.color.to_array());
-                    changed += &format!("{name} {index}: ({x:?}, {y:?}) {color:?}\n");
+                    let _ = writeln!(changed, "{name} {index}: ({x:?}, {y:?}) {color:?}");
                 }
-                changed += &format!("{name} indices: {:?}\n", mesh.indices);
+                let _ = writeln!(changed, "{name} indices: {:?}", mesh.indices);
             }
         }
         assert!(
