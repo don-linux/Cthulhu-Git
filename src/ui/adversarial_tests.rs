@@ -275,6 +275,7 @@ fn sidebar_toggles_are_saved() {
     repo.commit("Awaken");
     let mut harness = sandbox.app(Some(repo.root.clone()));
     settle_open(&mut harness);
+    assert_shows(&harness, "Show terminal", "the terminal starts hidden");
     let before = sandbox.json();
     // (toggle, saved field, a title only that sidebar shows)
     for (toggle, field, title) in [

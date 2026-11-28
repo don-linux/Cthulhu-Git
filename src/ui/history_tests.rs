@@ -1729,7 +1729,7 @@ fn selected_commit_shows_the_hover_details() {
         stats: Some(CommitStats {
             files: 2,
             insertions: 4,
-            deletions: 1,
+            deletions: 0,
         }),
         tags: Vec::new(),
     };
@@ -1741,7 +1741,8 @@ fn selected_commit_shows_the_hover_details() {
     harness.get_by_label("3 hours ago · 2024-05-01 09:30");
     harness.get_by_label("2 files changed");
     harness.get_by_label("4 insertions(+)");
-    harness.get_by_label("1 deletion(-)");
+    let deletions = harness.query_all_by_label_contains("deletion").count();
+    assert_eq!(deletions, 0, "a count of zero is listed");
     harness.get_by_label("Grace Hopper");
     harness.get_by_label("#12");
     harness.get_by_label("Open on GitHub");
@@ -1870,6 +1871,8 @@ fn clicking_the_author_card_hash_copies_it() {
 fn view_changes_shows_tags_and_a_colored_diff() {
     let mut repo = one_commit("field notes from the estuary");
     let oid = repo.latest.as_ref().expect("commit").oid.clone();
+    // Wider than the file list, so the list cuts it.
+    let path = format!("notes/{}seal.txt", "deep/".repeat(12));
     let hover = CommitHover {
         oid: oid.clone(),
         author: person("Ada Lovelace", "ada@example.invalid"),
@@ -1878,14 +1881,14 @@ fn view_changes_shows_tags_and_a_colored_diff() {
         authored_at: "2024-05-01 09:30".to_owned(),
         message: "field notes from the estuary".to_owned(),
         files: vec![CommitFile {
-            path: "notes/seal.txt".to_owned(),
+            path: path.clone(),
             previous: None,
             insertions: Some(1),
             deletions: Some(1),
         }],
         stats: Some(CommitStats {
             files: 1,
-            insertions: 1,
+            insertions: 0,
             deletions: 1,
         }),
         tags: vec!["v1,0".to_owned()],
@@ -1894,7 +1897,7 @@ fn view_changes_shows_tags_and_a_colored_diff() {
     repo.diffs.store_ready(
         super::changes::DiffKey {
             oid: oid.clone(),
-            path: "notes/seal.txt".to_owned(),
+            path: path.clone(),
         },
         FileDiff {
             notice: None,
@@ -1918,6 +1921,9 @@ fn view_changes_shows_tags_and_a_colored_diff() {
     let mut harness = pick_harness(repo, true);
     harness.get_by_label("v1,0");
     harness.get_by_label("1 file changed");
+    harness.get_by_label("1 deletion(-)");
+    let insertions = harness.query_all_by_label_contains("insertion").count();
+    assert_eq!(insertions, 0, "a count of zero is listed");
     let author_title = header_title(&harness, "Author");
     let row_author = label_rects(&harness, "Ada Lovelace")
         .into_iter()
@@ -1940,13 +1946,18 @@ fn view_changes_shows_tags_and_a_colored_diff() {
     harness.get_by_label("View changes").click_accesskit();
     harness.step();
     settle(&mut harness);
-    let file = harness.get_by_role_and_label(Role::Button, "notes/seal.txt");
-    let toggled = file.accesskit_node().toggled();
-    assert_eq!(
-        toggled,
-        Some(Toggled::True),
-        "the shown file is not selected"
-    );
+    let file = harness.get_by_role_and_label(Role::Button, &path);
+    let selected = file.accesskit_node().toggled() == Some(Toggled::True);
+    assert!(selected, "the shown file is not selected");
+    // The listed path is cut where the counts' 88-point slot starts.
+    let counts = harness.get_by_label("+1").rect();
+    let listed = painted_text(&harness, &path)
+        .into_iter()
+        .map(|text| text.bounds)
+        .min_by(|left, right| left.left().total_cmp(&right.left()))
+        .expect("the listed path");
+    let gap = counts.left() - listed.right();
+    assert!((0.0..88.0).contains(&gap), "the path ends {gap} before +1");
     let added = harness.get_by_label("vault door opens").rect();
     let removed = harness.get_by_label("vault door shuts").rect();
     let palette = theme::DEFAULT_THEME.palette;
@@ -1961,6 +1972,15 @@ fn view_changes_shows_tags_and_a_colored_diff() {
             .iter()
             .any(|rect| rect.contains(removed.center())),
         "the removed line has no red background"
+    );
+    // A pull that moves the latest commit closes the old one's changes.
+    if let Some(latest) = &mut harness.state_mut().repo.latest {
+        latest.oid = "b".repeat(40);
+    }
+    harness.step();
+    assert!(
+        harness.state().repo.changes.is_none(),
+        "the changes stayed open"
     );
 }
 
