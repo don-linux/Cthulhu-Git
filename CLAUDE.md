@@ -30,6 +30,7 @@ clippy before a turn ends.
   Silence a lint with `#[expect(lint, reason = "…")]`, never a bare `allow`.
 - Errors: one `thiserror` enum per module; keep messages stable, the UI shows them.
 - Do not add a dependency without asking. Prefer std and what is already locked.
+  Cargo skips versions under a week old (`.cargo/config.toml` says how to override).
 - Prefer deleting or merging code over adding a layer. No test-only hooks inside
   production code: inject the dependency (settings path, transport, store, git).
 - Security invariants live in `docs/TESTING.md`: the token only reaches
