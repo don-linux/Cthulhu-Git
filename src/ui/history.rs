@@ -1021,9 +1021,84 @@ fn glow_share(alpha: u8, share: f32) -> u8 {
     (f32::from(alpha) * share).round() as u8
 }
 
-/// A ribbon along `start`→`end`. Full alpha out to the stroke edge, since the
+/// A band along `start`→`end`, sampled every [`GLOW_SAMPLE`] or closer. Each
+/// sample reads its `light` once; `shade` colors each stop across the band
+/// from that light and the stop's share. A segment with no length, or with
+/// no sample that `shows`, adds nothing.
+fn ribbon<T: Copy>(
+    mesh: &mut Mesh,
+    start: Pos2,
+    end: Pos2,
+    stops: &[(f32, f32)],
+    light: impl Fn(Pos2) -> T,
+    shows: impl Fn(T) -> bool,
+    shade: impl Fn(T, f32) -> Color32,
+) {
+    let delta = end - start;
+    let length = delta.length();
+    if length < 0.5 {
+        return;
+    }
+    let steps = (length / GLOW_SAMPLE).ceil().max(1.0) as usize;
+    let tangent = delta / length;
+    let normal = Vec2::new(-tangent.y, tangent.x);
+    let samples: Vec<(Pos2, T)> = (0..=steps)
+        .map(|step| {
+            let point = start + delta * (step as f32 / steps as f32);
+            (point, light(point))
+        })
+        .collect();
+    let crosses = samples.iter().any(|&(_, light)| shows(light));
+    if !crosses {
+        return;
+    }
+    let first = mesh.vertices.len() as u32;
+    for (point, light) in samples {
+        for &(offset, share) in stops {
+            mesh.colored_vertex(point + normal * offset, shade(light, share));
+        }
+    }
+    stitch(mesh, first, steps as u32, stops.len() as u32, false);
+}
+
+/// Rings of `steps` vertices around `center`, each `base * scale` from it in
+/// one color, and the bands between neighboring rings.
+fn rings(mesh: &mut Mesh, center: Pos2, base: f32, steps: usize, rings: &[(f32, Color32)]) {
+    let first = mesh.vertices.len() as u32;
+    for &(scale, color) in rings {
+        for step in 0..steps {
+            let angle = step as f32 / steps as f32 * std::f32::consts::TAU;
+            let (sin, cos) = angle.sin_cos();
+            mesh.colored_vertex(center + Vec2::new(cos, sin) * base * scale, color);
+        }
+    }
+    let bands = rings.len().saturating_sub(1) as u32;
+    stitch(mesh, first, bands, steps as u32, true);
+}
+
+/// Two triangles for each pair of neighbors in `bands` + 1 rows of `width`
+/// vertices from `first`, joining each row to the next. A `closed` row also
+/// joins its last vertex to its first.
+fn stitch(mesh: &mut Mesh, first: u32, bands: u32, width: u32, closed: bool) {
+    let pairs = if closed {
+        width
+    } else {
+        width.saturating_sub(1)
+    };
+    for band in 0..bands {
+        let row = first + band * width;
+        let next = row + width;
+        for index in 0..pairs {
+            let right = (index + 1) % width;
+            mesh.add_triangle(row + index, next + index, row + right);
+            mesh.add_triangle(row + right, next + index, next + right);
+        }
+    }
+}
+
+/// The halo along `start`→`end`. Full alpha out to the stroke edge, since the
 /// stroke is painted on top of the center, then a falloff that clears before
-/// the next lane. Samples follow content Y, including on a diagonal.
+/// the next lane.
 fn add_glow_segment(mesh: &mut Mesh, start: Pos2, end: Pos2, color: Color32, glow: LaneGlow) {
     // Offset from the stroke center, and the share of this sample's alpha.
     const STOPS: [(f32, f32); 6] = [
@@ -1034,38 +1109,15 @@ fn add_glow_segment(mesh: &mut Mesh, start: Pos2, end: Pos2, color: Color32, glo
         (GLOW_SHOULDER, GLOW_EDGE_SHARE),
         (GLOW_RADIUS, 0.0),
     ];
-    let delta = end - start;
-    let length = delta.length();
-    if length < 0.5 {
-        return;
-    }
-    let steps = (length / GLOW_SAMPLE).ceil().max(1.0) as usize;
-    let tangent = delta / length;
-    let normal = Vec2::new(-tangent.y, tangent.x);
-    let base = mesh.vertices.len() as u32;
-    let across = STOPS.len() as u32;
-    for step in 0..=steps {
-        let point = start + delta * (step as f32 / steps as f32);
-        let alpha = glow_alpha(glow.time, glow.origin + point.y);
-        for (offset, share) in STOPS {
-            mesh.colored_vertex(
-                point + normal * offset,
-                glow_color(color, glow_share(alpha, share)),
-            );
-        }
-    }
-    for step in 0..steps as u32 {
-        let row = base + step * across;
-        let next = row + across;
-        for index in 0..across - 1 {
-            let left = row + index;
-            let right = left + 1;
-            let next_left = next + index;
-            let next_right = next_left + 1;
-            mesh.add_triangle(left, next_left, right);
-            mesh.add_triangle(right, next_left, next_right);
-        }
-    }
+    ribbon(
+        mesh,
+        start,
+        end,
+        &STOPS,
+        |point| glow_alpha(glow.time, glow.origin + point.y),
+        |_| true,
+        |alpha, share| glow_color(color, glow_share(alpha, share)),
+    );
 }
 
 /// Ring outside the commit dot. `inner` is the opaque circle; `outer` is where
@@ -1074,37 +1126,15 @@ fn add_glow_disc(mesh: &mut Mesh, center: Pos2, inner: f32, outer: f32, color: C
     if outer < inner + 0.5 {
         return;
     }
-    const STEPS: usize = 16;
-    let mid_radius = (inner + outer) * 0.5;
-    let rings = [
-        (inner, peak),
-        (mid_radius, glow_share(peak, GLOW_EDGE_SHARE)),
-        (outer, 0),
+    let tint = |alpha| glow_color(color, alpha);
+    let shoulder = tint(glow_share(peak, GLOW_EDGE_SHARE));
+    let aura = [
+        (inner, tint(peak)),
+        ((inner + outer) * 0.5, shoulder),
+        (outer, tint(0)),
     ];
-    let base = mesh.vertices.len() as u32;
-    for (radius, alpha) in rings {
-        for step in 0..STEPS {
-            let angle = step as f32 / STEPS as f32 * std::f32::consts::TAU;
-            let (sin, cos) = angle.sin_cos();
-            mesh.colored_vertex(
-                center + Vec2::new(cos, sin) * radius,
-                glow_color(color, alpha),
-            );
-        }
-    }
-    for ring in 0..2 {
-        let inner_ring = base + ring * STEPS as u32;
-        let outer_ring = inner_ring + STEPS as u32;
-        for step in 0..STEPS {
-            let next = (step + 1) % STEPS;
-            let a = inner_ring + step as u32;
-            let b = inner_ring + next as u32;
-            let c = outer_ring + step as u32;
-            let d = outer_ring + next as u32;
-            mesh.add_triangle(a, c, b);
-            mesh.add_triangle(b, c, d);
-        }
-    }
+    // On a base of 1, each scale is exactly the radius it names.
+    rings(mesh, center, 1.0, 16, &aura);
 }
 
 fn crest_color(lane: Color32, lobe: f32, share: f32) -> Color32 {
@@ -1124,7 +1154,8 @@ fn crest_color(lane: Color32, lobe: f32, share: f32) -> Color32 {
     )
 }
 
-/// A short light along `start`→`end`, sampled so it follows a diagonal.
+/// A short light along `start`→`end`. A segment the spark does not reach
+/// adds nothing.
 fn add_crest_segment(mesh: &mut Mesh, start: Pos2, end: Pos2, color: Color32, glow: LaneGlow) {
     // Offset from the stroke center, and the share of this sample's alpha.
     const STOPS: [(f32, f32); 5] = [
@@ -1134,43 +1165,15 @@ fn add_crest_segment(mesh: &mut Mesh, start: Pos2, end: Pos2, color: Color32, gl
         (LANE_STROKE / 2.0, 0.7),
         (GLOW_CREST_RADIUS, 0.0),
     ];
-    let delta = end - start;
-    let length = delta.length();
-    if length < 0.5 {
-        return;
-    }
-    let steps = (length / GLOW_SAMPLE).ceil().max(1.0) as usize;
-    let tangent = delta / length;
-    let normal = Vec2::new(-tangent.y, tangent.x);
-    let lobe_at = |point: Pos2| crest_lobe(glow.time, glow.origin + point.y);
-    let crosses = (0..=steps).any(|step| {
-        let point = start + delta * (step as f32 / steps as f32);
-        lobe_at(point) > 0.02
-    });
-    if !crosses {
-        return;
-    }
-    let base = mesh.vertices.len() as u32;
-    let across = STOPS.len() as u32;
-    for step in 0..=steps {
-        let point = start + delta * (step as f32 / steps as f32);
-        let lobe = lobe_at(point);
-        for (offset, share) in STOPS {
-            mesh.colored_vertex(point + normal * offset, crest_color(color, lobe, share));
-        }
-    }
-    for step in 0..steps as u32 {
-        let row = base + step * across;
-        let next = row + across;
-        for index in 0..across - 1 {
-            let left = row + index;
-            let right = left + 1;
-            let next_left = next + index;
-            let next_right = next_left + 1;
-            mesh.add_triangle(left, next_left, right);
-            mesh.add_triangle(right, next_left, next_right);
-        }
-    }
+    ribbon(
+        mesh,
+        start,
+        end,
+        &STOPS,
+        |point| crest_lobe(glow.time, glow.origin + point.y),
+        |lobe| lobe > 0.02,
+        |lobe, share| crest_color(color, lobe, share),
+    );
 }
 
 /// Soft spot on the commit dot, fading at `radius`.
@@ -1178,30 +1181,9 @@ fn add_crest_disc(mesh: &mut Mesh, center: Pos2, radius: f32, color: Color32, lo
     if radius < 0.5 {
         return;
     }
-    const STEPS: usize = 12;
-    let rings = [(0.0, 1.0), (0.55, 0.45), (1.0, 0.0)];
-    let base = mesh.vertices.len() as u32;
-    for (scale, share) in rings {
-        let tint = crest_color(color, lobe, share);
-        for step in 0..STEPS {
-            let angle = step as f32 / STEPS as f32 * std::f32::consts::TAU;
-            let (sin, cos) = angle.sin_cos();
-            mesh.colored_vertex(center + Vec2::new(cos, sin) * radius * scale, tint);
-        }
-    }
-    for ring in 0..2 {
-        let inner_ring = base + ring * STEPS as u32;
-        let outer_ring = inner_ring + STEPS as u32;
-        for step in 0..STEPS {
-            let next = (step + 1) % STEPS;
-            let a = inner_ring + step as u32;
-            let b = inner_ring + next as u32;
-            let c = outer_ring + step as u32;
-            let d = outer_ring + next as u32;
-            mesh.add_triangle(a, c, b);
-            mesh.add_triangle(b, c, d);
-        }
-    }
+    let tint = |share| crest_color(color, lobe, share);
+    let spot = [(0.0, tint(1.0)), (0.55, tint(0.45)), (1.0, tint(0.0))];
+    rings(mesh, center, radius, 12, &spot);
 }
 
 /// Returns whether a different commit was chosen. A second click on the
