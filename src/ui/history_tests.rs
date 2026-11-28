@@ -1231,8 +1231,9 @@ fn hovering_a_panel_toggle_does_not_grow_the_top_bar() {
     }
 }
 
-/// `main` on the spine and `feature` on its own color, joined at the root.
-fn fork_graph() -> HistoryGraph {
+/// `main` on the spine, `mains` commits down to the root, and `feature` on its
+/// own color, forking off the root below all of them.
+fn fork_graph(mains: u8) -> HistoryGraph {
     let author = person("Ada Lovelace", "ada@example.invalid");
     let commit = |oid: u8, summary: &str, parents: &[u8]| GraphCommit {
         oid: format!("{oid:040x}"),
@@ -1244,13 +1245,14 @@ fn fork_graph() -> HistoryGraph {
         author: author.clone(),
         co_authors: Vec::new(),
     };
+    let base = mains + 1;
+    let mut commits: Vec<_> = (1..=mains)
+        .map(|oid| commit(oid, &format!("main {oid}"), &[oid + 1]))
+        .collect();
+    commits.push(commit(u8::MAX, "on feature", &[base]));
+    commits.push(commit(base, "base", &[]));
     layout_graph(
-        &[
-            commit(1, "on main", &[2]),
-            commit(3, "on feature", &[4]),
-            commit(2, "mid main", &[4]),
-            commit(4, "base", &[]),
-        ],
+        &commits,
         &[
             GraphTip {
                 name: "main".to_owned(),
@@ -1261,7 +1263,7 @@ fn fork_graph() -> HistoryGraph {
             },
             GraphTip {
                 name: "feature".to_owned(),
-                oid: format!("{:040x}", 3),
+                oid: format!("{:040x}", u8::MAX),
                 color: 3,
                 principal: false,
                 current: false,
@@ -1372,7 +1374,7 @@ fn assert_glow_is(harness: &Harness<'_, Screen>, lane: egui::Color32) {
 
 #[test]
 fn clicking_a_branch_tag_lights_only_that_lanes_halo() {
-    let repo = opened_graph("lane-glow", fork_graph());
+    let repo = opened_graph("lane-glow", fork_graph(2));
     let mut harness = harness(
         egui::vec2(1400.0, HEIGHT),
         screen(repo, HistoryColumns::default(), false, false),
@@ -1394,6 +1396,34 @@ fn clicking_a_branch_tag_lights_only_that_lanes_halo() {
 
     click_branch(&mut harness, "main");
     assert_glow_is(&harness, main);
+}
+
+/// The crest asks for its next frame only while a painted row glows and the
+/// window has focus: (lit branch, window focused, frame requested). Forty
+/// commits of `main` keep `feature`'s rows below the window.
+#[test]
+fn the_glow_asks_for_frames_only_while_seen() {
+    for (lit, focused, requested) in [
+        (None, true, false),
+        (Some("main"), true, true),
+        (Some("main"), false, false),
+        (Some("feature"), true, false),
+    ] {
+        let mut repo = opened_graph("glow-frames", fork_graph(40));
+        repo.lit_branch = lit.map(str::to_owned);
+        let mut harness = harness(
+            egui::vec2(1400.0, HEIGHT),
+            screen(repo, HistoryColumns::default(), false, false),
+        );
+        harness.input_mut().focused = focused;
+        harness.step();
+        let delay = harness.output().viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert_eq!(
+            delay < std::time::Duration::MAX,
+            requested,
+            "{lit:?} lit, focused {focused}: next frame in {delay:?}"
+        );
+    }
 }
 
 /// Two commits on `main`, in a repository with a GitHub remote, so the

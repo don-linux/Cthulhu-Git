@@ -342,11 +342,8 @@ pub fn show(
         head: rows[0].oid.clone(),
     });
     let time = ui.input(|input| input.time);
-    if lit.is_some() {
-        ui.ctx().request_repaint_after(GLOW_FRAME);
-    }
 
-    let click = ui
+    let (click, glowed) = ui
         .scope(|ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             let (header_rect, _) =
@@ -363,6 +360,7 @@ pub fn show(
                 time,
                 selected: selected_commit.as_deref(),
                 click: None,
+                glowed: false,
             };
             // Where the rows were placed this frame. The scroll area's returned
             // offset already includes this frame's wheel and scrollbar input,
@@ -382,9 +380,14 @@ pub fn show(
             ui.ctx()
                 .data_mut(|data| data.insert_temp(origin_id, origin_x));
             header(ui, header_rect, origin_x, &layout, *view_id, palette);
-            cells.click
+            (cells.click, cells.glowed)
         })
         .inner;
+    // The crest moves only while it is on screen and someone can watch it:
+    // a lit lane scrolled away, or a window in the background, costs no frames.
+    if glowed && ui.input(|input| input.focused) {
+        ui.ctx().request_repaint_after(GLOW_FRAME);
+    }
     let reveal_detail = click.is_some_and(|click| {
         // The sidebar and the lanes are already drawn. One more frame shows the click.
         ui.ctx().request_repaint();
@@ -557,6 +560,8 @@ struct RowContext<'a> {
     /// This frame's click, applied once every row is drawn, so the whole
     /// table paints the state the frame started with.
     click: Option<RowClick>,
+    /// A painted row carried the lit lane's light this frame.
+    glowed: bool,
 }
 
 enum RowClick {
@@ -636,7 +641,7 @@ fn history_row(
             }
         }
         let lanes = painter.with_clip_rect(graph.intersect(ui.clip_rect()));
-        paint_lanes(
+        cx.glowed |= paint_lanes(
             &lanes,
             graph,
             row,
@@ -878,6 +883,7 @@ fn commit_dot(graph: Rect, row: &GraphRow, lane_width: f32) -> (Pos2, f32, f32) 
     (center, outer, DOT_INNER.min(outer - 1.5).max(1.0))
 }
 
+/// Returns whether the row carried any of the lit lane's light.
 fn paint_lanes(
     painter: &egui::Painter,
     graph: Rect,
@@ -886,7 +892,7 @@ fn paint_lanes(
     lane_width: f32,
     fill: Color32,
     glow: Option<LaneGlow>,
-) {
+) -> bool {
     let (dot, outer, inner) = commit_dot(graph, row, lane_width);
     let (halo, crest) = glow
         .map(|glow| {
@@ -899,6 +905,7 @@ fn paint_lanes(
             )
         })
         .unwrap_or_default();
+    let glowed = !halo.is_empty() || !crest.is_empty();
     if !halo.is_empty() {
         painter.add(halo);
     }
@@ -919,6 +926,7 @@ fn paint_lanes(
     if !crest.is_empty() {
         painter.add(crest);
     }
+    glowed
 }
 
 /// The light on the lit lane in one row, in `color`: the halo, painted under
