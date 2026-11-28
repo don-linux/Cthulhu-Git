@@ -48,8 +48,3 @@ Details in `.claude/rules/testing.md` (loaded when editing tests).
 - A new test must reproduce a bug or kill a mutant nothing else kills.
 - A refactor must not grow net test lines. Never weaken an assertion to make it pass.
 - The skill `/slim-tests` holds the coverage + mutation workflow for pruning.
-
-## Work in progress
-
-The repo is being slimmed down; the plan and the audit evidence are in
-`docs/refactor-audit-2026-11.md`.
